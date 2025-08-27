@@ -183,7 +183,7 @@ class SGLangWorker(Worker):
                 )
 
             # Create RolloutResult from the outputs.
-            rollout_result = RolloutResult.from_engine_results(
+            rollout_result = RolloutResult.from_sglang_results(
                 results,
                 request.n,
                 request.input_ids,
@@ -343,7 +343,7 @@ class AsyncSGLangWorker(SGLangWorker):
                             continue
 
                     input_ids = [input_ids] * len(results)
-                    rollout_result = RolloutResult.from_engine_results(
+                    rollout_result = RolloutResult.from_sglang_results(
                         results,
                         rollout_request.n,
                         input_ids,

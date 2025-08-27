@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+from vllm.outputs import RequestOutput as VllmRequestOutput
 from omegaconf import DictConfig
 
 from rlinf.data.datasets import batch_pad_to_fixed_len
@@ -250,7 +251,15 @@ class RolloutResult:
         return attention_mask, position_ids
 
     @staticmethod
-    def from_engine_results(
+    def from_vllm_results(
+        results: List[VllmRequestOutput],
+        answers: Optional[List[List[int]]] = None,
+        return_logprobs: bool = False,
+    ) -> "RolloutResult":
+        return NotImplementedError
+
+    @staticmethod
+    def from_sglang_results(
         results: List[Dict],
         group_size: int,
         input_ids: List[List[int]],
