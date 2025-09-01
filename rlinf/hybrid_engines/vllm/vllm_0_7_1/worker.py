@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import gc
 import os
 import signal
@@ -56,6 +57,8 @@ from rlinf.workers.rollout.vllm.io_struct import (
     SyncHFWeightCommand,
     WorkerReadyResponse,
 )
+
+from . import weight_loader  # noqa all
 
 logger = init_logger(__name__)
 
@@ -110,9 +113,9 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
         )
 
     def sync_hf_weight(self, command: SyncHFWeightCommand) -> CollectiveRpcResponse:
-        use_cudagraph = not self.rlinf_config.rollout.enforce_eager
+        _ = not self.rlinf_config.rollout.enforce_eager
         colocate = self.placement_mode == PlacementMode.COLLOCATED
-        assert use_cudagraph, "use_cudagraph must be True now."
+        # assert use_cudagraph, "use_cudagraph must be True now."
 
         state_dict = self.recv(
             src_group_name=self._actor_group_name, src_rank=self.actor_weight_rank
@@ -136,39 +139,37 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
                 del new_weight
         else:
             model.load_weights(state_dict.items())
-        return CollectiveRpcResponse(rank=self._rank, data=None, success=True)
+        return CollectiveRpcResponse(rank=self.rank, data=None, success=True)
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: SchedulerOutput):
         output: ModelRunnerOutput = super().execute_model(scheduler_output)
-        return CollectiveRpcResponse(
-            rank=self._rank, data=output if self._rank == 0 else None, success=True
-        )
+        return CollectiveRpcResponse(rank=self.rank, data=output, success=True)
 
     def get_kv_cache_spec(self) -> CollectiveRpcResponse:
         kv_cache_spec: KVCacheSpec = super().get_kv_cache_spec()
-        return CollectiveRpcResponse(rank=self._rank, data=kv_cache_spec, success=True)
+        return CollectiveRpcResponse(rank=self.rank, data=kv_cache_spec, success=True)
 
     def initialize_cache(self, kv_cache_config: KVCacheConfig) -> CollectiveRpcResponse:
         result: None = super().initialize_cache(kv_cache_config)
-        return CollectiveRpcResponse(rank=self._rank, data=result, success=True)
+        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
 
     def compile_or_warm_up_model(self) -> CollectiveRpcResponse:
         result: None = super().compile_or_warm_up_model()
-        return CollectiveRpcResponse(rank=self._rank, data=result, success=True)
+        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
 
     @torch.inference_mode()
     def determine_available_memory(self) -> CollectiveRpcResponse:
         result: int = super().determine_available_memory()  # byte
-        return CollectiveRpcResponse(rank=self._rank, data=result, success=True)
+        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
 
     def profile(self, is_start: bool = True) -> CollectiveRpcResponse:
         result: None = super().profile(is_start)
-        return CollectiveRpcResponse(rank=self._rank, data=result, success=True)
+        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
 
     def check_health(self) -> CollectiveRpcResponse:
         result: None = super().check_health()
-        return CollectiveRpcResponse(rank=self._rank, data=result, success=True)
+        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
 
     def offload_model_weights(
         self, command: OffloadModelWeightCommand
@@ -187,23 +188,21 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
         )
         return CollectiveRpcResponse(
             command_id=command.command_id,
-            rank=self._rank,
+            rank=self.rank,
             data={"freed_bytes": freed_bytes},
             success=True,
         )
 
     def get_model(self) -> CollectiveRpcResponse:
         result: nn.Module = super().get_model()
-        return CollectiveRpcResponse(
-            rank=self._rank, data=result if self._rank == 0 else None, success=True
-        )
+        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
 
     def init_device(self):
         if self.device_config.device.type == "cuda":
             os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             # because of cuda_visible_devices, use rank in process group
-            self.device = torch.device(f"cuda:{self.rank}")
+            self.device = torch.device(f"cuda:{self.local_rank}")
             torch.cuda.set_device(self.device)
 
             _check_if_gpu_supports_dtype(self.model_config.dtype)
@@ -293,11 +292,11 @@ class ZmqWorkerProc:
 
         pid = os.getpid()
         _add_prefix(
-            sys.stdout, f"VllmZmqWorker[rank={rank},local_rank={local_rank}]", pid
+            sys.stdout,
+            f"VllmZmqWorker[dp_rank={self.worker.get_parent_rank()},tp_rank={self.rank}]",
+            pid,
         )
-        _add_prefix(
-            sys.stderr, f"VllmZmqWorker[rank={rank},local_rank={local_rank}]", pid
-        )
+
         self.worker.init_device()
         self.worker.load_model()
         # after load_model, we should save it's named_buffers to implement sync weight
