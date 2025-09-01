@@ -264,13 +264,16 @@ class RolloutResult:
         response_ids = []
         logprobs = []
         is_end = []
-        for res in results:
+        for index, res in enumerate(results):
             if res.prompt_token_ids is not None:
                 prompt_ids.append(res.prompt_token_ids)
                 prompt_lengths.append(len(res.prompt_token_ids))
             else:
                 return NotImplementedError("should tokenize prompt.")
             response_id = list(res.outputs[0].token_ids)
+            print(
+                f"for idx: {index},prompt ids:{res.prompt_token_ids}, output is {res.outputs[0]},output len is {len(res.outputs)}"
+            )
             response_ids.append(response_id)
             response_lengths.append(len(response_id))
             is_end.append(res.finished)

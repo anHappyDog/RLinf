@@ -18,7 +18,7 @@ from typing import List
 from omegaconf import DictConfig
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from rlinf.config import torch_dtype_from_precision
 from rlinf.data.io_struct import RolloutRequest, RolloutResult
@@ -54,6 +54,7 @@ class VLLMWorker(Worker):
             sampling_params = SamplingParams(
                 temperature=0,
                 max_tokens=cfg_sampling_params.max_new_tokens,
+                output_kind=RequestOutputKind.FINAL_ONLY,
             )
         else:
             sampling_params = SamplingParams(
@@ -62,6 +63,7 @@ class VLLMWorker(Worker):
                 top_p=cfg_sampling_params.top_p,
                 repetition_penalty=cfg_sampling_params.repetition_penalty,
                 max_tokens=cfg_sampling_params.max_new_tokens,
+                output_kind=RequestOutputKind.FINAL_ONLY,
             )
         return sampling_params
 
@@ -84,7 +86,8 @@ class VLLMWorker(Worker):
             enable_sleep_mode=True,  # it enables offload weights
         )
         vllm_config: VllmConfig = engine_args.create_engine_config()
-
+        vllm_config.cache_config.enable_prefix_caching = False
+        vllm_config.scheduler_config.enable_chunked_prefill = False
         self.log_info(f"[LLM dp {self._rank}] start to initialize VLLM engine")
         self._vllm_engine = VLLMEngine(
             rlinf_config=self._cfg,
@@ -128,7 +131,6 @@ class VLLMWorker(Worker):
                     self._return_logprobs,
                 )
                 rollout_results.append(results)
-
                 if self._cfg.rollout.print_outputs:
                     raise NotImplementedError("TODO")
             output_channel.put(rollout_results)

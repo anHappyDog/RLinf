@@ -82,7 +82,7 @@ class VLLMExecutor(Executor):
         self._listen_engine_handle.start()
 
         super().__init__(vllm_config)
-        logger.info("VLLMExecutor initialized.", flush=True)
+        logger.info("VLLMExecutor initialized.")
 
     def _listen_engine(self):
         while True:
@@ -142,9 +142,7 @@ class VLLMExecutor(Executor):
                 f"vllm_executor: local rank is : {self.placement._rollout_gpus[self.dp_rank * self.tp_size + rank]}"
             )
             worker = ZmqWorkerProc.make_worker_process(
-                local_rank=self.placement._rollout_gpus[
-                    self.dp_rank * self.tp_size + rank
-                ],
+                local_rank=rank,
                 rank=rank,
                 worker_input_ipc_name=self.worker_input_ipc_name,
                 worker_output_ipc_name=self.worker_output_ipc_name,
@@ -153,9 +151,9 @@ class VLLMExecutor(Executor):
                 placement=self.placement,
                 vllm_config=self.vllm_config,
             )
-            logger.info(f"worker process created for rank:{rank}", flush=True)
+            logger.info(f"worker process created for rank:{rank}")
             self.workers.append(worker)
-            logger.info("all worker created!", flush=True)
+            logger.info("all worker created!")
 
         ready_workers: Set[int] = set()
 
@@ -204,6 +202,7 @@ class VLLMExecutor(Executor):
     ) -> List[Any]:
         kwargs = kwargs or {}
         timeout_ms = -1 if timeout is None else int(timeout * 1000)
+
         try:
             if isinstance(method, str):
                 send_method = method
@@ -211,7 +210,8 @@ class VLLMExecutor(Executor):
                 send_method = cloudpickle.dumps(
                     method, protocol=pickle.HIGHEST_PROTOCOL
                 )
-            logger.debug(f"Sending RPC request: {send_method}", flush=True)
+
+            logger.debug(f"Sending RPC request: {send_method}")
             command = CollectiveRpcCommand(method=send_method, args=args, kwargs=kwargs)
 
             self.send_to_workers.send_pyobj(command)
@@ -226,15 +226,13 @@ class VLLMExecutor(Executor):
                     )
                     logger.debug(
                         f"recevied collective rpc response : {response}",
-                        flush=True,
                     )
                     assert isinstance(response, CollectiveRpcResponse), (
                         f"Expected CollectiveRpcResponse, got {type(response)}"
                     )
                     if response.command_id != command.command_id:
                         logger.error(
-                            f"Received a stale RPC response for command {response.command_id}, expecting {command.command_id}. Discarding.",
-                            flush=True,
+                            f"Received a stale RPC response for command {response.command_id}, expecting {command.command_id}. Discarding."
                         )
                         continue
 
@@ -250,11 +248,10 @@ class VLLMExecutor(Executor):
             logger.error(
                 f"RPC call timed out after {timeout}s. "
                 f"Received {responses_received}/{self.world_size} responses.",
-                flush=True,
             )
             return responses
         except Exception as e:
-            logger.error(f"Error occurred during RPC call: {e}", flush=True)
+            logger.error(f"Error occurred during RPC call: {e}")
             return responses
 
     def check_health(self):
