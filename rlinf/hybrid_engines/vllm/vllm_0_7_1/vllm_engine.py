@@ -144,3 +144,4 @@ class VLLMEngine:
         assert response.command_id == command.command_id, (
             f"Expected get {command.command_id}'s response, got, {response.command_id}"
         )
+        self._engine.reset_prefix_cache()

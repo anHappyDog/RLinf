@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import os
 from typing import List
 
 from omegaconf import DictConfig
@@ -34,6 +34,7 @@ class VLLMWorker(Worker):
         self._cfg = config
         self._placement = placement
 
+        self._prepare_vllm_environment()
         self._return_logprobs = self._cfg.rollout.return_logprobs
         self._sampling_params = self._get_sampling_params_from_config()
 
@@ -47,6 +48,20 @@ class VLLMWorker(Worker):
                 * self._cfg.rollout.tensor_parallel_size
                 * self._cfg.rollout.pipeline_parallel_size
             )
+
+    def _prepare_vllm_environment(self) -> None:
+        # use v1 engine
+        os.environ["VLLM_USE_V1"] = "1"
+        os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = (
+            "1" if self._cfg.rollout.enable_flash_infer_sampler else "0"
+        )
+        # use spawn to avoid fork issues with CUDA
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        # set False to use Inproclient, which uses sync calls.
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        # avoid nccl cumem issues
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+        os.environ["VLLM_ATTENTION_BACKEND"] = self._cfg.rollout.vllm_attention_backend
 
     def _get_sampling_params_from_config(self) -> SamplingParams:
         cfg_sampling_params = self._cfg.algorithm.sampling_params
@@ -77,8 +92,8 @@ class VLLMWorker(Worker):
             dtype=torch_dtype_from_precision(self._cfg.actor.model.precision),
             gpu_memory_utilization=self._cfg.rollout.gpu_memory_utilization,
             enforce_eager=self._cfg.rollout.enforce_eager,
-            enable_chunked_prefill=False,
-            enable_prefix_caching=False,
+            enable_chunked_prefill=self._cfg.rollout.enable_chunked_prefill,
+            enable_prefix_caching=self._cfg.rollout.enable_prefix_caching,
             task="generate",
             trust_remote_code=self._cfg.actor.tokenizer.trust_remote_code,
             max_model_len=self._cfg.runner.seq_length,
@@ -86,14 +101,13 @@ class VLLMWorker(Worker):
             enable_sleep_mode=True,  # it enables offload weights
         )
         vllm_config: VllmConfig = engine_args.create_engine_config()
-        vllm_config.cache_config.enable_prefix_caching = False
-        vllm_config.scheduler_config.enable_chunked_prefill = False
+        self.log_info(f"vllm_config is {vllm_config}")
         self.log_info(f"[LLM dp {self._rank}] start to initialize VLLM engine")
         self._vllm_engine = VLLMEngine(
             rlinf_config=self._cfg,
             vllm_config=vllm_config,
-            log_stats=True,  # temporarily True for debug
-            multiprocess_model=True,  # use SyncMPClient
+            log_stats=not self._cfg.rollout.disable_log_stats,
+            multiprocess_model=False,  # use Inproclient
             parent_address=self.worker_address,
             placement=self._placement,
             dp_rank=self._rank,
