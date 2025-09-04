@@ -93,9 +93,9 @@ rollout:
   eos: null                   # will be tokenizer.eos_token_id if null.
   enable_chunked_prefill: True  # enable vllm to use chunked_prefill
   enable_prefix_caching: True   # enable vllm to use prefix_caching
-  enable_flash_infer_sampler: False # if True, vllm will use flashinfer to do sampling.
+  enable_flash_infer_sampler: True # if True, vllm will use flashinfer to do sampling.
 
-  vllm_attention_backend: XFORMERS # used by vllm
+  vllm_attention_backend: FLASH_ATTN # used by vllm
   attention_backend: triton # used by sglang
   return_logprobs: ${not:${algorithm.recompute_logprobs}}
 
