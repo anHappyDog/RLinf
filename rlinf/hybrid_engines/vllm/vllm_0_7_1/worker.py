@@ -29,7 +29,9 @@ import zmq
 from omegaconf import DictConfig
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.device_allocator.cumem import CuMemAllocator
+from vllm.device_allocator.cumem import (
+    CuMemAllocator,
+)
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
@@ -123,22 +125,21 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
 
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up()
-
         model = self.model_runner.model
-
-        self.restore_named_buffers()
-
         if colocate:
             for name, handle in state_dict.items():
                 func, args = handle
                 list_args = list(args)
                 list_args[6] = torch.cuda.current_device()
-                new_weight = func(*list_args)
-
+                new_weight: torch.Tensor = func(*list_args)
                 model.load_weights([(name, new_weight)])
                 del new_weight
         else:
             model.load_weights(state_dict.items())
+
+        self.restore_named_buffers()
+        torch.cuda.synchronize()
+
         return CollectiveRpcResponse(rank=self.rank, data=None, success=True)
 
     @torch.inference_mode()
@@ -174,9 +175,13 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
     def offload_model_weights(
         self, command: OffloadModelWeightCommand
     ) -> CollectiveRpcResponse:
+        # it's important
+
+        self.save_named_buffers()
         free_bytes_before_offload = torch.cuda.mem_get_info()[0]
         allocator = CuMemAllocator.get_instance()
-        allocator.sleep(offload_tags=())
+        allocator.sleep(offload_tags=("weights",))
+
         free_bytes_after_offload = torch.cuda.mem_get_info()[0]
         freed_bytes = free_bytes_after_offload - free_bytes_before_offload
         assert freed_bytes >= 0, (
@@ -226,18 +231,22 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
 
     def save_named_buffers(self) -> None:
         model = self.model_runner.model
-        saved_buffers = {}
-        for name, buffer in model.named_buffers(recurse=True):
-            saved_buffers[name] = buffer.detach().cpu()
-        logger.info(f"vllm worker saved named buffers: {list(saved_buffers.keys())}")
-        self.saved_buffers = saved_buffers
+        self.saved_buffers = {
+            name: buffer.cpu().clone() for name, buffer in model.named_buffers()
+        }
 
     def restore_named_buffers(self) -> None:
         model = self.model_runner.model
-        for name, buffer in model.named_buffers(recurse=True):
+        for name, buffer in model.named_buffers():
             if name in self.saved_buffers:
-                buffer.copy_(self.saved_buffers[name].to(buffer.device))
+                buffer.data.copy_(self.saved_buffers[name].data)
+        self.saved_buffers = {}
         logger.info("vllm worker restored named buffers from saved buffers")
+
+    def use_sharded_weights(self) -> None:
+        model = self.model_runner.model
+        for _, param in model.named_parameters():
+            setattr(param, "is_sharded_weight", True)
 
 
 @dataclass
@@ -300,7 +309,7 @@ class ZmqWorkerProc:
         self.worker.init_device()
         self.worker.load_model()
         # after load_model, we should save it's named_buffers to implement sync weight
-        self.worker.save_named_buffers()
+        self.worker.use_sharded_weights()
 
         # send ready response to executor
         command: WorkerReadyResponse = WorkerReadyResponse(rank=self.rank)
@@ -417,5 +426,7 @@ class ZmqWorkerProc:
             except zmq.Again:
                 continue
             except Exception as e:
-                logger.error(f"Unexpected error in dispatch loop: {e}")
+                logger.error(
+                    f"Unexpected error in dispatch loop, when handling {command}: {e}"
+                )
                 traceback.print_exc()

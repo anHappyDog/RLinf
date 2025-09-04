@@ -271,9 +271,6 @@ class RolloutResult:
             else:
                 return NotImplementedError("should tokenize prompt.")
             response_id = list(res.outputs[0].token_ids)
-            print(
-                f"for idx: {index},prompt ids:{res.prompt_token_ids}, output is {res.outputs[0]},output len is {len(res.outputs)}"
-            )
             response_ids.append(response_id)
             response_lengths.append(len(response_id))
             is_end.append(res.finished)

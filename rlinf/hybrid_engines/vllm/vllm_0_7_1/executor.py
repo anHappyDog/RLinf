@@ -238,8 +238,7 @@ class VLLMExecutor(Executor):
 
                     if responses[response.rank] is None:
                         responses_received += 1
-
-                    responses[response.rank] = response.data
+                        responses[response.rank] = response.data
 
                 else:
                     raise TimeoutError
