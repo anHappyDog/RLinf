@@ -115,9 +115,9 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
         )
 
     def sync_hf_weight(self, command: SyncHFWeightCommand) -> CollectiveRpcResponse:
-        _ = not self.rlinf_config.rollout.enforce_eager
+        use_cudagraph = not self.rlinf_config.rollout.enforce_eager
         colocate = self.placement_mode == PlacementMode.COLLOCATED
-        # assert use_cudagraph, "use_cudagraph must be True now."
+        assert use_cudagraph, "use_cudagraph must be True now."
 
         state_dict = self.recv(
             src_group_name=self._actor_group_name, src_rank=self.actor_weight_rank
@@ -139,7 +139,7 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
 
         self.restore_named_buffers()
         torch.cuda.synchronize()
-
+        super().compile_or_warm_up_model()
         return CollectiveRpcResponse(rank=self.rank, data=None, success=True)
 
     @torch.inference_mode()

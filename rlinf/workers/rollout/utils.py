@@ -22,9 +22,12 @@ from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from omegaconf import DictConfig
 from torch.utils.tensorboard import SummaryWriter
 
 from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
+from rlinf.workers.rollout.sglang.sglang_worker import AsyncSGLangWorker, SGLangWorker
+from rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
 
 if typing.TYPE_CHECKING:
     from vllm.outputs import RequestOutput
@@ -534,3 +537,23 @@ class DisaggRankMapper(RankMapper):
         )
 
         return (corresponding_rollout_dp_rank, corresponding_rollout_tp_rank)
+
+
+def get_rollout_backend_worker(cfg: DictConfig,placement: ModelParallelComponentPlacement) -> Union[VLLMWorker, SGLangWorker]:
+    rollout_backend = cfg.rollout.get("rollout_backend", "not_assigned")
+    if rollout_backend == "vllm":
+        if placement.placement_mode == PlacementMode.COLLOCATED:
+            return VLLMWorker
+        else:
+            raise NotImplementedError(
+                "vLLM rollout backend currently only support sync backend."
+            )
+    elif rollout_backend == "sglang":
+        if placement.placement_mode == PlacementMode.COLLOCATED:
+            return SGLangWorker
+        elif placement.placement_mode == PlacementMode.DISAGGREGATED:
+            return AsyncSGLangWorker
+        else:
+    else:
+        raise ValueError(f"Unsupported rollout backend: {rollout_backend}")
+

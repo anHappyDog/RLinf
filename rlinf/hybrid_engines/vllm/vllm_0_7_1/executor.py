@@ -68,6 +68,8 @@ class VLLMExecutor(Executor):
         self.parent_address = parent_address
         self.placement = placement
 
+        self._rpc_lock = threading.RLock()
+
         self.dp_rank = dp_rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         # used by LLMengine to communicate straightly with executor
@@ -204,54 +206,56 @@ class VLLMExecutor(Executor):
         timeout_ms = -1 if timeout is None else int(timeout * 1000)
 
         try:
-            if isinstance(method, str):
-                send_method = method
-            else:
-                send_method = cloudpickle.dumps(
-                    method, protocol=pickle.HIGHEST_PROTOCOL
+            with self._rpc_lock:
+                if isinstance(method, str):
+                    send_method = method
+                else:
+                    send_method = cloudpickle.dumps(
+                        method, protocol=pickle.HIGHEST_PROTOCOL
+                    )
+
+                logger.debug(f"Sending RPC request: {send_method}")
+                command = CollectiveRpcCommand(
+                    method=send_method, args=args, kwargs=kwargs
                 )
 
-            logger.debug(f"Sending RPC request: {send_method}")
-            command = CollectiveRpcCommand(method=send_method, args=args, kwargs=kwargs)
+                self.send_to_workers.send_pyobj(command)
 
-            self.send_to_workers.send_pyobj(command)
-
-            responses_received = 0
-            responses = [None] * self.world_size
-            while responses_received < self.world_size:
-                socks = dict(self.worker_response_poller.poll(timeout=timeout_ms))
-                if self.recv_from_workers in socks:
-                    response: CollectiveRpcResponse = (
-                        self.recv_from_workers.recv_pyobj()
-                    )
-                    logger.debug(
-                        f"recevied collective rpc response : {response}",
-                    )
-                    assert isinstance(response, CollectiveRpcResponse), (
-                        f"Expected CollectiveRpcResponse, got {type(response)}"
-                    )
-                    if response.command_id != command.command_id:
-                        logger.error(
-                            f"Received a stale RPC response for command {response.command_id}, expecting {command.command_id}. Discarding."
+                responses_received = 0
+                responses = [None] * self.world_size
+                while responses_received < self.world_size:
+                    socks = dict(self.worker_response_poller.poll(timeout=timeout_ms))
+                    if self.recv_from_workers in socks:
+                        response: CollectiveRpcResponse = (
+                            self.recv_from_workers.recv_pyobj()
                         )
-                        continue
+                        logger.debug(
+                            f"recevied collective rpc response : {response}",
+                        )
+                        assert isinstance(response, CollectiveRpcResponse), (
+                            f"Expected CollectiveRpcResponse, got {type(response)}"
+                        )
+                        if response.command_id != command.command_id:
+                            logger.error(
+                                f"Received a stale RPC response for command {response.command_id}, expecting {command.command_id}. Discarding."
+                            )
+                            continue
 
-                    if responses[response.rank] is None:
-                        responses_received += 1
-                        responses[response.rank] = response.data
-
-                else:
-                    raise TimeoutError
-            return responses
+                        if responses[response.rank] is None:
+                            responses_received += 1
+                            responses[response.rank] = response.data
+                    else:
+                        raise TimeoutError
+                return responses
         except TimeoutError:
             logger.error(
                 f"RPC call timed out after {timeout}s. "
                 f"Received {responses_received}/{self.world_size} responses.",
             )
-            return responses
+            raise
         except Exception as e:
             logger.error(f"Error occurred during RPC call: {e}")
-            return responses
+            raise
 
     def check_health(self):
         self.collective_rpc("check_health")
@@ -286,7 +290,7 @@ class VLLMExecutor(Executor):
                 p.kill()
 
     def shutdown(self):
-        if getattr(self, "shutting_down", False):
+        if not getattr(self, "shutting_down", False):
             self.shutting_down = True
 
             try:
