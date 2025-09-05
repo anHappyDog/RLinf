@@ -25,9 +25,8 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.tensorboard import SummaryWriter
 
+from rlinf.scheduler.worker.worker import Worker
 from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
-from rlinf.workers.rollout.sglang.sglang_worker import AsyncSGLangWorker, SGLangWorker
-from rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
 
 if typing.TYPE_CHECKING:
     from vllm.outputs import RequestOutput
@@ -539,7 +538,10 @@ class DisaggRankMapper(RankMapper):
         return (corresponding_rollout_dp_rank, corresponding_rollout_tp_rank)
 
 
-def get_rollout_backend_worker(cfg: DictConfig,placement: ModelParallelComponentPlacement) -> Union[VLLMWorker, SGLangWorker]:
+def get_rollout_backend_worker(cfg: DictConfig,placement: ModelParallelComponentPlacement) -> Worker:
+    from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker,AsyncSGLangWorker
+    from rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
+
     rollout_backend = cfg.rollout.get("rollout_backend", "not_assigned")
     if rollout_backend == "vllm":
         if placement.placement_mode == PlacementMode.COLLOCATED:

@@ -53,7 +53,7 @@ class VLLMWorker(Worker):
         # use v1 engine
         os.environ["VLLM_USE_V1"] = "1"
         os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = (
-            "1" if self._cfg.rollout.enable_flash_infer_sampler else "0"
+            "1" if self._cfg.rollout.vllm.enable_flash_infer_sampler else "0"
         )
         # use spawn to avoid fork issues with CUDA
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -61,7 +61,7 @@ class VLLMWorker(Worker):
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # avoid nccl cumem issues
         os.environ["NCCL_CUMEM_ENABLE"] = "0"
-        os.environ["VLLM_ATTENTION_BACKEND"] = self._cfg.rollout.vllm_attention_backend
+        os.environ["VLLM_ATTENTION_BACKEND"] = self._cfg.rollout.vllm.attention_backend
 
     def _get_sampling_params_from_config(self) -> SamplingParams:
         cfg_sampling_params = self._cfg.algorithm.sampling_params
@@ -92,8 +92,8 @@ class VLLMWorker(Worker):
             dtype=torch_dtype_from_precision(self._cfg.actor.model.precision),
             gpu_memory_utilization=self._cfg.rollout.gpu_memory_utilization,
             enforce_eager=self._cfg.rollout.enforce_eager,
-            enable_chunked_prefill=self._cfg.rollout.enable_chunked_prefill,
-            enable_prefix_caching=self._cfg.rollout.enable_prefix_caching,
+            enable_chunked_prefill=self._cfg.rollout.vllm.enable_chunked_prefill,
+            enable_prefix_caching=self._cfg.rollout.vllm.enable_prefix_caching,
             task="generate",
             trust_remote_code=self._cfg.actor.tokenizer.trust_remote_code,
             max_model_len=self._cfg.runner.seq_length,

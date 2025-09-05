@@ -274,7 +274,6 @@ class RolloutResult:
             response_ids.append(response_id)
             response_lengths.append(len(response_id))
             is_end.append(res.finished)
-            prompt_lengths
 
         result: RolloutResult = RolloutResult(
             num_sequence=num_sequences,
