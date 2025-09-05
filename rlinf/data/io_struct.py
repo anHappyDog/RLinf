@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from vllm.outputs import RequestOutput as VllmRequestOutput
 from omegaconf import DictConfig
+from vllm.outputs import RequestOutput as VllmRequestOutput
 
 from rlinf.data.datasets import batch_pad_to_fixed_len
 from rlinf.utils.data_iter_utils import (

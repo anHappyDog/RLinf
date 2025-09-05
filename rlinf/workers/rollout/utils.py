@@ -538,24 +538,31 @@ class DisaggRankMapper(RankMapper):
         return (corresponding_rollout_dp_rank, corresponding_rollout_tp_rank)
 
 
-def get_rollout_backend_worker(cfg: DictConfig,placement: ModelParallelComponentPlacement) -> Worker:
-    from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker,AsyncSGLangWorker
+def get_rollout_backend_worker(
+    cfg: DictConfig, placement: ModelParallelComponentPlacement
+) -> Worker:
+    from rlinf.workers.rollout.sglang.sglang_worker import (
+        AsyncSGLangWorker,
+        SGLangWorker,
+    )
     from rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
 
     rollout_backend = cfg.rollout.get("rollout_backend", "not_assigned")
     if rollout_backend == "vllm":
         if placement.placement_mode == PlacementMode.COLLOCATED:
             return VLLMWorker
-        else:
+        elif placement.placement_mode == PlacementMode.DISAGGREGATED:
             raise NotImplementedError(
                 "vLLM rollout backend currently only support sync backend."
             )
+        else:
+            raise ValueError(f"Unsupported placement mode: {placement.placement_mode}")
     elif rollout_backend == "sglang":
         if placement.placement_mode == PlacementMode.COLLOCATED:
             return SGLangWorker
         elif placement.placement_mode == PlacementMode.DISAGGREGATED:
             return AsyncSGLangWorker
         else:
+            raise ValueError(f"Unsupported placement mode: {placement.placement_mode}")
     else:
         raise ValueError(f"Unsupported rollout backend: {rollout_backend}")
-

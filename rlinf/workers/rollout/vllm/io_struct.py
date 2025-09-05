@@ -15,7 +15,7 @@
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Literal, Optional, Tuple, Union
+from typing import Literal, Union
 
 
 @dataclass
@@ -35,30 +35,9 @@ class OffloadModelWeightCommand(BaseCommand):
 
 
 @dataclass
-class CollectiveRpcCommand(BaseCommand):
-    method: Union[str, bytes, None] = None
-    command_type: Literal["collective_rpc"] = "collective_rpc"
-    args: Tuple[Any, ...] = field(default_factory=tuple)
-    kwargs: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        if self.method is None:
-            raise ValueError("method must be provided for CollectiveRpcCommand")
-
-
-@dataclass
 class BaseResponse:
     command_id: uuid.UUID = field(default_factory=uuid.uuid4)
     timestamp: datetime = field(default_factory=datetime.now)
-
-
-@dataclass
-class WorkerReadyResponse(BaseResponse):
-    rank: int = -1
-
-    def __post_init__(self):
-        if self.rank < 0:
-            raise ValueError("rank must be non-negative")
 
 
 @dataclass
@@ -71,18 +50,4 @@ class OffloadModelWeightResponse(BaseResponse):
     pass
 
 
-@dataclass
-class CollectiveRpcResponse(BaseResponse):
-    rank: int = -1
-    data: Union[Any, None] = None
-    success: bool = False
-    error: Optional[str] = None
-
-    def __post_init__(self):
-        if self.rank < 0:
-            raise ValueError("rank must be non-negative")
-
-
-VLLMCommand = Union[
-    CollectiveRpcCommand, SyncHFWeightCommand, OffloadModelWeightCommand
-]
+VLLMCommand = Union[SyncHFWeightCommand, OffloadModelWeightCommand]
