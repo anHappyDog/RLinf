@@ -12,40 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gc
 import os
+import pickle
 import signal
 import sys
-import traceback
-from dataclasses import dataclass
-from functools import partial
-from multiprocessing.process import BaseProcess
 from typing import Dict, List
 
-import cloudpickle
 import psutil
 import torch
 import zmq
 from omegaconf import DictConfig
-from torch import nn
 from vllm.config import VllmConfig
 from vllm.device_allocator.cumem import (
     CuMemAllocator,
 )
-from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
+from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
-from vllm.model_executor import set_random_seed
-from vllm.utils import GiB_bytes, get_mp_context
-from vllm.v1.core.scheduler import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.utils import get_mp_context, get_open_zmq_ipc_path, zmq_socket_ctx
+from vllm.v1.executor.multiproc_executor import WorkerProc, WorkerProcHandle
 from vllm.v1.worker.gpu_worker import Worker as _VllmInnerWorker
-from vllm.v1.worker.gpu_worker import (
-    _check_if_gpu_supports_dtype,
-    init_worker_distributed_environment,
-)
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from rlinf.scheduler import Worker as _RLinfWorker
@@ -53,11 +39,8 @@ from rlinf.scheduler import WorkerAddress
 from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
 from rlinf.workers.rollout.utils import DisaggRankMapper, HybridRankMapper
 from rlinf.workers.rollout.vllm.io_struct import (
-    CollectiveRpcCommand,
-    CollectiveRpcResponse,
     OffloadModelWeightCommand,
     SyncHFWeightCommand,
-    WorkerReadyResponse,
 )
 
 from . import weight_loader  # noqa all
@@ -75,10 +58,12 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
         placement: ModelParallelComponentPlacement,
         local_rank: int,
         rank: int,
-        world_size: int,
     ):
         _RLinfWorker.__init__(
-            self, parent_address=parent_address, world_size=world_size, rank=rank
+            self,
+            parent_address=parent_address,
+            world_size=vllm_config.parallel_config.world_size,
+            rank=rank,
         )
         super().__init__(vllm_config, local_rank, rank, distributed_init_method)
 
@@ -114,7 +99,7 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
             f"Running VllmInnerWoker dp rank {self.get_parent_rank()}, tp_rank {self._rank}, corresponding actor weight rank = {self.actor_weight_rank}"
         )
 
-    def sync_hf_weight(self, command: SyncHFWeightCommand) -> CollectiveRpcResponse:
+    def sync_hf_weight(self, command: SyncHFWeightCommand) -> None:
         use_cudagraph = not self.rlinf_config.rollout.enforce_eager
         colocate = self.placement_mode == PlacementMode.COLLOCATED
         assert use_cudagraph, "use_cudagraph must be True now."
@@ -140,43 +125,8 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
         self.restore_named_buffers()
         torch.cuda.synchronize()
         super().compile_or_warm_up_model()
-        return CollectiveRpcResponse(rank=self.rank, data=None, success=True)
 
-    @torch.inference_mode()
-    def execute_model(self, scheduler_output: SchedulerOutput):
-        output: ModelRunnerOutput = super().execute_model(scheduler_output)
-        return CollectiveRpcResponse(rank=self.rank, data=output, success=True)
-
-    def get_kv_cache_spec(self) -> CollectiveRpcResponse:
-        kv_cache_spec: KVCacheSpec = super().get_kv_cache_spec()
-        return CollectiveRpcResponse(rank=self.rank, data=kv_cache_spec, success=True)
-
-    def initialize_cache(self, kv_cache_config: KVCacheConfig) -> CollectiveRpcResponse:
-        result: None = super().initialize_cache(kv_cache_config)
-        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
-
-    def compile_or_warm_up_model(self) -> CollectiveRpcResponse:
-        result: None = super().compile_or_warm_up_model()
-        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
-
-    @torch.inference_mode()
-    def determine_available_memory(self) -> CollectiveRpcResponse:
-        result: int = super().determine_available_memory()  # byte
-        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
-
-    def profile(self, is_start: bool = True) -> CollectiveRpcResponse:
-        result: None = super().profile(is_start)
-        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
-
-    def check_health(self) -> CollectiveRpcResponse:
-        result: None = super().check_health()
-        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
-
-    def offload_model_weights(
-        self, command: OffloadModelWeightCommand
-    ) -> CollectiveRpcResponse:
-        # it's important
-
+    def offload_model_weights(self, command: OffloadModelWeightCommand) -> None:
         self.save_named_buffers()
         free_bytes_before_offload = torch.cuda.mem_get_info()[0]
         allocator = CuMemAllocator.get_instance()
@@ -187,47 +137,6 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
         assert freed_bytes >= 0, (
             f"before offload:{free_bytes_before_offload}, after offload:{free_bytes_after_offload}"
         )
-        logger.debug(
-            "Vllm inner worker offload weights: offloaded %.2f GiB memory",
-            freed_bytes / GiB_bytes,
-        )
-        return CollectiveRpcResponse(
-            command_id=command.command_id,
-            rank=self.rank,
-            data={"freed_bytes": freed_bytes},
-            success=True,
-        )
-
-    def get_model(self) -> CollectiveRpcResponse:
-        result: nn.Module = super().get_model()
-        return CollectiveRpcResponse(rank=self.rank, data=result, success=True)
-
-    def init_device(self):
-        if self.device_config.device.type == "cuda":
-            os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
-            os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
-            # because of cuda_visible_devices, use rank in process group
-            self.device = torch.device(f"cuda:{self.local_rank}")
-            torch.cuda.set_device(self.device)
-
-            _check_if_gpu_supports_dtype(self.model_config.dtype)
-            gc.collect()
-            torch.cuda.empty_cache()
-            self.init_gpu_memory = torch.cuda.mem_get_info()[0]
-        else:
-            raise RuntimeError(f"Not support device type: {self.device_config.device}")
-        # Initialize the distributed environment.
-        init_worker_distributed_environment(
-            self.parallel_config,
-            self.rank,
-            self.distributed_init_method,
-            self.local_rank,
-        )
-        # Set random seed.
-        set_random_seed(self.model_config.seed)
-
-        # Construct the model runner
-        self.model_runner = GPUModelRunner(self.vllm_config, self.device)
 
     def save_named_buffers(self) -> None:
         model = self.model_runner.model
@@ -249,49 +158,29 @@ class VLLMWorker(_VllmInnerWorker, _RLinfWorker):
             setattr(param, "is_sharded_weight", True)
 
 
-@dataclass
-class ZmqWorkerProcHandle:
-    proc: BaseProcess
-    rank: int
-
-
-class ZmqWorkerProc:
+class VLLMWorkerProc(WorkerProc):
     def __init__(
         self,
         vllm_config: VllmConfig,
         local_rank: int,
         rank: int,
-        worker_input_ipc_name: str,
-        worker_output_ipc_name: str,
         parent_address: WorkerAddress,
         distributed_init_method: str,
+        input_shm_handle: Handle,
+        ready_path: str,
         placement: ModelParallelComponentPlacement,
     ):
         self.rank = rank  # global rank in 2D parallel (tp,pp)
-        self.vllm_config = vllm_config
-
-        self.worker_input_ipc_name = worker_input_ipc_name
-        self.worker_output_ipc_name = worker_output_ipc_name
-
-        context = zmq.Context()
-
-        self.send_to_executor = context.socket(zmq.PUSH)
-        self.send_to_executor.connect(self.worker_output_ipc_name)
-
-        self.recv_from_executor = context.socket(zmq.SUB)
-        self.recv_from_executor.setsockopt_string(zmq.SUBSCRIBE, "")
-        self.recv_from_executor.connect(self.worker_input_ipc_name)
 
         wrapper = WorkerWrapperBase(vllm_config=vllm_config, rpc_rank=rank)
         all_kwargs: List[Dict] = [
-            {} for _ in range(vllm_config.parallel_config.tensor_parallel_size)
+            {} for _ in range(vllm_config.parallel_config.world_size)
         ]
         all_kwargs[rank] = {
             "vllm_config": vllm_config,
             "local_rank": local_rank,
             "rank": rank,
             "distributed_init_method": distributed_init_method,
-            "world_size": vllm_config.parallel_config.world_size,
             "parent_address": parent_address,
             "placement": placement,
         }
@@ -302,21 +191,92 @@ class ZmqWorkerProc:
         pid = os.getpid()
         _add_prefix(
             sys.stdout,
-            f"VllmZmqWorker[dp_rank={self.worker.get_parent_rank()},tp_rank={self.rank}]",
+            f"VllmWorkerProc[dp_rank={self.worker.get_parent_rank()},tp_rank={self.rank}]",
             pid,
         )
+        _add_prefix(
+            sys.stderr,
+            f"VllmWorkerProc[dp_rank={self.worker.get_parent_rank()},tp_rank={self.rank}]",
+            pid,
+        )
+        # Initialize MessageQueue for receiving SchedulerOutput
+        self.rpc_broadcast_mq = MessageQueue.create_from_handle(
+            input_shm_handle, self.worker.rank
+        )
+
+        # Initializes a message queue for sending the model output
+        self.worker_response_mq = MessageQueue(1, 1)
+        worker_response_mq_handle = self.worker_response_mq.export_handle()
+
+        # Send Readiness signal to EngineCore process.
+        with zmq_socket_ctx(ready_path, zmq.constants.PUSH) as ready_socket:
+            payload = pickle.dumps(
+                worker_response_mq_handle, protocol=pickle.HIGHEST_PROTOCOL
+            )
+            ready_socket.send_string(WorkerProc.READY_STR)
+            ready_socket.send(payload)
 
         self.worker.init_device()
         self.worker.load_model()
         # after load_model, we should save it's named_buffers to implement sync weight
         self.worker.use_sharded_weights()
 
-        # send ready response to executor
-        command: WorkerReadyResponse = WorkerReadyResponse(rank=self.rank)
-        self.send_to_executor.send_pyobj(command)
+    @staticmethod
+    def make_worker_process(
+        rank: int,
+        local_rank: int,
+        distributed_init_method: str,
+        parent_address: WorkerAddress,
+        placement: ModelParallelComponentPlacement,
+        vllm_config: VllmConfig,
+        input_shm_handle: Handle,
+    ) -> WorkerProcHandle:
+        """
+        Note:
+        This function is modified from vllm's raw implementation. because it in vllm hardcodes that
+        it will launch `WorkerProc` which can't be selected, we can only copy and modify it here.
+        """
+        context = get_mp_context()
+
+        # ZMQ path for worker to send ready message and shm_broadcast handle
+        # back to core process.
+        ready_path = get_open_zmq_ipc_path()
+        process_kwargs = {
+            "rank": rank,
+            "local_rank": local_rank,
+            "distributed_init_method": distributed_init_method,
+            "parent_address": parent_address,
+            "placement": placement,
+            "vllm_config": vllm_config,
+            "input_shm_handle": input_shm_handle,
+            "ready_path": ready_path,
+        }
+
+        proc = context.Process(
+            target=VLLMWorkerProc.worker_main, kwargs=process_kwargs, daemon=True
+        )
+
+        proc.start()
+        # Wait for startup
+        worker_response_mq_handle = WorkerProc.wait_for_startup(proc, ready_path)
+
+        worker_response_mq = MessageQueue.create_from_handle(
+            worker_response_mq_handle, 0
+        )
+
+        return WorkerProcHandle(proc, rank, ready_path, worker_response_mq)
 
     @staticmethod
     def worker_main(*args, **kwargs):
+        """
+        Note:
+        This function is modified from vllm's raw implementation. because it in vllm hardcodes that
+        it will launch `WorkerProc` which can't be selected, we can only copy and modify it here.
+        """
+
+        # Signal handler used for graceful termination.
+        # SystemExit exception is only raised once to allow this and worker
+        # processes to terminate without error
         shutdown_requested = False
 
         def signal_handler(signum, frame):
@@ -325,108 +285,33 @@ class ZmqWorkerProc:
                 shutdown_requested = True
                 raise SystemExit()
 
+        # Either SIGTERM or SIGINT will terminate the worker
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
         worker = None
         try:
-            worker = ZmqWorkerProc(*args, **kwargs)
+            worker = VLLMWorkerProc(*args, **kwargs)
+
+            # Ensure message queues are ready. Will deadlock if re-ordered.
+            # Must be kept consistent with the Executor
+            worker.rpc_broadcast_mq.wait_until_ready()
+            worker.worker_response_mq.wait_until_ready()
 
             worker.worker_busy_loop()
+
         except SystemExit:
-            logger.debug("Vllm inner worker proc interrupted.")
-        except Exception as e:
-            logger.fatal(f"Vllm inner worker proc failed with exception: {e}")
+            logger.debug("Worker interrupted.")
+
+        except Exception:
+            # worker_busy_loop sends exceptions exceptons to Executor
+            # for shutdown, but if there is an error in startup or an
+            # error with IPC itself, we need to alert the parent.
             psutil.Process().parent().send_signal(signal.SIGUSR1)
             raise
+
         finally:
+            # Clean up once worker exits busy loop
             if worker is not None:
                 worker.shutdown()
                 worker = None
-
-    @staticmethod
-    def make_worker_process(
-        rank: int,
-        local_rank: int,
-        worker_input_ipc_name: str,
-        worker_output_ipc_name: str,
-        distributed_init_method: str,
-        parent_address: WorkerAddress,
-        placement: ModelParallelComponentPlacement,
-        vllm_config: VllmConfig,
-    ) -> ZmqWorkerProcHandle:
-        mp_context = get_mp_context()
-        process_kwargs = {
-            "rank": rank,
-            "local_rank": local_rank,
-            "worker_input_ipc_name": worker_input_ipc_name,
-            "worker_output_ipc_name": worker_output_ipc_name,
-            "distributed_init_method": distributed_init_method,
-            "parent_address": parent_address,
-            "placement": placement,
-            "vllm_config": vllm_config,
-        }
-
-        proc = mp_context.Process(
-            target=ZmqWorkerProc.worker_main, kwargs=process_kwargs, daemon=True
-        )
-
-        proc.start()
-        logger.debug(f"proc started, return handle for rank:{rank}", flush=True)
-        return ZmqWorkerProcHandle(proc=proc, rank=rank)
-
-    def shutdown(self):
-        if getattr(self, "shutting_down", False):
-            self.shutting_down = True
-
-        self.send_to_executor.close()
-        self.recv_from_executor.close()
-        destroy_model_parallel()
-        destroy_distributed_environment()
-
-    def worker_busy_loop(self):
-        while True:
-            try:
-                logger.debug("Vllm inner worker waiting for command...", flush=True)
-                command: CollectiveRpcCommand = self.recv_from_executor.recv_pyobj()
-                assert isinstance(command, CollectiveRpcCommand), (
-                    f"Expected CollectiveRpcCommand, got {type(command)}"
-                )
-                logger.debug(f"received rpc method call: {command.method}")
-                if isinstance(command.method, str):
-                    func = getattr(self.worker, command.method, None)
-                elif isinstance(command.method, bytes):
-                    func = partial(cloudpickle.loads(command.method), self.worker)
-                else:
-                    logger.error(
-                        f"Unknown method type received in zmq worker's worker_busy_loop: {type(command.method)}"
-                    )
-                    func = None
-                if func:
-                    logger.debug(f"Vllm inner worker dispatching command: {command}")
-                    response: CollectiveRpcResponse = func(
-                        *command.args, **command.kwargs
-                    )
-                    response.command_id = command.command_id
-                else:
-                    logger.error(
-                        f"Vllm inner worker received unknown command: {command}"
-                    )
-                    response: CollectiveRpcResponse = CollectiveRpcResponse(
-                        command_id=command.command_id,
-                        rank=self.rank,
-                        data=None,
-                        success=False,
-                        error=f"Unknown command type: {command.command_type}",
-                    )
-                assert isinstance(response, CollectiveRpcResponse), (
-                    "Response is not a CollectiveRpcResponse. Check if there is some function you don't reimplement"
-                )
-                self.send_to_executor.send_pyobj(response)
-            except zmq.Again:
-                continue
-            except Exception as e:
-                logger.error(
-                    f"Unexpected error in dispatch loop, when handling {command}: {e}"
-                )
-                traceback.print_exc()
