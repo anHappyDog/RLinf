@@ -553,7 +553,7 @@ def get_rollout_backend_worker(
             return VLLMWorker
         elif placement.placement_mode == PlacementMode.DISAGGREGATED:
             raise NotImplementedError(
-                "vLLM rollout backend currently only support sync backend."
+                "vLLM rollout backend does not support the pipeline mode."
             )
         else:
             raise ValueError(f"Unsupported placement mode: {placement.placement_mode}")

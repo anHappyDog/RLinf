@@ -50,7 +50,7 @@ algorithm:
   # val rollout mbs
   val_rollout_batch_size_per_gpu: 4 # ${.rollout_batch_size_per_gpu}
 
-  recompute_logprobs: True
+  recompute_logprobs: False
   shuffle_rollout: True
 
   # GRPO loss params
@@ -72,7 +72,7 @@ algorithm:
   sampling_params:
     use_greedy: False
     temperature: 1.0
-    top_k: 100000
+    top_k: 1000000
     top_p: 1.0
     repetition_penalty: 1.0
     max_new_tokens: ${subtract:${runner.seq_length}, ${data.max_prompt_length}}
@@ -92,7 +92,7 @@ rollout:
   padding: null               # will be tokenizer.pad_token_id if null. it is used to filter megatron's padding for rollout engine
   eos: null                   # will be tokenizer.eos_token_id if null.
 
-  rollout_backend: sglang     # [sglang, vllm]
+  rollout_backend: sglang     # here choose which backend to rollout,support [sglang, vllm] 
 
   sglang:
     attention_backend: triton # [flashinfer, triton] for more, see sglang's doc
@@ -115,7 +115,7 @@ rollout:
   validate_save_dir: null # the directory to save the weights for comparison. If validate_weight is True, this will be used to save the weights for comparison.
   print_outputs: False         # whether to print the outputs (token ids, texts, etc.) of rollout engine.
 
-  max_running_requests: 64 # the maximum number of running requests in the inference engine.
+  max_running_requests: 64 # the maximum number of running requests in the rollout engine.
   cuda_graph_max_bs: 128 # the maximum batch size for cuda graph. If the batch size is larger than this, cuda graph will not be used.
 
 data:

@@ -24,6 +24,7 @@ from rlinf.config import torch_dtype_from_precision
 from rlinf.data.io_struct import RolloutRequest, RolloutResult
 from rlinf.scheduler import Channel, Worker
 from rlinf.utils.placement import ComponentPlacement
+from rlinf.workers.rollout.utils import print_vllm_outputs
 
 from . import VLLMEngine
 
@@ -49,6 +50,14 @@ class VLLMWorker(Worker):
                 * self._cfg.rollout.pipeline_parallel_size
             )
 
+        self._validate_sampling_params = SamplingParams(temperature=0, max_tokens=32)
+        self._validate_prompts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+
     def _prepare_vllm_environment(self) -> None:
         # use v1 engine
         os.environ["VLLM_USE_V1"] = "1"
@@ -59,8 +68,6 @@ class VLLMWorker(Worker):
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         # set False to use Inproclient, which uses sync calls.
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-        # avoid nccl cumem issues
-        os.environ["NCCL_CUMEM_ENABLE"] = "0"
         os.environ["VLLM_ATTENTION_BACKEND"] = self._cfg.rollout.vllm.attention_backend
 
     def _get_sampling_params_from_config(self) -> SamplingParams:
@@ -81,6 +88,18 @@ class VLLMWorker(Worker):
                 output_kind=RequestOutputKind.FINAL_ONLY,
             )
         return sampling_params
+
+    # def _validate_weight_at_first(self) -> None:
+    #     """
+    #     Validate the model weights before starting to rollout formally.
+    #     """
+    #     if self._cfg.rollout.detokenize:
+    #         outputs = self._vllm_engine.generate(
+    #             input_ids=None,
+    #             sampling_params=self._validate_sampling_params,
+    #             return_logprobs=False,
+    #             prompts=self._validate_prompts,
+    #         )
 
     def sync_model_from_actor(self) -> None:
         self._vllm_engine.sync_hf_weight()
@@ -122,29 +141,38 @@ class VLLMWorker(Worker):
         self._vllm_engine.offload_model_weights()
 
     def rollout(self, input_channel: Channel, output_channel: Channel) -> None:
-        while True:
-            request: RolloutRequest = input_channel.get()
-            if request is None:
-                self._stop()
-                break
+        request: RolloutRequest = input_channel.get()
 
-            requests: List[RolloutRequest] = request.repeat_and_split(
-                self._rollout_batch_size
-            )
-            rollout_results: List[RolloutResult] = []
-            for request in requests:
+        requests: List[RolloutRequest] = request.repeat_and_split(
+            self._rollout_batch_size
+        )
+
+        # Acquire the GPUs to ensure no one is using them during rollout
+        output_channel.gpu_lock.acquire()
+
+        rollout_results: List[RolloutResult] = []
+        for request in requests:
+            with self.worker_timer():
                 vllm_results = self._vllm_engine.generate(
                     input_ids=request.input_ids,
                     sampling_params=self._sampling_params,
                     return_logprobs=self._return_logprobs,
                 )
-                # should be converted by _vllm_engine side.
-                results = RolloutResult.from_vllm_results(
-                    vllm_results,
-                    request.answers,
-                    self._return_logprobs,
-                )
-                rollout_results.append(results)
-                if self._cfg.rollout.print_outputs:
-                    raise NotImplementedError("TODO")
-            output_channel.put(rollout_results)
+            # should be converted by _vllm_engine side.
+            results = RolloutResult.from_vllm_results(
+                group_size=self._cfg.algorithm.group_size,
+                results=vllm_results,
+                answers=request.answers,
+                return_logprobs=self._return_logprobs,
+            )
+            rollout_results.append(results)
+            if self._cfg.rollout.print_outputs:
+                print_vllm_outputs(outputs=vllm_results)
+
+        # Stop and offload SGLang first before putting into channel
+        # This avoids running SGLang and Megatron simultaneously
+        self._stop()
+        # Release the GPUs once the engine has offloaded
+        output_channel.gpu_lock.release()
+        rollout_result = RolloutResult.merge_result_list(rollout_results)
+        output_channel.put(rollout_result)

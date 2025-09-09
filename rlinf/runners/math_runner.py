@@ -341,13 +341,11 @@ class MathRunner:
                         input_channel=inference_channel,
                         output_channel=self.reward_channel,
                     )
-
                     # Advantages and returns
                     adv_handle: Handle = self.actor.compute_advantages_and_returns(
                         input_channel=self.reward_channel,
                         output_channel=self.actor_channel,
                     )
-
                     # Actor training
                     actor_input_channel = self.actor_channel
                     if self.is_pipeline:
@@ -359,7 +357,6 @@ class MathRunner:
                     )
 
                     metrics = actor_handle.wait()
-
                     self.global_steps += 1
 
                     run_time_exceeded = self.run_timer.is_finished()
@@ -371,10 +368,8 @@ class MathRunner:
                         1.0,
                         run_time_exceeded=run_time_exceeded,
                     )
-
                     if save_model:
                         self._save_checkpoint()
-
                     if is_train_end:
                         logging.info(
                             f"Step limit given by max_steps={self.max_steps} reached. Stopping run"
@@ -399,7 +394,6 @@ class MathRunner:
                     time_metrics["inference"] = infer_handle.consume_duration(
                         reduction_type="min"
                     )
-
                 logging_steps = (
                     self.global_steps - 1
                 ) * self.cfg.algorithm.n_minibatches

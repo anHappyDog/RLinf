@@ -92,7 +92,7 @@ rollout:
   padding: null               # will be tokenizer.pad_token_id if null. it is used to filter megatron's padding for rollout engine
   eos: null                   # will be tokenizer.eos_token_id if null.
   
-  rollout_backend: sglang     # [sglang, vllm]
+  rollout_backend: sglang     # here choose which backend to rollout,support [sglang, vllm] 
 
   sglang:
     attention_backend: triton # [flashinfer, triton] for more, see sglang's doc
@@ -115,7 +115,7 @@ rollout:
   validate_save_dir: null # the directory to save the weights for comparison. If validate_weight is True, this will be used to save the weights for comparison.
   print_outputs: False         # whether to print the outputs (token ids, texts, etc.) of rollout engine.
 
-  max_running_requests: 64 # the maximum number of running requests in the inference engine.
+  max_running_requests: 64 # the maximum number of running requests in the rollout engine.
   cuda_graph_max_bs: 128 # the maximum batch size for cuda graph. If the batch size is larger than this, cuda graph will not be used.
 
 data:

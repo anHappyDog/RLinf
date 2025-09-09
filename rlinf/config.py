@@ -156,7 +156,7 @@ def validate_rollout_cfg(cfg):
         cfg.torch_compile_max_bs = cfg.get("torch_compile_max_bs", 128)
         return cfg
 
-    def valid_vllm_cfg(cfg):
+    def validate_vllm_cfg(cfg):
         assert cfg is not None, (
             "vllm config must be specified if rollout_backend is vllm."
         )
@@ -179,7 +179,7 @@ def validate_rollout_cfg(cfg):
             f"rollout_backend must be one of {SUPPORTED_ROLLOUT_BACKENDS}."
         )
         cfg.sglang = validate_sglang_cfg(cfg.sglang)
-        cfg.vllm = valid_vllm_cfg(cfg.vllm)
+        cfg.vllm = validate_vllm_cfg(cfg.vllm)
 
     return cfg
 

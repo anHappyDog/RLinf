@@ -11,12 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import tempfile
 from functools import partial
 from typing import List, Optional, Union
 
-import cloudpickle
-import zmq
 from omegaconf import DictConfig
 from vllm.config import VllmConfig
 from vllm.inputs.data import TokensPrompt
@@ -27,50 +24,28 @@ from vllm.v1.engine.llm_engine import LLMEngine as _LLMEngine
 
 from rlinf.scheduler.manager.worker_manager import WorkerAddress
 from rlinf.utils.placement import ModelParallelComponentPlacement
-from rlinf.workers.rollout.vllm.io_struct import (
-    OffloadModelWeightCommand,
-    OffloadModelWeightResponse,
-    SyncHFWeightCommand,
-    SyncHFWeightResponse,
-)
 
 
 class VLLMEngine:
     def __init__(
         self,
-        rlinf_config: DictConfig,
         vllm_config: VllmConfig,
         log_stats: bool,
         dp_rank: int,
+        rlinf_config: DictConfig,
         parent_address: WorkerAddress,
         placement: ModelParallelComponentPlacement,
         multiprocess_model: bool = False,
     ):
-        self.executor_ipc_input_name = (
-            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        )
-        self.executor_ipc_output_name = (
-            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        )
+        # vllm_worker_cls = partial(VLLMWorker, rlinf_config=rlinf_config)
+        vllm_worker_cls = "rlinf.hybrid_engines.vllm.vllm_0_8_5.worker.VLLMWorker"
+        vllm_config.parallel_config.worker_cls = vllm_worker_cls
 
-        context = zmq.Context()
-        self.send_to_executor = context.socket(zmq.PUSH)
-        self.send_to_executor.bind(self.executor_ipc_input_name)
-
-        self.recv_from_executor = context.socket(zmq.PULL)
-        self.recv_from_executor.bind(self.executor_ipc_output_name)
-
-        from rlinf.hybrid_engines.vllm.vllm_0_7_1.worker import VLLMWorker
-
-        vllm_worker_cls = partial(VLLMWorker, rlinf_config=rlinf_config)
-        vllm_config.parallel_config.worker_cls = cloudpickle.dumps(vllm_worker_cls)
-
-        from rlinf.hybrid_engines.vllm.vllm_0_7_1.executor import VLLMExecutor
+        from rlinf.hybrid_engines.vllm.vllm_0_8_5.executor import VLLMExecutor
 
         executor_factory = partial(
             VLLMExecutor,
-            executor_ipc_input_name=self.executor_ipc_input_name,
-            executor_ipc_output_name=self.executor_ipc_output_name,
+            rlinf_config=rlinf_config,
             parent_address=parent_address,
             placement=placement,
             dp_rank=dp_rank,
@@ -90,6 +65,7 @@ class VLLMEngine:
         sampling_params: Optional[SamplingParams] = None,
         return_logprobs: bool = False,
     ) -> List[RequestOutput]:
+        sampling_params.logprobs = 0 if return_logprobs else None
         self._add_requests(input_ids, sampling_params)
         results: List[RequestOutput] = self._run_engine()
         return results
@@ -124,24 +100,7 @@ class VLLMEngine:
         return sorted(outputs, key=lambda x: int(x.request_id))
 
     def offload_model_weights(self) -> None:
-        command = OffloadModelWeightCommand()
-        self.send_to_executor.send_pyobj(command)
-        response: OffloadModelWeightResponse = self.recv_from_executor.recv_pyobj()
-        assert isinstance(response, OffloadModelWeightResponse), (
-            f"Expected OffloadModelWeightResponse, got {type(response)}"
-        )
-        assert response.command_id == command.command_id, (
-            f"Expected get {command.command_id}'s response, got, {response.command_id}"
-        )
+        self._engine.collective_rpc("offload_model_weights")
 
     def sync_hf_weight(self) -> None:
-        command = SyncHFWeightCommand()
-        self.send_to_executor.send_pyobj(command)
-        response: SyncHFWeightResponse = self.recv_from_executor.recv_pyobj()
-        assert isinstance(response, SyncHFWeightResponse), (
-            f"Expected SyncHFWeightResponse, got {type(response)}"
-        )
-        assert response.command_id == command.command_id, (
-            f"Expected get {command.command_id}'s response, got, {response.command_id}"
-        )
-        self._engine.reset_prefix_cache()
+        self._engine.collective_rpc("sync_hf_weight")
