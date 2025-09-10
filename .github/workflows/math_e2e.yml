@@ -39,7 +39,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-    qwen-grpo-test:
+    qwen-grpo-sglang-test:
         runs-on: rlinf
         container:
             image: rlinf/rlinf:math-rlinf0.1-torch2.5.1-sglang0.4.4-vllm0.7.1-megatron0.11.0-te2.1
@@ -55,9 +55,27 @@ jobs:
             - name: Collocated mode
               run: |
                 export REPO_PATH=$(pwd)
-                bash tests/e2e_tests/math/run_collocated.sh
+                bash tests/e2e_tests/math/sglang/run_collocated.sh
 
             - name: Pipeline mode
               run: |
                 export REPO_PATH=$(pwd)
-                bash tests/e2e_tests/math/run_pipeline.sh
+                bash tests/e2e_tests/math/sglang/run_pipeline.sh
+
+    qwen-grpo-vllm-test:
+        runs-on: rlinf
+        container:
+            image: rlinf/rlinf:math-rlinf0.1-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1
+            volumes:
+                - /mnt/public/dataset:/workspace/dataset
+                - /mnt/public/tokenizer:/workspace/tokenizer
+            options: --gpus="all" --shm-size=80g
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Collocated mode
+              run: |
+                export REPO_PATH=$(pwd)
+                bash tests/e2e_tests/math/vllm/run_collocated.sh
