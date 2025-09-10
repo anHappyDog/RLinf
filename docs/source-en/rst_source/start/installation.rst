@@ -163,7 +163,7 @@ Run the following commands to install Megatron, SGLang/vLLM, and their dependenc
 .. code-block:: shell
 
    uv sync --extra sgl_vllm
-   mkdir -p /opt && git clone https://github.com/NVIDIA/Megatron-LM.git -b core_r0.11.0 /opt/Megatron-LM
+   mkdir -p /opt && git clone https://github.com/NVIDIA/Megatron-LM.git -b core_r0.13.0 /opt/Megatron-LM
    APEX_CPP_EXT=1 APEX_CUDA_EXT=1 uv pip install -r requirements/megatron.txt --no-build-isolation
 
 Before using Megatron, ensure its path is added to the ``PYTHONPATH`` environment variable:

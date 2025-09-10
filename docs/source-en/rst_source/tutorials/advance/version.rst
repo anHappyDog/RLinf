@@ -87,7 +87,7 @@ Install from Source
             torch_compile_max_bs: 128 # the maximum batch size for torch compile. If the batch size is larger than this, torch compile will not be used.
 
         vllm: # used when rollout_backend is vllm
-            attention_backend: FLASH_ATTN # [FLASH_ATTN,XFORMERS] VLLM 使用的注意力后端,更多信息见 vLLM 文档
+            attention_backend: FLASH_ATTN # [FLASH_ATTN,XFORMERS] attention backend used by vLLM, for more info,see vLLM's doc
             enable_chunked_prefill: True  # enable vllm to use chunked_prefill.
             enable_prefix_caching: True  # enable vllm to use prefix_caching.
             enable_flash_infer_sampler: True #  # if True, vllm will use flashinfer to do sampling.
