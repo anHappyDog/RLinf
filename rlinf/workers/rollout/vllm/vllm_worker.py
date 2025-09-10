@@ -16,6 +16,7 @@ import os
 from typing import List
 
 from omegaconf import DictConfig
+from transformers import AutoTokenizer
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -38,7 +39,7 @@ class VLLMWorker(Worker):
         self._prepare_vllm_environment()
         self._return_logprobs = self._cfg.rollout.return_logprobs
         self._sampling_params = self._get_sampling_params_from_config()
-
+        self._tokenizer = AutoTokenizer.from_pretrained(self._cfg.rollout.model_dir)
         self._vllm_engine = None
 
         if self._cfg.algorithm.rollout_batch_size_per_gpu is None:
@@ -59,6 +60,9 @@ class VLLMWorker(Worker):
         ]
 
     def _prepare_vllm_environment(self) -> None:
+        """
+        Set up environment variables for VLLM.
+        """
         # use v1 engine
         os.environ["VLLM_USE_V1"] = "1"
         os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = (
@@ -71,6 +75,9 @@ class VLLMWorker(Worker):
         os.environ["VLLM_ATTENTION_BACKEND"] = self._cfg.rollout.vllm.attention_backend
 
     def _get_sampling_params_from_config(self) -> SamplingParams:
+        """
+        Get sampling parameters built from the configuration.
+        """
         cfg_sampling_params = self._cfg.algorithm.sampling_params
         if cfg_sampling_params.use_greedy:
             sampling_params = SamplingParams(
@@ -89,22 +96,38 @@ class VLLMWorker(Worker):
             )
         return sampling_params
 
-    # def _validate_weight_at_first(self) -> None:
-    #     """
-    #     Validate the model weights before starting to rollout formally.
-    #     """
-    #     if self._cfg.rollout.detokenize:
-    #         outputs = self._vllm_engine.generate(
-    #             input_ids=None,
-    #             sampling_params=self._validate_sampling_params,
-    #             return_logprobs=False,
-    #             prompts=self._validate_prompts,
-    #         )
+    def _validate_weight_at_first(self) -> None:
+        """
+        Validate the model weights before starting to rollout formally.
+        """
+        if self._cfg.rollout.detokenize:
+            outputs = self._vllm_engine.generate(
+                input_ids=None,
+                sampling_params=self._validate_sampling_params,
+                return_logprobs=False,
+                prompt_texts=self._validate_prompts,
+            )
+        else:
+            prompt_ids = self._tokenizer(self._validate_prompts).input_ids
+            outputs = self._vllm_engine.generate(
+                input_ids=prompt_ids,
+                sampling_params=self._validate_sampling_params,
+                return_logprobs=False,
+            )
+        print_vllm_outputs(outputs=outputs)
+        print("===============================", flush=True)
 
     def sync_model_from_actor(self) -> None:
+        """
+        Use vllm_engine to sync model weights from the actor.
+        """
         self._vllm_engine.sync_hf_weight()
 
     def init_worker(self) -> None:
+        """
+        Use EngineArgs and VllmConfig to initialize the VLLM engine.
+        Then offload the model weights, ready to use weights sent from actor.
+        """
         engine_args: EngineArgs = EngineArgs(
             model=self._cfg.rollout.model_dir,
             tensor_parallel_size=self._cfg.rollout.tensor_parallel_size,
@@ -135,12 +158,25 @@ class VLLMWorker(Worker):
         self._vllm_engine.offload_model_weights()
 
     def _stop(self) -> None:
+        """
+        Helper function to stop the VLLM engine and offload model weights.
+        This should only be called when vllm engine has no more requests to process.
+        """
         self.log_debug(
             f"[LLM dp {self._rank}] Received None input tokens, rollout end."
         )
         self._vllm_engine.offload_model_weights()
 
     def rollout(self, input_channel: Channel, output_channel: Channel) -> None:
+        """
+        The main rollout function to interact with the VLLM engine.
+        It receives RolloutRequest from input_channel, and sends back RolloutResult
+        to output_channel.
+
+        Args:
+            input_channel (Channel): The channel to receive RolloutRequest.
+            output_channel (Channel): The channel to send RolloutResult.
+        """
         request: RolloutRequest = input_channel.get()
 
         requests: List[RolloutRequest] = request.repeat_and_split(

@@ -16,8 +16,9 @@ from typing import List, Optional, Union
 
 from omegaconf import DictConfig
 from vllm.config import VllmConfig
-from vllm.inputs.data import TokensPrompt
+from vllm.inputs.data import TextPrompt, TokensPrompt
 from vllm.outputs import RequestOutput
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import Counter
 from vllm.v1.engine.llm_engine import LLMEngine as _LLMEngine
@@ -62,24 +63,71 @@ class VLLMEngine:
     def generate(
         self,
         input_ids: Union[List[List[int]], List[int]],
-        sampling_params: Optional[SamplingParams] = None,
+        sampling_params: Union[SamplingParams, PoolingParams],
+        prompt_texts: Optional[Union[List[str], str]] = None,
         return_logprobs: bool = False,
     ) -> List[RequestOutput]:
+        """
+        Use the VLLM engine to generate text based on input token IDs or prompt text.
+
+        Args:
+            input_ids: A list of lists of input token IDs, or a single list of input
+                token IDs.
+            sampling_params: Sampling parameters for generation.
+            prompt_text: Optional; A list of prompt strings or a single prompt string,
+                if provided, it will be used instead of input_ids.
+            return_logprobs: Whether to return log probabilities of the generated tokens.
+
+        Returns:
+            A list of RequestOutput objects containing the results of the generation.
+        """
         sampling_params.logprobs = 0 if return_logprobs else None
-        self._add_requests(input_ids, sampling_params)
+        self._add_requests(
+            input_ids=input_ids,
+            prompt_texts=prompt_texts,
+            sampling_params=sampling_params,
+        )
         results: List[RequestOutput] = self._run_engine()
         return results
 
     def _add_requests(
         self,
         input_ids: Union[List[List[int]], List[int]],
-        sampling_params: Optional[SamplingParams] = None,
+        sampling_params: Union[SamplingParams, PoolingParams],
+        prompt_texts: Optional[Union[List[str], str]] = None,
     ) -> None:
+        """
+        Add generation requests to the engine.
+
+        Args:
+            input_ids: A list of lists of input token IDs, or a single list of input token IDs.
+            prompt_texts: Optional; A list of prompt strings or a single prompt string, if provided,
+                it will be used instead of input_ids.
+            sampling_params: Optional; Sampling parameters for generation.
+        """
+        if prompt_texts is not None:
+            # if not None, we use prompt_text rather than input_ids
+            if isinstance(prompt_texts, str):
+                prompt_texts = [prompt_texts]
+            assert isinstance(prompt_texts, list), (
+                f"Expected list for prompt_texts, got {type(prompt_texts)}"
+            )
+            for prompt_text in prompt_texts:
+                request_id = str(next(self.request_counter))
+                text_prompt = TextPrompt(prompt=prompt_text)
+                self._engine.add_request(
+                    request_id=request_id,
+                    prompt=text_prompt,
+                    params=sampling_params,
+                )
+            return
+
         assert isinstance(input_ids, list), (
             f"Expected list for input_ids, got {type(input_ids)}"
         )
         if not isinstance(input_ids[0], list):
             input_ids = [input_ids]
+
         for input_id in input_ids:
             request_id = str(next(self.request_counter))
             tokens_prompt = TokensPrompt(prompt_token_ids=input_id)
@@ -90,6 +138,12 @@ class VLLMEngine:
             )
 
     def _run_engine(self) -> List[RequestOutput]:
+        """
+        Run the engine until all requests are finished.
+
+        Returns:
+            A list of RequestOutput objects containing the results of the generation.
+        """
         outputs: List[RequestOutput] = []
 
         while self._engine.has_unfinished_requests():
@@ -100,7 +154,13 @@ class VLLMEngine:
         return sorted(outputs, key=lambda x: int(x.request_id))
 
     def offload_model_weights(self) -> None:
+        """
+        Offload most graphic memory vllm used, including model's weights, buffers and kv cache.
+        """
         self._engine.collective_rpc("offload_model_weights")
 
     def sync_hf_weight(self) -> None:
+        """
+        Sync model weights from actor to the vllm workers.
+        """
         self._engine.collective_rpc("sync_hf_weight")
