@@ -255,6 +255,23 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
             "timing_log_option", "minmax"
         )  # choices=['max', 'minmax', 'all']
 
+        # Megatron >= 0.12.0
+        cfg.megatron.init_model_with_meta_device = cfg.megatron.get(
+            "init_model_with_meta_device", False
+        )
+        cfg.megatron.use_torch_fsdp2 = cfg.megatron.get("use_torch_fsdp2", False)
+        cfg.megatron.use_custom_fsdp = cfg.megatron.get("use_custom_fsdp", False)
+        cfg.megatron.check_for_large_grads = cfg.megatron.get(
+            "check_for_large_grads", False
+        )
+        cfg.megatron.ddp_num_buckets = cfg.megatron.get("ddp_num_buckets", None)
+        cfg.megatron.ddp_pad_buckets_for_high_nccl_busbw = cfg.megatron.get(
+            "ddp_pad_buckets_for_high_nccl_busbw", False
+        )
+        cfg.megatron.enable_gloo_process_groups = cfg.megatron.get(
+            "enable_gloo_process_groups", True
+        )
+
         # ddp config
         cfg.megatron.check_for_nan_in_loss_and_grad = cfg.megatron.get(
             "check_for_nan_in_loss_and_grad", False
