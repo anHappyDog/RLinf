@@ -555,7 +555,7 @@ def validate_math_cfg(cfg: DictConfig) -> DictConfig:
             f"runner.seq_length ({cfg.runner.seq_length}) must be greater than data.max_prompt_length ({cfg.data.max_prompt_length})"
         )
 
-    cfg.rollout = validate_rollout_cfg(cfg.rollout)
+        cfg.rollout = validate_rollout_cfg(cfg.rollout)
     return cfg
 
 

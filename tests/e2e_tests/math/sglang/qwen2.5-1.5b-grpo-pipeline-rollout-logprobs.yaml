@@ -95,7 +95,7 @@ rollout:
   padding: null               # will be tokenizer.pad_token_id if null. it is used to filter megatron's padding for vllm rollout
   eos: null                   # will be tokenizer.eos_token_id if null.
 
-  rollout_backend: vllm     # [sglang, vllm]
+  rollout_backend: sglang     # [sglang, vllm]
 
   sglang:
     attention_backend: triton # [flashinfer, triton] for more, see sglang's doc
