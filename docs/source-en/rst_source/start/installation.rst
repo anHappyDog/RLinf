@@ -158,7 +158,7 @@ After installing ``uv``, create a virtual environment and install PyTorch along 
 Megatron and SGLang/vLLM Dependencies
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Run the following commands to install Megatron, SGLang/vLLM, and their dependencies:
+Run the following commands to install Megatron, SGLang or vLLM, and their dependencies:
 
 .. code-block:: shell
 
@@ -171,6 +171,18 @@ Before using Megatron, ensure its path is added to the ``PYTHONPATH`` environmen
 .. code-block:: shell
 
    export PYTHONPATH=/opt/Megatron-LM:$PYTHONPATH
+
+SGLang installation:
+
+.. code-block:: shell
+
+   uv sync --extra sglang
+
+vLLM installation:
+
+.. code-block:: shell
+
+   uv sync --extra vllm
 
 .. _embodied-dependencies:
 

@@ -39,7 +39,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-    qwen-grpo-sglang-test:
+    qwen-grpo-test:
         runs-on: rlinf
         container:
             image: rlinf/rlinf:math-rlinf0.1-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1

@@ -167,6 +167,18 @@ Megatron 和 SGLang/vLLM 依赖
 
    export PYTHONPATH=/opt/Megatron-LM:$PYTHONPATH
 
+SGLang 安装：
+
+.. code-block:: shell
+
+   uv sync --extra sglang
+
+vLLM 安装：
+
+.. code-block:: shell
+
+   uv sync --extra vllm
+
 .. _embodied-dependencies:
 
 具身智能相关依赖
