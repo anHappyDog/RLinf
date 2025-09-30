@@ -315,6 +315,7 @@ class VLLMWorker(Worker):
             enable_prefix_caching=self._cfg.rollout.vllm.enable_prefix_caching,
             max_num_batched_tokens=self._cfg.rollout.vllm.max_num_batched_tokens,
             task="generate",
+            load_format="dummy" if not self._cfg.rollout.validate_weight else "auto",
             trust_remote_code=self._cfg.actor.tokenizer.trust_remote_code,
             max_model_len=self._cfg.runner.seq_length,
             max_num_seqs=self._cfg.rollout.max_running_requests,
