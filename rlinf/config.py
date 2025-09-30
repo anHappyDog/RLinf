@@ -561,9 +561,12 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
 
     if cfg.runner.task_type == "embodied":
         cfg = validate_embodied_cfg(cfg)
-    if cfg.runner.task_type == "reasoning":
+    elif cfg.runner.task_type == "reasoning":
         cfg = validate_reasoning_cfg(cfg)
-
+    else:
+        raise ValueError(
+            f"Unsupported task_type {cfg.runner.task_type}. Supported task types are 'embodied' and 'reasoning'."
+        )
     if (
         cfg.algorithm.adv_type == "embodied_grpo"
         or cfg.algorithm.adv_type == "math_grpo"
