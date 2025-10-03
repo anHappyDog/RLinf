@@ -405,9 +405,11 @@ def math_verify_call(
     has_timeout = False
     for jobs in all_jobs:
         try:
+            label = 0
             for job in as_completed(jobs, timeout=timeout):
                 x = job.result()
-                labels.append(x)
+                label = label or x
+            labels.append(label)
         except TimeoutError:
             has_timeout = True
 
