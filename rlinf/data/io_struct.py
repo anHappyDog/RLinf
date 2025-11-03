@@ -59,8 +59,8 @@ class RolloutRequest:
     n: int
     input_ids: List[List[int]]
     image_data: Union[List[List[bytes]], List[List[str]]]
-    answers: List[Union[List[str], dict]]
-    multi_modal_inputs: List[dict]
+    answers: List[Union[List[str], Dict]]
+    multi_modal_inputs: List[Optional[Dict]]
 
     def to_seq_group_infos(self) -> List["SeqGroupInfo"]:
         """Convert the RolloutRequest into a list of SeqGroupInfo objects.
@@ -103,7 +103,7 @@ class SeqGroupInfo:
     Attributes:
         id (int): Unique identifier for the sequence group.
         input_ids (List[int]): List of input IDs of the original sequence.
-        answer (Union[List[str], dict]): List of answers of the original sequence.(One sequence can have multiple equivalent answers), or a dict in case of vqa task.
+        answer (Union[List[str], Dict]): List of answers of the original sequence.(One sequence can have multiple equivalent answers), or a dict in case of vqa task.
         group_size (int): Number of sequences in the group.
         idx_completed (set[int]): Set of indices for sequences that have completed rollout and are ready for evaluation.
         idx_aborted (set[int]): Set of indices for sequences that have been aborted. These sequences need to be re-rolled out before they can be evaluated.
@@ -117,8 +117,8 @@ class SeqGroupInfo:
     idx_completed: set[int] = field(init=False, compare=False)
     idx_aborted: set[int] = field(init=False, compare=False)
     results: List[Optional[Dict]] = field(init=False, compare=False)
-    image_data: List
-    multi_modal_inputs: Dict
+    image_data: Optional[List] = None
+    multi_modal_inputs: Optional[Dict] = None
 
     def __post_init__(self):
         assert self.group_size > 0, "group_size must be greater than 0"
@@ -272,9 +272,9 @@ class RolloutResult:
     @staticmethod
     def from_vllm_results(
         group_size: int,
-        results: list["VllmRequestOutput"],
-        answers: Optional[Union[list[str], dict]] = None,
-        multi_modal_inputs: Optional[list[Dict]] = None,
+        results: List["VllmRequestOutput"],
+        answers: Optional[Union[List[str], Dict]] = None,
+        multi_modal_inputs: Optional[List[Dict]] = None,
         return_logprobs: bool = False,
     ) -> "RolloutResult":
         """
@@ -292,8 +292,8 @@ class RolloutResult:
         """
 
         def get_logprobs(
-            response_ids: list[int], output: "CompletionOutput"
-        ) -> list[float]:
+            response_ids: List[int], output: "CompletionOutput"
+        ) -> List[float]:
             logprobs = []
             returned_logprobs = output.logprobs
             assert logprobs is not None, (
