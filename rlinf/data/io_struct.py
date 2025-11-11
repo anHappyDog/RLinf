@@ -314,7 +314,8 @@ class RolloutResult:
         return_logprobs: bool = False,
     ) -> "RolloutResult":
         """
-        Create a RolloutResult from the given vLLM results.
+        Create a RolloutResult from the given vLLM results. every result is generated with n=1,
+        so its outputs len is 1
 
         Args:
             group_size (int): The group size used during rollout.
@@ -339,62 +340,36 @@ class RolloutResult:
                 logprobs.append(logprob[response_ids[i]].logprob)
             return logprobs
 
-        num_sequences = len(results) * group_size
-
-        if multi_modal_inputs:
-            mm_inputs = []
-            for mm_input in multi_modal_inputs:
-                mm_inputs.extend([mm_input] * group_size)
-        else:
-            mm_inputs = None
-
         # for VQA task, answers is a dict
         if isinstance(answers, dict):
             answers = [answers]
 
-        prompt_lengths = []
-        prompt_ids = []
-        response_lengths = []
-        response_ids = []
-        logprobs = []
-        is_end = []
-        response_texts = []
-        rollout_answers = (
-            [answer for answer in answers for _ in range(group_size)]
-            if answers
-            else None
-        )
-        for vllm_result in results:
-            if vllm_result.prompt_token_ids is not None:
-                prompt_ids.extend([vllm_result.prompt_token_ids] * group_size)
-                prompt_lengths.extend([len(vllm_result.prompt_token_ids)] * group_size)
-            else:
-                raise NotImplementedError("vllm should return tokenized prompt.")
-            response_ids.extend(
-                [list(output.token_ids) for output in vllm_result.outputs]
-            )
-            response_texts.extend([output.text for output in vllm_result.outputs])
-            response_lengths.extend(
-                [len(output.token_ids) for output in vllm_result.outputs]
-            )
-            is_end.extend([vllm_result.finished] * group_size)
-            if return_logprobs:
-                logprobs.extend(
-                    [
-                        get_logprobs(list(output.token_ids), output)
-                        for output in vllm_result.outputs
-                    ]
+        # here vllm must return prompt ids because we pass input_ids as input
+        prompt_ids = [vllm_result.prompt_token_ids for vllm_result in results]
+        prompt_lengths = [len(vllm_result.prompt_token_ids) for vllm_result in results]
+        response_ids = [vllm_result.outputs[0].token_ids for vllm_result in results]
+        response_texts = [vllm_result.outputs[0].text for vllm_result in results]
+        response_lengths = [
+            len(vllm_result.outputs[0].token_ids) for vllm_result in results
+        ]
+        is_end = [vllm_result.finished for vllm_result in results]
+        if return_logprobs:
+            logprobs = [
+                get_logprobs(
+                    list(vllm_result.outputs[0].token_ids), vllm_result.outputs[0]
                 )
+                for vllm_result in results
+            ]
         result: RolloutResult = RolloutResult(
             group_size=group_size,
-            num_sequence=num_sequences,
-            answers=rollout_answers,
+            num_sequence=len(results),
+            answers=answers,
             prompt_ids=prompt_ids,
             prompt_lengths=prompt_lengths,
             response_ids=response_ids,
             response_lengths=response_lengths,
             response_texts=response_texts,
-            multi_modal_inputs=mm_inputs,
+            multi_modal_inputs=multi_modal_inputs,
             is_end=is_end,
         )
         if return_logprobs:

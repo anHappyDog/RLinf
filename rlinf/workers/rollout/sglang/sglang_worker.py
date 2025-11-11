@@ -243,11 +243,11 @@ class SGLangWorker(Worker):
         if self._cfg.rollout.validate_weight:
             await self._validate_weight_at_first()
         if self._placement.is_collocated:
-            await self.offload_engine()
+            await self.offload_model_weights()
         if self._use_auto_scheduler:
             asyncio.create_task(self._scheduler.main_loop())
 
-    async def offload_engine(self):
+    async def offload_model_weights(self):
         """
         Offload the model weights from the SGLang engine.
         """
@@ -397,7 +397,7 @@ class SGLangWorker(Worker):
                 self._collect_stats(all_rollout_results)
 
             if self._placement.is_collocated or self._placement.is_auto:
-                await self.offload_engine()
+                await self.offload_model_weights()
                 if self._use_auto_scheduler:
                     await self._scheduler.report_offloaded()
 

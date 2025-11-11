@@ -61,7 +61,7 @@ class VLLMWorker(Worker):
             "The future of AI is",
         ]
         self._request_counter = Counter()
-
+        self._running_request_ids: set[str] = set()
         self.status_manager = RunningStatusManager()
         self._use_auto_scheduler = self._placement.is_auto
 
@@ -285,21 +285,36 @@ class VLLMWorker(Worker):
                     )
                 else:
                     inputs.append(TokensPrompt(prompt_token_ids=input_id))
-
+        request_ids = [str(next(self._request_counter)) for _ in inputs]
+        self._running_request_ids.update(request_ids)
         outputs = await asyncio.gather(
             *[
                 self._get_output_from_async_generator(
                     self._async_engine.generate(
                         prompt=inp,
                         sampling_params=sampling_params,
-                        request_id=str(next(self.request_counter)),
+                        request_id=request_id,
                     )
                 )
-                for inp in inputs
+                for inp, request_id in zip(inputs, request_ids, strict=True)
             ]
         )
-
+        for request_id in request_ids:
+            self._running_request_ids.remove(request_id)
         return outputs
+
+    async def abort_generation(self) -> None:
+        """
+        Abort all ongoing and waiting generations in the vllm async engine.
+        """
+        request_ids = list(self._running_request_ids)
+        self._running_request_ids.clear()
+        await asyncio.gather(
+            *[
+                self._async_engine.abort(request_id=request_id)
+                for request_id in request_ids
+            ]
+        )
 
     async def init_worker(self) -> None:
         """
@@ -348,26 +363,17 @@ class VLLMWorker(Worker):
 
         self.log_info(f"[LLM dp {self._rank}] VLLM engine initialized.")
 
-        if not self._placement.is_disaggregated:
+        if self._placement.is_collocated:
             await self.offload_model_weights()
-
-    async def _stop(self) -> None:
-        """
-        Helper function to stop the VLLM engine and offload model weights.
-        This should only be called when vllm engine has no more requests to process.
-        """
-        self.log_debug(
-            f"[LLM dp {self._rank}] Received None input tokens, rollout end."
-        )
-        if not self._placement.is_disaggregated:
-            await self.offload_model_weights()
+        if self._use_auto_scheduler:
+            asyncio.create_task(self._scheduler.main_loop())
 
     async def _async_generate_group(self, seq_group_info: SeqGroupInfo) -> SeqGroupInfo:
         async def generate_with_idx(
             idx: int,
             input_ids: list[int],
             image_data: Optional[list[Union[bytes, str]]],
-        ) -> tuple[int, RequestOutput, int]:
+        ) -> tuple[int, RequestOutput]:
             outputs = await self.generate(
                 input_ids=input_ids,
                 image_data=image_data,
@@ -393,7 +399,6 @@ class VLLMWorker(Worker):
                 seq_idx_list.append(idx)
                 input_batch.append(seq_group_info.input_ids + generated_ids)
                 image_data_list.append(seq_group_info.image_data)
-                image_data_list.append(seq_group_info.image_data)
 
         tasks = [
             asyncio.create_task(generate_with_idx(idx, input_ids, image_data))
@@ -413,9 +418,9 @@ class VLLMWorker(Worker):
         ).async_wait()
         groups = rollout_request.to_seq_group_infos()
         async_wait_type = (
-            asyncio.ALL_COMPLETED
-            if self._cfg.rollout.wait_all_completed
-            else asyncio.FIRST_EXCEPTION
+            asyncio.FIRST_COMPLETED
+            if self._placement.is_pipeline
+            else asyncio.ALL_COMPLETED
         )
         with self.device_lock, self.worker_timer():
             num_residual = self.status_manager.num_seq_group
@@ -428,7 +433,6 @@ class VLLMWorker(Worker):
                 task = asyncio.create_task(self._async_generate_group(group))
                 self.status_manager.add_task(group, task)
 
-            all_rollout_results = []
             while pending := self.status_manager.get_running_tasks():
                 done, pending = await asyncio.wait(pending, return_when=async_wait_type)
                 returned_seq_groups: list[SeqGroupInfo] = [
@@ -436,11 +440,10 @@ class VLLMWorker(Worker):
                 ]
                 for group in returned_seq_groups:
                     if group.all_completed:
-                        rollout_result = RolloutResult.from_sglang_seq_group(
+                        rollout_result = RolloutResult.from_vllm_seq_group(
                             group,
                             self._return_logprobs,
                         )
-                        all_rollout_results.append(rollout_result)
                         await output_channel.put(
                             item=rollout_result, async_op=True
                         ).async_wait()
