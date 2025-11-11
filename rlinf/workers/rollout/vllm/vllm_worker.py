@@ -33,14 +33,16 @@ from vllm.v1.engine.async_llm import AsyncLLM as AsyncLLMEngine
 from rlinf.config import torch_dtype_from_precision
 from rlinf.data.io_struct import RolloutRequest, RolloutResult, SeqGroupInfo
 from rlinf.scheduler import Channel, Worker
-from rlinf.utils.placement import ComponentPlacement
-from rlinf.workers.rollout.utils import print_vllm_outputs
+from rlinf.scheduler.dynamic_scheduler.manager import RolloutScalingScheduler
+from rlinf.scheduler.dynamic_scheduler.utils import get_scheduler_channel
+from rlinf.utils.placement import ModelParallelComponentPlacement
+from rlinf.workers.rollout.utils import RunningStatusManager, print_vllm_outputs
 
 from . import VLLMExecutor
 
 
 class VLLMWorker(Worker):
-    def __init__(self, config: DictConfig, placement: ComponentPlacement):
+    def __init__(self, config: DictConfig, placement: ModelParallelComponentPlacement):
         Worker.__init__(self)
         self._cfg = config
         self._placement = placement
@@ -58,7 +60,22 @@ class VLLMWorker(Worker):
             "The capital of France is",
             "The future of AI is",
         ]
-        self.request_counter = Counter()
+        self._request_counter = Counter()
+
+        self.status_manager = RunningStatusManager()
+        self._use_auto_scheduler = self._placement.is_auto
+
+        if self._use_auto_scheduler:
+            self._init_scheduler()
+
+    def _init_scheduler(self) -> None:
+        self.schedule_channel = self.connect_channel(
+            get_scheduler_channel("rollout", self._rank)
+        )
+
+        self._scheduler = RolloutScalingScheduler(
+            self._rank, self.schedule_channel, self
+        )
 
     def _prepare_vllm_environment(self) -> None:
         """
@@ -91,7 +108,6 @@ class VLLMWorker(Worker):
                 temperature=0,
                 max_tokens=cfg_sampling_params.max_new_tokens,
                 output_kind=RequestOutputKind.FINAL_ONLY,
-                n=self._cfg.algorithm.group_size,
                 logprobs=0 if self._return_logprobs else None,
             )
         else:
@@ -102,14 +118,13 @@ class VLLMWorker(Worker):
                 repetition_penalty=cfg_sampling_params.repetition_penalty,
                 max_tokens=cfg_sampling_params.max_new_tokens,
                 output_kind=RequestOutputKind.FINAL_ONLY,
-                n=self._cfg.algorithm.group_size,
                 logprobs=0 if self._return_logprobs else None,
             )
         return sampling_params
 
     def _process_image_data(
         self, image_data: Optional[list[Union[bytes, str]]]
-    ) -> Optional[list[Image]]:
+    ) -> Optional[list[Image.Image]]:
         """
         Process the batch image data which can be bytes or image paths.
 
@@ -336,23 +351,6 @@ class VLLMWorker(Worker):
         if not self._placement.is_disaggregated:
             await self.offload_model_weights()
 
-    async def _put_result(self, result: RolloutResult, output_channel: Channel) -> None:
-        """
-        Helper function to put the result to output channel.
-
-        Args:
-            result: The RolloutResult to put to the channel.
-            output_channel: The output channel to send results to.
-        """
-        # NOTE:
-        # To fit reward worker and actor workers' expected input count,
-        # currently we can only split result into groups.
-        splited_results = RolloutResult.split_result_list_by_group([result])
-        put_tasks = [
-            output_channel.put(r, async_op=True).async_wait() for r in splited_results
-        ]
-        await asyncio.gather(*put_tasks)
-
     async def _stop(self) -> None:
         """
         Helper function to stop the VLLM engine and offload model weights.
@@ -364,56 +362,104 @@ class VLLMWorker(Worker):
         if not self._placement.is_disaggregated:
             await self.offload_model_weights()
 
-    async def rollout_and_return(
-        self, seq_info: SeqGroupInfo, output_channel: Channel
-    ) -> None:
-        """
-        Helper function to rollout for a single SeqGroupInfo and build RolloutResult then
-        put it to output channel.
+    async def _async_generate_group(self, seq_group_info: SeqGroupInfo) -> SeqGroupInfo:
+        async def generate_with_idx(
+            idx: int,
+            input_ids: list[int],
+            image_data: Optional[list[Union[bytes, str]]],
+        ) -> tuple[int, RequestOutput, int]:
+            outputs = await self.generate(
+                input_ids=input_ids,
+                image_data=image_data,
+                sampling_params=self._sampling_params,
+            )
+            return idx, outputs[0]
 
-        Args:
-            seq_info: The SeqGroupInfo to process.
-            output_channel: The output channel to send results to.
-        """
-        vllm_results: list[RequestOutput] = await self.generate(
-            input_ids=seq_info.input_ids,
-            image_data=seq_info.image_data,
-            sampling_params=self._sampling_params,
-        )
-        rollout_result: RolloutResult = RolloutResult.from_vllm_results(
-            group_size=self._cfg.algorithm.group_size,
-            results=vllm_results,
-            answers=seq_info.answer,
-            multi_modal_inputs=[seq_info.multi_modal_inputs],
-            return_logprobs=self._return_logprobs,
-        )
-        if self._cfg.rollout.print_outputs:
-            print_vllm_outputs(outputs=vllm_results)
-        await self._put_result(result=rollout_result, output_channel=output_channel)
+        if seq_group_info.num_aborted == 0:
+            assert seq_group_info.num_returned == 0
+            seq_idx_list = list(range(seq_group_info.group_size))
+            input_batch = [seq_group_info.input_ids] * seq_group_info.group_size
+            image_data_list = [seq_group_info.image_data] * seq_group_info.group_size
+        else:
+            idx_aborted = seq_group_info.idx_aborted.copy()
+            seq_idx_list: list[int] = []
+            seq_group_info.idx_aborted.clear()
+            input_batch: list[list[int]] = []
+            image_data_list: list = []
+            for idx in idx_aborted:
+                generated_ids: list[int] = (
+                    seq_group_info.results[idx].outputs[0].token_ids
+                )
+                seq_idx_list.append(idx)
+                input_batch.append(seq_group_info.input_ids + generated_ids)
+                image_data_list.append(seq_group_info.image_data)
+                image_data_list.append(seq_group_info.image_data)
+
+        tasks = [
+            asyncio.create_task(generate_with_idx(idx, input_ids, image_data))
+            for idx, input_ids, image_data in zip(
+                seq_idx_list, input_batch, image_data_list
+            )
+        ]
+        for future in asyncio.as_completed(tasks):
+            idx, request_output = await future
+            seq_group_info.record_vllm_result(idx, request_output, self._logger)
+
+        return seq_group_info
 
     async def rollout(self, input_channel: Channel, output_channel: Channel) -> None:
-        """
-            Perform rollout using vllm engine.
-            It will read `RolloutRequest` from input_channel and put `RolloutResult` to output_channel.
-            If the input request is None, it will stop the rollout.
-
-        Args:
-            input_channel: The input channel to read from.
-            output_channel: The output channel to send results to.
-        """
         rollout_request: RolloutRequest = await input_channel.get(
             async_op=True
         ).async_wait()
-        seq_infos = rollout_request.to_seq_group_infos()
-
+        groups = rollout_request.to_seq_group_infos()
+        async_wait_type = (
+            asyncio.ALL_COMPLETED
+            if self._cfg.rollout.wait_all_completed
+            else asyncio.FIRST_EXCEPTION
+        )
         with self.device_lock, self.worker_timer():
-            rollout_tasks = [
-                asyncio.create_task(
-                    self.rollout_and_return(
-                        seq_info=seq_info, output_channel=output_channel
-                    )
-                )
-                for seq_info in seq_infos
-            ]
-            await asyncio.gather(*rollout_tasks)
-            await self._stop()
+            num_residual = self.status_manager.num_seq_group
+            assert num_residual == 0, (
+                f"There are {num_residual} "
+                f"sequence group{'' if num_residual == 1 else 's'} before rollout."
+            )
+
+            for group in groups:
+                task = asyncio.create_task(self._async_generate_group(group))
+                self.status_manager.add_task(group, task)
+
+            all_rollout_results = []
+            while pending := self.status_manager.get_running_tasks():
+                done, pending = await asyncio.wait(pending, return_when=async_wait_type)
+                returned_seq_groups: list[SeqGroupInfo] = [
+                    task.result() for task in done
+                ]
+                for group in returned_seq_groups:
+                    if group.all_completed:
+                        rollout_result = RolloutResult.from_sglang_seq_group(
+                            group,
+                            self._return_logprobs,
+                        )
+                        all_rollout_results.append(rollout_result)
+                        await output_channel.put(
+                            item=rollout_result, async_op=True
+                        ).async_wait()
+                        self.status_manager.mark_done(group)
+                    else:
+                        self.status_manager.mark_aborted(group)
+
+                if (
+                    self._use_auto_scheduler
+                    and self.status_manager.num_seq_group_running == 0
+                ):
+                    # rollout should not exit immediately when using auto scheduler
+                    # because there might be migrations
+                    # if so, `pending` will not be empty in while loop condition
+                    await self.status_manager.wait_notification()
+
+            self.status_manager.clear()
+
+            if self._placement.is_collocated or self._placement.is_auto:
+                await self.offload_model_weights()
+                if self._use_auto_scheduler:
+                    await self._scheduler.report_offloaded()

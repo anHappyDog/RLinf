@@ -49,10 +49,10 @@ def get_seq_length(
 class RolloutRequest:
     """
     Attr
-    input_ids: List of input token IDs for rollout
+    input_ids: list of input token IDs for rollout
     n: Number of completions to generate for each input
     image_data: list of image data (bytes or URLs) for multimodal inputs
-    answers: List of answers for the requests, where each answer can be either a list of strings (for typical tasks) or a dict (for VQA tasks), if available.
+    answers: list of answers for the requests, where each answer can be either a list of strings (for typical tasks) or a dict (for VQA tasks), if available.
     multi_modal_inputs: list of multi-modal inputs for the requests
     """
 
@@ -66,7 +66,7 @@ class RolloutRequest:
         """Convert the RolloutRequest into a list of SeqGroupInfo objects.
 
         Returns:
-            List[SeqGroupInfo]: A list of SeqGroupInfo objects.
+            list[SeqGroupInfo]: A list of SeqGroupInfo objects.
         """
         return [
             SeqGroupInfo(
@@ -102,12 +102,12 @@ class SeqGroupInfo:
 
     Attributes:
         id (int): Unique identifier for the sequence group.
-        input_ids (List[int]): List of input IDs of the original sequence.
-        answer (Union[List[str], Dict]): List of answers of the original sequence.(One sequence can have multiple equivalent answers), or a dict in case of vqa task.
+        input_ids (list[int]): list of input IDs of the original sequence.
+        answer (Union[list[str], dict]): list of answers of the original sequence.(One sequence can have multiple equivalent answers), or a dict in case of vqa task.
         group_size (int): Number of sequences in the group.
         idx_completed (set[int]): Set of indices for sequences that have completed rollout and are ready for evaluation.
         idx_aborted (set[int]): Set of indices for sequences that have been aborted. These sequences need to be re-rolled out before they can be evaluated.
-        results (List[Optional[Dict]]): List storing result dictionaries for each sequence, or None if not yet available.
+        results (list[Optional[dict]]): list storing result for each sequence, or None if not yet available.
     """
 
     id: int
@@ -116,7 +116,9 @@ class SeqGroupInfo:
     group_size: int
     idx_completed: set[int] = field(init=False, compare=False)
     idx_aborted: set[int] = field(init=False, compare=False)
-    results: list[Optional[dict]] = field(init=False, compare=False)
+    results: list[Optional[Union[dict, "VllmRequestOutput"]]] = field(
+        init=False, compare=False
+    )
     image_data: Optional[list] = None
     multi_modal_inputs: Optional[dict] = None
 
@@ -125,6 +127,18 @@ class SeqGroupInfo:
         self.idx_completed = set()
         self.idx_aborted = set()
         self.results = [None for _ in range(self.group_size)]
+
+    def record_vllm_result(self, idx: int, result: "VllmRequestOutput", logger=None):
+        finish_reason = result.outputs[0].finish_reason
+        if finish_reason is None or finish_reason == "abort":
+            self.idx_aborted.add(idx)
+        else:
+            self.idx_completed.add(idx)
+
+        if self.results[idx] is None:
+            self.results[idx] = result
+        else:
+            self.results[idx].add(next_output=result, aggregate=True)
 
     def record_sglang_result(self, idx: int, result: dict, logger=None):
         """Record a single sglang execution result and update internal tracking.
@@ -139,7 +153,7 @@ class SeqGroupInfo:
         Args:
             idx: int
                 The index of the sequence within the group (0 <= idx < group_size).
-            result: Dict
+            result: dict
                 Result of SGLang. Expected to contain at least:
                 - "meta_info": {"finish_reason": {"type": FinishReasonEnum}}
                 - "output_ids": a list (or list-like) of output identifier elements
@@ -306,7 +320,7 @@ class RolloutResult:
             group_size (int): The group size used during rollout.
             results (list[VllmRequestOutput]): The rollout results from vLLM.
             answers (Optional[Union[list[str], dict]]): The answers corresponding to the inputs, notably, if task type is vqa, answers is a dict.
-            multi_modal_inputs (Optional[list[Dict]]): The multi-modal inputs corresponding to the inputs.
+            multi_modal_inputs (Optional[list[dict]]): The multi-modal inputs corresponding to the inputs.
             return_logprobs (bool): Whether to return log probabilities.
 
         Returns:
@@ -400,8 +414,8 @@ class RolloutResult:
         """Create a MathRolloutResult from the given results and input IDs.
 
         Args:
-            results (List[Dict]): The rollout results from the model.
-            input_ids (List[List[int]]): The input IDs for the prompts.
+            results (list[dict]): The rollout results from the model.
+            input_ids (list[list[int]]): The input IDs for the prompts.
             return_logprobs (bool): Whether to return log probabilities.
         """
         assert len(results) == len(input_ids), (
@@ -443,6 +457,16 @@ class RolloutResult:
             [seq_group.input_ids] * seq_group.group_size,
             [seq_group.answer] * seq_group.group_size,
             image_data=[seq_group.image_data] * seq_group.group_size,
+            multi_modal_inputs=[seq_group.multi_modal_inputs] * seq_group.group_size,
+            return_logprobs=return_logprobs,
+        )
+
+    @classmethod
+    def from_vllm_seq_group(cls, seq_group: SeqGroupInfo, return_logprobs: bool):
+        return cls.from_vllm_results(
+            seq_group.group_size,
+            seq_group.results,
+            answers=[seq_group.answer] * seq_group.group_size,
             multi_modal_inputs=[seq_group.multi_modal_inputs] * seq_group.group_size,
             return_logprobs=return_logprobs,
         )
@@ -550,10 +574,10 @@ class RolloutResult:
         If input has multiple RolloutResult objects, split each one and merge the results.
 
         Args:
-            rollout_results: List of input RolloutResult objects
+            rollout_results: list of input RolloutResult objects
 
         Returns:
-            List of RolloutResult objects grouped by group_size
+            list of RolloutResult objects grouped by group_size
         """
         assert len(rollout_results) > 0, "No rollout results to split."
 
@@ -576,7 +600,7 @@ class RolloutResult:
             rollout_result: The RolloutResult to be split
 
         Returns:
-            List of split RolloutResult objects
+            list of split RolloutResult objects
         """
         group_size = rollout_result.group_size
         num_sequence = rollout_result.num_sequence
@@ -710,7 +734,7 @@ class RolloutResult:
             pad_token (int): Token used for padding, e.g., `tokenizer.pad_token_id`.
 
         Returns:
-            Dict[str, torch.Tensor]: A dictionary with keys:
+            dict[str, torch.Tensor]: A dictionary with keys:
 
             input_ids (torch.Tensor):
                 Concatenated prompt and response token IDs,
