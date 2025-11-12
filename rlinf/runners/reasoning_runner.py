@@ -183,7 +183,7 @@ class ReasoningRunner:
         # Init workers
         self.rollout.init_worker().wait()
         if self.use_pre_process_policy:
-            self.rollout.offload_model_weights().wait()
+            self.rollout.offload_engine().wait()
         self.actor.init_worker().wait()
         if self.has_dedicated_inference:
             self.inference.init_worker().wait()

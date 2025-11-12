@@ -173,7 +173,7 @@ class VLLMWorker(Worker):
         for request_output in vllm_outputs:
             print_vllm_outputs(request_output, self._tokenizer)
 
-    async def offload_model_weights(self) -> None:
+    async def offload_engine(self) -> None:
         """
         Use async_engine to offload model weights/kv cache.
         """
@@ -300,7 +300,7 @@ class VLLMWorker(Worker):
             ]
         )
         for request_id in request_ids:
-            self._running_request_ids.remove(request_id)
+            self._running_request_ids.discard(request_id)
         return outputs
 
     async def abort_generation(self) -> None:
@@ -308,13 +308,13 @@ class VLLMWorker(Worker):
         Abort all ongoing and waiting generations in the vllm async engine.
         """
         request_ids = list(self._running_request_ids)
-        self._running_request_ids.clear()
         await asyncio.gather(
             *[
                 self._async_engine.abort(request_id=request_id)
                 for request_id in request_ids
             ]
         )
+        self._running_request_ids.difference_update(request_ids)
 
     async def init_worker(self) -> None:
         """
@@ -364,7 +364,7 @@ class VLLMWorker(Worker):
         self.log_info(f"[LLM dp {self._rank}] VLLM engine initialized.")
 
         if self._placement.is_collocated:
-            await self.offload_model_weights()
+            await self.offload_engine()
         if self._use_auto_scheduler:
             asyncio.create_task(self._scheduler.main_loop())
 
@@ -463,6 +463,6 @@ class VLLMWorker(Worker):
             self.status_manager.clear()
 
             if self._placement.is_collocated or self._placement.is_auto:
-                await self.offload_model_weights()
+                await self.offload_engine()
                 if self._use_auto_scheduler:
                     await self._scheduler.report_offloaded()
