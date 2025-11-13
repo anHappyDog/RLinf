@@ -26,7 +26,7 @@ from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs.data import PromptType, TextPrompt, TokensPrompt
 from vllm.outputs import RequestOutput
-from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.sampling_params import SamplingParams
 from vllm.utils import Counter
 from vllm.v1.engine.async_llm import AsyncLLM as AsyncLLMEngine
 
@@ -61,7 +61,7 @@ class VLLMWorker(Worker):
             "The future of AI is",
         ]
         self._request_counter = Counter()
-        self._running_request_ids: set[str] = set()
+        self._running_generate_tasks: dict[str, asyncio.Task] = {}
         self.status_manager = RunningStatusManager()
         self._use_auto_scheduler = self._placement.is_auto
 
@@ -107,7 +107,6 @@ class VLLMWorker(Worker):
             sampling_params = SamplingParams(
                 temperature=0,
                 max_tokens=cfg_sampling_params.max_new_tokens,
-                output_kind=RequestOutputKind.FINAL_ONLY,
                 logprobs=0 if self._return_logprobs else None,
             )
         else:
@@ -117,7 +116,6 @@ class VLLMWorker(Worker):
                 top_p=cfg_sampling_params.top_p,
                 repetition_penalty=cfg_sampling_params.repetition_penalty,
                 max_tokens=cfg_sampling_params.max_new_tokens,
-                output_kind=RequestOutputKind.FINAL_ONLY,
                 logprobs=0 if self._return_logprobs else None,
             )
         return sampling_params
@@ -194,9 +192,12 @@ class VLLMWorker(Worker):
         Helper function to get the final output from an async generator.
         """
         output: RequestOutput = None
-        async for out in async_generator:
-            output = out
-        assert output is not None, "Async generator returned no output."
+        try:
+            async for out in async_generator:
+                output = out
+            assert output is not None, "Async generator returned no output."
+        except asyncio.CancelledError:
+            pass
         return output
 
     async def generate(
@@ -286,9 +287,9 @@ class VLLMWorker(Worker):
                 else:
                     inputs.append(TokensPrompt(prompt_token_ids=input_id))
         request_ids = [str(next(self._request_counter)) for _ in inputs]
-        self._running_request_ids.update(request_ids)
-        outputs = await asyncio.gather(
-            *[
+        local_tasks = {}
+        for inp, request_id in zip(inputs, request_ids, strict=True):
+            local_tasks[request_id] = asyncio.create_task(
                 self._get_output_from_async_generator(
                     self._async_engine.generate(
                         prompt=inp,
@@ -296,25 +297,21 @@ class VLLMWorker(Worker):
                         request_id=request_id,
                     )
                 )
-                for inp, request_id in zip(inputs, request_ids, strict=True)
-            ]
-        )
+            )
+
+            self._running_generate_tasks[request_id] = local_tasks[request_id]
+        outputs = await asyncio.gather(*local_tasks.values())
         for request_id in request_ids:
-            self._running_request_ids.discard(request_id)
+            self._running_generate_tasks.pop(request_id, None)
         return outputs
 
     async def abort_generation(self) -> None:
         """
         Abort all ongoing and waiting generations in the vllm async engine.
         """
-        request_ids = list(self._running_request_ids)
-        await asyncio.gather(
-            *[
-                self._async_engine.abort(request_id=request_id)
-                for request_id in request_ids
-            ]
-        )
-        self._running_request_ids.difference_update(request_ids)
+        for generation_task in self._running_generate_tasks.values():
+            generation_task.cancel()
+        self._running_generate_tasks.clear()
 
     async def init_worker(self) -> None:
         """
