@@ -38,7 +38,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.utils.utils import clear_memory, is_vla_model
 
 
-class FSDP1Strategy(FSDPStrategyBase):
+class FSDPStrategy(FSDPStrategyBase):
     def wrap_model(self, model: nn.Module, device_mesh: DeviceMesh) -> FSDP:
         """
         Wrap the model with FSDP using the specified configuration,
@@ -93,7 +93,7 @@ class FSDP1Strategy(FSDPStrategyBase):
         return fsdp_model
 
     @classmethod
-    def get_fsdp_version(cls) -> FSDP:
+    def get_fsdp_version(cls) -> FSDPVersion:
         return FSDPVersion.FSDP
 
     def get_model_state_dict(self, model: FSDP) -> dict:

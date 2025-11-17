@@ -35,7 +35,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
     get_lr_scheduler,
 )
 from rlinf.utils.logging import get_logger
-from rlinf.utils.utils import fake_optimizer_step
+from rlinf.utils.utils import warmup_optimizer_state
 
 
 class FSDPModelManager:
@@ -240,11 +240,6 @@ class FSDPModelManager:
         self.optimizer = self.build_optimizer(
             model=self.model, enable_critic_warmup=self.critic_warmup_steps > 0
         )
-        # fake run optimizer step to initialize optimizer.state
-        # to avoid KeyError during load_state_dict/set_optimizer_state_dict
-        # in save/load_checkpoint calls
-
-        fake_optimizer_step(self.optimizer)
 
         self.lr_scheduler = self.build_lr_scheduler(optimizer=self.optimizer)
         self.grad_scaler = self.build_grad_scaler(
@@ -436,6 +431,11 @@ class FSDPModelManager:
         optimizer = torch.optim.AdamW(
             param_groups,
         )
+
+        # run optimizer empty step to initialize optimizer.state
+        # to avoid KeyError during get_state_dict/set_state_dict
+        # in save/load_checkpoint calls
+        warmup_optimizer_state(optimizer)
         return optimizer
 
     def build_grad_scaler(self, enabled: bool) -> GradScaler:

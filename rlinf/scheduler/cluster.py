@@ -151,7 +151,6 @@ class Cluster:
                 logging_level=Cluster.LOGGING_LEVEL,
                 namespace=Cluster.NAMESPACE,
                 runtime_env={
-                    "py_executable": sys.executable,
                     "env_vars": dict(os.environ),
                 },
             )
@@ -160,7 +159,6 @@ class Cluster:
                 logging_level=Cluster.LOGGING_LEVEL,
                 namespace=Cluster.NAMESPACE,
                 runtime_env={
-                    "py_executable": sys.executable,
                     "env_vars": dict(os.environ),
                 },
             )

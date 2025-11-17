@@ -28,7 +28,7 @@ from rlinf.hybrid_engines.fsdp.utils import FSDPVersion
 from rlinf.utils.utils import get_rng_state, set_rng_state
 
 
-class FSDPTrainingState(Stateful):
+class Checkpoint(Stateful):
     def __init__(
         self,
         model: Union[FSDP, FSDPModule],

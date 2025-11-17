@@ -285,20 +285,7 @@ def is_vla_model(cfg: DictConfig) -> bool:
     return model_type in vla_model_types
 
 
-def zero_grad_like(p):
-    if getattr(p, "is_meta", False) or (
-        hasattr(p, "device") and p.device.type == "meta"
-    ):
-        return None  # skip meta
-    try:
-        if p.layout is torch.strided and not isinstance(p, DTensor):
-            return torch.zeros_like(p, memory_format=torch.preserve_format)
-    except Exception:
-        pass
-    return p.detach().new_zeros(p.shape)
-
-
-def fake_optimizer_step(optimizer: Optimizer) -> None:
+def warmup_optimizer_state(optimizer: Optimizer) -> None:
     """
     pre initialize optimizer.state to avoid KeyError during subsequent load_state_dict/set_optimizer_state_dict.
     This function does not modify parameter values (by temporarily setting lr to zero + using zero gradients

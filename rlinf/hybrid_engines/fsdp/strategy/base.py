@@ -26,7 +26,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from rlinf.hybrid_engines.fsdp import FSDP, FSDPModule
-from rlinf.hybrid_engines.fsdp.state import FSDPTrainingState
+from rlinf.hybrid_engines.fsdp.strategy.checkpoint import Checkpoint
 from rlinf.hybrid_engines.fsdp.utils import FSDPVersion
 
 
@@ -55,7 +55,7 @@ class FSDPStrategyBase(ABC):
         Factory method: create and return a concrete FSDP strategy instance based on cfg.
 
         Selection rules (case-insensitive):
-        - fsdp / fsdp1 -> FSDP1Strategy (classic torch.distributed.fsdp)
+        - fsdp         -> FSDPStrategy (classic torch.distributed.fsdp)
         - fsdp2        -> FSDP2Strategy (fully_shard API)
 
         Args:
@@ -74,9 +74,9 @@ class FSDPStrategyBase(ABC):
         strategy = str(cfg.fsdp_config.get("strategy", "fsdp2")).lower()
         match strategy:
             case FSDPVersion.FSDP:
-                from .fsdp1 import FSDP1Strategy
+                from .fsdp import FSDPStrategy
 
-                return FSDP1Strategy(
+                return FSDPStrategy(
                     cfg=cfg,
                     world_size=world_size,
                     dp_group=dp_group,
@@ -169,17 +169,20 @@ class FSDPStrategyBase(ABC):
         torch.distributed.barrier()
         opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
         try:
-            training_state = FSDPTrainingState(
+            training_state = Checkpoint(
                 model,
                 optimizer,
                 lr_scheduler,
                 opts,
                 fsdp_version=cls.get_fsdp_version(),
             )
-            dcp.save({"training_state": training_state}, checkpoint_id=save_path)
+            dcp.save({"fsdp_checkpoint": training_state}, checkpoint_id=save_path)
         except BaseException as e:
+            import traceback
+
             if hasattr(cls, "logger") and cls.logger is not None:
                 cls.logger.error(f"Failed to save checkpoint to {save_path}: {e}")
+            traceback.print_exc()
             raise e
 
         torch.distributed.barrier()
@@ -210,17 +213,20 @@ class FSDPStrategyBase(ABC):
         torch.distributed.barrier()
         opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
         try:
-            training_state = FSDPTrainingState(
+            training_state = Checkpoint(
                 model=model,
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
                 opts=opts,
                 fsdp_version=cls.get_fsdp_version(),
             )
-            dcp.load({"training_state": training_state}, checkpoint_id=load_path)
+            dcp.load({"fsdp_checkpoint": training_state}, checkpoint_id=load_path)
         except BaseException as e:
+            import traceback
+
             if hasattr(cls, "logger") and cls.logger is not None:
-                cls.logger.error(f"Failed to load checkpoint to {load_path}: {e}")
+                cls.logger.error(f"Failed to load checkpoint from {load_path}: {e}")
+            traceback.print_exc()
             raise e
         torch.distributed.barrier()
 
