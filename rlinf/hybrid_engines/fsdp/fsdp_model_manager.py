@@ -35,6 +35,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
     get_lr_scheduler,
 )
 from rlinf.utils.logging import get_logger
+from rlinf.utils.utils import fake_optimizer_step
 
 
 class FSDPModelManager:
@@ -79,7 +80,7 @@ class FSDPModelManager:
         )
 
         self._strategy = FSDPStrategyBase.create(
-            self._cfg, world_size, rank, self._dp_group, self._logger
+            self._cfg, world_size, self._dp_group, self._logger
         )
 
         self.amp_context = self._create_amp_context()
@@ -239,28 +240,16 @@ class FSDPModelManager:
         self.optimizer = self.build_optimizer(
             model=self.model, enable_critic_warmup=self.critic_warmup_steps > 0
         )
+        # fake run optimizer step to initialize optimizer.state
+        # to avoid KeyError during load_state_dict/set_optimizer_state_dict
+        # in save/load_checkpoint calls
+
+        fake_optimizer_step(self.optimizer)
+
         self.lr_scheduler = self.build_lr_scheduler(optimizer=self.optimizer)
         self.grad_scaler = self.build_grad_scaler(
             self._cfg.fsdp_config.amp.use_grad_scaler
         )
-
-    def get_rng_state(self) -> dict:
-        """
-        Get rng state.
-
-        Returns:
-            rng_state: the current rng state.
-        """
-        return self._strategy.save_rng_state()
-
-    def load_rng_state(self, rng_state: dict) -> None:
-        """
-        Load rng state.
-
-        Params:
-            rng_state: the rng state to load.
-        """
-        self._strategy.load_rng_state(rng_state)
 
     def get_model_state_dict(self) -> dict:
         """
