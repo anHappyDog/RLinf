@@ -13,12 +13,10 @@
 # limitations under the License.
 
 import asyncio
-import io
 import os
 from functools import partial
-from typing import AsyncGenerator, Optional, Union
+from typing import AsyncGenerator, Optional, Union, cast
 
-import requests
 from omegaconf import DictConfig
 from PIL import Image
 from transformers import AutoTokenizer
@@ -35,6 +33,7 @@ from rlinf.data.io_struct import RolloutRequest, RolloutResult, SeqGroupInfo
 from rlinf.scheduler import Channel, Worker
 from rlinf.scheduler.dynamic_scheduler.manager import RolloutScalingScheduler
 from rlinf.scheduler.dynamic_scheduler.utils import get_scheduler_channel
+from rlinf.utils.data_process import process_image_data
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.rollout.utils import RunningStatusManager, print_vllm_outputs
 
@@ -50,7 +49,7 @@ class VLLMWorker(Worker):
         self._prepare_vllm_environment()
         self._return_logprobs = self._cfg.rollout.return_logprobs
         self._sampling_params = self._get_sampling_params_from_config()
-        self._tokenizer = AutoTokenizer.from_pretrained(self._cfg.rollout.model_dir)
+        self._tokenizer = self._load_tokenizer()
         self._vllm_engine = None
 
         self._validate_sampling_params = SamplingParams(temperature=0, max_tokens=32)
@@ -98,6 +97,26 @@ class VLLMWorker(Worker):
             if not os.path.exists(self._cfg.rollout.vllm.torch_profiler_dir):
                 os.makedirs(self._cfg.rollout.vllm.torch_profiler_dir)
 
+    def _load_tokenizer(self):
+        model_dir = self._cfg.rollout.model_dir
+        trust_remote_code = self._cfg.actor.tokenizer.get("trust_remote_code", False)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_dir,
+                use_fast=True,
+                trust_remote_code=trust_remote_code,
+            )
+        except (OSError, ValueError):
+            self.log_warning(
+                "Fast tokenizer unavailable; falling back to the slow tokenizer."
+            )
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_dir,
+                use_fast=False,
+                trust_remote_code=trust_remote_code,
+            )
+        return tokenizer
+
     def _get_sampling_params_from_config(self) -> SamplingParams:
         """
         Get sampling parameters built from the configuration.
@@ -119,38 +138,6 @@ class VLLMWorker(Worker):
                 logprobs=0 if self._return_logprobs else None,
             )
         return sampling_params
-
-    def _process_image_data(
-        self, image_data: Optional[list[Union[bytes, str]]]
-    ) -> Optional[list[Image.Image]]:
-        """
-        Process the batch image data which can be bytes or image paths.
-
-        Args:
-            batch_image_data (Optional[List[List[Union[bytes,str]]]]): A batch of
-                image data, each item can be bytes or image path (local or URL).
-        Returns:
-            Optional[List[List[Image]]]: A batch of list of PIL Image. If input
-                is None, return None.
-        """
-        if image_data is None:
-            return None
-        if not isinstance(image_data, list):
-            raise ValueError("image_data should be a list of list of image data.")
-        image_list = []
-        for img in image_data:
-            if isinstance(img, bytes):
-                image = Image.open(io.BytesIO(img))
-            elif isinstance(img, str):
-                if img.startswith("http://") or img.startswith("https://"):
-                    response = requests.get(img)
-                    image = Image.open(io.BytesIO(response.content))
-                else:
-                    image = Image.open(img)
-            else:
-                raise ValueError("Unsupported image data type.")
-            image_list.append(image)
-        return image_list
 
     async def _validate_weight_at_first(self) -> None:
         """
@@ -248,7 +235,7 @@ class VLLMWorker(Worker):
                 assert len(prompt_texts) > 0, "prompt_text should not be empty."
                 return prompt_texts
 
-        def check_image_data() -> Optional[list[list[Image.Image]]]:
+        def check_image_data() -> Optional[list[list[Union[bytes, str]]]]:
             if image_data is None or not any(image_data):
                 return None
             assert isinstance(image_data, list), "image_data should be a list."
@@ -260,13 +247,19 @@ class VLLMWorker(Worker):
         input_ids = check_input_ids()
         prompt_texts = check_prompt_text()
         image_list = check_image_data()
-
+        processed_images: Optional[list[list[Image.Image]]] = None
+        if image_list is not None:
+            gathered_images = await asyncio.gather(
+                *(process_image_data(images) for images in image_list)
+            )
+            processed_images = [
+                cast(list[Image.Image], images) for images in gathered_images
+            ]
         inputs: list[PromptType] = []
-        outputs: list[RequestOutput] = []
         if prompt_texts is not None:
             for i, prompt_text in enumerate(prompt_texts):
-                if image_list is not None:
-                    images = self._process_image_data(image_data=image_list[i])
+                if processed_images is not None:
+                    images = processed_images[i]
                     inputs.append(
                         TextPrompt(
                             prompt=prompt_text, multi_modal_data={"image": images}
@@ -276,8 +269,8 @@ class VLLMWorker(Worker):
                     inputs.append(TextPrompt(prompt=prompt_text))
         else:
             for i, input_id in enumerate(input_ids):
-                if image_list is not None:
-                    images = self._process_image_data(image_data=image_list[i])
+                if processed_images is not None:
+                    images = processed_images[i]
                     inputs.append(
                         TokensPrompt(
                             prompt_token_ids=input_id,
@@ -286,10 +279,14 @@ class VLLMWorker(Worker):
                     )
                 else:
                     inputs.append(TokensPrompt(prompt_token_ids=input_id))
-        request_ids = [str(next(self._request_counter)) for _ in inputs]
-        local_tasks = {}
-        for inp, request_id in zip(inputs, request_ids, strict=True):
-            local_tasks[request_id] = asyncio.create_task(
+        outputs: list[Optional[RequestOutput]] = [None] * len(inputs)
+        request_ids: list[str] = []
+        task_to_request: dict[asyncio.Task[RequestOutput], str] = {}
+        request_to_index: dict[str, int] = {}
+        for idx, inp in enumerate(inputs):
+            request_id = str(next(self._request_counter))
+            request_ids.append(request_id)
+            task = asyncio.create_task(
                 self._get_output_from_async_generator(
                     self._async_engine.generate(
                         prompt=inp,
@@ -298,12 +295,39 @@ class VLLMWorker(Worker):
                     )
                 )
             )
+            self._running_generate_tasks[request_id] = task
+            task_to_request[task] = request_id
+            request_to_index[request_id] = idx
 
-            self._running_generate_tasks[request_id] = local_tasks[request_id]
-        outputs = await asyncio.gather(*local_tasks.values())
-        for request_id in request_ids:
-            self._running_generate_tasks.pop(request_id, None)
-        return outputs
+        pending: set[asyncio.Task[RequestOutput]] = set(task_to_request.keys())
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    request_id = task_to_request[task]
+                    try:
+                        output = task.result()
+                    except Exception:
+                        for remain_task in pending:
+                            remain_task.cancel()
+                        if pending:
+                            await asyncio.gather(*pending, return_exceptions=True)
+                        raise
+                    finally:
+                        self._running_generate_tasks.pop(request_id, None)
+
+                    idx = request_to_index[request_id]
+                    outputs[idx] = output
+        finally:
+            for request_id in request_ids:
+                self._running_generate_tasks.pop(request_id, None)
+
+        if any(output is None for output in outputs):
+            raise RuntimeError("vLLM generation returned no output for some prompts.")
+
+        return cast(list[RequestOutput], outputs)
 
     async def abort_generation(self) -> None:
         """
@@ -381,8 +405,16 @@ class VLLMWorker(Worker):
         if seq_group_info.num_aborted == 0:
             assert seq_group_info.num_returned == 0
             seq_idx_list = list(range(seq_group_info.group_size))
-            input_batch = [seq_group_info.input_ids] * seq_group_info.group_size
-            image_data_list = [seq_group_info.image_data] * seq_group_info.group_size
+            input_batch = [
+                list(seq_group_info.input_ids) for _ in range(seq_group_info.group_size)
+            ]
+            if seq_group_info.image_data is None:
+                image_data_list = [None] * seq_group_info.group_size
+            else:
+                image_data_list = [
+                    list(seq_group_info.image_data)
+                    for _ in range(seq_group_info.group_size)
+                ]
         else:
             idx_aborted = seq_group_info.idx_aborted.copy()
             seq_idx_list: list[int] = []
@@ -395,7 +427,10 @@ class VLLMWorker(Worker):
                 )
                 seq_idx_list.append(idx)
                 input_batch.append(seq_group_info.input_ids + generated_ids)
-                image_data_list.append(seq_group_info.image_data)
+                if seq_group_info.image_data is None:
+                    image_data_list.append(None)
+                else:
+                    image_data_list.append(list(seq_group_info.image_data))
 
         tasks = [
             asyncio.create_task(generate_with_idx(idx, input_ids, image_data))
