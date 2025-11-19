@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import asyncio
+import copy
 import os
 from functools import partial
 from typing import AsyncGenerator, Optional, Union, cast
@@ -60,6 +60,14 @@ class VLLMWorker(Worker):
             "The future of AI is",
         ]
         self._request_counter = Counter()
+
+        # NOTE(daibo):
+        # because 0.8.5 vLLM can not return outputs when generation
+        # request is aborted, we need to track the running generate tasks
+        # in vLLM instance and cancel them in asyncio level and get
+        # the final outputs from async generator as aborted generation
+        # output. If newer vLLM version supports returning outputs
+        # everything about _running_generate_tasks can be removed.
         self._running_generate_tasks: dict[str, asyncio.Task] = {}
         self.status_manager = RunningStatusManager()
         self._use_auto_scheduler = self._placement.is_auto
@@ -279,13 +287,13 @@ class VLLMWorker(Worker):
                     )
                 else:
                     inputs.append(TokensPrompt(prompt_token_ids=input_id))
-        outputs: list[Optional[RequestOutput]] = [None] * len(inputs)
-        request_ids: list[str] = []
-        task_to_request: dict[asyncio.Task[RequestOutput], str] = {}
-        request_to_index: dict[str, int] = {}
-        for idx, inp in enumerate(inputs):
+
+        # use local_tasks to track current generation request's tasks
+        # which is subset of self._running_generate_tasks, after this
+        # generate is done, we will remove them from self._running_generate_tasks
+        local_tasks: dict[str, asyncio.Task] = {}
+        for inp in inputs:
             request_id = str(next(self._request_counter))
-            request_ids.append(request_id)
             task = asyncio.create_task(
                 self._get_output_from_async_generator(
                     self._async_engine.generate(
@@ -296,46 +304,27 @@ class VLLMWorker(Worker):
                 )
             )
             self._running_generate_tasks[request_id] = task
-            task_to_request[task] = request_id
-            request_to_index[request_id] = idx
+            local_tasks[request_id] = task
+        outputs: list[RequestOutput] = await asyncio.gather(*local_tasks.values())
+        # clean up the local tasks from the global running tasks
+        # after generation is done
+        for request_id in local_tasks.keys():
+            self._running_generate_tasks.pop(request_id, None)
 
-        pending: set[asyncio.Task[RequestOutput]] = set(task_to_request.keys())
-        try:
-            while pending:
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in done:
-                    request_id = task_to_request[task]
-                    try:
-                        output = task.result()
-                    except Exception:
-                        for remain_task in pending:
-                            remain_task.cancel()
-                        if pending:
-                            await asyncio.gather(*pending, return_exceptions=True)
-                        raise
-                    finally:
-                        self._running_generate_tasks.pop(request_id, None)
-
-                    idx = request_to_index[request_id]
-                    outputs[idx] = output
-        finally:
-            for request_id in request_ids:
-                self._running_generate_tasks.pop(request_id, None)
-
-        if any(output is None for output in outputs):
-            raise RuntimeError("vLLM generation returned no output for some prompts.")
-
-        return cast(list[RequestOutput], outputs)
+        return outputs
 
     async def abort_generation(self) -> None:
         """
         Abort all ongoing and waiting generations in the vllm async engine.
         """
-        for generation_task in self._running_generate_tasks.values():
-            generation_task.cancel()
-        self._running_generate_tasks.clear()
+        # we first cancel all running asyncio Task in a sync way
+        # then send abort signal to vLLM engine to make sure
+        # the generation requests are aborted in vLLM side
+        current_request_ids = list(self._running_generate_tasks.keys())
+        for request_id in current_request_ids:
+            task: asyncio.Task = self._running_generate_tasks.pop(request_id, None)
+            if task is not None:
+                task.cancel()
 
     async def init_worker(self) -> None:
         """
@@ -394,11 +383,12 @@ class VLLMWorker(Worker):
             idx: int,
             input_ids: list[int],
             image_data: Optional[list[Union[bytes, str]]],
+            sampling_params: SamplingParams,
         ) -> tuple[int, RequestOutput]:
             outputs = await self.generate(
                 input_ids=input_ids,
                 image_data=image_data,
-                sampling_params=self._sampling_params,
+                sampling_params=sampling_params,
             )
             return idx, outputs[0]
 
@@ -415,27 +405,45 @@ class VLLMWorker(Worker):
                     list(seq_group_info.image_data)
                     for _ in range(seq_group_info.group_size)
                 ]
+            sampling_params_list: list[SamplingParams] = [
+                self._sampling_params for _ in range(seq_group_info.group_size)
+            ]
         else:
             idx_aborted = seq_group_info.idx_aborted.copy()
             seq_idx_list: list[int] = []
             seq_group_info.idx_aborted.clear()
             input_batch: list[list[int]] = []
             image_data_list: list = []
+            sampling_params_list: list[SamplingParams] = []
             for idx in idx_aborted:
                 generated_ids: list[int] = (
                     seq_group_info.results[idx].outputs[0].token_ids
                 )
+                if len(generated_ids) >= self._sampling_params.max_tokens:
+                    result = seq_group_info.results[idx]
+                    result.outputs[0].finish_reason = "length"
+                    seq_group_info.idx_aborted.remove(idx)
+                    seq_group_info.idx_completed.add(idx)
+                    continue
                 seq_idx_list.append(idx)
                 input_batch.append(seq_group_info.input_ids + generated_ids)
                 if seq_group_info.image_data is None:
                     image_data_list.append(None)
                 else:
                     image_data_list.append(list(seq_group_info.image_data))
-
+                sampling_params = copy.deepcopy(self._sampling_params)
+                sampling_params.max_tokens -= len(generated_ids)
+                sampling_params_list.append(sampling_params)
         tasks = [
-            asyncio.create_task(generate_with_idx(idx, input_ids, image_data))
-            for idx, input_ids, image_data in zip(
-                seq_idx_list, input_batch, image_data_list
+            asyncio.create_task(
+                generate_with_idx(idx, input_ids, image_data, sampling_params)
+            )
+            for idx, input_ids, image_data, sampling_params in zip(
+                seq_idx_list,
+                input_batch,
+                image_data_list,
+                sampling_params_list,
+                strict=True,
             )
         ]
         for future in asyncio.as_completed(tasks):

@@ -50,11 +50,8 @@ async def _fetch_and_decode(
 
 
 async def process_image_data(
-    image_data: Optional[list[Union[bytes, str]]],
-) -> Optional[list[Image.Image]]:
-    if image_data is None:
-        return None
-
+    image_data: list[Union[bytes, str]],
+) -> list[Image.Image]:
     if not isinstance(image_data, list):
         raise ValueError("image_data must be a list of bytes or file paths.")
 
