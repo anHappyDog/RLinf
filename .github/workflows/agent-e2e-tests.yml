@@ -62,6 +62,25 @@ jobs:
           source .venv/bin/activate
           bash tests/e2e_tests/reasoning/run.sh qwen2.5-1.5b-grpo-collocated-fsdp-vllm
 
+  reason-qwen-grpo-test-async:
+    runs-on: reason
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Megatron SGLang Async mode
+        timeout-minutes: 20
+        run: |
+          export REPO_PATH=$(pwd)
+          source switch_env reason
+          bash tests/e2e_tests/reasoning/run.sh qwen2.5-1.5b-grpo-async-mg-sgl
+
+      - name: Megatron vLLM Async mode
+        timeout-minutes: 20
+        run: |
+          export REPO_PATH=$(pwd)
+          source switch_env reason
+          bash tests/e2e_tests/reasoning/run.sh qwen2.5-1.5b-grpo-async-mg-vllm
       - name: FSDP SGLang Pipeline mode
         timeout-minutes: 20
         run: |
