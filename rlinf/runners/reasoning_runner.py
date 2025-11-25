@@ -193,7 +193,7 @@ class ReasoningRunner:
                 )
 
         # Init workers
-        self.rollout.init_worker().wait()
+        self.rollout.init_worker(dataloader_channel=self.dataloader_channel).wait()
         if self.use_pre_process_policy:
             self.rollout.offload_engine().wait()
         self.actor.init_worker().wait()
@@ -360,7 +360,6 @@ class ReasoningRunner:
                     # Rollout
                     if self.enable_async_rl:
                         rollout_handle: Handle = self.rollout.async_rollout(
-                            input_channel=self.dataloader_channel,
                             output_channel=self.rollout_channel,
                         )
                     else:
