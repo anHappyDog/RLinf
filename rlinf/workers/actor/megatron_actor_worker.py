@@ -805,7 +805,6 @@ class MegatronActor(MegatronModelManager, Worker):
             self.compute_advantages_and_returns
         )
 
-        # Advantage normalization
         if self.cfg.algorithm.normalize_advantages:
 
             def normalize_advantages(batch: dict[str, torch.Tensor]):
