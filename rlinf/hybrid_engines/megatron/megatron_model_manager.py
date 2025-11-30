@@ -417,7 +417,19 @@ class MegatronModelManager:
             output = output[..., 0]
         return output
 
+    def _get_pinned_buffer(self, tensor):
+        if not hasattr(tensor, "cpu_data") or tensor.cpu_data is None:
+            tensor.cpu_data = torch.empty(
+                tensor.size(),
+                dtype=tensor.dtype,
+                layout=tensor.layout,
+                pin_memory=True,
+                device="cpu",
+            )
+        return tensor.cpu_data
+
     def offload_model_weights_and_grad(self, offload_grad=True, offload_weight=True):
+        buffers_to_resize = []
         for model_idx, model_chunk in enumerate(self.model):
             if isinstance(model_chunk, DDP):
                 for buffer_idx, buffer in enumerate(model_chunk.buffers):
@@ -427,17 +439,11 @@ class MegatronModelManager:
                     ):
                         param_size = buffer.param_data.untyped_storage().size()
 
-                        buffer.param_data.cpu_data = (
-                            buffer.param_data.data.cpu().pin_memory()
-                        )
+                        cpu_data = self._get_pinned_buffer(buffer.param_data)
+                        cpu_data.copy_(buffer.param_data, non_blocking=True)
+
                         buffer.param_data_size = param_size
-
-                        buffer.param_data.untyped_storage().resize_(0)
-
-                        assert (
-                            buffer.param_data_size
-                            == buffer.param_data.cpu_data.untyped_storage().size()
-                        )
+                        buffers_to_resize.append(buffer.param_data)
 
                     if offload_grad and buffer.grad_data.untyped_storage().size() > 0:
                         grad_size = buffer.grad_data.untyped_storage().size()
@@ -447,10 +453,31 @@ class MegatronModelManager:
             else:
                 for param_name, param in model_chunk.named_parameters():
                     if offload_weight and param.data is not None:
-                        param.data = param.data.to("cpu", non_blocking=True)
+                        cpu_data = self._get_pinned_buffer(param)
+                        cpu_data.copy_(param.data, non_blocking=True)
+                        param.data = cpu_data
 
                     if offload_grad and param.grad is not None:
-                        param.grad = param.grad.to("cpu", non_blocking=True)
+                        # For gradients, we attach the pinned buffer to the param object
+                        # because param.grad tensor might be recreated by autograd
+                        if (
+                            not hasattr(param, "cpu_grad_data")
+                            or param.cpu_grad_data is None
+                        ):
+                            param.cpu_grad_data = torch.empty(
+                                param.grad.size(),
+                                dtype=param.grad.dtype,
+                                layout=param.grad.layout,
+                                pin_memory=True,
+                                device="cpu",
+                            )
+                        param.cpu_grad_data.copy_(param.grad, non_blocking=True)
+                        param.grad = param.cpu_grad_data
+
+        if buffers_to_resize:
+            torch.cuda.synchronize()
+            for tensor in buffers_to_resize:
+                tensor.untyped_storage().resize_(0)
 
         # clear memory
         clear_memory()
@@ -473,9 +500,10 @@ class MegatronModelManager:
                             buffer.param_data_size
                         )
                         # copy data from cpu to cuda
-                        buffer.param_data.copy_(
-                            buffer.param_data.cpu_data, non_blocking=True
-                        )
+                        if hasattr(buffer.param_data, "cpu_data"):
+                            buffer.param_data.copy_(
+                                buffer.param_data.cpu_data, non_blocking=True
+                            )
             else:
                 device_id = torch.cuda.current_device()
                 for _, param in model_chunk.named_parameters():
@@ -484,7 +512,7 @@ class MegatronModelManager:
                         param.grad = param.grad.to(device_id, non_blocking=True)
         clear_memory()
 
-    def offload_megatron_copy_params(self, optimizers):
+    def offload_megatron_copy_params(self, optimizers, tensors_to_resize=None):
         """
         Offload optimizer parameters to CPU. Supports both Megatron optimizers
         and `ChainedOptimizer`, which wraps a list of underlying optimizers.
@@ -501,7 +529,13 @@ class MegatronModelManager:
         def offload_tensor_to_cpu(tensor):
             if tensor is None:
                 return
-            tensor.data = tensor.data.to("cpu", non_blocking=True)
+            cpu_data = self._get_pinned_buffer(tensor)
+            cpu_data.copy_(tensor.data, non_blocking=True)
+            if tensors_to_resize is not None:
+                tensors_to_resize.append(tensor)
+            else:
+                torch.cuda.synchronize()
+                tensor.storage().resize_(0)
 
         def offload_group_to_cpu(group):
             if group is None:
@@ -539,8 +573,12 @@ class MegatronModelManager:
         def load_tensor_to_gpu(tensor):
             if tensor is None:
                 return
-            device_id = torch.cuda.current_device()
-            tensor.data = tensor.data.to(device_id, non_blocking=True)
+            if hasattr(tensor, "cpu_data"):
+                tensor.storage().resize_(tensor.cpu_data.storage().size())
+                tensor.copy_(tensor.cpu_data, non_blocking=True)
+            else:
+                device_id = torch.cuda.current_device()
+                tensor.data = tensor.data.to(device_id, non_blocking=True)
 
         def load_group_to_gpu(group):
             if group is None:
@@ -568,18 +606,26 @@ class MegatronModelManager:
                 return opt.chained_optimizers
             return [opt]
 
+        tensors_to_resize = []
         for _opt in _iter_opts(self.optimizer):
-            self.offload_megatron_copy_params(_opt)
+            self.offload_megatron_copy_params(_opt, tensors_to_resize)
             for v in _opt.optimizer.state.values():
                 # Offloading through resetting the storage size can ensure that the tensor can be offloaded correctly even when it has tensor views.
                 if "exp_avg" in v:
                     buffer = v["exp_avg"]
-                    buffer.cpu_data = buffer.data.cpu().pin_memory()
-                    buffer.storage().resize_(0)
+                    cpu_data = self._get_pinned_buffer(buffer)
+                    cpu_data.copy_(buffer.data, non_blocking=True)
+                    tensors_to_resize.append(buffer)
                 if "exp_avg_sq" in v:
                     buffer = v["exp_avg_sq"]
-                    buffer.cpu_data = buffer.data.cpu().pin_memory()
-                    buffer.storage().resize_(0)
+                    cpu_data = self._get_pinned_buffer(buffer)
+                    cpu_data.copy_(buffer.data, non_blocking=True)
+                    tensors_to_resize.append(buffer)
+
+        if tensors_to_resize:
+            torch.cuda.synchronize()
+            for tensor in tensors_to_resize:
+                tensor.storage().resize_(0)
         clear_memory()
 
     def onload_megatron_optimizer(self):
@@ -592,11 +638,13 @@ class MegatronModelManager:
             self.load_megatron_copy_params(_opt)
             for v in _opt.optimizer.state.values():
                 if "exp_avg" in v:
-                    v["exp_avg"].data = v["exp_avg"].cpu_data.to(
-                        torch.cuda.current_device(), non_blocking=True
-                    )
+                    tensor = v["exp_avg"]
+                    if hasattr(tensor, "cpu_data"):
+                        tensor.storage().resize_(tensor.cpu_data.storage().size())
+                        tensor.copy_(tensor.cpu_data, non_blocking=True)
                 if "exp_avg_sq" in v:
-                    v["exp_avg_sq"].data = v["exp_avg_sq"].cpu_data.to(
-                        torch.cuda.current_device(), non_blocking=True
-                    )
+                    tensor = v["exp_avg_sq"]
+                    if hasattr(tensor, "cpu_data"):
+                        tensor.storage().resize_(tensor.cpu_data.storage().size())
+                        tensor.copy_(tensor.cpu_data, non_blocking=True)
         clear_memory()
