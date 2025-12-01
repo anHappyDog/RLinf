@@ -435,36 +435,46 @@ class MegatronModelManager:
             output = output[..., 0]
         return output
 
-    def _get_pinned_buffer(self, tensor: torch.Tensor) -> torch.Tensor:
+    def _get_pinned_buffer(
+        self,
+        tensor: torch.Tensor,
+        holder: Optional[Any] = None,
+        attr_name: str = "cpu_data",
+    ) -> torch.Tensor:
         """
         Get or create a pinned CPU buffer for the given tensor.
-        Creates a pinned memory buffer on first call and caches it as `tensor.cpu_data`.
+        Creates a pinned memory buffer on first call and caches it as `attr_name` on `holder`.
         Subsequent calls return the cached buffer for efficient DMA transfers.
 
         Args:
             tensor: The GPU tensor to create a pinned buffer for.
+            holder: The object to attach the pinned buffer to. If None, attaches to `tensor`.
+            attr_name: The attribute name to use for caching the buffer.
 
         Returns:
             A pinned CPU tensor with the same size, dtype, and layout as the input.
         """
+        if holder is None:
+            holder = tensor
 
-        assert not tensor.is_cpu, (
-            "Tensor is already on CPU while _get_pinned_buffer is called."
-        )
         needed_size = tensor.untyped_storage().size()
         if (
-            not hasattr(tensor, "cpu_data")
-            or tensor.cpu_data is None
-            or tensor.cpu_data.untyped_storage().size() < needed_size
+            not hasattr(holder, attr_name)
+            or getattr(holder, attr_name) is None
+            or getattr(holder, attr_name).untyped_storage().size() < needed_size
         ):
-            tensor.cpu_data = torch.empty(
-                tensor.size(),
-                dtype=tensor.dtype,
-                layout=tensor.layout,
-                pin_memory=True,
-                device="cpu",
+            setattr(
+                holder,
+                attr_name,
+                torch.empty(
+                    tensor.size(),
+                    dtype=tensor.dtype,
+                    layout=tensor.layout,
+                    pin_memory=True,
+                    device="cpu",
+                ),
             )
-        return tensor.cpu_data
+        return getattr(holder, attr_name)
 
     def offload_model_weights_and_grad(
         self, offload_grad: bool = True, offload_weight: bool = True
@@ -509,20 +519,11 @@ class MegatronModelManager:
                     if offload_grad and param.grad is not None:
                         # For gradients, we attach the pinned buffer to the param object
                         # because param.grad tensor might be recreated by autograd
-                        if (
-                            not hasattr(param, "cpu_grad_data")
-                            or param.cpu_grad_data is None
-                            or param.cpu_grad_data.size() != param.grad.size()
-                        ):
-                            param.cpu_grad_data = torch.empty(
-                                param.grad.size(),
-                                dtype=param.grad.dtype,
-                                layout=param.grad.layout,
-                                pin_memory=True,
-                                device="cpu",
-                            )
-                        param.cpu_grad_data.copy_(param.grad, non_blocking=True)
-                        param.grad = param.cpu_grad_data
+                        cpu_grad_data = self._get_pinned_buffer(
+                            param.grad, holder=param, attr_name="cpu_grad_data"
+                        )
+                        cpu_grad_data.copy_(param.grad, non_blocking=True)
+                        param.grad = cpu_grad_data
 
         if buffers_to_resize:
             torch.cuda.synchronize()
