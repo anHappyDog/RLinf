@@ -20,7 +20,7 @@ import random
 import sys
 from contextlib import contextmanager
 from functools import partial, wraps
-from typing import Callable, Coroutine
+from typing import Callable, Coroutine, Generator, Optional
 
 import numpy as np
 import torch
@@ -50,7 +50,7 @@ cuda_dict = partial(apply_func_to_dict, partial(move_to_device_if_tensor, "cuda"
 cpu_dict = partial(apply_func_to_dict, partial(move_to_device_if_tensor, "cpu"))
 
 
-def retrieve_model_state_dict_in_cpu(model):
+def retrieve_model_state_dict_in_cpu(model: torch.nn.Module) -> dict:
     """get a copy of the model states in CPU"""
     cpu_dict = {}
 
@@ -65,7 +65,9 @@ def retrieve_model_state_dict_in_cpu(model):
 
 
 @torch.no_grad()
-def swap_dict(resident_model, cpu_weights, offload_onto_cpu=True):
+def swap_dict(
+    resident_model: torch.nn.Module, cpu_weights: dict, offload_onto_cpu: bool = True
+) -> dict:
     """swap the state dict with a specified state dict, and offload the current state dict onto CPU
     if needed
     """
@@ -79,7 +81,7 @@ def swap_dict(resident_model, cpu_weights, offload_onto_cpu=True):
 
 
 @contextmanager
-def cpu_weight_swap(resident_model, cpu_weights):
+def cpu_weight_swap(resident_model: torch.nn.Module, cpu_weights: dict) -> Generator:
     """swap the weights into GPU, and then swap it out once return"""
     cpu_dict = swap_dict(resident_model, cpu_weights)
 
@@ -90,7 +92,7 @@ def cpu_weight_swap(resident_model, cpu_weights):
         swap_dict(resident_model, cpu_dict, offload_onto_cpu=False)
 
 
-def configure_batch_sizes(rank, mbs, gbs, dp=1):
+def configure_batch_sizes(rank: int, mbs: int, gbs: int, dp: int = 1) -> None:
     from megatron.core.num_microbatches_calculator import (
         reconfigure_num_microbatches_calculator,
     )
@@ -104,7 +106,7 @@ def configure_batch_sizes(rank, mbs, gbs, dp=1):
     )
 
 
-def masked_mean(values: torch.Tensor, mask: torch.Tensor, axis=None):
+def masked_mean(values: torch.Tensor, mask: torch.Tensor, axis=None) -> torch.Tensor:
     """Compute mean of tensor with a masked values."""
     if mask is None:
         return values.mean(axis=axis)
@@ -114,18 +116,17 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor, axis=None):
         return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
 
 
-def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis=None):
-    """Compute mean of tensor with a masked values."""
-    return (values * mask).sum(axis=axis)
-
-
-def seq_mean_token_sum(values: torch.Tensor, mask: torch.Tensor, dim: int = -1):
+def seq_mean_token_sum(
+    values: torch.Tensor, mask: torch.Tensor, dim: int = -1
+) -> torch.Tensor:
     seq_losses = torch.sum(values * mask, dim=-1)  # token-sum
     loss = torch.mean(seq_losses)  # seq-mean
     return loss
 
 
-def seq_mean_token_mean(values: torch.Tensor, mask: torch.Tensor, dim: int = -1):
+def seq_mean_token_mean(
+    values: torch.Tensor, mask: torch.Tensor, dim: int = -1
+) -> torch.Tensor:
     seq_losses = torch.sum(values * mask, dim=-1) / torch.sum(
         mask, dim=-1
     )  # token-mean
@@ -135,7 +136,7 @@ def seq_mean_token_mean(values: torch.Tensor, mask: torch.Tensor, dim: int = -1)
 
 def masked_mean_ratio(
     values: torch.Tensor, mask: torch.Tensor, loss_mask_ratio: torch.Tensor
-):
+) -> torch.Tensor:
     # for embodied tasks
     return (values / loss_mask_ratio * mask).mean()
 
@@ -153,7 +154,12 @@ def get_loss_agg_func(
         raise ValueError(f"Unsupported loss aggregation method: {loss_agg}")
 
 
-def reshape_entropy(entropy, entropy_type, action_dim=7, batch_size=1):
+def reshape_entropy(
+    entropy: Optional[torch.Tensor],
+    entropy_type: str,
+    action_dim: int = 7,
+    batch_size: int = 1,
+) -> Optional[torch.Tensor]:
     if entropy is not None:
         if entropy_type == "action_level":
             entropy = entropy.reshape(batch_size, -1, action_dim).sum(dim=-1)
@@ -162,7 +168,21 @@ def reshape_entropy(entropy, entropy_type, action_dim=7, batch_size=1):
     return entropy
 
 
-def logprobs_from_logits_flash_attn(logits, labels, inplace_backward=True):
+def logprobs_from_logits_flash_attn(
+    logits: torch.Tensor, labels: torch.Tensor, inplace_backward: bool = True
+) -> torch.Tensor:
+    """
+    Compute log probabilities from logits using flash-attn's cross_entropy_loss.
+
+    Args:
+        logits: [B, vocab_size]
+        labels: [B]
+        inplace_backward: whether to use inplace backward to save memory
+
+    Returns:
+        logprobs: [B]
+    """
+
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
 
     output = cross_entropy_loss(logits, labels, inplace_backward=inplace_backward)

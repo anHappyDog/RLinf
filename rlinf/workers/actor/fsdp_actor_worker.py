@@ -434,37 +434,37 @@ class FSDPActor(FSDPModelManager, Worker):
                 ]  # (bsz, response_length, vocab_size)
                 logprobs = compute_logprobs_from_logits(logits, responses)
 
-                    if self.cfg.algorithm.get("importance_sampling_fix", False):
-                        rollout_prev_logprobs = batch["prev_logprobs"]
-                        recompute_prev_logprobs = batch["recompute_prev_logprobs"]
-                        advantages = advantages * torch.clamp(
-                            (recompute_prev_logprobs - rollout_prev_logprobs).exp(),
-                            min=self.cfg.algorithm.importance_sampling_clip,
-                        )
-                    behave_weight_threshold = self.cfg.algorithm.get(
-                        "behave_weight_threshold", None
+                if self.cfg.algorithm.get("importance_sampling_fix", False):
+                    rollout_prev_logprobs = batch["prev_logprobs"]
+                    recompute_prev_logprobs = batch["recompute_prev_logprobs"]
+                    advantages = advantages * torch.clamp(
+                        (recompute_prev_logprobs - rollout_prev_logprobs).exp(),
+                        min=self.cfg.algorithm.importance_sampling_clip,
                     )
-                    if self.cfg.algorithm.get("async", False):
-                        proximal_logprobs = m_batch["recompute_prev_logprobs"]
-                        old_logprobs = m_batch["prev_logprobs"]
-                    else:
-                        proximal_logprobs = m_batch["prev_logprobs"]
-                        old_logprobs = m_batch["prev_logprobs"]
+                behave_weight_threshold = self.cfg.algorithm.get(
+                    "behave_weight_threshold", None
+                )
+                if self.cfg.algorithm.get("async", False):
+                    proximal_logprobs = m_batch["recompute_prev_logprobs"]
+                    old_logprobs = m_batch["prev_logprobs"]
+                else:
+                    proximal_logprobs = m_batch["prev_logprobs"]
+                    old_logprobs = m_batch["prev_logprobs"]
 
-                    loss, mbs_metrics_data = policy_loss(
-                        loss_type=self.cfg.algorithm.loss_type,
-                        loss_agg_func=self.loss_agg_func,
-                        logprobs=logprobs,
-                        proximal_logprobs=proximal_logprobs,
-                        old_logprobs=old_logprobs,
-                        advantages=advantages,
-                        clip_ratio_low=clip_ratio_low,
-                        clip_ratio_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_mask=loss_mask,
-                        task_type=self.cfg.runner.task_type,
-                        behave_weight_threshold=behave_weight_threshold,
-                    )
+                loss, mbs_metrics_data = policy_loss(
+                    loss_type=self.cfg.algorithm.loss_type,
+                    loss_agg_func=self.loss_agg_func,
+                    logprobs=logprobs,
+                    proximal_logprobs=proximal_logprobs,
+                    old_logprobs=old_logprobs,
+                    advantages=advantages,
+                    clip_ratio_low=clip_ratio_low,
+                    clip_ratio_high=clip_ratio_high,
+                    clip_ratio_c=clip_ratio_c,
+                    loss_mask=loss_mask,
+                    task_type=self.cfg.runner.task_type,
+                    behave_weight_threshold=behave_weight_threshold,
+                )
 
                 entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
                 if self.calculate_entropy:
@@ -990,7 +990,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         self.cfg.algorithm.entropy_bonus > 0
                         and not kwargs["critic_warmup"]
                     ):
-                        entropy = output_dict["entropy"]
+                        entropy: torch.Tensor = output_dict["entropy"]
                         entropy = reshape_entropy(
                             entropy,
                             entropy_type=self.cfg.algorithm.entropy_type,
