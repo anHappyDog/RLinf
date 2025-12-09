@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from abc import ABC, abstractmethod
 from logging import Logger
 from typing import ContextManager, Optional, Union
@@ -20,14 +21,21 @@ import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from omegaconf import DictConfig
-from torch.distributed.checkpoint.state_dict import StateDictOptions
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+)
 from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from rlinf.hybrid_engines.fsdp import FSDP, FSDPModule
 from rlinf.hybrid_engines.fsdp.strategy.checkpoint import Checkpoint
-from rlinf.hybrid_engines.fsdp.utils import FSDPVersion
+from rlinf.hybrid_engines.fsdp.utils import (
+    FSDPVersion,
+    copy_model_config_and_code,
+    save_state_dict_sharded_safetensors,
+)
 
 
 class FSDPStrategyBase(ABC):
@@ -145,6 +153,7 @@ class FSDPStrategyBase(ABC):
     @classmethod
     def save_checkpoint(
         cls,
+        checkpoint_load_path: str,
         model: Union[FSDP, FSDPModule],
         optimizer: Optimizer,
         lr_scheduler: LRScheduler,
@@ -176,6 +185,7 @@ class FSDPStrategyBase(ABC):
                 fsdp_version=cls.get_fsdp_version(),
             )
             dcp.save({"fsdp_checkpoint": training_state}, checkpoint_id=save_path)
+
         except BaseException as e:
             import traceback
 
@@ -183,7 +193,17 @@ class FSDPStrategyBase(ABC):
                 cls.logger.error(f"Failed to save checkpoint to {save_path}: {e}")
             traceback.print_exc()
             raise e
+        torch.distributed.barrier()
 
+        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        sd_save_path = os.path.join(save_path, "model")
+        model_state_dict = get_model_state_dict(model=model, options=opts)
+        save_state_dict_sharded_safetensors(
+            state_dict=model_state_dict, out_dir=sd_save_path
+        )
+        copy_model_config_and_code(
+            model_path=checkpoint_load_path, save_path=sd_save_path
+        )
         torch.distributed.barrier()
 
     @classmethod
