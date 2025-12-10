@@ -19,6 +19,7 @@ import random
 import sys
 from contextlib import contextmanager
 from functools import partial, wraps
+from typing import Callable
 
 import numpy as np
 import torch
@@ -136,6 +137,19 @@ def masked_mean_ratio(
 ):
     # for embodied tasks
     return (values / loss_mask_ratio * mask).mean()
+
+
+def get_loss_agg_func(
+    loss_agg: str,
+) -> Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]:
+    if loss_agg == "seq-mean-token-sum":
+        return seq_mean_token_sum
+    elif loss_agg == "seq-mean-token-mean":
+        return seq_mean_token_mean
+    elif loss_agg == "token-mean":
+        return masked_mean
+    else:
+        raise ValueError(f"Unsupported loss aggregation method: {loss_agg}")
 
 
 def reshape_entropy(entropy, entropy_type, action_dim=7, batch_size=1):
