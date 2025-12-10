@@ -13,26 +13,30 @@
 # limitations under the License.
 
 import os
+import typing
 
-from omegaconf.dictconfig import DictConfig
 from tqdm import tqdm
 
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.metric_logger import MetricLogger
 from rlinf.utils.metric_utils import compute_evaluate_metrics
 from rlinf.utils.runner_utils import check_progress
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
-from rlinf.workers.env.env_worker import EnvWorker
-from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+
+if typing.TYPE_CHECKING:
+    from omegaconf.dictconfig import DictConfig
+
+    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+    from rlinf.workers.env.env_worker import EnvWorker
+    from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
 class EmbodiedRunner:
     def __init__(
         self,
-        cfg: DictConfig,
-        actor: EmbodiedFSDPActor,
-        rollout: MultiStepRolloutWorker,
-        env: EnvWorker,
+        cfg: "DictConfig",
+        actor: "EmbodiedFSDPActor",
+        rollout: "MultiStepRolloutWorker",
+        env: "EnvWorker",
         critic=None,
         reward=None,
         run_timer=None,
