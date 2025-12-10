@@ -153,7 +153,7 @@ class FSDPStrategyBase(ABC):
     @classmethod
     def save_checkpoint(
         cls,
-        checkpoint_load_path: str,
+        model_path: str,
         model: Union[FSDP, FSDPModule],
         optimizer: Optimizer,
         lr_scheduler: LRScheduler,
@@ -169,7 +169,7 @@ class FSDPStrategyBase(ABC):
         this is done in `init_worker`.
 
         Args:
-            checkpoint_load_path (str): The original path to load model config and code, we
+            model_path (str): The original path to load model config and code, we
                 use it to copy model config and code to safetensors' save_path.
             model (Union[FSDP, FSDPModule]): The model to be saved.
             optimizer (Optimizer): The optimizer to be saved.
@@ -200,12 +200,11 @@ class FSDPStrategyBase(ABC):
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         sd_save_path = os.path.join(save_path, "model")
         model_state_dict = get_model_state_dict(model=model, options=opts)
-        copy_model_config_and_code(
-            model_path=checkpoint_load_path, save_path=sd_save_path
-        )
-        save_state_dict_sharded_safetensors(
-            state_dict=model_state_dict, out_dir=sd_save_path
-        )
+        if torch.distributed.get_rank() == 0:
+            copy_model_config_and_code(model_path=model_path, save_path=sd_save_path)
+            save_state_dict_sharded_safetensors(
+                state_dict=model_state_dict, out_dir=sd_save_path
+            )
         torch.distributed.barrier()
 
     @classmethod

@@ -74,7 +74,7 @@ class FSDPModelManager:
             self.critic_warmup_steps = self._cfg.optim.critic_warmup_steps
         self.store_requires_grad_param_name = []
 
-        self.checkpoint_load_path = self._cfg.checkpoint_load_path
+        self.model_path = self._cfg.model.model_path
         if cfg.get("tokenizer", {}).get("tokenizer_model", None) is not None:
             self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
 
@@ -282,7 +282,7 @@ class FSDPModelManager:
             save_path: the directory to save checkpoint.
         """
         self._strategy.save_checkpoint(
-            self.checkpoint_load_path,
+            self.model_path,
             self.model,
             self.optimizer,
             self.lr_scheduler,
