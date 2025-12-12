@@ -188,28 +188,23 @@ def compute_logprobs_from_logits(logits, target, task_type="embodied"):
     return logprobs
 
 
-def entropy_from_logits(logits: torch.Tensor):
+def entropy_from_logits(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Calculate entropy from logits."""
-    pd = torch.nn.functional.softmax(logits, dim=-1)
-    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+    logp = F.log_softmax(logits, dim=dim)
+    entropy = -(logp * logp.exp()).sum(dim=dim)
     return entropy
 
 
-def compute_entropy_from_logits(logits, epsilon=1e-10, task_type="embodied"):
+def compute_entropy_from_logits(logits, dim: int = -1) -> torch.Tensor:
     """
     Compute entropy by logits.
 
     Args:
-        logits: [B, vocab-size, seq-len]
+        logits: [B,seq-len,vocab-size]
     Returns:
         entropy: [B, seq-len]
     """
-    if task_type == "embodied":
-        all_probs = F.softmax(logits, dim=1)  # [B, vocab-size, seq-len]
-        all_log_probs = torch.log(all_probs + epsilon)
-        entropy = -torch.sum(all_probs * all_log_probs, dim=1)  # [B, seq-len]
-        return entropy
-    return entropy_from_logits(logits=logits)
+    return entropy_from_logits(logits=logits, dim=dim)
 
 
 class DualOutput:
