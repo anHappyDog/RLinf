@@ -286,7 +286,7 @@ class FSDPModelManager:
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
 
-    def save_checkpoint(self, save_path: str) -> None:
+    def save_checkpoint(self, save_path: str, step: int) -> None:
         """
         Save checkpoint to local path.
         Every rank will save its own model and optim shard.
@@ -415,6 +415,8 @@ class FSDPModelManager:
             Optimizer: The constructed optimizer.
         """
         betas = (self._cfg.optim.adam_beta1, self._cfg.optim.adam_beta2)
+        adam_eps = self._cfg.optim.adam_eps
+        weight_decay = self._cfg.optim.weight_decay
 
         params_actor = []
         params_critic = []
@@ -458,6 +460,8 @@ class FSDPModelManager:
             )
         optimizer = torch.optim.AdamW(
             param_groups,
+            eps=adam_eps,
+            weight_decay=weight_decay,
         )
 
         # run optimizer empty step to initialize optimizer.state

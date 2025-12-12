@@ -101,9 +101,12 @@ class FSDPActor(FSDPModelManager, Worker):
         else:
             self._inference_group_name = None
         self.loss_agg_func = get_loss_agg_func(self.cfg.algorithm.loss_agg_func)
-        self.enable_offload = self.cfg.actor.get("enable_offload", False)
+        self.enable_offload = (
+            self.cfg.actor.get("enable_offload", False) and not self.is_pipeline
+        )
         self.micro_batch_size = self.cfg.actor.micro_batch_size
         self.n_mini_batches = self.cfg.algorithm.n_minibatches
+        self.task_type = self.cfg.runner.task_type
 
     def init_worker(self) -> None:
         self.setup_model_and_optimizer()
@@ -258,7 +261,7 @@ class FSDPActor(FSDPModelManager, Worker):
 
         responses = input_ids[:, -self.response_len :]
         logprobs = compute_logprobs_from_logits(
-            logits, responses, task_type=self.cfg.runner.task_type
+            logits, responses, task_type=self.task_type
         )
         return logprobs
 
@@ -400,7 +403,7 @@ class FSDPActor(FSDPModelManager, Worker):
                     :, -self.response_len - 1 : -1, :
                 ]  # (bsz, response_length, vocab_size)
                 logprobs = compute_logprobs_from_logits(
-                    logits, responses, task_type=self.cfg.runner.task_type
+                    logits, responses, task_type=self.task_type
                 )
 
                 if self.cfg.algorithm.get("importance_sampling_fix", False):
@@ -421,12 +424,14 @@ class FSDPActor(FSDPModelManager, Worker):
                     clip_ratio_high=clip_ratio_high,
                     clip_ratio_c=clip_ratio_c,
                     loss_mask=loss_mask,
-                    task_type=self.cfg.runner.task_type,
+                    task_type=self.task_type,
                 )
 
                 entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
                 if self.calculate_entropy:
-                    entropy = compute_entropy_from_logits(logits.permute(0, 2, 1))
+                    entropy = compute_entropy_from_logits(
+                        logits,
+                    )
 
                     entropy_loss = self.loss_agg_func(entropy, mask=loss_mask)
                     if self.calculate_entropy_loss:
@@ -596,7 +601,7 @@ class FSDPActor(FSDPModelManager, Worker):
             if batch.get("advantages", None) is None:
                 mask = batch["attention_mask"][:, -self.response_len :]
                 advantages, _ = calculate_adv_and_returns(
-                    task_type=self.cfg.runner.task_type,
+                    task_type=self.task_type,
                     adv_type=self.cfg.algorithm.adv_type,
                     rewards=batch["rewards"].cuda(),
                     loss_mask=mask.cuda(),
@@ -785,10 +790,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 rollout_batch["loss_mask"] = reward_filter_mask
 
         return rollout_batch
-
-    def compute_logprobs(self):
-        self.model.eval()
-        self.rollout_batch["logprob"] = self.rollout_batch["prev_logprobs"]
 
     def compute_advantages_and_returns(self):
         kwargs = {
