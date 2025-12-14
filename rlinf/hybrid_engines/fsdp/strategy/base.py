@@ -36,6 +36,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
     copy_model_config_and_code,
     save_state_dict_sharded_safetensors,
 )
+from rlinf.utils.utils import clear_memory
 
 
 class FSDPStrategyBase(ABC):
@@ -176,6 +177,7 @@ class FSDPStrategyBase(ABC):
             lr_scheduler (LRScheduler): The learning rate scheduler to be saved.
             save_path (str): The path to save the checkpoint.
         """
+        clear_memory()
         torch.distributed.barrier()
         opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
         try:
