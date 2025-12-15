@@ -54,11 +54,7 @@ class FSDPModelManager:
         """
         Initialize FSDP Model Manager.
 
-        Assumes:
-            - torch.distributed has been initialized outside before calling this constructor.
-            - all cfg parameters are validated in `valid_fsdp_config`.
-
-        Params:
+        Args:
             cfg: actor config in yaml file.
             world_size: total number of FSDP actor processes.
         """
@@ -178,7 +174,7 @@ class FSDPModelManager:
         """
         Replace model modules with liger-kernel optimized modules.
 
-        Params:
+        Args:
             model: the model to be optimized.
         """
         if self._cfg.model.get("gptq_model", False) or self._cfg.model.get(
@@ -235,7 +231,9 @@ class FSDPModelManager:
             self._logger.warning(f"[FSDP] Liger kernels not applied: {e}")
 
     def setup_model_and_optimizer(self) -> None:
-        """Setup model, lr_scheduler, optimizer and grad_scaler."""
+        """
+        Setup model, lr_scheduler, optimizer and grad_scaler.
+        """
         module = self.model_provider_func()
 
         # Enable gradient checkpointing if configured
@@ -279,7 +277,7 @@ class FSDPModelManager:
         """
         Load checkpoint from local path.
 
-        Params:
+        Args:
             load_path: the directory to load checkpoint.
         """
         self._strategy.load_checkpoint(
@@ -291,7 +289,7 @@ class FSDPModelManager:
         Save checkpoint to local path.
         Every rank will save its own model and optim shard.
 
-        Params:
+        Args:
             save_path: the directory to save checkpoint.
         """
         self._strategy.save_checkpoint(
@@ -306,7 +304,7 @@ class FSDPModelManager:
         """
         Offload FSDP parameters and gradients(options) to CPU.
 
-        Params:
+        Args:
             offload_grad: whether to offload gradients.
         """
         self._strategy.offload_param_and_grad(self.model, offload_grad)
@@ -316,7 +314,7 @@ class FSDPModelManager:
         """
         Load FSDP parameters and gradients(options) to the specified device.
 
-        Params:
+        Args:
             device_id: the target device id to load parameters and gradients.
             load_grad: whether to load gradients.
         """
@@ -334,7 +332,7 @@ class FSDPModelManager:
         """
         Load optimizer states to the specified device.
 
-        Params:
+        Args:
             device_id: the target device id to load optimizer states.
         """
         self._strategy.onload_optimizer(self.optimizer, device_id)
