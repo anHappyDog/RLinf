@@ -1,4 +1,6 @@
 defaults:
+  - ../training_backend/fsdp@inference.fsdp_config
+  - ../training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
 
 hydra:
@@ -89,7 +91,16 @@ inference:
   group_name: "InferenceGroup"
   load_from_actor: True
   model:
+    model_path: /path/to/model/DeepSeek-R1-Distill-Qwen-1.5B/
     model_type: ${rollout.model.model_type}
+    precision: fp16              # precision for rollout model, support [fp16, bf16, fp32]
+    is_lora: False
+
+  tokenizer:
+    tokenizer_model: ${inference.model.model_path}
+    use_fast: True
+    trust_remote_code: True
+    padding_side: 'right'
 
 rollout:
   group_name: "RolloutGroup"

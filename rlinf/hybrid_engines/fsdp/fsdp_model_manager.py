@@ -58,24 +58,24 @@ class FSDPModelManager:
             cfg: actor config in yaml file.
             world_size: total number of FSDP actor processes.
         """
-        self._cfg = cfg
+        self.role_cfg = cfg
         self._logger = get_logger()
-        self.torch_dtype = torch_dtype_from_precision(self._cfg.model.precision)
+        self.torch_dtype = torch_dtype_from_precision(self.role_cfg.model.precision)
 
         self.optimizer_steps = 0
         self.critic_warmup_steps = 0
-        if self._cfg.optim.get("critic_warmup_steps", None) and self._cfg.model.get(
-            "add_value_head", False
-        ):
-            self.critic_warmup_steps = self._cfg.optim.critic_warmup_steps
+        if self.role_cfg.get("optim", {}).get(
+            "critic_warmup_steps", None
+        ) and self.role_cfg.model.get("add_value_head", False):
+            self.critic_warmup_steps = self.role_cfg.optim.critic_warmup_steps
         self.store_requires_grad_param_name = []
 
-        self.model_path = self._cfg.model.model_path
+        self.model_path = self.role_cfg.model.model_path
         if cfg.get("tokenizer", {}).get("tokenizer_model", None) is not None:
             self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
 
         self._device_mesh = create_device_mesh(
-            world_size, self._cfg.fsdp_config.get("fsdp_size", -1)
+            world_size, self.role_cfg.fsdp_config.get("fsdp_size", -1)
         )
         self._dp_group = (
             self._device_mesh["ddp"].get_group()
@@ -84,9 +84,12 @@ class FSDPModelManager:
         )
 
         self._strategy = FSDPStrategyBase.create(
-            self._cfg, world_size, self._dp_group, self._logger
+            self.role_cfg, world_size, self._dp_group, self._logger
         )
         self.amp_context = self._create_amp_context()
+
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        self.device = torch.cuda.current_device()
 
         self.is_weight_offloaded = False
         self.is_optimizer_offloaded = False
@@ -101,11 +104,11 @@ class FSDPModelManager:
         """
         from contextlib import nullcontext
 
-        if not self._cfg.fsdp_config.amp.enabled:
+        if not self.role_cfg.fsdp_config.amp.enabled:
             self._logger.info("[FSDP] AMP is disabled.")
             return nullcontext()
 
-        precision = torch_dtype_from_precision(self._cfg.fsdp_config.amp.precision)
+        precision = torch_dtype_from_precision(self.role_cfg.fsdp_config.amp.precision)
 
         self._logger.info(f"[FSDP] AMP is enabled with precision: {precision}.")
 
@@ -118,7 +121,7 @@ class FSDPModelManager:
         Returns:
             model: the initialized model.
         """
-        cfg = self._cfg
+        cfg = self.role_cfg
         use_gptq = cfg.model.get("gptq_model", False)
         load_in_8bit = cfg.model.get("load_in_8bit", False)
 
@@ -177,7 +180,7 @@ class FSDPModelManager:
         Args:
             model: the model to be optimized.
         """
-        if self._cfg.model.get("gptq_model", False) or self._cfg.model.get(
+        if self.role_cfg.model.get("gptq_model", False) or self.role_cfg.model.get(
             "load_in_8bit", False
         ):
             self._logger.info(
@@ -211,7 +214,7 @@ class FSDPModelManager:
                 ),
             }
             model_type = get_supported_model(
-                self._cfg.model.get("model_type", "").lower()
+                self.role_cfg.model.get("model_type", "").lower()
             )
             if model_type in MODEL_LIGER_KERNEL_APPLY_FUNC:
                 apply_func, apply_kwargs = MODEL_LIGER_KERNEL_APPLY_FUNC[model_type]
@@ -237,7 +240,7 @@ class FSDPModelManager:
         module = self.model_provider_func()
 
         # Enable gradient checkpointing if configured
-        if self._cfg.fsdp_config.get("gradient_checkpointing", False):
+        if self.role_cfg.fsdp_config.get("gradient_checkpointing", False):
             self._logger.info("[FSDP] Enabling gradient checkpointing")
             module.gradient_checkpointing_enable()
         else:
@@ -253,7 +256,7 @@ class FSDPModelManager:
 
         self.lr_scheduler = self.build_lr_scheduler(optimizer=self.optimizer)
         self.grad_scaler = self.build_grad_scaler(
-            self._cfg.fsdp_config.amp.use_grad_scaler
+            self.role_cfg.fsdp_config.amp.use_grad_scaler
         )
 
     def get_model_state_dict(self, cpu_offload: bool, full_state_dict: bool) -> dict:
@@ -381,12 +384,14 @@ class FSDPModelManager:
         Returns:
             LRScheduler: The learning rate scheduler.
         """
-        total_steps = self._cfg.optim.get("total_training_steps", 0)
-        num_warmup_steps = int(self._cfg.optim.get("lr_warmup_steps", -1))
-        warmup_style = self._cfg.optim.get("warmup_style", "constant")
-        num_cycles = self._cfg.optim.get("num_cycles", 0.5)
+        total_steps = self.role_cfg.optim.get("total_training_steps", 0)
+        num_warmup_steps = int(self.role_cfg.optim.get("lr_warmup_steps", -1))
+        warmup_style = self.role_cfg.optim.get("warmup_style", "constant")
+        num_cycles = self.role_cfg.optim.get("num_cycles", 0.5)
         if num_warmup_steps < 0:
-            num_warmup_steps_ratio = self._cfg.optim.get("lr_warmup_steps_ratio", 0.0)
+            num_warmup_steps_ratio = self.role_cfg.optim.get(
+                "lr_warmup_steps_ratio", 0.0
+            )
             num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
 
         return get_lr_scheduler(
@@ -412,9 +417,9 @@ class FSDPModelManager:
         Returns:
             Optimizer: The constructed optimizer.
         """
-        betas = (self._cfg.optim.adam_beta1, self._cfg.optim.adam_beta2)
-        adam_eps = self._cfg.optim.adam_eps
-        weight_decay = self._cfg.optim.weight_decay
+        betas = (self.role_cfg.optim.adam_beta1, self.role_cfg.optim.adam_beta2)
+        adam_eps = self.role_cfg.optim.adam_eps
+        weight_decay = self.role_cfg.optim.weight_decay
 
         params_actor = []
         params_critic = []
@@ -444,7 +449,7 @@ class FSDPModelManager:
             param_groups.append(
                 {
                     "params": params_actor,
-                    "lr": self._cfg.optim.lr,
+                    "lr": self.role_cfg.optim.lr,
                     "betas": betas,
                 }
             )
@@ -452,7 +457,7 @@ class FSDPModelManager:
             param_groups.append(
                 {
                     "params": params_critic,
-                    "lr": self._cfg.optim.value_lr,
+                    "lr": self.role_cfg.optim.value_lr,
                     "betas": betas,
                 }
             )

@@ -18,7 +18,8 @@ from functools import partial
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed._shard.sharded_tensor import ShardedTensor
+from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
@@ -69,7 +70,7 @@ class FSDPActor(FSDPModelManager, Worker):
         self.cfg = cfg
 
         self.response_len = (
-            cfg.actor.model.encoder_seq_length - cfg.data.max_prompt_length
+            self.cfg.actor.model.encoder_seq_length - self.cfg.data.max_prompt_length
         )
         self.calculate_entropy = self.cfg.algorithm.calculate_entropy
         self.calculate_entropy_loss = (
@@ -84,16 +85,8 @@ class FSDPActor(FSDPModelManager, Worker):
             // self._world_size
         )
 
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        self.device = torch.cuda.current_device()
-        world_size = self._world_size
-        self.device_mesh = init_device_mesh(
-            "cuda", mesh_shape=(world_size,), mesh_dim_names=["fsdp"]
-        )
-
         self._rollout_group_name = cfg.rollout.group_name
         self._component_placement = placement
-        self.is_data_io_rank = True
         self.is_pipeline = self._component_placement.is_disaggregated
         self.ref_policy_state_dict = None
         if self.is_pipeline:
@@ -119,6 +112,8 @@ class FSDPActor(FSDPModelManager, Worker):
             self.offload_param_and_grad()
             self.offload_optimizer()
         self._setup_rollout_weight_dst_ranks()
+        if self.is_pipeline:
+            self._setup_inference_weight_dst_ranks()
 
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """Setup destination ranks for token and weight communication."""
@@ -129,6 +124,28 @@ class FSDPActor(FSDPModelManager, Worker):
         self.log_info(
             f"Actor rank {self._rank} will send weights to {self._weight_dst_rank_in_rollout}"
         )
+
+    def _setup_inference_weight_dst_ranks(self) -> None:
+        inference_world_size = self._component_placement.get_world_size("inference")
+        actor_world_size = self._component_placement.get_world_size("actor")
+
+        assert (
+            actor_world_size % inference_world_size == 0
+            or inference_world_size % actor_world_size == 0
+        ), (
+            f"Actor world size {actor_world_size} and inference world size {inference_world_size} are not compatible for weight communication."
+        )
+        if actor_world_size >= inference_world_size:
+            actor_ranks_per_inference = actor_world_size // inference_world_size
+            self._weight_dst_rank_in_inference = [
+                self._rank // actor_ranks_per_inference
+            ]
+        else:
+            inference_ranks_per_actor = inference_world_size // actor_world_size
+            self._weight_dst_rank_in_inference = [
+                self._rank * inference_ranks_per_actor + i
+                for i in range(inference_ranks_per_actor)
+            ]
 
     def del_reshard_state_dict(self) -> None:
         if hasattr(self, "rollout_state_dict"):
@@ -147,14 +164,32 @@ class FSDPActor(FSDPModelManager, Worker):
             self.load_param_and_grad(self.device, False)
 
         inference_state_dict = self.get_model_state_dict(
-            cpu_offload=False, full_state_dict=True
+            cpu_offload=False, full_state_dict=False
+        )
+        assert isinstance(self._weight_dst_rank_in_inference, list), (
+            "In pipeline mode, _weight_dst_rank_in_inference should be a list of ranks."
         )
 
-        if self._rank == 0:
+        local_state_dict = {}
+        for k, v in inference_state_dict.items():
+            if isinstance(v, DTensor):
+                local_tensor = v.to_local()
+            elif isinstance(v, ShardedTensor):
+                local_tensor = v.local_shards()[0].tensor
+            elif torch.is_tensor(v):
+                local_tensor = v
+            else:
+                raise ValueError(
+                    f"Unsupported tensor type {type(v)} in state_dict for key {k}."
+                )
+            local_state_dict[k] = local_tensor
+
+        for inference_rank in self._weight_dst_rank_in_inference:
             self.send(
-                object=inference_state_dict,
+                object=local_state_dict,
                 dst_group_name=self._inference_group_name,
-                dst_rank=0,
+                dst_rank=inference_rank,
+                async_op=True,
             )
 
         torch.distributed.barrier()
@@ -192,10 +227,16 @@ class FSDPActor(FSDPModelManager, Worker):
                     state_dict,
                     self._rollout_group_name,
                     self._weight_dst_rank_in_rollout,
+                    async_op=True,
                 )
             else:
                 for weight_dst_rank in self._weight_dst_rank_in_rollout:
-                    self.send(state_dict, self._rollout_group_name, weight_dst_rank)
+                    self.send(
+                        state_dict,
+                        self._rollout_group_name,
+                        weight_dst_rank,
+                        async_op=True,
+                    )
 
         if self.enable_offload and not self.is_weight_offloaded:
             self.offload_param_and_grad()
@@ -211,15 +252,6 @@ class FSDPActor(FSDPModelManager, Worker):
             self.tokenizer.eos_token_id,
         )
         return batch, result
-
-    def put_result(self, result: RolloutResult, channel: Channel) -> None:
-        if channel.is_local:
-            # Local channel, every process will put its own data locally
-            # No need to broadcast
-            channel.put(result)
-        else:
-            if self.is_data_io_rank:
-                channel.put(result)
 
     def _load_weight_and_optimizer(self) -> None:
         # Acquire the GPUs to ensure that no one is using them before loading models
@@ -315,7 +347,7 @@ class FSDPActor(FSDPModelManager, Worker):
                         ref_logprobs.append(self.inference_step(micro_batch).cpu())
                     rollout_result.ref_logprobs = torch.cat(ref_logprobs)
 
-            self.put_result(rollout_result, output_channel)
+            output_channel.put(rollout_result)
 
         assert recv_batch_size == self.total_batch_size_per_dp, (
             f"Expected {self.total_batch_size_per_dp} sequences from channel, but got {recv_batch_size}"
@@ -400,9 +432,7 @@ class FSDPActor(FSDPModelManager, Worker):
                 logits = logits[
                     :, -self.response_len - 1 : -1, :
                 ]  # (bsz, response_length, vocab_size)
-                logprobs = compute_logprobs_from_logits(
-                    logits, responses, task_type=self.task_type
-                )
+                logprobs = compute_logprobs_from_logits(logits, responses)
 
                 if self.cfg.algorithm.get("importance_sampling_fix", False):
                     rollout_prev_logprobs = prev_logprobs
@@ -625,13 +655,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
         super().__init__(cfg.actor, self._world_size, self._rank)
-
         self.cfg = cfg
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        self.device = torch.cuda.current_device()
-        self.device_mesh = init_device_mesh(
-            "cuda", mesh_shape=(self._world_size,), mesh_dim_names=["fsdp"]
-        )
         self._env_group_name = cfg.env.group_name
         self._rollout_group_name = cfg.rollout.group_name
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
@@ -673,9 +697,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
         if self._weight_dst_rank_in_rollout is not None:
             self.send(
-                state_dict, self._rollout_group_name, self._weight_dst_rank_in_rollout
+                state_dict,
+                self._rollout_group_name,
+                self._weight_dst_rank_in_rollout,
+                async_op=True,
             )
-
         if self.enable_offload and not self.is_weight_offloaded:
             self.offload_param_and_grad()
 
