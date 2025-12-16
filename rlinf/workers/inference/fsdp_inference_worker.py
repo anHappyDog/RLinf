@@ -126,7 +126,6 @@ class FSDPInference(FSDPModelManager, Worker):
             )
             for rank in self._actor_weight_src_ranks
         ]
-        print("Waiting for receiving model weights from actors...")
         received_state_dicts: list[dict[str, torch.Tensor]] = [
             job.wait() for job in receiving_jobs
         ]
