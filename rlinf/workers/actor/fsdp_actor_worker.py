@@ -260,9 +260,7 @@ class FSDPActor(FSDPModelManager, Worker):
         logits = logits / self.cfg.algorithm.sampling_params.temperature
 
         responses = input_ids[:, -self.response_len :]
-        logprobs = compute_logprobs_from_logits(
-            logits, responses, task_type=self.task_type
-        )
+        logprobs = compute_logprobs_from_logits(logits, responses)
         return logprobs
 
     def run_inference(

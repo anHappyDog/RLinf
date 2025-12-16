@@ -171,12 +171,19 @@ def logprobs_from_logits_flash_attn(logits, labels, inplace_backward=True):
     return -output[0]
 
 
-def compute_logprobs_from_logits(logits, target, task_type="embodied"):
-    if task_type == "embodied":
-        logprobs = -F.cross_entropy(
-            logits, target=target, reduction="none"
-        )  # [B, action-dim]
-        return logprobs
+def compute_logprobs_from_logits(
+    logits: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    """
+    Compute logprobs by logits. Using flash-attn cross_entropy for better efficiency.
+
+    Args:
+        logits(torch.Tensor): [B, seq-len, vocab-size]
+        target(torch.Tensor): [B, seq-len]
+
+    Returns:
+        logprobs(torch.Tensor): [B, seq-len]
+    """
     batch_dim = logits.shape[:-1]
     last_dim = logits.shape[-1]
     logits = logits.reshape(-1, last_dim)
@@ -188,23 +195,21 @@ def compute_logprobs_from_logits(logits, target, task_type="embodied"):
     return logprobs
 
 
-def entropy_from_logits(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Calculate entropy from logits."""
+def compute_entropy_from_logits(logits, dim: int = -1) -> torch.Tensor:
+    """
+    Compute entropy by logits,formula: H(X) = - sum(p(x) * log(p(x)))
+    In case logits are too small to cause numerical instability(like downflow to zero after softmax),
+    we use log_softmax to compute(it will automatically stabilize the computation) logp.
+
+    Args:
+        - logits(torch.Tensor): [B,seq-len,vocab-size]
+        - dim(int): the dimension to compute entropy
+    Returns:
+        - entropy(torch.Tensor): [B, seq-len]
+    """
     logp = F.log_softmax(logits, dim=dim)
     entropy = -(logp * logp.exp()).sum(dim=dim)
     return entropy
-
-
-def compute_entropy_from_logits(logits, dim: int = -1) -> torch.Tensor:
-    """
-    Compute entropy by logits.
-
-    Args:
-        logits: [B,seq-len,vocab-size]
-    Returns:
-        entropy: [B, seq-len]
-    """
-    return entropy_from_logits(logits=logits, dim=dim)
 
 
 class DualOutput:
