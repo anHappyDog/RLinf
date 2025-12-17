@@ -34,11 +34,6 @@ from rlinf.utils.utils import (
     cpu_weight_swap,
     retrieve_model_state_dict_in_cpu,
 )
-from rlinf.workers.inference.utils import (
-    _get_full_numel,
-    _get_local_tensor,
-    _shard_range_1d,
-)
 
 
 class FSDPInference(FSDPModelManager, Worker):
@@ -47,6 +42,13 @@ class FSDPInference(FSDPModelManager, Worker):
         cfg: DictConfig,
         placement: ModelParallelComponentPlacement,
     ):
+        """
+        FSDP Inference worker used in pipeline mode.
+
+        Args:
+            cfg (DictConfig): The global yaml config.
+            placement (ModelParallelComponentPlacement): The accelerator placement for inference worker.
+        """
         Worker.__init__(self)
         super().__init__(cfg.inference, self._world_size, self._rank)
         self.cfg = cfg
@@ -66,8 +68,17 @@ class FSDPInference(FSDPModelManager, Worker):
             * self.cfg.algorithm.group_size
             // self._world_size
         )
+        self._actor_world_size = self._component_placement.get_world_size("actor")
+        # here key is actor ranks, value is dict of param name to (actor_shard_offset,inference_shard_offset,needed_size)
+        self._actor_dst_map: dict[int, dict[str, tuple[int, int, int]]] = {}
 
     def init_worker(self) -> None:
+        """
+        Init the FSDP inference worker. It will build the model and use
+        FSDP to wrap it. If needed, it will also retrieve the reference model's state_dict from CPU.
+        And finally, it will determine which actor ranks will send their params to this inference rank
+        by do a All-to-All handshake, swapping their shard tensors' metadata.
+        """
         # create and wrap model with FSDP's strategy
         model = self.model_provider_func()
         self.model = self._strategy.wrap_model(
@@ -81,110 +92,74 @@ class FSDPInference(FSDPModelManager, Worker):
         ) and self.combine_reference_model:
             ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model[0])
         self.ref_policy_state_dict = ref_policy_state_dict
-        self._setup_actor_weight_src_ranks()
-
-    def _setup_actor_weight_src_ranks(self) -> None:
-        self.actor_world_size = self._component_placement.get_world_size("actor")
-        self.inference_world_size = self._component_placement.get_world_size(
-            "inference"
-        )
-
-        assert (
-            self.actor_world_size % self.inference_world_size == 0
-            or self.inference_world_size % self.actor_world_size == 0
-        ), "Actor and Inference world sizes must be multiples of each other."
-
-        if self.actor_world_size >= self.inference_world_size:
-            actor_ranks_per_inference = (
-                self.actor_world_size // self.inference_world_size
-            )
-            self._actor_weight_src_ranks = [
-                self._rank * actor_ranks_per_inference + i
-                for i in range(actor_ranks_per_inference)
-            ]
-        else:
-            inference_ranks_per_actor = (
-                self.inference_world_size // self.actor_world_size
-            )
-            self._actor_weight_src_ranks = [self._rank // inference_ranks_per_actor]
-            self.sync_model_idx = self._rank % inference_ranks_per_actor
 
     @torch.no_grad()
-    def load_from_actor_by_intersection(
+    def load_from_actors_by_intersection(
         self, cur_state_dict: dict[str, torch.Tensor | DTensor | ShardedTensor]
     ) -> None:
         """
-        Synchronize the model weights from actor workers to the inference workers by computing the intersection
-        of the sharded weights sent from actor workers and load them into the current rank's state_dict.
+        Synchronize the model weights from actor workers to the inference workers according former All-to-All
+        handshake with actor workers.
 
         Args:
             cur_state_dict(dict[str, torch.Tensor|DTensor|ShardedTensor]): The current rank's state_dict to be updated.
         """
+
+        if not self._actor_dst_map:
+            self._strategy.setup_inference_sync_actor_ranks(self)
+
+        needed_actor_ranks = list(self._actor_dst_map.keys())
         receiving_jobs = [
             self.recv(
                 src_rank=rank, src_group_name=self._actor_group_name, async_op=True
             )
-            for rank in self._actor_weight_src_ranks
+            for rank in needed_actor_ranks
         ]
         received_state_dicts: list[dict[str, torch.Tensor]] = [
             job.wait() for job in receiving_jobs
         ]
 
         for k, cur_tensor in cur_state_dict.items():
-            dst_local = _get_local_tensor(cur_tensor)
-            if dst_local is None:
-                continue
-
-            full_numel = _get_full_numel(cur_tensor)
-            dst_start, dst_end, _ = _shard_range_1d(
-                full_numel, self._world_size, self._rank
+            inference_local = (
+                cur_tensor.to_local() if isinstance(cur_tensor, DTensor) else cur_tensor
             )
 
-            dst_flat = dst_local.view(-1)
+            inference_flat = inference_local.view(-1)
 
-            for src_dict, src_actor_rank in zip(
-                received_state_dicts, self._actor_weight_src_ranks
-            ):
-                if k not in src_dict:
-                    self.logger.warning(
-                        f"FSDPInference sync model weight: Key {k} not found in actor rank {src_actor_rank}'s state_dict."
-                    )
-                    continue
+            for actor_rank, src_dict in zip(needed_actor_ranks, received_state_dicts):
+                # ranks is setup in setup_inference_sync_actor_ranks, so
+                # every src_dict should contain k, or need to check implementation.
+                assert k in src_dict, (
+                    f"Key {k} not found in received state dict from actors."
+                )
+                actor_flat = src_dict[k].view(-1)
 
-                src_tensor = src_dict[k]
-                src_flat = src_tensor.to(
-                    device=dst_flat.device, dtype=dst_flat.dtype, non_blocking=True
-                ).view(-1)
+                assert actor_rank in self._actor_dst_map, (
+                    f"Actor rank {actor_rank} not found in actor_dst_map."
+                )
+                assert k in self._actor_dst_map[actor_rank], (
+                    f"Key {k} not found in actor_dst_map for actor rank {actor_rank}."
+                )
+                actor_shard_off, inference_shard_off, need_size = self._actor_dst_map[
+                    actor_rank
+                ][k]
 
-                src_start, src_end, src_shard_size = _shard_range_1d(
-                    full_numel, self.actor_world_size, src_actor_rank
+                inference_flat[
+                    inference_shard_off : inference_shard_off + need_size
+                ].copy_(
+                    actor_flat[actor_shard_off : actor_shard_off + need_size],
+                    non_blocking=True,
                 )
 
-                inter_start = max(dst_start, src_start)
-                inter_end = min(dst_end, src_end)
-                if inter_start >= inter_end:
-                    self.logger.error(
-                        f"FSDPInference sync model weight: No intersection for key {k} between actor rank {src_actor_rank} and inference rank {self._rank}."
-                    )
-                    continue
-
-                n = inter_end - inter_start
-                dst_off = inter_start - dst_start
-                src_off = inter_start - src_start
-
-                assert dst_off + n <= dst_flat.numel(), (
-                    f"{k}: dst overflow in FSDPInference's sync_model_from_actor, dst_off={dst_off}, n={n}, dst_flat.numel()={dst_flat.numel()}"
-                )
-                assert src_off + n <= src_flat.numel(), (
-                    f"{k}: src overflow in FSDPInference's sync_model_from_actor, src_off={src_off}, n={n}, src_flat.numel()={src_flat.numel()}"
-                )
-
-                dst_flat[dst_off : dst_off + n].copy_(src_flat[src_off : src_off + n])
+        # NOTE: there may be problem that non_blocking copy not finished when new inference batch comes,
+        # need to check
+        torch.distributed.barrier()
 
     def sync_model_from_actor(self) -> None:
+        """ """
         opts = StateDictOptions(cpu_offload=False, full_state_dict=False)
         current_rank_state_dict = get_model_state_dict(model=self.model, options=opts)
-        self.load_from_actor_by_intersection(cur_state_dict=current_rank_state_dict)
+        self.load_from_actors_by_intersection(cur_state_dict=current_rank_state_dict)
         set_model_state_dict(
             model=self.model, model_state_dict=current_rank_state_dict, options=opts
         )

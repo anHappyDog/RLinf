@@ -18,7 +18,6 @@ from functools import partial
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 
@@ -63,7 +62,16 @@ from rlinf.workers.rollout.utils import RankMapper
 
 
 class FSDPActor(FSDPModelManager, Worker):
-    def __init__(self, cfg: DictConfig, placement: ModelParallelComponentPlacement):
+    def __init__(
+        self, cfg: DictConfig, placement: ModelParallelComponentPlacement
+    ) -> None:
+        """
+        FSDPActor worker used to train the model with data from rollout workers.
+
+        Args:
+            cfg (DictConfig): The global yaml configuration.
+            placement (ModelParallelComponentPlacement): The accelerator placement for actor worker.
+        """
         Worker.__init__(self)
         super().__init__(cfg.actor, self._world_size, self._rank)
 
@@ -91,8 +99,14 @@ class FSDPActor(FSDPModelManager, Worker):
         self.ref_policy_state_dict = None
         if self.is_pipeline:
             self._inference_group_name = cfg.inference.group_name
+            self._inference_world_size = self._component_placement.get_world_size(
+                "inference"
+            )
+            self._inference_dst_map: dict[int, list[str]] = {}
         else:
             self._inference_group_name = None
+            self._inference_world_size = 0
+            self._inference_dst_map = None
         self.loss_agg_func = get_loss_agg_func(self.cfg.algorithm.loss_agg_func)
         self.enable_offload = (
             self.cfg.actor.get("enable_offload", False) and not self.is_pipeline
@@ -102,6 +116,13 @@ class FSDPActor(FSDPModelManager, Worker):
         self.task_type = self.cfg.runner.task_type
 
     def init_worker(self) -> None:
+        """
+        Initialize the actor worker. build the model and use corresponding training backend
+        (FSDP/FSDP2) to wrap it. If needed, offload model parameters and optimizer states to CPU.
+        If kl_beta > 0, retrieve the reference policy model state dict to CPU.
+        If mode is disaggregated, setup which inference ranks it needs to sync weights to by
+        doing a handshake with inference workers.
+        """
         self.setup_model_and_optimizer()
         if self.cfg.algorithm.kl_beta > 0 and self.cfg.actor.get(
             "combine_reference_model", True
@@ -112,8 +133,6 @@ class FSDPActor(FSDPModelManager, Worker):
             self.offload_param_and_grad()
             self.offload_optimizer()
         self._setup_rollout_weight_dst_ranks()
-        if self.is_pipeline:
-            self._setup_inference_weight_dst_ranks()
 
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """Setup destination ranks for token and weight communication."""
@@ -125,31 +144,9 @@ class FSDPActor(FSDPModelManager, Worker):
             f"Actor rank {self._rank} will send weights to {self._weight_dst_rank_in_rollout}"
         )
 
-    def _setup_inference_weight_dst_ranks(self) -> None:
-        inference_world_size = self._component_placement.get_world_size("inference")
-        actor_world_size = self._component_placement.get_world_size("actor")
-
-        assert (
-            actor_world_size % inference_world_size == 0
-            or inference_world_size % actor_world_size == 0
-        ), (
-            f"Actor world size {actor_world_size} and inference world size {inference_world_size} are not compatible for weight communication."
-        )
-        if actor_world_size >= inference_world_size:
-            actor_ranks_per_inference = actor_world_size // inference_world_size
-            self._weight_dst_rank_in_inference = [
-                self._rank // actor_ranks_per_inference
-            ]
-        else:
-            inference_ranks_per_actor = inference_world_size // actor_world_size
-            self._weight_dst_rank_in_inference = [
-                self._rank * inference_ranks_per_actor + i
-                for i in range(inference_ranks_per_actor)
-            ]
-
     def del_reshard_state_dict(self) -> None:
-        if hasattr(self, "rollout_state_dict"):
-            del self.rollout_state_dict
+        """Just for interface compatibility with MegatronActor."""
+        pass
 
     def sync_model_to_inference(self) -> None:
         """
@@ -157,44 +154,47 @@ class FSDPActor(FSDPModelManager, Worker):
         The model state_dict is the reference of actor's model
         parameters(by setting cpu_offload=False).
         """
-        if self.enable_offload and not self.is_optimizer_offloaded:
+        if not self._inference_dst_map:
+            self._strategy.setup_actor_sync_inference_ranks(self)
+
+        if self.is_optimizer_offloaded:
             self.offload_optimizer()
 
-        if self.enable_offload and self.is_weight_offloaded:
+        if self.is_weight_offloaded:
             self.load_param_and_grad(self.device, False)
 
         inference_state_dict = self.get_model_state_dict(
             cpu_offload=False, full_state_dict=False
         )
-        assert isinstance(self._weight_dst_rank_in_inference, list), (
-            "In pipeline mode, _weight_dst_rank_in_inference should be a list of ranks."
-        )
-
-        local_state_dict = {}
-        for k, v in inference_state_dict.items():
-            if isinstance(v, DTensor):
-                local_tensor = v.to_local()
-            elif isinstance(v, ShardedTensor):
-                local_tensor = v.local_shards()[0].tensor
-            elif torch.is_tensor(v):
-                local_tensor = v
-            else:
-                raise ValueError(
-                    f"Unsupported tensor type {type(v)} in state_dict for key {k}."
-                )
-            local_state_dict[k] = local_tensor
-
-        for inference_rank in self._weight_dst_rank_in_inference:
+        # NOTE: we have already know which inference rank needs which params
+        # by calling _strategy.setup_actor_sync_inference_ranks() to do handshake
+        # with each inference rank. just send them accordingly.
+        for rank, needed_params in self._inference_dst_map.items():
+            sended_params = {}
+            for name in needed_params:
+                if name in inference_state_dict:
+                    # mentioned again, no ShardedTensor here.
+                    sended_params[name] = (
+                        inference_state_dict[name].to_local()
+                        if isinstance(inference_state_dict[name], DTensor)
+                        else inference_state_dict[name]
+                    )
             self.send(
-                object=local_state_dict,
+                object=sended_params,
                 dst_group_name=self._inference_group_name,
-                dst_rank=inference_rank,
+                dst_rank=rank,
                 async_op=True,
             )
+
+        if self.enable_offload and not self.is_weight_offloaded:
+            self.offload_param_and_grad()
 
         torch.distributed.barrier()
 
     def sync_model_to_rollout(self) -> None:
+        """
+        Sync the model's full state dict to the rollout worker.
+        """
         if self.enable_offload and not self.is_optimizer_offloaded:
             self.offload_optimizer()
 
