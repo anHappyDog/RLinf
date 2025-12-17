@@ -143,7 +143,10 @@ class FSDPInference(FSDPModelManager, Worker):
                 actor_shard_off, inference_shard_off, need_size = self._actor_dst_map[
                     actor_rank
                 ][k]
-
+                print(
+                    f"Inference rank {self._rank} loading param {k} from actor rank {actor_rank}: "
+                    f"actor_shard_off={actor_shard_off}, inference_shard_off={inference_shard_off}, need_size={need_size}"
+                )
                 inference_flat[
                     inference_shard_off : inference_shard_off + need_size
                 ].copy_(
@@ -151,12 +154,16 @@ class FSDPInference(FSDPModelManager, Worker):
                     non_blocking=True,
                 )
 
-        # NOTE: there may be problem that non_blocking copy not finished when new inference batch comes,
-        # need to check
+        torch.cuda.synchronize()
         torch.distributed.barrier()
 
     def sync_model_from_actor(self) -> None:
-        """ """
+        """
+        Sync the model weights from actor workers to the inference workers.
+        In former All-to-All setup communication, each inference rank only receives needed shards from actor ranks.
+        So here we first get the current rank's state_dict, then load the needed shards from actor ranks,
+        and then set the updated state_dict back to the model.
+        """
         opts = StateDictOptions(cpu_offload=False, full_state_dict=False)
         current_rank_state_dict = get_model_state_dict(model=self.model, options=opts)
         self.load_from_actors_by_intersection(cur_state_dict=current_rank_state_dict)
