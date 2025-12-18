@@ -13,7 +13,7 @@ cluster:
   component_placement:
     rollout: 0
     inference: 1
-    actor: 2-3tests/e2e_tests/reasoning/qwen2.5-1.5b-grpo-pipeline-fsdp-vllm.yaml
+    actor: 2-3
     reward: 0
 
 runner:
