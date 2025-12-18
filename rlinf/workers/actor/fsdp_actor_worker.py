@@ -146,7 +146,9 @@ class FSDPActor(FSDPModelManager, Worker):
 
     def del_reshard_state_dict(self) -> None:
         """Just for interface compatibility with MegatronActor."""
-        pass
+        if hasattr(self, "rollout_state_dict"):
+            del self.rollout_state_dict
+        clear_memory(sync=False)
 
     def sync_model_to_inference(self) -> None:
         """
@@ -201,16 +203,16 @@ class FSDPActor(FSDPModelManager, Worker):
         if self.enable_offload and self.is_weight_offloaded:
             self.load_param_and_grad(self.device, True)
 
-        rollout_state_dict = self.get_model_state_dict(
+        self.rollout_state_dict = self.get_model_state_dict(
             cpu_offload=False, full_state_dict=True
         )
 
-        has_visual = any("visual." in k for k in rollout_state_dict.keys())
+        has_visual = any("visual." in k for k in self.rollout_state_dict.keys())
 
         state_dict = {}
 
         if self._weight_dst_rank_in_rollout is not None:
-            for k, v in rollout_state_dict.items():
+            for k, v in self.rollout_state_dict.items():
                 name = k
                 if has_visual:
                     if name.startswith("model.language_model."):
@@ -227,7 +229,6 @@ class FSDPActor(FSDPModelManager, Worker):
                     state_dict,
                     self._rollout_group_name,
                     self._weight_dst_rank_in_rollout,
-                    async_op=True,
                 )
             else:
                 for weight_dst_rank in self._weight_dst_rank_in_rollout:
@@ -235,9 +236,9 @@ class FSDPActor(FSDPModelManager, Worker):
                         state_dict,
                         self._rollout_group_name,
                         weight_dst_rank,
-                        async_op=True,
                     )
 
+        state_dict.clear()
         if self.enable_offload and not self.is_weight_offloaded:
             self.offload_param_and_grad()
 
