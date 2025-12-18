@@ -143,10 +143,6 @@ class FSDPInference(FSDPModelManager, Worker):
                 actor_shard_off, inference_shard_off, need_size = self._actor_dst_map[
                     actor_rank
                 ][k]
-                print(
-                    f"Inference rank {self._rank} loading param {k} from actor rank {actor_rank}: "
-                    f"actor_shard_off={actor_shard_off}, inference_shard_off={inference_shard_off}, need_size={need_size}"
-                )
                 inference_flat[
                     inference_shard_off : inference_shard_off + need_size
                 ].copy_(
