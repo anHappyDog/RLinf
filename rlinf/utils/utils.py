@@ -27,6 +27,13 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
+try:
+    from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+
+    HAS_LIGER = True
+except ImportError:
+    HAS_LIGER = False
+
 
 def clear_memory(sync=True):
     if sync:
@@ -188,9 +195,14 @@ def compute_logprobs_from_logits(
     last_dim = logits.shape[-1]
     logits = logits.reshape(-1, last_dim)
     labels = target.reshape(-1)
-    # flash_attn can not handle -inf properly, so currently we use F.cross_entropy here
-    logprobs = -F.cross_entropy(logits, labels, reduction="none")
-    logprobs = logprobs.view(*batch_dim)
+
+    if HAS_LIGER:
+        loss_func = LigerCrossEntropyLoss(reduction="none")
+        logprobs = -loss_func(logits, labels)
+    else:
+        logprobs = -F.cross_entropy(logits, labels, reduction="none")
+
+    logprobs = logprobs.view(*batch_dim).float()
     return logprobs
 
 
