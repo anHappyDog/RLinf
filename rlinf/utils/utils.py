@@ -175,7 +175,7 @@ def compute_logprobs_from_logits(
     logits: torch.Tensor, target: torch.Tensor
 ) -> torch.Tensor:
     """
-    Compute logprobs by logits. Using flash-attn cross_entropy for better efficiency.
+    Compute logprobs by logits.
 
     Args:
         logits(torch.Tensor): [B, seq-len, vocab-size]
@@ -188,14 +188,13 @@ def compute_logprobs_from_logits(
     last_dim = logits.shape[-1]
     logits = logits.reshape(-1, last_dim)
     labels = target.reshape(-1)
-    logprobs = logprobs_from_logits_flash_attn(
-        logits, labels=labels, inplace_backward=False
-    )
+    # flash_attn can not handle -inf properly, so currently we use F.cross_entropy here
+    logprobs = -F.cross_entropy(logits, labels, reduction="none")
     logprobs = logprobs.view(*batch_dim)
     return logprobs
 
 
-def compute_entropy_from_logits(logits, dim: int = -1) -> torch.Tensor:
+def compute_entropy_from_logits(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """
     Compute entropy by logits,formula: H(X) = - sum(p(x) * log(p(x)))
     In case logits are too small to cause numerical instability(like downflow to zero after softmax),
@@ -208,7 +207,10 @@ def compute_entropy_from_logits(logits, dim: int = -1) -> torch.Tensor:
         - entropy(torch.Tensor): [B, seq-len]
     """
     logp = F.log_softmax(logits, dim=dim)
-    entropy = -(logp * logp.exp()).sum(dim=dim)
+    p = logp.exp()
+    # for some models like openvla series, -inf may be used, so we need to mask them out
+    entropy_term = torch.where(p > 0, p * logp, 0.0)
+    entropy = -entropy_term.sum(dim=dim)
     return entropy
 
 
