@@ -72,7 +72,7 @@ class SGLangWorker(Worker):
             self._cfg.rollout, "collect_meta_stats", False
         )
         self._use_auto_scheduler = self._placement.is_auto
-        self._use_async_rollout = self._cfg.algorithm.get("async", False)
+        self._use_async_rollout = self._placement.is_async
 
         if self._collect_meta_stats:
             self._init_meta_stats_collector()
@@ -85,9 +85,6 @@ class SGLangWorker(Worker):
         assert self._use_async_rollout, (
             "AsyncRolloutManager is only initialized when async rollout is enabled."
         )
-        assert self._placement.is_disaggregated, (
-            "AsyncRolloutManager is only supported in disaggregated mode."
-        )
         rollout_batch_size = self._cfg.data.rollout_batch_size
         rollout_dp_size = self._placement.rollout_dp_size
         max_num_gen_batches = self._cfg.algorithm.get("max_num_gen_batches", 1)
@@ -99,6 +96,8 @@ class SGLangWorker(Worker):
         )
         self.staleness_threshold = self._cfg.algorithm.get("staleness_threshold", 0)
         self._async_manager = AsyncRolloutManager(worker=self, logger=self._logger)
+        # need to wait utils params sync finished.
+        self._async_manager.pause_generation()
         self._getting_batch_task: Optional[asyncio.Task] = None
 
     def _init_scheduler(self):
@@ -356,7 +355,6 @@ class SGLangWorker(Worker):
                 params["max_new_tokens"] -= len(generated_ids)
                 sampling_params_list.append(params)
                 image_data_list.append(seq_group_info.image_data)
-
         tasks = [
             asyncio.create_task(
                 self.async_generate(

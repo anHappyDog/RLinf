@@ -96,6 +96,7 @@ class FSDPActor(FSDPModelManager, Worker):
         self._rollout_group_name = cfg.rollout.group_name
         self._component_placement = placement
         self.is_pipeline = self._component_placement.is_disaggregated
+        self.is_async = self._component_placement.is_async
         self.ref_policy_state_dict = None
         if self.is_pipeline:
             self._inference_group_name = cfg.inference.group_name
@@ -110,7 +111,7 @@ class FSDPActor(FSDPModelManager, Worker):
         self.loss_agg_func = get_loss_agg_func(self.cfg.algorithm.loss_agg_func)
         self.enable_offload = (
             self.cfg.actor.get("enable_offload", False) and not self.is_pipeline
-        )
+        ) and not self.is_async
         self.micro_batch_size = self.cfg.actor.micro_batch_size
         self.n_mini_batches = self.cfg.algorithm.n_minibatches
         self.task_type = self.cfg.runner.task_type
@@ -129,7 +130,7 @@ class FSDPActor(FSDPModelManager, Worker):
         ):
             self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
 
-        if self.enable_offload and not self.is_pipeline:
+        if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
         self._setup_rollout_weight_dst_ranks()
@@ -223,8 +224,12 @@ class FSDPActor(FSDPModelManager, Worker):
 
                     # elif name.startswith("model."):
                     #     name = name[6:]
-                state_dict[name] = reduce_tensor(v) if not self.is_pipeline else v
-            if not self.is_pipeline:
+                state_dict[name] = (
+                    reduce_tensor(v)
+                    if not self.is_pipeline and not self.is_async
+                    else v
+                )
+            if not self.is_pipeline and not self.is_async:
                 self.send(
                     state_dict,
                     self._rollout_group_name,
@@ -311,44 +316,53 @@ class FSDPActor(FSDPModelManager, Worker):
             compute_ref_logprobs: Whether to compute reference logprobs.
         """
         recv_batch_size = 0
+        results = []
         while recv_batch_size < self.total_batch_size_per_dp:
-            batch, rollout_result = self.get_batch(input_channel)
-            recv_batch_size += rollout_result.num_sequence
-            self._load_weight_and_optimizer()
+            result: RolloutResult = input_channel.get()
+            results.append(result)
+            recv_batch_size += result.num_sequence
+        self._load_weight_and_optimizer()
 
-            num_splits = (
-                rollout_result.num_sequence
-                // self.cfg.algorithm.logprob_forward_micro_batch_size
-            )
-            micro_batches_iter = get_iterator_k_split(
-                batch,
-                num_splits=num_splits,
-            )
-            micro_batches = list(micro_batches_iter)
+        rollout_result = RolloutResult.merge_result_list(results)
+        batch = rollout_result.to_actor_batch(
+            self.cfg.data.max_prompt_length,
+            self.cfg.actor.model.encoder_seq_length,
+            self.tokenizer.eos_token_id,
+        )
 
-            prev_logprobs = []
-            with self.worker_timer():
+        num_splits = (
+            rollout_result.num_sequence
+            // self.cfg.algorithm.logprob_forward_micro_batch_size
+        )
+        micro_batches_iter = get_iterator_k_split(
+            batch,
+            num_splits=num_splits,
+        )
+        micro_batches = list(micro_batches_iter)
+
+        prev_logprobs = []
+        with self.worker_timer():
+            for micro_batch in micro_batches:
+                prev_logprobs.append(self.inference_step(micro_batch).cpu())
+
+            if rollout_result.rollout_logprobs is not None:
+                # Rollout has returned logprobs, store the recomputed logprobs in recompute_prev_logprobs
+                rollout_result.recompute_prev_logprobs = torch.cat(prev_logprobs)
+            else:
+                # Otherwise, directly store the logprobs in prev_logprobs (the final logprobs used for training)
+                rollout_result.prev_logprobs = torch.cat(prev_logprobs)
+
+        if compute_ref_logprobs:
+            assert self.ref_policy_state_dict is not None, (
+                "Reference policy state dict is None but compute_ref_logprobs is True"
+            )
+            ref_logprobs = []
+            with cpu_weight_swap(self.model, self.ref_policy_state_dict):
                 for micro_batch in micro_batches:
-                    prev_logprobs.append(self.inference_step(micro_batch).cpu())
+                    ref_logprobs.append(self.inference_step(micro_batch).cpu())
+                rollout_result.ref_logprobs = torch.cat(ref_logprobs)
 
-                if rollout_result.rollout_logprobs is not None:
-                    # Rollout has returned logprobs, store the recomputed logprobs in recompute_prev_logprobs
-                    rollout_result.recompute_prev_logprobs = torch.cat(prev_logprobs)
-                else:
-                    # Otherwise, directly store the logprobs in prev_logprobs (the final logprobs used for training)
-                    rollout_result.prev_logprobs = torch.cat(prev_logprobs)
-
-            if compute_ref_logprobs:
-                assert self.ref_policy_state_dict is not None, (
-                    "Reference policy state dict is None but compute_ref_logprobs is True"
-                )
-                ref_logprobs = []
-                with cpu_weight_swap(self.model, self.ref_policy_state_dict):
-                    for micro_batch in micro_batches:
-                        ref_logprobs.append(self.inference_step(micro_batch).cpu())
-                    rollout_result.ref_logprobs = torch.cat(ref_logprobs)
-
-            output_channel.put(rollout_result)
+        output_channel.put(rollout_result)
 
         assert recv_batch_size == self.total_batch_size_per_dp, (
             f"Expected {self.total_batch_size_per_dp} sequences from channel, but got {recv_batch_size}"
@@ -394,13 +408,13 @@ class FSDPActor(FSDPModelManager, Worker):
                         dim=0,
                     ).cuda()
 
-                    input_ids = m_batch["input_ids"]
-                    attention_mask = m_batch["attention_mask"]
-                    position_ids = m_batch["position_ids"]
-                    advantages = m_batch["advantages"]
-                    ref_logprobs = None
-                    if "ref_logprobs" in m_batch:
-                        ref_logprobs = m_batch["ref_logprobs"]
+            input_ids = m_batch["input_ids"]
+            attention_mask = m_batch["attention_mask"]
+            position_ids = m_batch["position_ids"]
+            advantages = m_batch["advantages"]
+            ref_logprobs = None
+            if "ref_logprobs" in m_batch:
+                ref_logprobs = m_batch["ref_logprobs"]
 
             loss_mask = m_batch["attention_mask"][:, -self.response_len :]
 
@@ -558,7 +572,7 @@ class FSDPActor(FSDPModelManager, Worker):
 
     def run_training(self, input_channel: Channel) -> tuple[dict, list]:
         # Get all batches for this DP
-        if self.is_pipeline:
+        if self.is_pipeline and not self.is_async:
             with self.worker_timer():
                 return self.run_training_pipeline(input_channel)
 

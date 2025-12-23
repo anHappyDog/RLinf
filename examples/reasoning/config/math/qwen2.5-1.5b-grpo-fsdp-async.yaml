@@ -1,4 +1,6 @@
 defaults:
+  - ../training_backend/fsdp@inference.fsdp_config
+  - ../training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
 
 hydra:
@@ -7,6 +9,7 @@ hydra:
   output_subdir: null
 
 cluster:
+  async: True
   num_nodes: 8
   component_placement:
     rollout: 0-15
@@ -58,10 +61,8 @@ algorithm:
   max_num_gen_batches: 1
 
   # asynchronous training params
-  async: True # whether to use asynchronous training(decouple actor and rollout)
   staleness_threshold: 4 # maximum staleness allowed in asynchronous training, if set to null/0, it will be synchronous training
   behave_weight_threshold: 2 # used in asynchronous training to filter behavior weights(if set to null, no filtering will be applied)
-
 
   # GRPO loss params
   loss_type: actor
@@ -70,19 +71,19 @@ algorithm:
   kl_penalty_type: low_var_kl
   ratio_clip_eps: 0.2
   entropy_bonus: 0.0
-  calculate_entropy: True
+  calculate_entropy: False
   clip_ratio_c: null # 3.0
   clip_ratio_low: null # if null or not set, will use ratio_clip_eps
   clip_ratio_high: null # if null or not set, will use ratio_clip_eps
 
-  adv_type: gae
-  normalize_advantages: True
+  adv_type: grpo
+  normalize_advantages: False
   early_stop_imp_ratio: 5.0
   use_valid_token_scale: True
 
   # params for rollout
   sampling_params:
-    use_greedy: False
+    do_sample: True
     temperature: 1.0
     top_k: 1000000
     top_p: 1.0
@@ -91,22 +92,30 @@ algorithm:
     min_new_tokens: 1
 
 inference:
-  model_arch: ${rollout.model_arch}
+
   group_name: "InferenceGroup"
   load_from_actor: True
   model:
-    tensor_model_parallel_size: 2
-    pipeline_model_parallel_size: 1
-    sequence_parallel: True
+    model_path: /path/to/model/DeepSeek-R1-Distill-Qwen-1.5B/
+    model_type: ${rollout.model.model_type}
+    precision: fp16              # precision for rollout model, support [fp16, bf16, fp32]
+    is_lora: False
+
+  tokenizer:
+    tokenizer_model: ${inference.model.model_path}
+    use_fast: True
+    trust_remote_code: True
+    padding_side: 'right'
 
 rollout:
   group_name: "RolloutGroup"
 
   gpu_memory_utilization: 0.55
 
-  model_dir: /path/to/model/DeepSeek-R1-Distill-Qwen-1.5B/
-  model_arch: qwen2.5
-  precision: ${actor.model.precision}              # precision for rollout model, support [fp16, bf16, fp32]  
+  model:
+    model_path: /path/to/model/DeepSeek-R1-Distill-Qwen-1.5B/
+    model_type: qwen2.5
+    precision: fp16              # precision for rollout model, support [fp16, bf16, fp32]
   enforce_eager: False         # if False, rollout engine will capture cuda graph, which will take more time to initialize.
   distributed_executor_backend: mp   # ray or mp
   disable_log_stats: False
@@ -130,7 +139,7 @@ rollout:
     max_num_batched_tokens: null # the maximum number of tokens to be batched together in vllm. If set to null, vllm will use its default value.
     torch_profiler_dir: null # if not null, vllm will enable torch profiler and save the result to the specified directory.
 
-  return_logprobs: True
+  return_logprobs: ${not:${algorithm.recompute_logprobs}}
 
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
@@ -159,33 +168,20 @@ data:
   train_data_paths: ["/dataset/boba/AReaL-boba-106k.jsonl"]
   val_data_paths: ["/dataset/boba/AReaL-boba-106k.jsonl"]
 
-  pin_memory: True
-  prefetch_factor: 4
 
 actor:
   group_name: "ActorGroup"
-  training_backend: megatron
-  mcore_gpt: True
-  spec_name: decoder_gpt
+  training_backend: fsdp
 
-  checkpoint_load_path: null
-
-  offload_optimizer: True
-  offload_weight: True
-  offload_grad: True
-
-  enable_dp_load_balance: False
-
-  calculate_flops: False
-
+  enable_offload: False
   seed: 1234
 
   model:
-    precision: fp16
+    model_path: "/path/to/model/DeepSeek-R1-Distill-Qwen-1.5B/"
+    model_type: qwen2.5
+    precision: fp32
     add_bias_linear: False
-
-    tensor_model_parallel_size: 2
-    pipeline_model_parallel_size: 1
+    is_lora: False
 
     activation: swiglu
     sequence_parallel: True
@@ -222,14 +218,13 @@ actor:
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-05
-    min_lr: 2.0e-6
     weight_decay: 0.05
     use_distributed_optimizer: True
     overlap_grad_reduce: False
     overlap_param_gather: False
     optimizer_enable_pin: false
     overlap_param_gather_with_optimizer_step: False
-    clip_grad: 1.0
+    clip_grad: 0.8
     loss_scale: 65536
 
   lr_sched:
@@ -247,43 +242,38 @@ actor:
     trust_remote_code: True
     padding_side: 'right'
 
-  megatron:
-    ddp_bucket_size: null
-    distributed_backend: nccl # Support 'nccl' and 'gloo'
-    distributed_timeout_minutes: 30
-    ckpt_format: torch
-    use_dist_ckpt: False
-    tp_comm_bootstrap_backend: nccl
-    tp_comm_overlap_cfg: null # tp_comm_overlap_cfg.yaml
-    use_hf_ckpt: True # if true, will transfer hf model to generate megatron checkpoint and use it for training.
-    use_profiler: False # if true, will enable torch profiler when training, pay attention it has influence on performance
+  fsdp_config:                  # below are fsdp configs, for more details, see https://pytorch.org/docs/stable/fsdp.html and https://huggingface.co/docs/accelerate/package_reference/fsdp
 
-    ckpt_convertor: # config for ckpt convertor
-      model: DeepSeek-R1-Distill-Qwen-1.5B
-      model_type: null # will be set by hf model's config if null
-      hf_model_path: ${rollout.model_dir} # path to the hf model
-      save_path: ${runner.output_dir}/${runner.experiment_name}/converted_ckpts/actor
-      use_gpu_num : 0
-      use_gpu_index: null
-      process_num: 16 # number of processes to use for checkpointing
-      tensor_model_parallel_size: ${actor.model.tensor_model_parallel_size}
-      pipeline_model_parallel_size: ${actor.model.pipeline_model_parallel_size}
-      
-    profiler: # profile megatron when inference and traning
-      output_dir: ${runner.output_dir}/${runner.experiment_name}/profiler
-      activities: ["cpu", "cuda"]
-      record_shapes: False
-      profile_memory: False
-      with_stack: False
-      with_flops: False
-      with_modules: True
-      export_tensorboard: True
-      export_chrome_trace: False
-      chrome_filename_prefix: "chrome_trace"
-      schedule_warmup: 2
-      schedule_active: 1
-      schedule_repeat: 1 # inference and training will repeat such times
-      # schedule_wait: it will be set at runtime
+    strategy: "fsdp"            # FSDP strategy: ["fsdp", "fsdp2"]
+
+    # Sharding strategy: "full_shard" (shard parameters, gradients, optimizer states),
+    # "shard_grad_op" (shard gradients and optimizer states only), 
+    # "hybrid_shard" (combines data parallelism and model parallelism - sharding within FSDP groups, replicate across DDP groups),
+    # "no_shard" (no sharding)
+    sharding_strategy: "full_shard" 
+
+    cpu_offload: False           # whether to offload parameters and gradients to CPU when not in use，if True, actor's enable_offload should be True too.
+    offload_pin_memory: False    # whether FSDP2's CPU offload policy should pin memory when cpu_offload is True
+    reshard_after_forward: True  # if True, FSDP2 will reshard parameters after forward pass to save memory
+
+    enable_gradient_accumulation: True  # if True, gradient accumulation will be enabled for FSDP/FSDP2 training, which will enhance training performance but increase memory usage.
+    forward_prefetch: True              # if True, FSDP will explicitly prefetches the next upcoming all-gather while executing in the forward pass. only use with static graphs. Overlaps communication with computation to improve performance.
+    limit_all_gathers: False            # if True, FSDP will synchronizes CPU threads to limit the number of concurrent all-gathers. Only affects strategies that schedule all-gathers
+    backward_prefetch: pre              # options are null, 'pre', 'post'. if 'pre', FSDP will prefetch the next upcoming all-gather while computing gradients. if 'post', FSDP will prefetch the next all-gather until current gradient is computed.
+    use_orig_params: False              # if True, FSDP will use module's original parameters, it means it will expose nn.Module.named_parameters rather than FlatParameter
+    use_liger_kernel: True              # if True, liger_kernel will be used for FSDP, note that currently supported models in RLinf are [qwen2.5, qwen2.5-vl], for more details, see liger_kernel's doc
+
+    fsdp_size: -1               # Number of GPUs per FSDP group for hybrid sharding. -1 means use all available GPUs in a single FSDP group
+
+    mixed_precision:            # mixed precision settings for fsdp/fsdp2
+      param_dtype: "fp16"
+      reduce_dtype: "fp16"
+      buffer_dtype: "fp32"
+
+    amp:
+      enabled: True                 # if True, automatic mixed precision (AMP) will be used in FSDP/FSDP2 training.
+      precision: "fp16"              # precision for AMP, options are ["fp16" , "bf16"]
+      use_grad_scaler: True          # if True, GradScaler will be used for AMP training to prevent underflow.
 
 
 reward:

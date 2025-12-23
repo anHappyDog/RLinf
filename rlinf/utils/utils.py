@@ -28,6 +28,13 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
+try:
+    from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+
+    HAS_LIGER = True
+except ImportError:
+    HAS_LIGER = False
+
 
 def clear_memory(sync=True):
     if sync:
@@ -144,6 +151,18 @@ def masked_mean_ratio(
 def get_loss_agg_func(
     loss_agg: str,
 ) -> Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]:
+    """
+    Get the loss aggregation function based on the specified method.
+
+    Args:
+        loss_agg (str): The loss aggregation method. Options are:
+            - "seq-mean-token-sum": Mean over sequences after summing over tokens.
+            - "seq-mean-token-mean": Mean over sequences after averaging over tokens.
+            - "token-mean": Mean over all tokens.
+
+    Returns:
+        Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]: The corresponding loss aggregation function.
+    """
     if loss_agg == "seq-mean-token-sum":
         return seq_mean_token_sum
     elif loss_agg == "seq-mean-token-mean":
@@ -160,6 +179,20 @@ def reshape_entropy(
     action_dim: int = 7,
     batch_size: int = 1,
 ) -> Optional[torch.Tensor]:
+    """
+    Reshape the entropy tensor based on the specified entropy type. if entropy is None, return None.
+    if entropy_type is "action_level", reshape the entropy tensor to (batch_size, -1, action_dim) and sum over the last dimension.
+    if entropy_type is "chunk_level", sum the entropy tensor over the last dimension.
+
+    Args:
+        entropy (Optional[torch.Tensor]): The entropy tensor to reshape.
+        entropy_type (str): The type of entropy. Options are "action_level" or "chunk_level".
+        action_dim (int): The dimension of actions. Default is 7.
+        batch_size (int): The batch size. Default is 1.
+
+    Returns:
+        Optional[torch.Tensor]: The reshaped entropy tensor.
+    """
     if entropy is not None:
         if entropy_type == "action_level":
             entropy = entropy.reshape(batch_size, -1, action_dim).sum(dim=-1)
@@ -209,9 +242,13 @@ def compute_logprobs_from_logits(
     last_dim = logits.shape[-1]
     logits = logits.reshape(-1, last_dim)
     labels = target.reshape(-1)
-    logprobs = logprobs_from_logits_flash_attn(
-        logits, labels=labels, inplace_backward=False
-    )
+    if HAS_LIGER:
+        loss_func = LigerCrossEntropyLoss(reduction="none")
+        logprobs = -loss_func(logits, labels)
+    else:
+        logprobs = logprobs_from_logits_flash_attn(
+            logits, labels=labels, inplace_backward=False
+        )
     logprobs = logprobs.view(*batch_dim)
     return logprobs
 

@@ -86,12 +86,6 @@ def print_sglang_outputs(prompts, outputs: list[dict], tokenizer):
         )
 
 
-def print_multi_sglang_outputs(prompts, outputs: list[list[dict]], tokenizer):
-    for i, resps in enumerate(outputs):
-        with sharp_cover(f"sglang dp {i}"):
-            print_sglang_outputs(prompts, resps, tokenizer)
-
-
 class RankMapper:
     @classmethod
     def get_actor_rank_to_rollout_rank_map(
@@ -131,7 +125,11 @@ class RankMapper:
         """
         if placement_mode == PlacementMode.COLLOCATED:
             return CollocateRankMapper
-        elif placement_mode in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO]:
+        elif placement_mode in [
+            PlacementMode.DISAGGREGATED,
+            PlacementMode.AUTO,
+            PlacementMode.ASYNC,
+        ]:
             return DisaggRankMapper
         else:
             raise ValueError(f"Unsupported mode: {placement_mode}.")

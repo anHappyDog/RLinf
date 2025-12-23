@@ -112,8 +112,8 @@ class ReasoningRunner:
         self.metric_logger = MetricLogger(cfg)
 
         # async RL
-        self.enable_async_rl = self.cfg.algorithm.get("async", False)
-        if self.enable_async_rl:
+        self.is_async = self.component_placement.is_async
+        if self.is_async:
             staleness_threshold = self.cfg.algorithm.get("staleness_threshold", 0)
             self.max_batch_per_step = staleness_threshold + 1
         else:
@@ -302,7 +302,6 @@ class ReasoningRunner:
             multi_modal_inputs = batch["multi_modal_inputs"]
             prompt_ids = [ids[-pmp_len:] for ids, pmp_len in zip(prompt_ids, lengths)]
             rollout_dp_size = self.component_placement.rollout_dp_size
-
             for input_ids, answers, image_data, multi_modal_inputs in zip(
                 split_list(prompt_ids, rollout_dp_size, enforce_divisible_batch=False),
                 split_list(answers, rollout_dp_size, enforce_divisible_batch=False),
@@ -328,7 +327,7 @@ class ReasoningRunner:
         self.actor.sync_model_to_rollout()
         self.rollout.sync_model_from_actor().wait()
         self.actor.del_reshard_state_dict().wait()
-        if self.enable_async_rl:
+        if self.is_async:
             self.rollout.set_version(self.global_steps).wait()
 
     def run(self):
@@ -358,7 +357,7 @@ class ReasoningRunner:
                         scheduler_handle = self.scheduler.schedule()
 
                     # Rollout
-                    if self.enable_async_rl:
+                    if self.is_async:
                         rollout_handle: Handle = self.rollout.async_rollout(
                             output_channel=self.rollout_channel,
                         )
