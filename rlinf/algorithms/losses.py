@@ -318,10 +318,7 @@ def compute_decoupled_ppo_actor_loss(
     )
     behav_mask_count = behav_mask.count_nonzero() or 1
     behav_weight = torch.where(behav_mask, behav_weight, 0.0)
-    # here needs careful checking, we use behav_mask to count valid tokens but
-    # loss_mask_ratio is passed. For math reasoning it's ok because it's None.
-    # but for embodiment intelligence scenario, it's not.
-    pg_loss = loss_agg_func(pg_loss * behav_weight, behav_mask, loss_mask_ratio)
+    pg_loss = loss_agg_func(pg_loss * behav_weight, loss_mask, loss_mask_ratio)
 
     if critic_warmup:
         pg_loss = torch.tensor(0.0, device=pg_loss.device)
@@ -339,6 +336,7 @@ def compute_decoupled_ppo_actor_loss(
         proximal_approx_kl = -proximal_approx_kl.sum() / loss_mask_count
         behav_approx_kl = torch.where(behav_mask, proximal_logprobs - old_logprobs, 0.0)
         behav_approx_kl = -behav_approx_kl.sum() / behav_mask_count
+        behav_clip_fraction = 1.0 - (behav_mask_count / loss_mask_count)
 
     metrics_data = {
         "actor/policy_loss": pg_loss.detach(),
@@ -348,6 +346,7 @@ def compute_decoupled_ppo_actor_loss(
         ),
         "actor/clip_fraction": clip_fraction,
         "actor/dual_clip_fraction": dual_clip_fraction,
+        "actor/behav_clip_fraction": behav_clip_fraction,
         "actor/proximal_approx_kl": proximal_approx_kl,
         "actor/behav_approx_kl": behav_approx_kl,
     }
