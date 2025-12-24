@@ -28,6 +28,11 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
+from rlinf.config import SupportedModel
+from rlinf.utils.logging import get_logger
+
+logger = get_logger()
+
 
 def clear_memory(sync=True):
     if sync:
@@ -465,4 +470,70 @@ def apply_liger_kernel_to_openvla(
     except ImportError as e:
         raise ImportError(
             "liger_kernel not installed but is required to apply liger kernels to OpenVLA model."
+        ) from e
+
+
+def apply_liger_kernel_to_model(
+    model: nn.Module,
+    model_type: SupportedModel,
+) -> None:
+    try:
+        from liger_kernel.transformers import (
+            apply_liger_kernel_to_qwen2,
+            apply_liger_kernel_to_qwen2_5_vl,
+        )
+
+        MODEL_LIGER_KERNEL_APPLY_FUNC = {
+            SupportedModel.QWEN2_5: (
+                apply_liger_kernel_to_qwen2,
+                {
+                    "rope": True,
+                    "rms_norm": True,
+                    "swiglu": True,
+                    "fused_linear_cross_entropy": True,
+                },
+            ),
+            SupportedModel.QWEN2_5_VL: (
+                apply_liger_kernel_to_qwen2_5_vl,
+                {
+                    "rope": True,
+                    "rms_norm": True,
+                    "swiglu": True,
+                    "fused_linear_cross_entropy": True,
+                },
+            ),
+            SupportedModel.OPENPI: (
+                apply_liger_kernel_to_openpi,
+                {
+                    "rope": True,
+                    "geglu": True,
+                },
+            ),
+            SupportedModel.OPENVLA: (
+                apply_liger_kernel_to_openvla,
+                {
+                    "rope": True,
+                    "fused_linear_cross_entropy": True,
+                    "rms_norm": True,
+                    "swiglu": True,
+                },
+            ),
+        }
+        if model_type in MODEL_LIGER_KERNEL_APPLY_FUNC:
+            apply_func, apply_kwargs = MODEL_LIGER_KERNEL_APPLY_FUNC[model_type]
+            apply_func(
+                model=model,
+                **apply_kwargs,
+            )
+            logger.info(
+                f"Applied liger-kernel optimizations for model_type: {model_type.value}, used kwargs: {apply_kwargs}"
+            )
+        else:
+            logger.info(
+                f"No liger-kernel optimizations applied for model_type: {model_type.value}"
+            )
+            return
+    except ImportError as e:
+        raise ImportError(
+            "liger_kernel not installed but is required to apply liger kernels to model."
         ) from e

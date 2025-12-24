@@ -19,7 +19,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
 
-from rlinf.config import SupportedModel
+from rlinf.config import SupportedModel, get_supported_model
 from rlinf.data.io_struct import ChunkStepResult, EmbodiedRolloutResult
 from rlinf.models import get_model, get_vla_model_config_and_processor
 from rlinf.scheduler import Channel, Cluster, Worker
@@ -62,6 +62,18 @@ class MultiStepRolloutWorker(Worker):
             self.hf_model.setup_config_and_processor(
                 model_config, self.cfg, input_processor
             )
+
+        if self.cfg.rollout.model.get("use_liger_kernel", False):
+            from rlinf.utils.utils import apply_liger_kernel_to_model
+
+            try:
+                model_type = get_supported_model(self.cfg.actor.model.model_type)
+                apply_liger_kernel_to_model(
+                    model=self.hf_model,
+                    model_type=model_type,
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to apply liger-kernel optimizations: {e}")
 
         self.hf_model.eval()
 
