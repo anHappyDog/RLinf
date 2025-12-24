@@ -193,6 +193,8 @@ class FSDPModelManager:
                 apply_liger_kernel_to_qwen2_5_vl,
             )
 
+            from rlinf.utils.utils import apply_liger_kernel_to_openpi
+
             MODEL_LIGER_KERNEL_APPLY_FUNC = {
                 SupportedModel.QWEN2_5: (
                     apply_liger_kernel_to_qwen2,
@@ -210,6 +212,13 @@ class FSDPModelManager:
                         "rms_norm": True,
                         "swiglu": True,
                         "fused_linear_cross_entropy": True,
+                    },
+                ),
+                SupportedModel.OPENPI: (
+                    apply_liger_kernel_to_openpi,
+                    {
+                        "rope": True,
+                        "geglu": True,
                     },
                 ),
             }

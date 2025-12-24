@@ -24,6 +24,7 @@ from typing import Callable
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
@@ -380,3 +381,40 @@ def set_rng_state(rng_state: dict) -> None:
     random.setstate(rng_state["random"])
     if torch.cuda.is_available() and "cuda" in rng_state:
         torch.cuda.set_rng_state(rng_state["cuda"])
+
+
+def apply_liger_kernel_to_openpi(
+    model: nn.Module, geglu: bool = False, rope: bool = False
+) -> None:
+    """
+    Apply liger_kernel's triton implementations to OpenPI model in-place.
+    **Because openpi modifies some paligemma's implementations like rmsnorm**, we can not
+    just apply liger_kernel's monkey patching function directly. We just apply swiglu(most important)
+    and rope here for better performance, these modules are not modified or just copied in openpi.
+
+    Args:
+        model (nn.Module): The OpenPI model to apply liger kernels to, just for compatibility.
+        geglu (bool): Whether to apply geglu kernel.
+        rope (bool): Whether to apply rope kernel.
+
+    Raises:
+        ImportError: If openpi or liger_kernel is not installed.
+    """
+    try:
+        from openpi.models_pytorch.transformers_replace.models.gemma import (
+            modeling_gemma,
+        )
+
+        if geglu:
+            from liger_kernel.transformers.geglu import LigerGEGLUMLP
+
+            modeling_gemma.GemmaMLP = LigerGEGLUMLP
+
+        if rope:
+            from liger_kernel.transformers.rope import liger_rotary_pos_emb
+
+            modeling_gemma.apply_rotary_pos_emb = liger_rotary_pos_emb
+    except ImportError as e:
+        raise ImportError(
+            "openpi and liger_kernel not installed but are required to apply liger kernels to OpenPI model."
+        ) from e
