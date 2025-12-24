@@ -257,7 +257,7 @@ def compute_logprobs_from_logits(
     labels = target.reshape(-1)
 
     assert op_type in ["torch", "flash_attn", "liger_kernel"], (
-        f"Unsupported op_type: {op_type} for logprobs computation."
+        f"Unsupported op_type: {op_type} for logprobs computation. Supported types are 'torch', 'flash_attn', 'liger_kernel'."
     )
     if op_type == "liger_kernel":
         logprobs = logprobs_from_logits_liger_kernel(logits, labels)
