@@ -418,3 +418,51 @@ def apply_liger_kernel_to_openpi(
         raise ImportError(
             "openpi and liger_kernel not installed but are required to apply liger kernels to OpenPI model."
         ) from e
+
+
+def apply_liger_kernel_to_openvla(
+    model: nn.Module,
+    rope: bool = False,
+    cross_entropy: bool = False,
+    fused_linear_cross_entropy: bool = False,
+    rms_norm: bool = False,
+    swiglu: bool = False,
+) -> None:
+    """
+    Apply liger_kernel's triton implementations to OpenVLA's llama model in-place. OpenVLA
+    does not modify the llama model, so we can directly apply liger_kernel's function.
+
+    Args:
+        model (nn.Module): The OpenVLA model to apply liger kernels to.
+        rope (bool): Whether to apply rope kernel.
+        cross_entropy (bool): Whether to apply cross_entropy kernel.
+        fused_linear_cross_entropy (bool): Whether to apply fused_linear_cross_entropy kernel.
+        rms_norm (bool): Whether to apply rms_norm kernel.
+        swiglu (bool): Whether to apply swiglu kernel.
+
+    Raises:
+        ImportError: If openvla or liger_kernel is not installed.
+    """
+    from transformers import LlamaForCausalLM
+
+    assert hasattr(model, "language_model"), (
+        "openvla does not have a 'language_model' attribute."
+    )
+    assert isinstance(model.language_model, LlamaForCausalLM), (
+        "OpenVLA model not using llama as its language backbone."
+    )
+    try:
+        from liger_kernel.transformers import apply_liger_kernel_to_llama
+
+        apply_liger_kernel_to_llama(
+            model=model.language_model,
+            rope=rope,
+            cross_entropy=cross_entropy,
+            fused_linear_cross_entropy=fused_linear_cross_entropy,
+            rms_norm=rms_norm,
+            swiglu=swiglu,
+        )
+    except ImportError as e:
+        raise ImportError(
+            "liger_kernel not installed but is required to apply liger kernels to OpenVLA model."
+        ) from e
