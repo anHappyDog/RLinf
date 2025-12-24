@@ -189,7 +189,6 @@ class MegatronActor(MegatronModelManager, Worker):
             * self.cfg.algorithm.group_size
             // parallel_state.get_data_parallel_world_size()
         )
-
         # Config validation
         if self.is_pipeline or self.is_async:
             assert not self.role_cfg.get("enable_dp_load_balance", False), (
@@ -284,6 +283,24 @@ class MegatronActor(MegatronModelManager, Worker):
             self._setup_inference_weight_dst_ranks()
 
         torch.distributed.barrier()
+
+    def get_rollout_result(self, channel: Channel) -> RolloutResult:
+        if channel.is_local:
+            # Local channel, every process will put its own data locally
+            # No need to broadcast
+            result: RolloutResult = channel.get()
+        else:
+            if self.is_data_io_rank:
+                result: RolloutResult = channel.get()
+            else:
+                result = None
+            result = self.broadcast(
+                result, ranks=parallel_state._MODEL_PARALLEL_GLOBAL_RANKS
+            )
+            result = self.broadcast(
+                result, ranks=parallel_state._CONTEXT_PARALLEL_GLOBAL_RANKS
+            )
+        return result
 
     def get_batch(
         self, channel: Channel
@@ -1158,10 +1175,8 @@ class MegatronActor(MegatronModelManager, Worker):
         recv_batch_size = 0
         results = []
         while recv_batch_size < self.total_batch_size_per_dp:
-            print(f"current recv bsz: {recv_batch_size}, self.total_batch_size_per_dp: {self.total_batch_size_per_dp}")
-            result : RolloutResult = input_channel.get()
+            result = self.get_rollout_result(input_channel)
             results.append(result)
-            print(f"received result with num_sequence: {result.num_sequence},need to recv left: {self.total_batch_size_per_dp - recv_batch_size - result.num_sequence}")
             recv_batch_size += result.num_sequence
 
         rollout_result = RolloutResult.merge_result_list(results)
@@ -1180,17 +1195,21 @@ class MegatronActor(MegatronModelManager, Worker):
 
             if rollout_result.rollout_logprobs is not None:
                 # Rollout has returned logprobs, store the recomputed logprobs in recompute_prev_logprobs
-                rollout_result.recompute_prev_logprobs = prev_logprobs.to("cpu",non_blocking=True)
+                rollout_result.recompute_prev_logprobs = prev_logprobs.to(
+                    "cpu", non_blocking=True
+                )
             else:
                 # Otherwise, store the logprobs in prev_logprobs (the final logprobs used for training)
-                rollout_result.prev_logprobs = prev_logprobs.to("cpu",non_blocking=True)
+                rollout_result.prev_logprobs = prev_logprobs.to(
+                    "cpu", non_blocking=True
+                )
 
         # Ref logprobs
         if compute_ref_logprobs:
             assert self.ref_policy_state_dict is not None
             with cpu_weight_swap(self.model[0], self.ref_policy_state_dict):
                 ref_logprobs = self.inference_step(batch)
-                rollout_result.ref_logprobs = ref_logprobs.to("cpu",non_blocking=True)
+                rollout_result.ref_logprobs = ref_logprobs.to("cpu", non_blocking=True)
         self.put_result(rollout_result, output_channel)
 
         assert recv_batch_size == self.total_batch_size_per_dp, (
