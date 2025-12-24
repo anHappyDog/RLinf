@@ -168,7 +168,7 @@ class MegatronActor(MegatronModelManager, Worker):
         self.is_optimizer_offloaded = False
         self.ref_policy_state_dict = None
         self.is_pipeline = self.component_placement.is_pipeline
-
+        self.is_async = self.component_placement.is_async
         # Rollout configurations
         self.rollout_group_name = self.cfg.rollout.group_name
 
@@ -191,7 +191,7 @@ class MegatronActor(MegatronModelManager, Worker):
         )
 
         # Config validation
-        if self.is_pipeline:
+        if self.is_pipeline or self.is_async:
             assert not self.role_cfg.get("enable_dp_load_balance", False), (
                 "DP load balance is not supported in pipeline mode."
             )
@@ -717,7 +717,7 @@ class MegatronActor(MegatronModelManager, Worker):
 
     def run_training(self, input_channel: Channel):
         """Run the training loop for the actor."""
-        if self.is_pipeline:
+        if self.is_pipeline and not self.is_async:
             with self.worker_timer():
                 return self.run_training_pipeline(input_channel)
 
@@ -1156,31 +1156,42 @@ class MegatronActor(MegatronModelManager, Worker):
             compute_ref_logprobs: Whether to compute reference logprobs.
         """
         recv_batch_size = 0
+        results = []
         while recv_batch_size < self.total_batch_size_per_dp:
-            batch, rollout_result = self.get_batch(input_channel)
-            recv_batch_size += rollout_result.num_sequence
-            # Must be called after batch is retrieved, suggesting that rollout has stopped
-            # Otherwise, loading model might cause OOM in the collocated mode
-            self._load_weight_and_optimizer()
+            print(f"current recv bsz: {recv_batch_size}, self.total_batch_size_per_dp: {self.total_batch_size_per_dp}")
+            result : RolloutResult = input_channel.get()
+            results.append(result)
+            print(f"received result with num_sequence: {result.num_sequence},need to recv left: {self.total_batch_size_per_dp - recv_batch_size - result.num_sequence}")
+            recv_batch_size += result.num_sequence
 
-            # Prev logprobs
-            with self.worker_timer():
-                prev_logprobs = self.inference_step(batch)
+        rollout_result = RolloutResult.merge_result_list(results)
+        batch = rollout_result.to_actor_batch(
+            self.cfg.data.max_prompt_length,
+            self.cfg.actor.model.encoder_seq_length,
+            self.tokenizer.eos_token_id,
+        )
+        # Must be called after batch is retrieved, suggesting that rollout has stopped
+        # Otherwise, loading model might cause OOM in the collocated mode
+        self._load_weight_and_optimizer()
 
-                if rollout_result.rollout_logprobs is not None:
-                    # Rollout has returned logprobs, store the recomputed logprobs in recompute_prev_logprobs
-                    rollout_result.recompute_prev_logprobs = prev_logprobs.cpu()
-                else:
-                    # Otherwise, store the logprobs in prev_logprobs (the final logprobs used for training)
-                    rollout_result.prev_logprobs = prev_logprobs.cpu()
+        # Prev logprobs
+        with self.worker_timer():
+            prev_logprobs = self.inference_step(batch)
 
-            # Ref logprobs
-            if compute_ref_logprobs:
-                assert self.ref_policy_state_dict is not None
-                with cpu_weight_swap(self.model[0], self.ref_policy_state_dict):
-                    ref_logprobs = self.inference_step(batch)
-                    rollout_result.ref_logprobs = ref_logprobs.cpu()
-            self.put_result(rollout_result, output_channel)
+            if rollout_result.rollout_logprobs is not None:
+                # Rollout has returned logprobs, store the recomputed logprobs in recompute_prev_logprobs
+                rollout_result.recompute_prev_logprobs = prev_logprobs.to("cpu",non_blocking=True)
+            else:
+                # Otherwise, store the logprobs in prev_logprobs (the final logprobs used for training)
+                rollout_result.prev_logprobs = prev_logprobs.to("cpu",non_blocking=True)
+
+        # Ref logprobs
+        if compute_ref_logprobs:
+            assert self.ref_policy_state_dict is not None
+            with cpu_weight_swap(self.model[0], self.ref_policy_state_dict):
+                ref_logprobs = self.inference_step(batch)
+                rollout_result.ref_logprobs = ref_logprobs.to("cpu",non_blocking=True)
+        self.put_result(rollout_result, output_channel)
 
         assert recv_batch_size == self.total_batch_size_per_dp, (
             f"Expected {self.total_batch_size_per_dp} sequences from channel, but got {recv_batch_size}"
@@ -1340,6 +1351,7 @@ class MegatronActor(MegatronModelManager, Worker):
             assert self.component_placement._placement_mode in [
                 PlacementMode.DISAGGREGATED,
                 PlacementMode.AUTO,
+                PlacementMode.ASYNC,
             ], "Unsupported placement mode for sending weights."
             assert isinstance(self._weight_dst_rank_in_rollout, list), (
                 f"In disaggregated mode, weight_dst_rank_in_rollout should be a list of ranks, got {type(self._weight_dst_rank_in_rollout)}"
