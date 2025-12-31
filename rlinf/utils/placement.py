@@ -28,6 +28,7 @@ class PlacementMode(Enum):
     COLLOCATED = auto()
     DISAGGREGATED = auto()
     HYBRID = auto()
+    ASYNC = auto()
     AUTO = auto()
 
 
@@ -100,6 +101,9 @@ class ModelParallelComponentPlacement(ComponentPlacement):
         if self._is_auto():
             self._placement_mode = PlacementMode.AUTO
             logging.info("Running in auto mode")
+        elif self._is_async():
+            self._placement_mode = PlacementMode.ASYNC
+            logging.info("Running in async mode")
         elif self._is_collocated():
             assert self._inference_gpus is None, (
                 "Inference GPUs must not be specified in collocated mode."
@@ -131,6 +135,14 @@ class ModelParallelComponentPlacement(ComponentPlacement):
 
         self._generate_placements()
 
+    def _is_async(self) -> bool:
+        if not getattr(self._config.cluster, "async", False):
+            return False
+        assert self._is_disaggregated(), (
+            "ASYNC mode is a more advanced version of disaggregated mode, so it must satisfy the requirements of disaggregated mode."
+        )
+        return True
+
     def _is_auto(self):
         if not getattr(self._config.cluster, "auto_scheduler", False):
             return False
@@ -138,22 +150,9 @@ class ModelParallelComponentPlacement(ComponentPlacement):
         assert self._is_disaggregated(), (
             "AUTO mode is a more advanced version of disaggregated mode, so it must satisfy the requirements of disaggregated mode."
         )
-
-        # Assert components order is : actor -> rollout -> inference
-        order_error_msg = "AUTO mode requires components to be placed in the order of actor -> rollout -> inference."
-        assert (
-            self._actor_gpus[0] == 0
-            and self._actor_gpus[-1] == self._rollout_gpus[0] - 1
-        ), order_error_msg
-        if self._inference_gpus is None:
-            assert self._rollout_gpus[-1] == self._cluster_num_gpus - 1, order_error_msg
-        else:
-            assert self._rollout_gpus[-1] == self._inference_gpus[0] - 1, (
-                order_error_msg
-            )
-            assert self._inference_gpus[-1] == self._cluster_num_gpus - 1, (
-                order_error_msg
-            )
+        assert self._inference_gpus is not None, (
+            "AUTO mode does not need dedicated inference GPUs."
+        )
         return True
 
     def _is_collocated(self):
@@ -257,6 +256,10 @@ class ModelParallelComponentPlacement(ComponentPlacement):
     @property
     def is_disaggregated(self):
         return self._placement_mode == PlacementMode.DISAGGREGATED
+
+    @property
+    def is_async(self):
+        return self._placement_mode == PlacementMode.ASYNC
 
     @property
     def is_auto(self):

@@ -136,6 +136,11 @@ class SeqGroupInfo:
         self.idx_aborted = set()
         self.results = [None for _ in range(self.group_size)]
 
+    def clear(self):
+        self.idx_completed.clear()
+        self.idx_aborted.clear()
+        self.results = [None for _ in range(self.group_size)]
+
     def record_vllm_result(self, idx: int, result: "VllmRequestOutput", logger=None):
         finish_reason = result.outputs[0].finish_reason
         if finish_reason is None or finish_reason == "abort":

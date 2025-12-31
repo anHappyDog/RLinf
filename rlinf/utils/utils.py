@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import atexit
 import gc
 import os
@@ -19,7 +20,7 @@ import random
 import sys
 from contextlib import contextmanager
 from functools import partial, wraps
-from typing import Callable, Literal, Optional
+from typing import Callable, Coroutine, Literal, Optional
 
 import numpy as np
 import torch
@@ -459,3 +460,20 @@ def set_rng_state(rng_state: dict) -> None:
     random.setstate(rng_state["random"])
     if torch.cuda.is_available() and "cuda" in rng_state:
         torch.cuda.set_rng_state(rng_state["cuda"])
+
+
+def create_task_with_callback(
+    coro: Coroutine, callback: Callable[[asyncio.Task], None]
+) -> asyncio.Task:
+    """
+    Create an asyncio Task with a callback function to be called upon completion.
+
+    coro (Coroutine): The coroutine to be scheduled as a Task.
+    callback (Callable[[asyncio.Task], None]): The callback function that takes the completed Task
+
+    Returns:
+        asyncio.Task: The created Task.
+    """
+    task = asyncio.create_task(coro)
+    task.add_done_callback(callback)
+    return task

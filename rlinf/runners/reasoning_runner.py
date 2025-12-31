@@ -65,6 +65,7 @@ class ReasoningRunner:
         self.cfg = cfg
         self.component_placement = placement
         self.is_pipeline = self.component_placement.is_pipeline
+        self.is_async = self.component_placement.is_async
         self.has_dedicated_inference = inference is not None
 
         # Workers
@@ -111,6 +112,12 @@ class ReasoningRunner:
 
         self.metric_logger = MetricLogger(cfg)
 
+        if self.is_async:
+            staleness_threshold = self.cfg.algorithm.get("staleness_threshold", 0)
+            self.max_batch_per_step = staleness_threshold + 1
+        else:
+            self.max_batch_per_step = 1
+
     def _build_dataloader(self, train_dataset, val_dataset, collate_fn=None):
         """
         Creates the train and validation dataloaders.
@@ -133,14 +140,20 @@ class ReasoningRunner:
 
         num_workers = self.cfg.data.num_workers
 
+        training_batch_size = self.cfg.data.rollout_batch_size * self.cfg.algorithm.get(
+            "max_num_gen_batches", 1
+        )
+
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.cfg.data.rollout_batch_size
-            * self.cfg.algorithm.get("max_num_gen_batches", 1),
+            batch_size=training_batch_size,
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
             sampler=sampler,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=self.cfg.data.get("prefetch_factor", 2),
+            pin_memory=self.cfg.data.get("pin_memory", False),
         )
 
         val_batch_size = (
@@ -156,6 +169,9 @@ class ReasoningRunner:
             shuffle=self.cfg.data.get("validation_shuffle", True),
             drop_last=False,
             collate_fn=collate_fn,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=self.cfg.data.get("prefetch_factor", 2),
+            pin_memory=self.cfg.data.get("pin_memory", False),
         )
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
@@ -182,7 +198,7 @@ class ReasoningRunner:
                 )
 
         # Init workers
-        self.rollout.init_worker().wait()
+        self.rollout.init_worker(dataloader_channel=self.dataloader_channel).wait()
         if self.use_pre_process_policy:
             self.rollout.offload_engine().wait()
         self.actor.init_worker().wait()
@@ -279,31 +295,34 @@ class ReasoningRunner:
     def epoch(self):
         return self.global_steps // self.num_steps_per_epoch
 
-    def _put_batch(self, batch: dict[str, torch.Tensor]):
-        prompt_ids = batch["prompt"].tolist()
-        lengths = batch["length"].tolist()
-        answers = batch["answer"]
-        image_data = batch["image_data"]
-        multi_modal_inputs = batch["multi_modal_inputs"]
-        prompt_ids = [ids[-pmp_len:] for ids, pmp_len in zip(prompt_ids, lengths)]
-        rollout_dp_size = self.component_placement.rollout_dp_size
-
-        for input_ids, answers, image_data, multi_modal_inputs in zip(
-            split_list(prompt_ids, rollout_dp_size, enforce_divisible_batch=False),
-            split_list(answers, rollout_dp_size, enforce_divisible_batch=False),
-            split_list(image_data, rollout_dp_size, enforce_divisible_batch=False),
-            split_list(
-                multi_modal_inputs, rollout_dp_size, enforce_divisible_batch=False
-            ),
-        ):
-            request = RolloutRequest(
-                n=self.cfg.algorithm.group_size,
-                input_ids=input_ids,
-                answers=answers,
-                image_data=image_data,
-                multi_modal_inputs=multi_modal_inputs,
-            )
-            self.dataloader_channel.put(request, async_op=True)
+    def _put_batch(self):
+        for _ in range(self.max_batch_per_step):
+            batch = next(self.training_iter, None)
+            if batch is None:
+                return
+            prompt_ids = batch["prompt"].tolist()
+            lengths = batch["length"].tolist()
+            answers = batch["answer"]
+            image_data = batch["image_data"]
+            multi_modal_inputs = batch["multi_modal_inputs"]
+            prompt_ids = [ids[-pmp_len:] for ids, pmp_len in zip(prompt_ids, lengths)]
+            rollout_dp_size = self.component_placement.rollout_dp_size
+            for input_ids, answers, image_data, multi_modal_inputs in zip(
+                split_list(prompt_ids, rollout_dp_size, enforce_divisible_batch=False),
+                split_list(answers, rollout_dp_size, enforce_divisible_batch=False),
+                split_list(image_data, rollout_dp_size, enforce_divisible_batch=False),
+                split_list(
+                    multi_modal_inputs, rollout_dp_size, enforce_divisible_batch=False
+                ),
+            ):
+                request = RolloutRequest(
+                    n=self.cfg.algorithm.group_size,
+                    input_ids=input_ids,
+                    answers=answers,
+                    image_data=image_data,
+                    multi_modal_inputs=multi_modal_inputs,
+                )
+                self.dataloader_channel.put(request, async_op=True)
 
     def _sync_weights(self):
         if self.has_dedicated_inference:
@@ -313,6 +332,8 @@ class ReasoningRunner:
         self.actor.sync_model_to_rollout()
         self.rollout.sync_model_from_actor().wait()
         self.actor.del_reshard_state_dict().wait()
+        if self.is_async:
+            self.rollout.set_version(self.global_steps).wait()
 
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
@@ -329,10 +350,11 @@ class ReasoningRunner:
 
         self.run_timer.start_time()
         for _ in epoch_iter:
-            for batch in self.train_dataloader:
+            self.training_iter = iter(self.train_dataloader)
+            while True:
                 with self.timer("step"):
                     with self.timer("prepare_data"):
-                        self._put_batch(batch)
+                        self._put_batch()
 
                     with self.timer("sync_weights"):
                         self._sync_weights()
@@ -341,10 +363,15 @@ class ReasoningRunner:
                         scheduler_handle = self.scheduler.schedule()
 
                     # Rollout
-                    rollout_handle: Handle = self.rollout.rollout(
-                        input_channel=self.dataloader_channel,
-                        output_channel=self.rollout_channel,
-                    )
+                    if self.is_async:
+                        rollout_handle: Handle = self.rollout.async_rollout(
+                            output_channel=self.rollout_channel,
+                        )
+                    else:
+                        rollout_handle: Handle = self.rollout.rollout(
+                            input_channel=self.dataloader_channel,
+                            output_channel=self.rollout_channel,
+                        )
 
                     # Rewards
                     reward_handle: Handle = self.reward.compute_rewards(
