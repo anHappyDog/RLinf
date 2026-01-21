@@ -88,7 +88,7 @@ def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     return ret_dict
 
 
-def process_nested_dict_for_train(nested_dict, shuffle_id):
+def process_nested_dict_for_train(nested_dict: dict, shuffle_id: int) -> dict:
     ret_dict = {}
     for key, value in nested_dict.items():
         if key in ["dones", "terminations", "truncations", "prev_values"]:
@@ -916,9 +916,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
         }
-
+        # print(f"Computing advantages with args: {kwargs.keys()}",flush=True)
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
-
+        # print("Computed advantages and returns.",flush=True)
         self.rollout_batch.update(advantages_and_returns)
         if kwargs["loss_mask"] is not None:
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})

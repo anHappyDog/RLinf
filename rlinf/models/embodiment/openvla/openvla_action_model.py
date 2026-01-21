@@ -561,11 +561,17 @@ class OpenVLAForRLActionPrediction(OpenVLAForBatchActionPrediction, BasePolicy):
             return outputs
 
         if compute_logprobs:
+            # print(f"DEBUG: [OpenVLA Internal] compute_logprobs=True. action_dim={self.action_dim}, chunks={self.num_action_chunks}")
             logits = outputs.logits[
                 :, -self.action_dim * self.num_action_chunks - 1 : -1
             ]  # [B, action-dim, vocab-size]
+            # print(f"DEBUG: [OpenVLA Internal] Logits slice shape: {logits.shape}")
+            # print(f"DEBUG: [OpenVLA Internal] Action tokens shape: {data['action_tokens'].shape}")
 
+            # 1. Masking
             processed_logits_tensor = logits / data["temperature"]
+
+            # 3. TopK
             top_k = min(data["top_k"], processed_logits_tensor.size(-1))  # Safety check
             if top_k > 0:
                 logits_warper = TopKLogitsWarper(
@@ -675,14 +681,13 @@ class OpenVLAForRLActionPrediction(OpenVLAForBatchActionPrediction, BasePolicy):
         )
         action_tokens = generated_results.sequences
         action_tokens = action_tokens[:, -self.action_dim :]
-
         token_logits = (
             generated_results.scores
         )  # ([B, vocab-size], ...), after logits processor and warper results
+
         token_logits_tensor = torch.stack(
             token_logits, dim=1
         )  # [B, action-dim, vocab-size]
-
         last_hidden_states = torch.stack(
             [
                 token_hidden_states[-1][:, -1]

@@ -346,17 +346,21 @@ class MultiStepRolloutWorker(Worker):
     ) -> dict[str, torch.Tensor]:
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         # Use asyncio so that it can run alongside async weight syncing
-        print(
-            f"Rollout Worker {self._rank} waiting for env output... (mode={mode})",
-            flush=True,
-        )
+        # print(
+        #     f"Rollout Worker {self._rank} waiting for env output... (mode={mode})",
+        #     flush=True,
+        # )
+        # print(
+        #     f"Rollout Worker {self._rank} receiving env output... (mode={mode})",
+        #     flush=True,
+        # )
         env_output = await input_channel.get(
             key=f"{self._rank}_{mode}", async_op=True
         ).async_wait()
-        print(
-            f"Rollout Worker {self._rank} received env output. (mode={mode})",
-            flush=True,
-        )
+        # print(
+        #     f"Rollout Worker {self._rank} received env output. (mode={mode})",
+        #     flush=True,
+        # )
         return env_output
 
     def send_chunk_actions(self, output_channel: Channel, chunk_actions, mode="train"):

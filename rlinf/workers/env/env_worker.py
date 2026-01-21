@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -119,7 +119,7 @@ class EnvWorker(Worker):
         if not self.only_eval:
             self._init_env()
 
-    def _init_env(self):
+    def _init_env(self) -> None:
         if self.cfg.env.train.auto_reset:
             for i in range(self.stage_num):
                 self.env_list[i].start_env()
@@ -143,7 +143,16 @@ class EnvWorker(Worker):
         self, chunk_actions: torch.Tensor, stage_id: int
     ) -> tuple[EnvOutput, dict[str, Any]]:
         """
-        This function is used to interact with the environment.
+        Execute chunked actions with the environment for pipeline stage `stage_id`.
+
+        Args:
+            chunk_actions(torch.Tensor): [num_envs,chunk_steps,action_dim]: batched action tokens generated
+                by rollout worker.
+            stage_id(int): represent for which pipeline stage this env chunk step is for.
+
+        Returns:
+            env_output(dict):
+            env_info(dict):
         """
         chunk_actions = prepare_actions(
             raw_chunk_actions=chunk_actions,
@@ -237,7 +246,9 @@ class EnvWorker(Worker):
         )
         return env_output, env_info
 
-    def recv_chunk_actions(self, input_channel: Channel, mode="train") -> np.ndarray:
+    def recv_chunk_actions(
+        self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
+    ) -> np.ndarray:
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         chunk_action = []
         for gather_id in range(self.gather_num):
@@ -249,7 +260,7 @@ class EnvWorker(Worker):
         chunk_action = np.concatenate(chunk_action, axis=0)
         return chunk_action
 
-    def finish_rollout(self, mode="train"):
+    def finish_rollout(self, mode: Literal["train", "eval"] = "train"):
         # reset
         if mode == "train":
             for i in range(self.stage_num):
@@ -263,7 +274,9 @@ class EnvWorker(Worker):
                 if not self.cfg.env.eval.auto_reset:
                     self.eval_env_list[i].update_reset_state_ids()
 
-    def split_env_batch(self, env_batch, gather_id, mode):
+    def split_env_batch(
+        self, env_batch: dict, gather_id: int, mode: Literal["train", "eval"]
+    ):
         env_batch_i = {}
         for key, value in env_batch.items():
             if isinstance(value, torch.Tensor):
@@ -293,7 +306,12 @@ class EnvWorker(Worker):
                 env_batch_i[key] = value
         return env_batch_i
 
-    def send_env_batch(self, output_channel: Channel, env_batch, mode="train"):
+    def send_env_batch(
+        self,
+        output_channel: Channel,
+        env_batch: dict,
+        mode: Literal["train", "eval"] = "train",
+    ):
         # split env_batch into num_processes chunks, each chunk contains gather_num env_batch
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         for gather_id in range(self.gather_num):
@@ -302,6 +320,10 @@ class EnvWorker(Worker):
                 item=env_batch_i,
                 key=f"{gather_id + self._rank * self.gather_num}_{mode}",
             )
+            # print(
+            #     f"Env Worker {self._rank} sent env batch for gather_id {gather_id} in mode {mode}...",
+            #     flush=True,
+            # )
 
     def interact(self, input_channel: Channel, output_channel: Channel):
         for env in self.env_list:

@@ -1251,6 +1251,7 @@ class ChunkStepResult:
     terminations: torch.Tensor = None  # [B, 1]
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
+    versions: torch.Tensor | None = None  # [B, 1]
 
     def __post_init__(self):
         if self.prev_logprobs is not None:
@@ -1267,6 +1268,8 @@ class ChunkStepResult:
             self.rewards = self.rewards.cpu().contiguous()
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
+        if self.versions is not None:
+            self.versions = self.versions.cpu().contiguous()
 
 
 @dataclass(kw_only=True)
@@ -1297,6 +1300,7 @@ class EmbodiedRolloutResult:
     transitions: list[tuple[dict[str, Any], dict[str, Any]]] = field(
         default_factory=list
     )
+    versions: list[torch.Tensor] = field(default_factory=list)
 
     def append_result(self, result: ChunkStepResult):
         if result.prev_logprobs is not None:
@@ -1313,6 +1317,8 @@ class EmbodiedRolloutResult:
             self.rewards.append(result.rewards)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
+        if result.versions is not None:
+            self.versions.append(result.versions)
 
     def add_transition(self, obs, next_obs):
         self.transitions.append(
@@ -1354,6 +1360,11 @@ class EmbodiedRolloutResult:
             if len(self.rewards) > 0
             else None
         )
+        rollout_result_dict["versions"] = (
+            torch.stack(self.versions, dim=0).cpu().contiguous()
+            if len(self.versions) > 0
+            else None
+        )
 
         merged_forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
         for k in merged_forward_inputs.keys():
@@ -1377,7 +1388,9 @@ class EmbodiedRolloutResult:
         assert (
             len(rollout_result_dict["dones"])
             == len(rollout_result_dict["rewards"]) + self.rollout_epoch
-        ), "dones length must be the length of rewards plus rollout_epoch"
+        ), (
+            f"dones length must be the length of rewards plus rollout_epoch, dones: {len(rollout_result_dict['dones'])}, rewards: {len(rollout_result_dict['rewards'])}, rollout_epoch: {self.rollout_epoch}"
+        )
 
         return rollout_result_dict
 

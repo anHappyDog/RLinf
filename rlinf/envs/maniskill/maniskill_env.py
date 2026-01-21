@@ -28,12 +28,14 @@ from mani_skill.utils.visualization.misc import (
     tile_images,
 )
 from omegaconf import open_dict
-from omegaconf.omegaconf import OmegaConf
+from omegaconf.omegaconf import DictConfig, OmegaConf
 
 __all__ = ["ManiskillEnv"]
 
 
-def extract_termination_from_info(info, num_envs, device):
+def extract_termination_from_info(
+    info: dict, num_envs: int, device: str | torch.device
+) -> torch.Tensor:
     if "success" in info:
         if "fail" in info:
             terminated = torch.logical_or(info["success"], info["fail"])
@@ -50,12 +52,12 @@ def extract_termination_from_info(info, num_envs, device):
 class ManiskillEnv(gym.Env):
     def __init__(
         self,
-        cfg,
-        num_envs,
-        seed_offset,
-        total_num_processes,
-        worker_info,
-        record_metrics=True,
+        cfg: DictConfig,
+        num_envs: int,
+        seed_offset: int,
+        total_num_processes: int,
+        worker_info: dict,
+        record_metrics: bool = True,
     ):
         env_seed = cfg.seed
         self.seed = env_seed + seed_offset
@@ -89,7 +91,7 @@ class ManiskillEnv(gym.Env):
             self._init_metrics()
 
     @property
-    def total_num_group_envs(self):
+    def total_num_group_envs(self) -> int:
         if hasattr(self.env.unwrapped, "total_num_trials"):
             return self.env.unwrapped.total_num_trials
         if hasattr(self.env, "xyz_configs") and hasattr(self.env, "quat_configs"):
@@ -136,7 +138,21 @@ class ManiskillEnv(gym.Env):
             repeats=self.group_size
         ).to(self.device)
 
-    def _wrap_obs(self, raw_obs):
+    def _wrap_obs(self, raw_obs: dict) -> dict[str, torch.Tensor]:
+        """
+        Maniskill env's obs support many modes, including "state", "state_dict", "none", "sensor_data", "any_textures", "pointcloud".
+        This function will extract observations based on different `wrap_obs_mode` in cfg.
+        If `wrap_obs_mode` is "simple", it will return dict with keys depending on obs_mode:
+            - for "state" mode, return {"states": state}
+            - for "rgb" mode, return {"main_images": main_camera_rgb, "extra_view_images": extra_view_rgbs, "states": state}
+        If `wrap_obs_mode` is not "simple", it will use `_extract_obs_image` function to extract observations,
+
+        Args:
+            raw_obs(dict[str,torch.Tensor]): raw observations returned by maniskill env step or reset function.
+
+        Returns:
+            wrapped_obs(dict[str,torch.Tensor]): extracted observations after wrapping.
+        """
         if getattr(self.cfg, "wrap_obs_mode", "vla") == "simple":
             if self.env.unwrapped.obs_mode == "state":
                 wrapped_obs = {
@@ -169,7 +185,28 @@ class ManiskillEnv(gym.Env):
             wrapped_obs = self._extract_obs_image(raw_obs)
         return wrapped_obs
 
-    def _extract_obs_image(self, raw_obs):
+    def _extract_obs_image(self, raw_obs: dict) -> dict[str, torch.Tensor]:
+        """
+        Extract observations from raw observations returned by maniskill env step or reset function.
+        It assumes the env obs_mode is "sensor_data" and use "3rd_view_camera" rgb image as main image.
+        The raw_obs contains keys:
+            - agent: Env agent's proprioception
+            - extra: env specific info dict, for sapien env, it's empty dict.
+            - sensor_param:
+            - sensor_data: a dict contains sensor's data.
+
+        The returned `extracted_obs` contains keys:
+            - main_images: rgb images from "3rd_view_camera" sensor.
+            - states: agent's proprioception.
+            - task_descriptions: language instruction for current task.
+
+        Args:
+            raw_obs(dict[str,torch.Tensor]): raw observations returned by maniskill env step or reset function.
+
+        Returns:
+            extracted_obs(dict[str,torch.Tensor]): extracted observations after wrapping, including `main_images`,
+            `states` and `task_descriptions`.
+        """
         obs_image = raw_obs["sensor_data"]["3rd_view_camera"]["rgb"].to(
             torch.uint8
         )  # [B, H, W, C]
@@ -183,7 +220,21 @@ class ManiskillEnv(gym.Env):
         }
         return extracted_obs
 
-    def _calc_step_reward(self, reward, info):
+    def _calc_step_reward(self, reward: torch.Tensor, info: dict) -> torch.Tensor:
+        """
+        Calculate step reward based on raw reward and info dict returned by env step function.
+        Maniskill reward calculation supposes `sparse`, `none` mode, using `success` and `fail`.
+        This function uses the returned reward, if reward model is raw, just use the given reward
+        as base reward, or use `is_src_obj_grasped`*0,1 + `consecutive_grasp`*0.1 + `success`*1.0 as base reward.
+        If rel_reward is supported, return the diff to previous step reward as step reward, or return base reward.
+
+        Args:
+            reward (torch.Tensor): [num_envs,]: raw reward returned by env step function.
+            info (dict): env info returned by Maniskill env.
+
+        Returns:
+            step_reward (torch.Tensor): [num_envs,]: calculated step reward.
+        """
         if getattr(self.cfg, "reward_mode", "default") == "raw":
             pass
         else:
@@ -202,7 +253,11 @@ class ManiskillEnv(gym.Env):
         else:
             return reward
 
-    def _init_metrics(self):
+    def _init_metrics(self) -> None:
+        """
+        Init maniskill env's metrics, including `success_once`,
+        `fail_once` and `returns`, whose shape are all [num_envs,].
+        """
         self.success_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -213,7 +268,14 @@ class ManiskillEnv(gym.Env):
             self.num_envs, device=self.device, dtype=torch.float32
         )
 
-    def _reset_metrics(self, env_idx=None):
+    def _reset_metrics(self, env_idx: Optional[list[int]] = None) -> None:
+        """
+        Reset metrics for specified envs by `env_idx`. If `env_idx` is None, reset all envs.
+        metrics include `success_once`, `fail_once` and `returns`.
+
+        Args:
+            env_idx(Optional[list[int]]): list of env indices to reset metrics. If None, reset all envs.
+        """
         if env_idx is not None:
             mask = torch.zeros(self.num_envs, dtype=bool, device=self.device)
             mask[env_idx] = True
@@ -229,7 +291,21 @@ class ManiskillEnv(gym.Env):
                 self.fail_once[:] = False
                 self.returns[:] = 0.0
 
-    def _record_metrics(self, step_reward, infos):
+    def _record_metrics(
+        self, step_reward: torch.Tensor, infos: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """
+        Update and return metrics for given step, using step_rewards and env returned infos to record
+        `success_once`, `fail_once`, `returns`, `episode_len` and `reward`. It will update episode info
+        with average reward, episode_len, returns, success_once and fail_once.
+
+        Args:
+            step_reward(torch.Tensor): [num_envs,]: step rewards for current step.
+            infos(dict): info dict returned by env step function.
+
+        Return:
+            infos(dict): infos with updated `episode` info.
+        """
         episode_info = {}
         self.returns += step_reward
         if "success" in infos:
@@ -249,7 +325,21 @@ class ManiskillEnv(gym.Env):
         *,
         seed: Optional[Union[int, list[int]]] = None,
         options: Optional[dict] = None,
-    ):
+    ) -> tuple[dict[str, torch.Tensor], dict]:
+        """
+        Call maniskill env's reset function to reset specified envs by `env_idx` value in `options` dict.
+        random seed is also supported to be set for the reset function.
+
+        Args:
+            seed(Optional[Union[int, list[int]]]): random seed for reset function,can be None,int and list of int,the last
+            if for GPU parallelized environments.
+            options(Optional[dict]): options for reset function, can be None or dict. If dict, it can contain key `env_idx` to specify which envs to reset,
+            and if `self.use_fixed_reset_state_ids` is True, it will also contain key `episode_id` to specify which state ids to reset to.
+
+        Returns:
+            extracted_obs(dict[str,torch.Tensor]):
+            infos(dict[str,torch.Tensor]):
+        """
         if options is None:
             seed = self.seed
             options = (
@@ -267,8 +357,14 @@ class ManiskillEnv(gym.Env):
         return extracted_obs, infos
 
     def step(
-        self, actions: Union[Array, dict] = None, auto_reset=True
+        self, actions: Union[Array, dict] = None, auto_reset: bool = True
     ) -> tuple[Array, Array, Array, Array, dict]:
+        """
+        Use maniskill env's step function to step the environment with given actions.
+        and return extracted observations, step rewards, terminations, truncations and infos.
+
+
+        """
         raw_obs, _reward, terminations, truncations, infos = self.env.step(actions)
         extracted_obs = self._wrap_obs(raw_obs)
         step_reward = self._calc_step_reward(_reward, infos)
@@ -294,7 +390,21 @@ class ManiskillEnv(gym.Env):
             extracted_obs, infos = self._handle_auto_reset(dones, extracted_obs, infos)
         return extracted_obs, step_reward, terminations, truncations, infos
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(self, chunk_actions: torch.Tensor) -> tuple:
+        """
+        Do a chunk step with Maniskill Env, return corresponding env outputs, including
+        extracted_obs, chunk_rewards,
+
+        Args:
+            chunk_actions(torch.Tensor):[num_envs, chunk_steps, action_dim]: batched action tokens.
+
+        Returns:
+            extracted_obs(dict): extracted observations after executing chunk actions.
+            chunk_rewards(torch.Tensor): [num_envs, chunk_steps]: rewards for each step in the chunk.
+            chunk_terminations(torch.Tensor): [num_envs, chunk_steps]: termination flags for each step in the chunk.
+            chunk_truncations(torch.Tensor): [num_envs, chunk_steps]: truncation flags for each step in the chunk.
+            infos(dict): info dict from the environment after executing the chunk actions.
+        """
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         chunk_rewards = []
@@ -340,7 +450,20 @@ class ManiskillEnv(gym.Env):
             infos,
         )
 
-    def _handle_auto_reset(self, dones, extracted_obs, infos):
+    def _handle_auto_reset(
+        self,
+        dones: torch.Tensor,
+        extracted_obs: dict[str, torch.Tensor],
+        infos: dict[str, torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """
+        Handle auto reset for the environments that are done. It will reset those environments by calling reset function
+        and then return extracted observations and infos with final observations and infos included.
+
+        Args:
+            dones()
+        """
+
         final_obs = torch_clone_dict(extracted_obs)
         env_idx = torch.arange(0, self.num_envs, device=self.device)[dones]
         options = {"env_idx": env_idx}
@@ -366,7 +489,7 @@ class ManiskillEnv(gym.Env):
             )
 
     # render utils
-    def capture_image(self, infos=None):
+    def capture_image(self, infos: dict | None = None):
         img = self.env.render()
         img = common.to_numpy(img)
         if len(img.shape) == 3:
@@ -385,7 +508,7 @@ class ManiskillEnv(gym.Env):
                 img = tile_images(img, nrows=int(np.sqrt(self.num_envs)))
         return img
 
-    def render(self, info, rew=None):
+    def render(self, info: dict, rew: torch.Tensor | None = None):
         if self.video_cfg.info_on_video:
             scalar_info = gym_utils.extract_scalars_from_info(
                 common.to_numpy(info), batch_size=self.num_envs
@@ -406,17 +529,17 @@ class ManiskillEnv(gym.Env):
     def sample_action_space(self):
         return self.env.action_space.sample()
 
-    def add_new_frames(self, infos, rewards=None):
+    def add_new_frames(self, infos: dict, rewards: None | torch.Tensor = None):
         image = self.render(infos, rewards)
         self.render_images.append(image)
 
-    def add_new_frames_from_obs(self, raw_obs):
+    def add_new_frames_from_obs(self, raw_obs: dict):
         """For debugging render"""
         raw_imgs = common.to_numpy(raw_obs["main_images"])
         raw_full_img = tile_images(raw_imgs, nrows=int(np.sqrt(self.num_envs)))
         self.render_images.append(raw_full_img)
 
-    def flush_video(self, video_sub_dir: Optional[str] = None):
+    def flush_video(self, video_sub_dir: str | None = None):
         output_dir = os.path.join(self.video_cfg.video_base_dir, f"seed_{self.seed}")
         if video_sub_dir is not None:
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")

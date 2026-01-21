@@ -263,7 +263,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         else:
             raise NotImplementedError
 
-    def sft_forward(self, data, **kwargs):
+    def sft_forward(self, data: dict, **kwargs):
         observation = data["observation"]
         actions = data["actions"]
         return super().forward(observation, actions)
@@ -317,7 +317,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "entropy": entropy,
         }
 
-    def obs_processor(self, env_obs):
+    def obs_processor(self, env_obs: dict) -> dict:
         # base observation
         processed_obs = {
             "observation/image": env_obs["main_images"],
@@ -340,7 +340,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # store used keys
         return processed_obs
 
-    def precision_processor(self, processed_obs):
+    def precision_processor(self, processed_obs: dict) -> dict:
         device = next(self.parameters()).device
         for key, value in processed_obs.items():
             if isinstance(value, list):
@@ -362,10 +362,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     def predict_action_batch(
         self,
-        env_obs,
+        env_obs: dict,
         mode: Literal["train", "eval"] = "train",
-        compute_values=True,
-        return_obs=True,
+        compute_values: bool = True,
+        return_obs: bool = True,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(

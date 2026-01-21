@@ -428,7 +428,7 @@ class RoboTwinEnv(gym.Env):
         self.video_cnt += 1
         self.render_images = []
 
-    def add_new_frames(self, raw_obs, plot_infos):
+    def add_new_frames(self, raw_obs: dict, plot_infos: dict):
         images = []
         for env_id, raw_single_obs in enumerate(raw_obs):
             info_item = {

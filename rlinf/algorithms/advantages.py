@@ -27,7 +27,7 @@ def compute_gae_advantages_and_returns(
     gamma: float = 1.0,
     gae_lambda: float = 1.0,
     values: Optional[torch.Tensor] = None,
-    normalize_advantages: bool = True,
+    normalize_advantages: bool = False,
     normalize_returns: bool = False,
     loss_mask: Optional[torch.Tensor] = None,
     dones: Optional[torch.Tensor] = None,
@@ -58,6 +58,10 @@ def compute_gae_advantages_and_returns(
     returns = torch.zeros_like(rewards)
     gae = 0
 
+    # temporarily set values None
+    # print("sum dones per t:", dones.float().sum(dim=1)[:25])
+    # print("sum dones last:", dones.float().sum(dim=1)[-25:])
+    # print(f"dones:{dones},shape:{dones.shape}", flush=True)
     critic_free = values is None
     if critic_free:
         gae_lambda = 1
@@ -80,6 +84,7 @@ def compute_gae_advantages_and_returns(
 
     if normalize_advantages:
         advantages = safe_normalize(advantages, loss_mask=loss_mask)
+
     if normalize_returns:
         returns = safe_normalize(returns, loss_mask=loss_mask)
 

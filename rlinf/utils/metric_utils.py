@@ -13,16 +13,17 @@
 # limitations under the License.
 
 import math
+from typing import Any
 
 import torch
 import torch.distributed
 
 
-def compute_split_num(num, split_num):
+def compute_split_num(num: int, split_num: int) -> int:
     return math.lcm(num, split_num) // split_num
 
 
-def count_trajectories(metrics_dict):
+def count_trajectories(metrics_dict: dict[Any, Any]) -> int:
     """
     Count the total number of trajectories from metrics dictionary.
 
@@ -52,7 +53,7 @@ def count_trajectories(metrics_dict):
         raise TypeError(f"Unsupported tensor type: {type(first_tensor)}")
 
 
-def compute_evaluate_metrics(eval_metrics_list):
+def compute_evaluate_metrics(eval_metrics_list: list[dict[Any, Any]]) -> dict[Any, Any]:
     """
     List of evaluate metrics, list length stands for rollout process
 
@@ -85,7 +86,7 @@ def compute_evaluate_metrics(eval_metrics_list):
     return all_eval_metrics
 
 
-def compute_rollout_metrics(data_buffer: dict) -> dict:
+def compute_rollout_metrics(data_buffer: dict[Any, Any]) -> dict[Any, Any]:
     rollout_metrics = {}
 
     if "rewards" in data_buffer:
@@ -143,14 +144,35 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
     return rollout_metrics
 
 
-def append_to_dict(data, new_data):
+def append_to_dict(data: dict[Any, list], new_data: dict[Any, list]):
     for key, val in new_data.items():
         if key not in data:
             data[key] = []
         data[key].append(val)
 
 
-def compute_loss_mask(dones):
+def compute_loss_mask(dones: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes loss mask and its sum based on done signals for variable-length episodes.
+
+    This function generates a boolean mask that identifies valid steps in a batch of rollouts.
+    It operates on the assumption that once a 'done' signal is encountered, all subsequent
+    steps in that trajectory are padding (invalid). It handles multidimensional inputs
+    (steps, batch, action_chunks) by treating (steps, action_chunks) as a continuous sequence
+    for termination logic.
+
+    Args:
+        dones (torch.Tensor): Termination signals of shape [n_steps + 1, batch_size, num_action_chunks].
+            The tensor includes an extra step (the reset observation)
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - loss_mask (torch.Tensor): Boolean mask of shape [n_steps, batch_size, num_action_chunks].
+              True indicates a valid step, False indicates padding.
+            - loss_mask_sum (torch.Tensor): The effective length (number of valid steps) of each
+              trajectory, broadcasted to match the shape of loss_mask.
+              Shape: [n_steps, batch_size, num_action_chunks].
+    """
     _, actual_bsz, num_action_chunks = dones.shape
     n_chunk_step = dones.shape[0] - 1
     flattened_dones = dones.transpose(1, 2).reshape(
