@@ -93,6 +93,10 @@ env:
     max_steps_per_rollout_epoch: 80
     init_params:
       use_multiple_plates: False
+
+    video_cfg:
+      save_video: True
+      video_base_dir: ${runner.logger.log_path}/video/train
   eval:
     total_num_envs: 320
     auto_reset: True

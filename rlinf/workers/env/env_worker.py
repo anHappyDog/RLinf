@@ -179,11 +179,23 @@ class EnvWorker(Worker):
                 if "episode" in infos:
                     for key in infos["episode"]:
                         env_info[key] = infos["episode"][key].cpu()
+                if "truncation" not in env_info:
+                    env_info["truncation"] = chunk_truncations[:, -1].float().cpu()
+                if "termination" not in env_info:
+                    env_info["termination"] = chunk_terminations[:, -1].float().cpu()
         elif chunk_dones.any():
             if "final_info" in infos:
                 final_info = infos["final_info"]
                 for key in final_info["episode"]:
                     env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+                if "truncation" not in env_info:
+                    env_info["truncation"] = (
+                        chunk_truncations[chunk_dones[:, -1], -1].float().cpu()
+                    )
+                if "termination" not in env_info:
+                    env_info["termination"] = (
+                        chunk_terminations[chunk_dones[:, -1], -1].float().cpu()
+                    )
 
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None

@@ -92,6 +92,9 @@ env:
     use_fixed_reset_state_ids: False
     max_episode_steps: 80 # max episode steps for truncation
     max_steps_per_rollout_epoch: 80
+    video_cfg:
+      save_video: True
+      video_base_dir: ${runner.logger.log_path}/video/train
   eval:
     total_num_envs: 16
     auto_reset: True
@@ -133,12 +136,12 @@ actor:
 
   optim:
     lr: 2e-6
-    value_lr: 3.0e-5
+    value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-05
     weight_decay: 0.01
-    clip_grad: 1.0
+    clip_grad: 10.0
     critic_warmup_steps: 0
 
   # Override the default values in training_backend/fsdp

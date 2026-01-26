@@ -129,10 +129,13 @@ class TestEmbodiedFSDPActorWorker(EmbodiedFSDPActor):
         g.manual_seed(self.cfg.actor.seed + self._rank)
         shuffle_id = torch.randperm(rollout_size, generator=g)
 
+        # for key, value in self.rollout_batch.items():
+        #     if isinstance(value, torch.Tensor):
+        #         print(f"in self.rollout_batch, {key} shape; {value.shape}",flush=True)
+
         self.rollout_batch = process_nested_dict_for_train(
             self.rollout_batch, shuffle_id
         )
-
         if self.cfg.algorithm.normalize_advantages:
             self.rollout_batch["advantages"] = masked_normalization(
                 self.rollout_batch["advantages"],
@@ -148,6 +151,7 @@ class TestEmbodiedFSDPActorWorker(EmbodiedFSDPActor):
         )
 
         rollout_size = self.rollout_batch["prev_logprobs"].size(0)
+        # print(f"rollout_size:{rollout_size}",flush=True)
         batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
         assert rollout_size % batch_size_per_rank == 0, (
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
@@ -221,8 +225,7 @@ class TestEmbodiedFSDPActorWorker(EmbodiedFSDPActor):
                     ]:
                         prev_logprobs = output_dict["prev_logprobs"]
 
-                    proximal_version = self.version
-                    current_version = self.version + idx
+                    current_version = self.version + 1
                     proximal_logprobs = data.get("proximal_logprobs", None)
 
                     kwargs = {
@@ -238,7 +241,6 @@ class TestEmbodiedFSDPActorWorker(EmbodiedFSDPActor):
                         "returns": returns,
                         "prev_values": prev_values,
                         "versions": versions,
-                        "proximal_version": proximal_version,
                         "current_version": current_version,
                         "clip_ratio_c": self.cfg.algorithm.get("clip_ratio_c", 3.0),
                         "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,

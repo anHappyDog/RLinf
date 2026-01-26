@@ -83,6 +83,10 @@ class ManiskillEnv(gym.Env):
         self.prev_step_reward = torch.zeros(self.num_envs, dtype=torch.float32).to(
             self.device
         )  # [B, ]
+        self.prev_consecutive_grasp = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+
         self.record_metrics = record_metrics
         self._is_start = True
         self._init_reset_state_ids()
@@ -241,9 +245,30 @@ class ManiskillEnv(gym.Env):
             reward = torch.zeros(self.num_envs, dtype=torch.float32).to(
                 self.env.unwrapped.device
             )  # [B, ]
-            reward += info["is_src_obj_grasped"] * 0.1
-            reward += info["consecutive_grasp"] * 0.1
-            reward += (info["success"] & info["is_src_obj_grasped"]) * 1.0
+            # Time penalty to prevent stalling behavior
+            reward += -0.05
+
+            # Grasp reward: small reward for grasping (0.1)
+            # reward += info["is_src_obj_grasped"] * 0.1
+
+            # Event-based rewards (only trigger on first occurrence)
+            if self.use_rel_reward:
+                # Relative reward mode handles state changes naturally via diff
+                # But we add extra shaping terms if available in info
+                reward += info["consecutive_grasp"] * 0.1
+            else:
+                # Absolute reward mode needs careful event tracking
+                consecutive_grasp = info["consecutive_grasp"]
+                # 1. Grasp Event: +0.1 on rising edge
+                reward += (consecutive_grasp & ~self.prev_consecutive_grasp) * 0.1
+
+            # State updates for event tracking
+            if "consecutive_grasp" in info:
+                self.prev_consecutive_grasp = info["consecutive_grasp"].clone()
+
+            # Success reward: strong terminal reward to encourage completion
+            reward += (info["success"] & info["is_src_obj_grasped"]) * 2.0
+
         # diff
         reward_diff = reward - self.prev_step_reward
         self.prev_step_reward = reward
@@ -280,12 +305,14 @@ class ManiskillEnv(gym.Env):
             mask = torch.zeros(self.num_envs, dtype=bool, device=self.device)
             mask[env_idx] = True
             self.prev_step_reward[mask] = 0.0
+            self.prev_consecutive_grasp[mask] = False
             if self.record_metrics:
                 self.success_once[mask] = False
                 self.fail_once[mask] = False
                 self.returns[mask] = 0
         else:
             self.prev_step_reward[:] = 0
+            self.prev_consecutive_grasp[:] = False
             if self.record_metrics:
                 self.success_once[:] = False
                 self.fail_once[:] = False

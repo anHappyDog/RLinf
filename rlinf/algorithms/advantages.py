@@ -62,6 +62,7 @@ def compute_gae_advantages_and_returns(
     # print("sum dones per t:", dones.float().sum(dim=1)[:25])
     # print("sum dones last:", dones.float().sum(dim=1)[-25:])
     # print(f"dones:{dones},shape:{dones.shape}", flush=True)
+    # values = None
     critic_free = values is None
     if critic_free:
         gae_lambda = 1

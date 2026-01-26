@@ -41,28 +41,18 @@ class TestMultiStepRolloutWorker(MultiStepRolloutWorker):
     async def stage_step(
         self, last_forward_inputs, stage_id, env_output, last_extracted_obs
     ) -> torch.Tensor:
-        # print(
-        #     f"Rollout Worker {self._rank} stage_step called for stage {stage_id}",
-        #     flush=True,
-        # )
         if last_forward_inputs[stage_id] is not None:
             last_forward_inputs[stage_id] = self.update_intervene_actions(
                 env_output, last_forward_inputs[stage_id]
             )
 
-        # print(f"Rollout Worker {self._rank} preprocessing env obs...", flush=True)
         extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-        # print(f"Rollout Worker {self._rank} getting dones and rewards...", flush=True)
         dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
             env_output, extracted_obs
         )
-        await self.wait_if_stale()
-        # print(f"Rollout Worker {self._rank} checking if paused...", flush=True)
         await self.wait_if_paused()
-        # print(f"Rollout Worker {self._rank} not paused, predicting...", flush=True)
         async with self._pause_lock:
             actions, result = self.predict(extracted_obs)
-        # print(f"Rollout Worker {self._rank} prediction done", flush=True)
         chunk_step_result = ChunkStepResult(
             prev_logprobs=result["prev_logprobs"],
             prev_values=result["prev_values"],
@@ -71,7 +61,7 @@ class TestMultiStepRolloutWorker(MultiStepRolloutWorker):
             terminations=env_output["terminations"],
             rewards=rewards,  # the first step is reset step, reward is none, which will not be appended to the buffer
             forward_inputs=last_forward_inputs[stage_id],
-            versions=torch.Tensor([self.version] * actions.shape[0]),
+            versions=torch.Tensor([self.version] * result["prev_logprobs"].shape[0]),
         )
         self.buffer_list[stage_id].append_result(chunk_step_result)
         if last_extracted_obs[stage_id] is not None and hasattr(

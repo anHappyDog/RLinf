@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -85,7 +85,12 @@ class TestEnvWorker(EnvWorker):
                     env_metrics[key] = []
                 env_metrics[key].append(value)
 
-    def send_env_batch_async(self, output_channel: Channel, env_batch, mode="train"):
+    def send_env_batch_async(
+        self,
+        output_channel: Channel,
+        env_batch: dict,
+        mode: Literal["train", "eval"] = "train",
+    ):
         """Async version of send_env_batch for use in async contexts."""
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         for gather_id in range(self.gather_num):

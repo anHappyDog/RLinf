@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import Callable, Optional, Union
+from typing import Callable, Optional
 
 import matplotlib.pyplot as plt
 import torch
@@ -84,12 +84,8 @@ def compute_decoupled_ppo_actor_loss(
     clip_ratio_high: float,
     advantages: torch.Tensor,
     proximal_logprobs: Optional[torch.Tensor] = None,
-    proximal_interp_alpha: Optional[Union[float, torch.Tensor]] = None,
     versions: Optional[torch.Tensor] = None,
     current_version: int | float | torch.Tensor | None = None,
-    proximal_version: int | float | torch.Tensor | None = None,
-    eps_denom: float = 1e-8,
-    interp_from_old: bool = True,
     loss_mask: Optional[torch.Tensor] = None,
     clip_ratio_c: Optional[float] = None,
     loss_agg_func: Callable[..., torch.Tensor]
@@ -111,6 +107,21 @@ def compute_decoupled_ppo_actor_loss(
             - directly passed via `proximal_interp_alpha`
             - derived from versions via (proximal_version/current_version)
     """
+
+    # if logprobs is not None:
+    #     print(f"in decoupled ppo actor loss, logprobs shape: {logprobs.shape}",flush=True)
+    # if old_logprobs is not None:
+    #     print(f"in decoupled ppo actor loss, old_logprobs shape: {old_logprobs.shape}",flush=True)
+    # if proximal_logprobs is not None:
+    #     print(f"in decoupled ppo actor loss, proximal_logprobs shape: {proximal_logprobs.shape}",flush=True)
+    # if versions is not None:
+    #     print(f"in decoupled ppo actor loss, versions shape: {versions.shape}",flush=True)
+    # if advantages is not None:
+    #     print(f"in decoupled ppo actor loss, advantages shape: {advantages.shape}",flush=True)
+    # if loss_mask is not None:
+    #     print(f"in decoupled ppo actor loss, loss_mask shape: {loss_mask.shape}",flush=True)
+    # if current_version is not None:
+    #     print(f"in decoupled ppo actor loss, current_version: {current_version}",flush=True)
 
     assert logprobs.dtype == torch.float32, (
         f"logprobs dtype: {logprobs.dtype}, needed torch.float32"
@@ -135,58 +146,29 @@ def compute_decoupled_ppo_actor_loss(
         loss_mask = torch.ones_like(logprobs).bool()
 
     if proximal_logprobs is None:
-        alpha = None
+        alpha = 0
+        v_proximal = current_version - 1
+        v_behav = versions.float()
+        v_theta = float(current_version)
 
-        if (
-            versions is not None
-            and (current_version is not None)
-            and (proximal_version is not None)
-        ):
-            # alpha = (prox_version - behav_version) / (cur_version - behav_version)
-            # versions is per-sample behavior version (same shape as logprobs or broadcastable)
-            v_old = versions.to(logprobs.device)
+        version_diff = v_theta - v_behav
+        version_gap = v_proximal - v_behav
 
-            v_cur = torch.as_tensor(
-                current_version, device=logprobs.device, dtype=logprobs.dtype
-            )
-            v_prox = torch.as_tensor(
-                proximal_version, device=logprobs.device, dtype=logprobs.dtype
-            )
+        generated_tokens_mask = versions >= 0
 
-            while v_old.ndim < logprobs.ndim:
-                v_old = v_old.unsqueeze(-1)
+        alpha = torch.where(
+            (version_diff > 0) & generated_tokens_mask,
+            version_gap / version_diff,
+            torch.zeros_like(v_behav),
+        ).unsqueeze(-1)
 
-            denom = (v_cur - v_old).clamp_min(eps_denom)
-            alpha = (v_prox - v_old) / denom
-
-        elif proximal_interp_alpha is not None:
-            alpha = torch.as_tensor(
-                proximal_interp_alpha, device=logprobs.device, dtype=logprobs.dtype
-            )
-
-        else:
-            raise ValueError(
-                "proximal_logprobs is None, so you must provide either:\n"
-                "  - proximal_interp_alpha, OR\n"
-                "  - (versions, current_version, proximal_version)\n"
-            )
-
-        if isinstance(alpha, torch.Tensor):
-            while alpha.ndim < logprobs.ndim:
-                alpha = alpha.unsqueeze(-1)
-
-        if interp_from_old:
-            proximal_logprobs = (1.0 - alpha) * old_logprobs + alpha * logprobs
-        else:
-            raise ValueError(
-                "interp_from_old=False requires proximal_logprobs to be provided."
-            )
-
+        alpha = torch.clamp(alpha, 0.0, 1.0)
+        proximal_logprobs = old_logprobs + alpha * (logprobs - old_logprobs)
     else:
         assert proximal_logprobs.dtype == torch.float32, (
             f"proximal_logprobs dtype: {proximal_logprobs.dtype}, needed torch.float32"
         )
-
+    # print(f"proximal_logprobs shape: {proximal_logprobs.shape},logprobs shape: {logprobs.shape}, old_logprobs shape: {old_logprobs.shape},alpha shape:{alpha.shape}")
     proximal_ratio = torch.where(
         loss_mask, torch.exp(logprobs - proximal_logprobs), 0.0
     )
@@ -421,13 +403,18 @@ def compute_ppo_critic_loss(
     value_loss_original = huber_loss(
         returns - values, huber_delta
     )  # [bsz, ] | [bsz, chunk-step]
+
+    # compute value clipping
     value_loss_clipped = huber_loss(
         returns - value_pred_clipped, huber_delta
     )  # [bsz, ] | [bsz, chunk-step]
+
+    # here to use value clipping
     value_loss = torch.max(value_loss_original, value_loss_clipped)
+    # value_loss = value_loss_original
     value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
 
-    value_clip_indicator = (value_pred_clipped - prev_values).abs() > value_clip
+    value_clip_indicator = (prev_values - values).abs() > value_clip
     value_clip_ratio = value_clip_indicator.float().mean()
 
     # explained variance

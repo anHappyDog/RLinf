@@ -165,13 +165,27 @@ class MultiStepRolloutWorker(Worker):
                         _final_values = result["prev_values"]
                     else:
                         _final_values = torch.zeros_like(actions[:, 0])
+                # public start
                 final_values = torch.zeros_like(_final_values[:, 0])  # [bsz, ]
-                last_step_dones = dones[:, -1]  # [bsz, ]
 
-                final_values[last_step_dones] = _final_values[:, 0][last_step_dones]
+                # old start, use dones instead of truncations
+                # last_step_dones = dones[:, -1]  # [bsz, ]
 
-                # Add bootstrap value to the last step of done episodes
+                # final_values[last_step_dones] = _final_values[:, 0][last_step_dones]
+
+                # # Add bootstrap value to the last step of done episodes
+                # rewards[:, -1] += self.cfg.algorithm.gamma * final_values.cpu()
+                # old end
+
+                # new start, use truncations instead of dones
+                trunc = env_output["truncations"].bool().cpu().contiguous()   # [B, chunk_steps]
+                last_step_trunc = trunc[:, -1]                               # [B]
+
+                final_values = torch.zeros_like(_final_values[:, 0])         # [B]
+                final_values[last_step_trunc] = _final_values[:, 0][last_step_trunc]
+
                 rewards[:, -1] += self.cfg.algorithm.gamma * final_values.cpu()
+                # new end
 
         if real_extracted_obs is None and hasattr(self.hf_model, "q_head"):
             real_extracted_obs = init_real_obs(extracted_obs)
