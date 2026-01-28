@@ -18,12 +18,16 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import DictConfig
 
-from rlinf.algorithms.registry import policy_loss
+from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.config import SupportedModel
 from rlinf.utils.data_iter_utils import get_iterator_k_split
-from rlinf.utils.distributed import all_reduce_dict, masked_normalization
+from rlinf.utils.distributed import (
+    all_reduce_dict,
+    masked_normalization,
+)
 from rlinf.utils.metric_utils import (
     append_to_dict,
+    compute_rollout_metrics,
 )
 from rlinf.utils.nested_dict_process import (
     put_tensor_device,
@@ -55,6 +59,18 @@ def process_nested_dict_for_train(nested_dict: dict, shuffle_id: int) -> dict:
     return ret_dict
 
 
+def debug_print_rollout_result(rollout_batch: dict) -> None:
+    for key, value in rollout_batch.items():
+        if isinstance(value, torch.Tensor):
+            print(
+                f"rollout_batch key: {key}, shape: {value.shape}, dtype: {value.dtype}",
+                flush=True,
+            )
+        elif isinstance(value, dict):
+            print(f"rollout_batch key: {key} is a nested dict:", flush=True)
+            debug_print_rollout_result(value)
+
+
 class TestEmbodiedFSDPActorWorker(EmbodiedFSDPActor):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
@@ -63,35 +79,76 @@ class TestEmbodiedFSDPActorWorker(EmbodiedFSDPActor):
     def set_version(self, version: int) -> None:
         self.version = version
 
+    def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+        """
+        Compute the advantages and returns.
+        """
+        proximal_values = self.rollout_batch.get("proximal_values", None)
+        prev_values = self.rollout_batch.get("prev_values", None)
+        if proximal_values is not None and prev_values is not None:
+            max_diff = (proximal_values - prev_values).abs().max().item()
+            mean_diff = (proximal_values - prev_values).abs().mean().item()
+            min_diff = (proximal_values - prev_values).abs().min().item()
+            print(
+                f"in fsdp actor worker computing advantages, prev values diff: mean={mean_diff}, max={max_diff}, min={min_diff}",
+                flush=True,
+            )
+
+        kwargs = {
+            "task_type": self.cfg.runner.task_type,
+            "adv_type": self.cfg.algorithm.adv_type,
+            "rewards": self.rollout_batch["rewards"],
+            "dones": self.rollout_batch["dones"],
+            "values": proximal_values if proximal_values is not None else prev_values,
+            "gamma": self.cfg.algorithm.get("gamma", 1),
+            "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
+            "group_size": self.cfg.algorithm.get("group_size", 8),
+            "reward_type": self.cfg.algorithm.reward_type,
+            "loss_mask": self.rollout_batch.get("loss_mask", None),
+            "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+        }
+        # print(f"Computing advantages with args: {kwargs.keys()}",flush=True)
+        advantages_and_returns = calculate_adv_and_returns(**kwargs)
+        # print("Computed advantages and returns.",flush=True)
+        self.rollout_batch.update(advantages_and_returns)
+        if kwargs["loss_mask"] is not None:
+            self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
+        if kwargs["loss_mask_sum"] is not None:
+            self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
+
+        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        return rollout_metrics
+
     @torch.no_grad()
     def compute_proximal_logprobs(self) -> None:
-        if self.is_weight_offloaded:
-            self.load_param_and_grad(self.device)
-
-        # # flatten here
-        rollout_size = (self.rollout_batch["dones"].shape[0] - 1) * self.rollout_batch[
-            "dones"
-        ].shape[1]
-        g = torch.Generator()
-        g.manual_seed(self.cfg.actor.seed + self._rank)
-        shuffle_id = torch.randperm(rollout_size, generator=g)
-
-        self.rollout_batch = process_nested_dict_for_train(
-            self.rollout_batch, shuffle_id
+        assert not self.is_weight_offloaded, (
+            "Weight offloading is not supported in compute_proximal_logprobs"
         )
+        # debug_print_rollout_result(self.rollout_batch)
+        # # flatten here
+        # rollout_size = (self.rollout_batch["dones"].shape[0] - 1) * self.rollout_batch[
+        #     "dones"
+        # ].shape[1]
+        # g = torch.Generator()
+        # g.manual_seed(self.cfg.actor.seed + self._rank)
+        # shuffle_id = torch.randperm(rollout_size, generator=g)
+        T = self.rollout_batch["prev_values"].shape[0] - 1
+        B = self.rollout_batch["prev_values"].shape[1]
+        flatten_rollout_batch = process_nested_dict_for_train(self.rollout_batch, None)
 
         self.model.eval()
 
-        total_size = self.rollout_batch["dones"].shape[0]
+        total_size = flatten_rollout_batch["dones"].shape[0]
         micro_batch_size = self.cfg.actor.micro_batch_size
 
         num_splits = (total_size + micro_batch_size - 1) // micro_batch_size
 
         iterator = get_iterator_k_split(
-            self.rollout_batch, num_splits, enforce_divisible_batch=False
+            flatten_rollout_batch, num_splits, enforce_divisible_batch=False
         )
 
-        all_proximal_logprobs = []
+        proximal_logprobs = []
+        proximal_values = []
 
         for micro_batch in iterator:
             if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -108,13 +165,20 @@ class TestEmbodiedFSDPActorWorker(EmbodiedFSDPActor):
                 data=device_micro_batch,
                 compute_logprobs=True,
                 compute_entropy=False,
-                compute_values=False,
-                use_cache=True,
+                compute_values=True,
+                use_cache=False,
             )
-            all_proximal_logprobs.append(output_dict["logprobs"].cpu())
+            proximal_logprobs.append(output_dict["logprobs"].cpu())
+            proximal_values.append(output_dict["values"].cpu())
 
         # Store result directly into the flattened batch
-        self.rollout_batch["proximal_logprobs"] = torch.cat(all_proximal_logprobs)
+        # proximal_logprobs = torch.cat(proximal_logprobs).reshape(
+        #     self.rollout_batch["prev_logprobs"].shape
+        # )
+        # self.rollout_batch["proximal_logprobs"] =  proximal_logprobs
+        last = self.rollout_batch["prev_values"][-1:].clone()
+        proximal_values = torch.cat(proximal_values).view(T, B, -1)
+        self.rollout_batch["proximal_values"] = torch.cat([proximal_values, last])
 
     def run_training(self) -> None:
         if self.is_weight_offloaded:
@@ -195,6 +259,7 @@ class TestEmbodiedFSDPActorWorker(EmbodiedFSDPActor):
                     prev_logprobs = data["prev_logprobs"]
                     returns = data.get("returns", None)
                     prev_values = data.get("prev_values", None)
+                    proximal_values = data.get("proximal_values", None)
                     loss_mask = data.get("loss_mask", None)
                     loss_mask_sum = data.get("loss_mask_sum", None)
                     versions = data.get("versions", None)
@@ -239,7 +304,9 @@ class TestEmbodiedFSDPActorWorker(EmbodiedFSDPActor):
                         "old_logprobs": prev_logprobs,
                         "advantages": advantages,
                         "returns": returns,
-                        "prev_values": prev_values,
+                        "prev_values": proximal_values
+                        if proximal_values is not None
+                        else prev_values,
                         "versions": versions,
                         "current_version": current_version,
                         "clip_ratio_c": self.cfg.algorithm.get("clip_ratio_c", 3.0),

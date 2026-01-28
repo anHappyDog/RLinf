@@ -85,7 +85,6 @@ def preprocess_embodied_advantages_inputs(
             loss_mask = loss_mask.max(dim=-1, keepdim=True)[0]
         if loss_mask_sum is not None:
             loss_mask_sum = loss_mask_sum.max(dim=-1, keepdim=True)[0]
-
     num_chunk, bsz, chunk_size = rewards.shape
     n_steps = num_chunk * chunk_size
     kwargs.update(

@@ -132,8 +132,6 @@ class TestMultiStepRolloutWorker(MultiStepRolloutWorker):
                 await self.wait_if_paused()
                 async with self._pause_lock:
                     actions, result = self.predict(extracted_obs)
-                # For the final step, we only need prev_values for bootstrapping
-                # This is a special case that doesn't create a full ChunkStepResult
                 if "prev_values" in result:
                     self.buffer_list[stage_id].prev_values.append(
                         result["prev_values"].cpu().contiguous()
@@ -150,21 +148,14 @@ class TestMultiStepRolloutWorker(MultiStepRolloutWorker):
     async def pause_generation(self):
         async with self._pause_lock:
             self._pause.set()
-            # print(f"Rollout Worker {self._rank} generation PAUSED", flush=True)
 
     async def resume_generation(self):
-        # print(f"Rollout Worker {self._rank} resuming generation...", flush=True)
         async with self._pause_lock:
             self._pause.clear()
-            # print(f"Rollout Worker {self._rank} generation RESUMED", flush=True)
 
     async def wait_if_paused(self):
-        # if self._pause.is_set():
-        # print(f"Rollout Worker {self._rank} waiting due to pause...", flush=True)
         while self._pause.is_set():
             await asyncio.sleep(0.1)
-        # if not self._pause.is_set():
-        # print(f"Rollout Worker {self._rank} resume from pause", flush=True)
 
     async def wait_if_stale(self):
         while True:

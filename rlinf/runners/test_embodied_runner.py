@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 from typing import TYPE_CHECKING
 
 from omegaconf.omegaconf import DictConfig
@@ -48,10 +49,17 @@ class TestEmbodiedRunner(EmbodiedRunner):
         self.env_metrics_channel = Channel.create("EnvMetrics")
 
     def get_env_metrics(self):
-        result = self.env_metrics_channel.get()
-        metrics = compute_evaluate_metrics([result])
-
-        env_metrics = {f"env/{k}": v for k, v in metrics.items()}
+        results = []
+        while True:
+            try:
+                result = self.env_metrics_channel.get_nowait()
+                results.append(result)
+            except asyncio.QueueEmpty:
+                break
+        print(f"Collected {len(results)} env metric results.", flush=True)
+        assert len(results) > 0, "No env metrics received from env workers."
+        env_metrics = compute_evaluate_metrics(results)
+        env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
         return env_metrics
 
     def update_rollout_weights(self):
@@ -87,11 +95,11 @@ class TestEmbodiedRunner(EmbodiedRunner):
         while self.global_step < self.max_steps:
             self.actor.recv_rollout_batch(input_channel=self.actor_channel).wait()
 
+            with self.timer("recompute_logprobs"):
+                self.actor.compute_proximal_logprobs().wait()
+
             with self.timer("cal_adv_and_returns"):
                 rollout_metrics = self.actor.compute_advantages_and_returns().wait()
-
-            # with self.timer("recompute_logprobs"):
-            #     self.actor.compute_proximal_logprobs().wait()
 
             with self.timer("actor_training"):
                 training_metrics = self.actor.run_training().wait()

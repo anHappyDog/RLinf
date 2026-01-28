@@ -178,10 +178,12 @@ class MultiStepRolloutWorker(Worker):
                 # old end
 
                 # new start, use truncations instead of dones
-                trunc = env_output["truncations"].bool().cpu().contiguous()   # [B, chunk_steps]
-                last_step_trunc = trunc[:, -1]                               # [B]
+                trunc = (
+                    env_output["truncations"].bool().cpu().contiguous()
+                )  # [B, chunk_steps]
+                last_step_trunc = trunc[:, -1]  # [B]
 
-                final_values = torch.zeros_like(_final_values[:, 0])         # [B]
+                final_values = torch.zeros_like(_final_values[:, 0])  # [B]
                 final_values[last_step_trunc] = _final_values[:, 0][last_step_trunc]
 
                 rewards[:, -1] += self.cfg.algorithm.gamma * final_values.cpu()

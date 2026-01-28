@@ -108,20 +108,46 @@ def compute_decoupled_ppo_actor_loss(
             - derived from versions via (proximal_version/current_version)
     """
 
-    # if logprobs is not None:
-    #     print(f"in decoupled ppo actor loss, logprobs shape: {logprobs.shape}",flush=True)
-    # if old_logprobs is not None:
-    #     print(f"in decoupled ppo actor loss, old_logprobs shape: {old_logprobs.shape}",flush=True)
-    # if proximal_logprobs is not None:
-    #     print(f"in decoupled ppo actor loss, proximal_logprobs shape: {proximal_logprobs.shape}",flush=True)
-    # if versions is not None:
-    #     print(f"in decoupled ppo actor loss, versions shape: {versions.shape}",flush=True)
-    # if advantages is not None:
-    #     print(f"in decoupled ppo actor loss, advantages shape: {advantages.shape}",flush=True)
-    # if loss_mask is not None:
-    #     print(f"in decoupled ppo actor loss, loss_mask shape: {loss_mask.shape}",flush=True)
-    # if current_version is not None:
-    #     print(f"in decoupled ppo actor loss, current_version: {current_version}",flush=True)
+    # if (
+    #     current_version is not None
+    #     and current_version <= 1
+    #     and torch.distributed.get_rank() == 0
+    # ):
+    #     if logprobs is not None:
+    #         print(
+    #             f"in decoupled ppo actor loss, logprobs shape: {logprobs.shape}",
+    #             flush=True,
+    #         )
+    #     if old_logprobs is not None:
+    #         print(
+    #             f"in decoupled ppo actor loss, old_logprobs shape: {old_logprobs.shape}",
+    #             flush=True,
+    #         )
+    #     if proximal_logprobs is not None:
+    #         print(
+    #             f"in decoupled ppo actor loss, proximal_logprobs shape: {proximal_logprobs.shape}",
+    #             flush=True,
+    #         )
+    #     if versions is not None:
+    #         print(
+    #             f"in decoupled ppo actor loss, versions shape: {versions.shape}",
+    #             flush=True,
+    #         )
+    #     if advantages is not None:
+    #         print(
+    #             f"in decoupled ppo actor loss, advantages shape: {advantages.shape}",
+    #             flush=True,
+    #         )
+    #     if loss_mask is not None:
+    #         print(
+    #             f"in decoupled ppo actor loss, loss_mask shape: {loss_mask.shape}",
+    #             flush=True,
+    #         )
+    #     if current_version is not None:
+    #         print(
+    #             f"in decoupled ppo actor loss, current_version: {current_version}",
+    #             flush=True,
+    #         )
 
     assert logprobs.dtype == torch.float32, (
         f"logprobs dtype: {logprobs.dtype}, needed torch.float32"
@@ -163,7 +189,7 @@ def compute_decoupled_ppo_actor_loss(
         ).unsqueeze(-1)
 
         alpha = torch.clamp(alpha, 0.0, 1.0)
-        proximal_logprobs = old_logprobs + alpha * (logprobs - old_logprobs)
+        proximal_logprobs = (old_logprobs + alpha * (logprobs - old_logprobs)).detach()
     else:
         assert proximal_logprobs.dtype == torch.float32, (
             f"proximal_logprobs dtype: {proximal_logprobs.dtype}, needed torch.float32"
@@ -204,10 +230,7 @@ def compute_decoupled_ppo_actor_loss(
     behav_mask_count = behav_mask.count_nonzero() or 1
     behav_weight = torch.where(behav_mask, behav_weight, 0.0)
 
-    if loss_mask_ratio is None:
-        pg_loss = loss_agg_func(pg_loss * behav_weight, loss_mask)
-    else:
-        pg_loss = loss_agg_func(pg_loss * behav_weight, loss_mask, loss_mask_ratio)
+    pg_loss = loss_agg_func(pg_loss * behav_weight, loss_mask, loss_mask_ratio)
 
     if critic_warmup:
         pg_loss = torch.tensor(0.0, device=pg_loss.device)
@@ -229,6 +252,11 @@ def compute_decoupled_ppo_actor_loss(
 
         behav_clip_fraction = 1.0 - (behav_mask_count / loss_mask_count)
 
+        if versions is not None:
+            average_version = versions.unsqueeze(-1)[loss_mask].float().mean().item()
+        else:
+            average_version = None
+
     metrics_data = {
         "actor/policy_loss": pg_loss.detach(),
         "actor/proximal_ratio": (
@@ -247,6 +275,10 @@ def compute_decoupled_ppo_actor_loss(
         "actor/proximal_approx_kl": proximal_approx_kl,
         "actor/behav_approx_kl": behav_approx_kl,
     }
+    if average_version is not None:
+        metrics_data["actor/average_version"] = torch.tensor(average_version)
+        metrics_data["actor/current_version"] = torch.tensor(current_version)
+
     return pg_loss, metrics_data
 
 

@@ -224,51 +224,16 @@ class ManiskillEnv(gym.Env):
         }
         return extracted_obs
 
-    def _calc_step_reward(self, reward: torch.Tensor, info: dict) -> torch.Tensor:
-        """
-        Calculate step reward based on raw reward and info dict returned by env step function.
-        Maniskill reward calculation supposes `sparse`, `none` mode, using `success` and `fail`.
-        This function uses the returned reward, if reward model is raw, just use the given reward
-        as base reward, or use `is_src_obj_grasped`*0,1 + `consecutive_grasp`*0.1 + `success`*1.0 as base reward.
-        If rel_reward is supported, return the diff to previous step reward as step reward, or return base reward.
-
-        Args:
-            reward (torch.Tensor): [num_envs,]: raw reward returned by env step function.
-            info (dict): env info returned by Maniskill env.
-
-        Returns:
-            step_reward (torch.Tensor): [num_envs,]: calculated step reward.
-        """
+    def _calc_step_reward(self, reward, info):
         if getattr(self.cfg, "reward_mode", "default") == "raw":
             pass
         else:
             reward = torch.zeros(self.num_envs, dtype=torch.float32).to(
                 self.env.unwrapped.device
             )  # [B, ]
-            # Time penalty to prevent stalling behavior
-            reward += -0.05
-
-            # Grasp reward: small reward for grasping (0.1)
-            # reward += info["is_src_obj_grasped"] * 0.1
-
-            # Event-based rewards (only trigger on first occurrence)
-            if self.use_rel_reward:
-                # Relative reward mode handles state changes naturally via diff
-                # But we add extra shaping terms if available in info
-                reward += info["consecutive_grasp"] * 0.1
-            else:
-                # Absolute reward mode needs careful event tracking
-                consecutive_grasp = info["consecutive_grasp"]
-                # 1. Grasp Event: +0.1 on rising edge
-                reward += (consecutive_grasp & ~self.prev_consecutive_grasp) * 0.1
-
-            # State updates for event tracking
-            if "consecutive_grasp" in info:
-                self.prev_consecutive_grasp = info["consecutive_grasp"].clone()
-
-            # Success reward: strong terminal reward to encourage completion
-            reward += (info["success"] & info["is_src_obj_grasped"]) * 2.0
-
+            reward += info["is_src_obj_grasped"] * 0.1
+            reward += info["consecutive_grasp"] * 0.1
+            reward += (info["success"] & info["is_src_obj_grasped"]) * 1.0
         # diff
         reward_diff = reward - self.prev_step_reward
         self.prev_step_reward = reward

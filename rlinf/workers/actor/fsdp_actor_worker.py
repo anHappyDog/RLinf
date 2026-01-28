@@ -1037,6 +1037,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     ]:
                         prev_logprobs = output_dict["prev_logprobs"]
 
+                    # logprobs = output_dict["logprobs"]
+                    # mean_diff = (logprobs - prev_logprobs).abs().mean().item()
+                    # max_diff = (logprobs - prev_logprobs).abs().max().item()
+                    # min_diff = (logprobs - prev_logprobs).abs().min().item()
+                    # print(f"in fsdp actor worker training, prev logprobs diff: mean={mean_diff}, max={max_diff}, min={min_diff}",flush=True)
+
                     kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
                         "logprob_type": self.cfg.algorithm.logprob_type,

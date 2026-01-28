@@ -47,10 +47,10 @@ algorithm:
   reward_type: chunk_level
   logprob_type: token_level
   entropy_type: chunk_level
-  update_epoch: 4
+  update_epoch: 1
   
   adv_type: gae
-  loss_type: actor_critic
+  loss_type: decoupled_actor_critic
   loss_agg_func: "token-mean" 
   kl_beta: 0.0
   entropy_bonus: 0.005
@@ -88,7 +88,7 @@ env:
   enable_offload: False
   # Override the default values in env/train or env/eval
   train:
-    total_num_envs: 40
+    total_num_envs: 80
     auto_reset: True
     use_fixed_reset_state_ids: False
     max_episode_steps: 80 # max episode steps for truncation
@@ -123,19 +123,19 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/mnt/public/daibo/models/RLinf-Pi05-ManiSkill-25Main-SFT/"
+    model_path: "/mnt/public/daibo/models/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT/"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 40      # how many samples each GPU processes per sampling step
-  global_batch_size: 320   # after how many sampled examples we perform one loss backward pass. Requirement: global bz must be '_world_size' multiples of local bs.
+  micro_batch_size: 32      # how many samples each GPU processes per sampling step
+  global_batch_size: 1280   # after how many sampled examples we perform one loss backward pass. Requirement: global bz must be '_world_size' multiples of local bs.
   seed: 0
   enable_offload: False
   # Override the default values in model/pi0
   model:
-    model_path: "/mnt/public/daibo/models/RLinf-Pi05-ManiSkill-25Main-SFT/"
+    model_path: "/mnt/public/daibo/models/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT/"
     model_name: "openpi"
     precision: null    # bf16
     num_action_chunks: 5 # interface for the env
