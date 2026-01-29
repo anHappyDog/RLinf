@@ -108,46 +108,46 @@ def compute_decoupled_ppo_actor_loss(
             - derived from versions via (proximal_version/current_version)
     """
 
-    # if (
-    #     current_version is not None
-    #     and current_version <= 1
-    #     and torch.distributed.get_rank() == 0
-    # ):
-    #     if logprobs is not None:
-    #         print(
-    #             f"in decoupled ppo actor loss, logprobs shape: {logprobs.shape}",
-    #             flush=True,
-    #         )
-    #     if old_logprobs is not None:
-    #         print(
-    #             f"in decoupled ppo actor loss, old_logprobs shape: {old_logprobs.shape}",
-    #             flush=True,
-    #         )
-    #     if proximal_logprobs is not None:
-    #         print(
-    #             f"in decoupled ppo actor loss, proximal_logprobs shape: {proximal_logprobs.shape}",
-    #             flush=True,
-    #         )
-    #     if versions is not None:
-    #         print(
-    #             f"in decoupled ppo actor loss, versions shape: {versions.shape}",
-    #             flush=True,
-    #         )
-    #     if advantages is not None:
-    #         print(
-    #             f"in decoupled ppo actor loss, advantages shape: {advantages.shape}",
-    #             flush=True,
-    #         )
-    #     if loss_mask is not None:
-    #         print(
-    #             f"in decoupled ppo actor loss, loss_mask shape: {loss_mask.shape}",
-    #             flush=True,
-    #         )
-    #     if current_version is not None:
-    #         print(
-    #             f"in decoupled ppo actor loss, current_version: {current_version}",
-    #             flush=True,
-    #         )
+    if (
+        current_version is not None
+        and current_version <= 1
+        and torch.distributed.get_rank() == 0
+    ):
+        if logprobs is not None:
+            print(
+                f"in decoupled ppo actor loss, logprobs shape: {logprobs.shape}",
+                flush=True,
+            )
+        if old_logprobs is not None:
+            print(
+                f"in decoupled ppo actor loss, old_logprobs shape: {old_logprobs.shape}",
+                flush=True,
+            )
+        if proximal_logprobs is not None:
+            print(
+                f"in decoupled ppo actor loss, proximal_logprobs shape: {proximal_logprobs.shape}",
+                flush=True,
+            )
+        if versions is not None:
+            print(
+                f"in decoupled ppo actor loss, versions shape: {versions.shape}",
+                flush=True,
+            )
+        if advantages is not None:
+            print(
+                f"in decoupled ppo actor loss, advantages shape: {advantages.shape}",
+                flush=True,
+            )
+        if loss_mask is not None:
+            print(
+                f"in decoupled ppo actor loss, loss_mask shape: {loss_mask.shape}",
+                flush=True,
+            )
+        if current_version is not None:
+            print(
+                f"in decoupled ppo actor loss, current_version: {current_version}",
+                flush=True,
+            )
 
     assert logprobs.dtype == torch.float32, (
         f"logprobs dtype: {logprobs.dtype}, needed torch.float32"
@@ -195,9 +195,7 @@ def compute_decoupled_ppo_actor_loss(
             f"proximal_logprobs dtype: {proximal_logprobs.dtype}, needed torch.float32"
         )
     # print(f"proximal_logprobs shape: {proximal_logprobs.shape},logprobs shape: {logprobs.shape}, old_logprobs shape: {old_logprobs.shape},alpha shape:{alpha.shape}")
-    proximal_ratio = torch.where(
-        loss_mask, torch.exp(logprobs - proximal_logprobs), 0.0
-    )
+    proximal_ratio = torch.where(loss_mask, torch.exp(logprobs - old_logprobs), 0.0)
     clipped_proximal_ratio = torch.clamp(
         proximal_ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high
     )
@@ -230,7 +228,7 @@ def compute_decoupled_ppo_actor_loss(
     behav_mask_count = behav_mask.count_nonzero() or 1
     behav_weight = torch.where(behav_mask, behav_weight, 0.0)
 
-    pg_loss = loss_agg_func(pg_loss * behav_weight, loss_mask, loss_mask_ratio)
+    pg_loss = loss_agg_func(pg_loss, loss_mask, loss_mask_ratio)
 
     if critic_warmup:
         pg_loss = torch.tensor(0.0, device=pg_loss.device)

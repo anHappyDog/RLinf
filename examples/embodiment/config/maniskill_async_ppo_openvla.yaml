@@ -43,7 +43,7 @@ algorithm:
   group_size: 1
 
   staleness_threshold: 2
-  behave_weight_threshold: 5
+  behave_weight_threshold: null
   rollout_epoch: 1
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 

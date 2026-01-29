@@ -49,8 +49,6 @@ class TestEnvWorker(EnvWorker):
                 )
                 env_outputs.append(env_output)
         else:
-            self.num_done_envs = 0
-            self.num_succ_envs = 0
             for stage_id in range(self.stage_num):
                 env_output = EnvOutput(
                     obs=self.last_obs_list[stage_id],
@@ -104,9 +102,6 @@ class TestEnvWorker(EnvWorker):
     async def start_interacting(
         self, input_channel: Channel, output_channel: Channel, metrics_channel: Channel
     ):
-        for env in self.env_list:
-            env.start_env()
-
         while not self.should_stop:
             env_outputs = self.init_env_outputs()
 
@@ -114,7 +109,7 @@ class TestEnvWorker(EnvWorker):
 
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
-                self.send_env_batch_async(output_channel, env_output.to_dict())
+                self.send_env_batch(output_channel, env_output.to_dict())
 
             for _ in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
@@ -122,15 +117,10 @@ class TestEnvWorker(EnvWorker):
                     env_output, env_info = self.env_interact_step(
                         raw_chunk_actions, stage_id
                     )
-                    self.send_env_batch_async(output_channel, env_output.to_dict())
+                    self.send_env_batch(output_channel, env_output.to_dict())
                     env_outputs[stage_id] = env_output
 
                     self.record_env_metrics(env_metrics, env_info)
-
-            for stage_id in range(self.stage_num):
-                self.send_env_batch_async(
-                    output_channel, env_outputs[stage_id].to_dict()
-                )
 
             aggregated_metrics = {}
             for key, values in env_metrics.items():

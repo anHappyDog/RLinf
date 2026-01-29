@@ -56,7 +56,7 @@ class TestEmbodiedRunner(EmbodiedRunner):
                 results.append(result)
             except asyncio.QueueEmpty:
                 break
-        print(f"Collected {len(results)} env metric results.", flush=True)
+        # print(f"Collected {len(results)} env metric results.", flush=True)
         assert len(results) > 0, "No env metrics received from env workers."
         env_metrics = compute_evaluate_metrics(results)
         env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
@@ -93,16 +93,18 @@ class TestEmbodiedRunner(EmbodiedRunner):
         )
 
         while self.global_step < self.max_steps:
+            self.actor.set_global_step(self.global_step)
+            self.rollout.set_global_step(self.global_step)
             self.actor.recv_rollout_batch(input_channel=self.actor_channel).wait()
+            with self.timer("step"):
+                with self.timer("recompute_logprobs"):
+                    self.actor.compute_proximal_logprobs().wait()
 
-            with self.timer("recompute_logprobs"):
-                self.actor.compute_proximal_logprobs().wait()
+                with self.timer("cal_adv_and_returns"):
+                    rollout_metrics = self.actor.compute_advantages_and_returns().wait()
 
-            with self.timer("cal_adv_and_returns"):
-                rollout_metrics = self.actor.compute_advantages_and_returns().wait()
-
-            with self.timer("actor_training"):
-                training_metrics = self.actor.run_training().wait()
+                with self.timer("actor_training"):
+                    training_metrics = self.actor.run_training().wait()
 
             self.global_step += 1
             self.update_rollout_weights()

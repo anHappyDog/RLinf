@@ -374,8 +374,6 @@ class EnvWorker(Worker):
                     )
                     env_output_list.append(env_output)
             else:
-                self.num_done_envs = 0
-                self.num_succ_envs = 0
                 for stage_id in range(self.stage_num):
                     env_output = EnvOutput(
                         obs=self.last_obs_list[stage_id],

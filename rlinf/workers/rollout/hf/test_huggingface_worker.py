@@ -81,8 +81,9 @@ class TestMultiStepRolloutWorker(MultiStepRolloutWorker):
         output_channel: Channel,
         actor_channel: Channel,
     ) -> None:
-        if self.enable_offload:
-            self.reload_model()
+        assert not self.enable_offload, (
+            "Offload not supported in TestMultiStepRolloutWorker"
+        )
 
         while not self.should_stop:
             self.buffer_list = [
@@ -94,10 +95,9 @@ class TestMultiStepRolloutWorker(MultiStepRolloutWorker):
             last_forward_inputs = [
                 None for _ in range(self.num_pipeline_stages)
             ]  # save actions
-
+            await self.wait_if_stale()
             for _ in range(self.n_train_chunk_steps):
                 for stage_id in range(self.num_pipeline_stages):
-                    await self.wait_if_stale()
                     env_output = await self.recv_env_output(input_channel)
                     actions = await self.stage_step(
                         last_forward_inputs,
