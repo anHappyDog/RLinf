@@ -251,7 +251,7 @@ def compute_decoupled_ppo_actor_loss(
         behav_clip_fraction = 1.0 - (behav_mask_count / loss_mask_count)
 
         if versions is not None:
-            average_version = versions.unsqueeze(-1)[loss_mask].float().mean().item()
+            average_version = versions[loss_mask].float().mean().item()
         else:
             average_version = None
 
