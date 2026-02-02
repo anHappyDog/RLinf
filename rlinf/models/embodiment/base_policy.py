@@ -61,9 +61,13 @@ class BasePolicy(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def default_forward(self, **kwargs):
-        raise NotImplementedError
+    def default_forward(self, **kwargs): ...
 
     @abstractmethod
-    def predict_action_batch(self, **kwargs):
-        raise NotImplementedError
+    def predict_action_batch(self, **kwargs): ...
+
+    @abstractmethod
+    def capture_cuda_graph(self, batch_size: int): ...
+
+    @abstractmethod
+    def release_cuda_graph(self): ...
