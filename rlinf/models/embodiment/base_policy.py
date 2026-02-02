@@ -68,3 +68,9 @@ class BasePolicy(ABC):
 
     def enable_torch_compile(self, mode: str = "max-autotune-no-cudagraphs"):
         return
+
+    def capture_cuda_graph(self, train_batch_size: int, eval_batch_size: int):
+        return
+
+    def release_cuda_graph(self):
+        return
