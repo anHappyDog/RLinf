@@ -232,12 +232,11 @@ class MLPPolicy(nn.Module, BasePolicy):
         else:
             action = raw_action
 
-            chunk_actions = action.reshape(-1, self.num_action_chunks, self.action_dim)
-
-            if hasattr(self, "value_head") and calculate_values:
-                chunk_values = self.value_head(states)
-            else:
-                chunk_values = torch.zeros_like(chunk_logprobs[..., :1])
+        chunk_actions = action.reshape(-1, self.num_action_chunks, self.action_dim)
+        if hasattr(self, "value_head") and calculate_values:
+            chunk_values = self.value_head(states)
+        else:
+            chunk_values = torch.zeros_like(chunk_logprobs[..., :1])
 
         return action, chunk_actions, chunk_logprobs, chunk_values
 
@@ -313,38 +312,11 @@ class MLPPolicy(nn.Module, BasePolicy):
         def action_generation_func(
             inputs: dict[str, torch.Tensor],
         ) -> dict[str, torch.Tensor]:
-            action_mean, action_logstd = self._sample_actions(inputs["states"])
-
-            action_std = torch.exp(action_logstd)
-
-            probs = Normal(action_mean, action_std)
-
-            if mode == "train":
-                raw_action = probs.rsample()
-            elif mode == "eval":
-                raw_action = action_mean.clone()
-            else:
-                raise NotImplementedError(f"{mode=}")
-
-            chunk_logprobs = probs.log_prob(raw_action)
-
-            if self.action_scale is not None:
-                action_normalized = torch.tanh(raw_action)
-                action = action_normalized * self.action_scale + self.action_bias
-
-                chunk_logprobs = chunk_logprobs - torch.log(
-                    self.action_scale * (1 - action_normalized.pow(2)) + 1e-6
+            action, chunk_actions, chunk_logprobs, chunk_values = (
+                self._generate_actions(
+                    inputs["states"], mode=mode, calculate_values=calculate_values
                 )
-            else:
-                action = raw_action
-
-            chunk_actions = action.reshape(-1, self.num_action_chunks, self.action_dim)
-
-            if hasattr(self, "value_head") and calculate_values:
-                chunk_values = self.value_head(inputs["states"])
-            else:
-                chunk_values = torch.zeros_like(chunk_logprobs[..., :1])
-
+            )
             outputs = {
                 "chunk_actions": chunk_actions,
                 "chunk_logprobs": chunk_logprobs,
@@ -394,7 +366,7 @@ class MLPPolicy(nn.Module, BasePolicy):
             independent_std=self.independent_std,
             final_tanh=self.final_tanh,
             mode="eval",
-            calculate_values=True,
+            calculate_values=False,
         )
 
         def generate_actions_func(

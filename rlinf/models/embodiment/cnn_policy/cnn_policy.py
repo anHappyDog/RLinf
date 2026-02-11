@@ -89,6 +89,7 @@ class CNNPolicy(nn.Module, BasePolicy):
             "img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 1, 3)
         )
         self.encoders = nn.ModuleList()
+        self.cuda_graph_manager = None
         encoder_out_dim = 0
         if self.cfg.backbone == "resnet":
             sample_x = torch.randn(1, *self.cfg.image_size)
@@ -220,7 +221,6 @@ class CNNPolicy(nn.Module, BasePolicy):
         )
         mix_feature, action_mean, action_logstd = self._policy_head(full_feature)
         return full_feature, mix_feature, action_mean, action_logstd
-        self.cuda_graph_manager = None
 
     @property
     def num_action_chunks(self):
@@ -346,35 +346,30 @@ class CNNPolicy(nn.Module, BasePolicy):
 
         return action, chunk_logprobs, full_feature
 
-    @torch.inference_mode()
-    def predict_action_batch(
+    def _generate_actions(
         self,
-        env_obs,
-        calculate_logprobs=True,
-        calculate_values=True,
-        return_obs=True,
-        return_shared_feature=False,
-        mode="train",
-        **kwargs,
-    ):
-        obs = self.preprocess_env_obs(env_obs)
+        states: torch.Tensor,
+        main_images: torch.Tensor,
+        extra_view_images: torch.Tensor,
+        calculate_values: bool,
+        mode: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         full_feature, mix_feature, action_mean, action_logstd = (
             self._actor_forward_from_processed_tensors(
-                obs["main_images"],
-                obs["states"],
-                obs.get("extra_view_images"),
+                main_images=main_images,
+                states=states,
+                extra_view_images=extra_view_images,
             )
         )
-
-        action_std = action_logstd.exp()
+        action_std = torch.exp(action_logstd)
         if self.cfg.std_range is not None:
             action_std = torch.clamp(
                 action_std, self.cfg.std_range[0], self.cfg.std_range[1]
             )
 
-        probs = torch.distributions.Normal(action_mean, action_std)
+        probs = Normal(action_mean, action_std)
         if mode == "train":
-            raw_action = probs.sample()
+            raw_action = probs.rsample()
         elif mode == "eval":
             raw_action = action_mean.clone()
         else:
@@ -394,12 +389,35 @@ class CNNPolicy(nn.Module, BasePolicy):
         chunk_actions = action.reshape(
             -1, self.cfg.num_action_chunks, self.cfg.action_dim
         )
-        chunk_actions = chunk_actions.cpu().numpy()
-
         if hasattr(self, "value_head") and calculate_values:
             chunk_values = self.value_head(mix_feature)
         else:
             chunk_values = torch.zeros_like(chunk_logprobs[..., :1])
+
+        return action, chunk_actions, chunk_logprobs, chunk_values, full_feature
+
+    @torch.inference_mode()
+    def predict_action_batch(
+        self,
+        env_obs,
+        calculate_logprobs=True,
+        calculate_values=True,
+        return_obs=True,
+        return_shared_feature=False,
+        mode="train",
+        **kwargs,
+    ):
+        obs = self.preprocess_env_obs(env_obs)
+        action, chunk_actions, chunk_logprobs, chunk_values, full_feature = (
+            self._generate_actions(
+                states=obs["states"],
+                main_images=obs["main_images"],
+                extra_view_images=obs.get("extra_view_images"),
+                mode=mode,
+                calculate_values=calculate_values,
+            )
+        )
+        chunk_actions = chunk_actions.cpu().numpy()
         forward_inputs = {"action": action}
 
         if return_obs:
@@ -473,62 +491,45 @@ class CNNPolicy(nn.Module, BasePolicy):
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
 
+        image_size = self.cfg.image_size
+        assert len(image_size) == 3, (
+            "image_size should be in the format of (C, H, W) or (H, W, C)"
+        )
+        if image_size[0] == 3:
+            image_size = [image_size[1], image_size[2], image_size[0]]
         inputs = {
             "states": torch.zeros(
                 (batch_size, self.cfg.state_dim), device=device, dtype=dtype
             ),
-            "images": torch.zeros(
-                (batch_size, self.cfg.image_num, *self.cfg.image_size),
+            "main_images": torch.zeros(
+                (batch_size, *image_size),
                 device=device,
                 dtype=dtype,
             ),
         }
+        if self.cfg.image_num > 1:
+            inputs["extra_view_images"] = torch.zeros(
+                (batch_size, self.cfg.image_num - 1, *image_size),
+                device=device,
+                dtype=dtype,
+            )
 
         def action_generation_func(
             inputs: dict[str, torch.Tensor],
         ) -> dict[str, torch.Tensor]:
-            full_feature, mix_feature, action_mean, action_logstd = (
-                self._actor_forward_from_processed_tensors(
-                    inputs["images"],
-                    inputs["states"],
-                    inputs.get("extra_view_images"),
+            action, chunk_actions, chunk_logprobs, chunk_values, full_feature = (
+                self._generate_actions(
+                    states=inputs["states"],
+                    main_images=inputs["main_images"],
+                    extra_view_images=inputs["extra_view_images"]
+                    if "extra_view_images" in inputs
+                    else None,
+                    calculate_values=calculate_values,
+                    mode=mode,
                 )
             )
-            action_std = action_logstd.exp()
-            if self.cfg.std_range is not None:
-                action_std = torch.clamp(
-                    action_std, self.cfg.std_range[0], self.cfg.std_range[1]
-                )
-
-            probs = torch.distributions.Normal(action_mean, action_std)
-            if mode == "train":
-                raw_action = probs.rsample()
-            elif mode == "eval":
-                raw_action = action_mean.clone()
-            else:
-                raise NotImplementedError(f"{mode=}")
-
-            chunk_logprobs = probs.log_prob(raw_action)
-            if self.action_scale is not None:
-                action_normalized = torch.tanh(raw_action)
-                action = action_normalized * self.action_scale + self.action_bias
-
-                chunk_logprobs = chunk_logprobs - torch.log(
-                    self.action_scale * (1 - action_normalized.pow(2)) + 1e-6
-                )
-            else:
-                action = raw_action
-
-            chunk_actions = action.reshape(
-                -1, self.cfg.num_action_chunks, self.cfg.action_dim
-            )
-            chunk_actions = chunk_actions.cpu().numpy()
-
-            if hasattr(self, "value_head") and calculate_values:
-                chunk_values = self.value_head(mix_feature)
-            else:
-                chunk_values = torch.zeros_like(chunk_logprobs[..., :1])
             outputs = {
+                "full_feature": full_feature,
                 "chunk_actions": chunk_actions,
                 "chunk_logprobs": chunk_logprobs,
                 "chunk_values": chunk_values,
@@ -539,10 +540,14 @@ class CNNPolicy(nn.Module, BasePolicy):
         graph_name = (
             f"action_generation_{batch_size}_{detach_encoder}_{calculate_values}_{mode}"
         )
+        external_inputs = {"states", "main_images"}
+        if self.cfg.image_num > 1:
+            external_inputs.add("extra_view_images")
         spec = GraphCaptureSpec(
             name=graph_name,
             func=action_generation_func,
             inputs=inputs,
+            external_inputs=external_inputs,
             warmup_iters=1,
         )
 
@@ -584,6 +589,31 @@ class CNNPolicy(nn.Module, BasePolicy):
             calculate_values=False,
             mode="eval",
         )
+
+        def _generate_func(
+            states, main_images, extra_view_images, calculate_values, mode
+        ):
+            batch_size = train_batch_size if mode == "train" else eval_batch_size
+            graph_name = (
+                f"action_generation_{batch_size}_{False}_{calculate_values}_{mode}"
+            )
+            inputs = {
+                "states": states,
+                "main_images": main_images,
+            }
+            if self.cfg.image_num > 1:
+                inputs["extra_view_images"] = extra_view_images
+
+            outputs = self.cuda_graph_manager.replay(graph_name, inputs)
+            return (
+                outputs["action"],
+                outputs["chunk_actions"],
+                outputs["chunk_logprobs"],
+                outputs["chunk_values"],
+                outputs["full_feature"],
+            )
+
+        self._generate_actions = _generate_func
 
     def release_cuda_graph(self):
         if self.cuda_graph_manager is not None:
