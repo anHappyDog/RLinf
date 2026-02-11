@@ -206,15 +206,21 @@ class MLPPolicy(nn.Module, BasePolicy):
         return action_mean, action_logstd
 
     def _generate_actions(
-        self, states: torch.Tensor, mode: str = "train", calculate_values: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        states: torch.Tensor,
+        mode: str = "train",
+        calculate_values: bool = True,
+        eps: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         action_mean, action_logstd = self._sample_actions(states)
 
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
 
         if mode == "train":
-            raw_action = probs.rsample()
+            if eps is None:
+                eps = torch.randn_like(action_mean)
+            raw_action = action_mean + action_std * eps
         elif mode == "eval":
             raw_action = action_mean.clone()
         else:
@@ -305,16 +311,22 @@ class MLPPolicy(nn.Module, BasePolicy):
         inputs = {
             "states": torch.zeros(
                 (batch_size, self.obs_dim), device=device, dtype=dtype
-            )
+            ),
+            "eps": torch.zeros(
+                (batch_size, self.action_dim), device=device, dtype=dtype
+            ),
         }
-        external_inputs = {"states"}
+        external_inputs = {"states", "eps"}
 
         def action_generation_func(
             inputs: dict[str, torch.Tensor],
         ) -> dict[str, torch.Tensor]:
             action, chunk_actions, chunk_logprobs, chunk_values = (
                 self._generate_actions(
-                    inputs["states"], mode=mode, calculate_values=calculate_values
+                    inputs["states"],
+                    mode=mode,
+                    calculate_values=calculate_values,
+                    eps=inputs["eps"],
                 )
             )
             outputs = {
@@ -373,9 +385,15 @@ class MLPPolicy(nn.Module, BasePolicy):
             states: torch.Tensor, mode: str, calculate_values: bool
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             graph_name = f"action_generation_{self.independent_std}_{self.final_tanh}_{mode}_{calculate_values}"
-            outputs = self.cuda_graph_manager.replay(
-                graph_name, inputs={"states": states}
-            )
+            inputs = {"states": states}
+            if mode == "train":
+                param_dtype = next(self.parameters()).dtype
+                inputs["eps"] = torch.randn(
+                    (states.shape[0], self.action_dim),
+                    device=states.device,
+                    dtype=param_dtype,
+                )
+            outputs = self.cuda_graph_manager.replay(graph_name, inputs=inputs)
             return (
                 outputs["action"],
                 outputs["chunk_actions"],

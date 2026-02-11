@@ -350,9 +350,10 @@ class CNNPolicy(nn.Module, BasePolicy):
         self,
         states: torch.Tensor,
         main_images: torch.Tensor,
-        extra_view_images: torch.Tensor,
+        extra_view_images: Optional[torch.Tensor],
         calculate_values: bool,
         mode: str,
+        eps: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         full_feature, mix_feature, action_mean, action_logstd = (
             self._actor_forward_from_processed_tensors(
@@ -369,7 +370,9 @@ class CNNPolicy(nn.Module, BasePolicy):
 
         probs = Normal(action_mean, action_std)
         if mode == "train":
-            raw_action = probs.rsample()
+            if eps is None:
+                eps = torch.randn_like(action_mean)
+            raw_action = action_mean + action_std * eps
         elif mode == "eval":
             raw_action = action_mean.clone()
         else:
@@ -506,6 +509,11 @@ class CNNPolicy(nn.Module, BasePolicy):
                 device=device,
                 dtype=dtype,
             ),
+            "eps": torch.zeros(
+                (batch_size, self.cfg.action_dim),
+                device=device,
+                dtype=dtype,
+            ),
         }
         if self.cfg.image_num > 1:
             inputs["extra_view_images"] = torch.zeros(
@@ -526,6 +534,7 @@ class CNNPolicy(nn.Module, BasePolicy):
                     else None,
                     calculate_values=calculate_values,
                     mode=mode,
+                    eps=inputs["eps"],
                 )
             )
             outputs = {
@@ -540,7 +549,7 @@ class CNNPolicy(nn.Module, BasePolicy):
         graph_name = (
             f"action_generation_{batch_size}_{detach_encoder}_{calculate_values}_{mode}"
         )
-        external_inputs = {"states", "main_images"}
+        external_inputs = {"states", "main_images", "eps"}
         if self.cfg.image_num > 1:
             external_inputs.add("extra_view_images")
         spec = GraphCaptureSpec(
@@ -601,6 +610,13 @@ class CNNPolicy(nn.Module, BasePolicy):
                 "states": states,
                 "main_images": main_images,
             }
+            if mode == "train":
+                param_dtype = next(self.parameters()).dtype
+                inputs["eps"] = torch.randn(
+                    (states.shape[0], self.cfg.action_dim),
+                    device=states.device,
+                    dtype=param_dtype,
+                )
             if self.cfg.image_num > 1:
                 inputs["extra_view_images"] = extra_view_images
 
