@@ -210,7 +210,7 @@ class MLPPolicy(nn.Module, BasePolicy):
         states: torch.Tensor,
         mode: str = "train",
         calculate_values: bool = True,
-        eps: torch.Tensor | None = None,
+        use_rsample: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         action_mean, action_logstd = self._sample_actions(states)
 
@@ -218,9 +218,7 @@ class MLPPolicy(nn.Module, BasePolicy):
         probs = Normal(action_mean, action_std)
 
         if mode == "train":
-            if eps is None:
-                eps = torch.randn_like(action_mean)
-            raw_action = action_mean + action_std * eps
+            raw_action = probs.rsample() if use_rsample else probs.sample()
         elif mode == "eval":
             raw_action = action_mean.clone()
         else:
@@ -312,11 +310,8 @@ class MLPPolicy(nn.Module, BasePolicy):
             "states": torch.zeros(
                 (batch_size, self.obs_dim), device=device, dtype=dtype
             ),
-            "eps": torch.zeros(
-                (batch_size, self.action_dim), device=device, dtype=dtype
-            ),
         }
-        external_inputs = {"states", "eps"}
+        external_inputs = {"states"}
 
         def action_generation_func(
             inputs: dict[str, torch.Tensor],
@@ -326,7 +321,7 @@ class MLPPolicy(nn.Module, BasePolicy):
                     inputs["states"],
                     mode=mode,
                     calculate_values=calculate_values,
-                    eps=inputs["eps"],
+                    use_rsample=True,
                 )
             )
             outputs = {
@@ -343,6 +338,7 @@ class MLPPolicy(nn.Module, BasePolicy):
             inputs=inputs,
             external_inputs=external_inputs,
             func=action_generation_func,
+            register_default_cuda_generator=True,
         )
         self.cuda_graph_manager.capture(spec)
 
@@ -386,13 +382,6 @@ class MLPPolicy(nn.Module, BasePolicy):
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             graph_name = f"action_generation_{self.independent_std}_{self.final_tanh}_{mode}_{calculate_values}"
             inputs = {"states": states}
-            if mode == "train":
-                param_dtype = next(self.parameters()).dtype
-                inputs["eps"] = torch.randn(
-                    (states.shape[0], self.action_dim),
-                    device=states.device,
-                    dtype=param_dtype,
-                )
             outputs = self.cuda_graph_manager.replay(graph_name, inputs=inputs)
             return (
                 outputs["action"],
@@ -403,18 +392,12 @@ class MLPPolicy(nn.Module, BasePolicy):
 
         self._generate_actions = generate_actions_func
 
-    def release_cuda_graph(self):
-        if self.cuda_graph_manager is not None:
-            self.cuda_graph_manager.destroy()
-            self.cuda_graph_manager = None
-
-    def is_cuda_graph_enabled(self) -> bool:
-        return self.cuda_graph_manager is not None
-
-    def enable_torch_compile(self, mode: str = "max-autotune-no-cudagraphs"):
+    def enable_torch_compile(
+        self,
+        mode: str = "max-autotune-no-cudagraphs",
+    ):
         if self.torch_compile_enabled:
             return
 
         self._sample_actions = torch.compile(self._sample_actions, mode=mode)
-
         self.torch_compile_enabled = True

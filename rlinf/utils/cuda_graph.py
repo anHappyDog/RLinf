@@ -103,10 +103,12 @@ class GraphCaptureSpec:
     """Specification for capturing a CUDA graph."""
 
     name: str
-    func: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+    func: Callable[[dict[str, Any]], dict[str, Any]]
     inputs: dict[str, Any]
     external_inputs: set[str] = field(default_factory=set)
     warmup_iters: int = 3
+    register_default_cuda_generator: bool = False
+    cuda_generators: tuple[torch.Generator, ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -146,6 +148,29 @@ class CUDAGraphManager:
     def create_shared_pool(self) -> None:
         self.graph_pool = torch.cuda.graph_pool_handle()
 
+    def _register_generators(
+        self,
+        graph: torch.cuda.CUDAGraph,
+        spec: GraphCaptureSpec,
+    ) -> None:
+        if not hasattr(graph, "register_generator_state"):
+            if spec.register_default_cuda_generator or spec.cuda_generators:
+                raise RuntimeError(
+                    "Current PyTorch build does not support CUDAGraph.register_generator_state."
+                )
+            return
+
+        if spec.register_default_cuda_generator:
+            device_index = (
+                self.device.index
+                if self.device.index is not None
+                else torch.cuda.current_device()
+            )
+            graph.register_generator_state(torch.cuda.default_generators[device_index])
+
+        for generator in spec.cuda_generators:
+            graph.register_generator_state(generator)
+
     def capture(
         self,
         spec: GraphCaptureSpec,
@@ -170,6 +195,7 @@ class CUDAGraphManager:
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
+        self._register_generators(graph, spec)
 
         # Use shared pool if requested for memory optimization
         pool = self.graph_pool if use_shared_pool else None
