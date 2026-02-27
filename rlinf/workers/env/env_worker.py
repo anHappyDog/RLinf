@@ -65,18 +65,20 @@ class EnvWorker(Worker):
             "train": self._setup_dst_ranks(
                 self.cfg.env.train.total_num_envs // self.stage_num
             ),
-            "eval": self._setup_dst_ranks(
-                self.cfg.env.eval.total_num_envs // self.stage_num
-            ),
         }
         self.src_ranks = {
             "train": self._setup_src_ranks(
                 self.cfg.env.train.total_num_envs // self.stage_num
             ),
-            "eval": self._setup_src_ranks(
-                self.cfg.env.eval.total_num_envs // self.stage_num
-            ),
         }
+
+        if self.enable_eval:
+            self.dst_ranks["eval"] = self._setup_dst_ranks(
+                self.cfg.env.eval.total_num_envs // self.stage_num
+            )
+            self.src_ranks["eval"] = self._setup_src_ranks(
+                self.cfg.env.eval.total_num_envs // self.stage_num
+            )
         self.log_info(f"Env worker initialized with dst_ranks: {self.dst_ranks}")
         self.log_info(f"Env worker initialized with src_ranks: {self.src_ranks}")
         train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)

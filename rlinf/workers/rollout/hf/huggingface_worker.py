@@ -76,6 +76,7 @@ class MultiStepRolloutWorker(Worker):
             self.total_num_eval_envs // self._world_size // self.num_pipeline_stages
         )
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
+        self.enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -106,18 +107,20 @@ class MultiStepRolloutWorker(Worker):
             "train": self._setup_dst_ranks(
                 self.total_num_train_envs // self.num_pipeline_stages
             ),
-            "eval": self._setup_dst_ranks(
-                self.total_num_eval_envs // self.num_pipeline_stages
-            ),
         }
         self.src_ranks = {
             "train": self._setup_src_ranks(
                 self.total_num_train_envs // self.num_pipeline_stages
             ),
-            "eval": self._setup_src_ranks(
-                self.total_num_eval_envs // self.num_pipeline_stages
-            ),
         }
+        if self.enable_eval:
+            self.dst_ranks["eval"] = self._setup_dst_ranks(
+                self.total_num_eval_envs // self.num_pipeline_stages
+            )
+            self.src_ranks["eval"] = self._setup_src_ranks(
+                self.total_num_eval_envs // self.num_pipeline_stages
+            )
+
         self.log_info(f"Rollout worker initialized with dst_ranks: {self.dst_ranks}")
         self.log_info(f"Rollout worker initialized with src_ranks: {self.src_ranks}")
         self.setup_sample_params()
