@@ -69,18 +69,6 @@ class MultiStepRolloutWorker(Worker):
         self.total_num_eval_envs = cfg.env.eval.total_num_envs
         self.num_pipeline_stages = cfg.rollout.pipeline_stage_num
 
-        assert (
-            self.total_num_train_envs % (self.num_pipeline_stages * self._world_size)
-            == 0
-        ), (
-            f"total_num_train_envs ({self.total_num_train_envs}) must be divisible by num_pipeline_stages ({self.num_pipeline_stages}) * worldsize ({self._world_size})."
-        )
-        assert (
-            self.total_num_eval_envs % (self.num_pipeline_stages * self._world_size)
-            == 0
-        ), (
-            f"total_num_eval_envs ({self.total_num_eval_envs}) must be divisible by num_pipeline_stages ({self.num_pipeline_stages}) * worldsize ({self._world_size})."
-        )
         self.train_batch_size = (
             self.total_num_train_envs // self._world_size // self.num_pipeline_stages
         )

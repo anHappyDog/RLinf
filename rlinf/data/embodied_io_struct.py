@@ -99,12 +99,13 @@ class EnvOutput:
         """Merge multiple env output dicts into one batch-aligned env output.
 
         Merge strategy:
+
         - Tensor fields: concatenate on batch dimension.
         - List fields: flatten in source order.
         - ``None`` fields: keep ``None``.
         - ``final_obs`` supports partial ``None`` across shards. For shards
-          without ``final_obs``, use the corresponding ``obs`` as fallback to
-          keep batch alignment.
+            without ``final_obs``, use the corresponding ``obs`` as fallback to
+            keep batch alignment.
 
         Args:
             env_outputs: Per-source env output dicts that share the same schema.
