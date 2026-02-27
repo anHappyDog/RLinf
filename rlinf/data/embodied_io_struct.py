@@ -81,7 +81,9 @@ class EnvOutput:
         )
         states = obs["states"] if "states" in obs else None
         task_descriptions = (
-            list(obs["task_descriptions"]) if "task_descriptions" in obs else None
+            list(obs["task_descriptions"])
+            if "task_descriptions" in obs and obs["task_descriptions"] is not None
+            else None
         )
 
         return {
