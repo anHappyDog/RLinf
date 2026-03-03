@@ -430,16 +430,3 @@ The main difference can be summarized simply:
 So the main change is not the high-level PPO objective itself. The main change is the execution model of the training system.
 
 If your bottleneck is system-side, Async PPO is often worth the added complexity. If your main difficulty is algorithmic convergence, synchronous PPO is usually easier to tune first.
-
-
-14. Practical Recommendation
-----------------------------
-
-For real workloads, a good rollout plan is:
-
-1. start from an existing single-node config,
-2. validate system metrics before trusting reward curves,
-3. keep staleness conservative before scaling throughput,
-4. only adopt Async PPO as the default when synchronous PPO is clearly limited by barriers.
-
-Async PPO in RLinf should be understood as a high-throughput execution system for PPO-based embodied training, not just a more complicated PPO variant. To use it correctly, you need to reason about the algorithm, version control, and system scheduling at the same time.

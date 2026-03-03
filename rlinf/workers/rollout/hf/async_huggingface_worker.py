@@ -79,7 +79,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 await self.send_rollout_trajectories(
                     self.rollout_results[stage_id], replay_channel
                 )
-            self.finished_episodes += self.total_num_train_envs
+            self.finished_episodes += self.total_num_train_envs * self.rollout_epoch
             rollout_metrics = self.pop_execution_times()
             rollout_metrics = {
                 f"time/rollout/{k}": v for k, v in rollout_metrics.items()
