@@ -73,7 +73,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 for _ in range(self.num_pipeline_stages)
             ]
             await self.wait_if_stale()
-            await self.generate_one_epoch(input_channel, output_channel)
+            for _ in range(self.rollout_epoch):
+                await self.generate_one_epoch(input_channel, output_channel)
             for stage_id in range(self.num_pipeline_stages):
                 await self.send_rollout_trajectories(
                     self.rollout_results[stage_id], replay_channel
@@ -90,9 +91,14 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             return
         while True:
             capacity = (
-                self.staleness_threshold + self.version + 1
-            ) * self.total_num_train_envs
-            if self.finished_episodes + self.total_num_train_envs <= capacity:
+                (self.staleness_threshold + self.version + 1)
+                * self.total_num_train_envs
+                * self.rollout_epoch
+            )
+            if (
+                self.finished_episodes + self.total_num_train_envs * self.rollout_epoch
+                <= capacity
+            ):
                 break
             await asyncio.sleep(0.01)
 

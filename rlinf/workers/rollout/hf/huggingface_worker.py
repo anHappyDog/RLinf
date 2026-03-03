@@ -54,7 +54,7 @@ class MultiStepRolloutWorker(Worker):
 
         actor_world_size = self.placement.get_world_size("actor")
         self.actor_weight_src_rank = self._rank % actor_world_size
-
+        self.rollout_epoch = cfg.algorithm.get("rollout_epoch", 1)
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.model_weights_id = ""
         self.count_update = 0
@@ -423,7 +423,7 @@ class MultiStepRolloutWorker(Worker):
         ]
 
         for _ in tqdm(
-            range(self.cfg.algorithm.rollout_epoch),
+            range(self.rollout_epoch),
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
