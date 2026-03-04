@@ -42,7 +42,7 @@ algorithm:
   reward_coef: 1.0
   staleness_threshold: 2
   behave_weight_threshold: 5
-  rollout_epoch: 8
+  rollout_epoch: 1
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: chunk_level

@@ -372,8 +372,3 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             op=torch.distributed.ReduceOp.AVG,
         )
         return mean_metric_dict
-
-    def sync_model_to_rollout(self, version: int = -1) -> None:
-        super().sync_model_to_rollout()
-        if version >= 0:
-            self.set_version(version)

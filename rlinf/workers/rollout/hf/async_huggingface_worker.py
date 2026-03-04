@@ -26,7 +26,6 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         super().__init__(cfg)
         self._generate_task: asyncio.Task = None
         self.staleness_threshold = cfg.algorithm.get("staleness_threshold", None)
-        self.finished_episodes = 0
         self.num_envs_per_stage = (
             self.cfg.env.train.total_num_envs
             // self._world_size
@@ -89,6 +88,9 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
     async def wait_if_stale(self) -> None:
         if self.staleness_threshold is None:
             return
+        assert self.finished_episodes is not None, (
+            "finished_episodes should be initialized."
+        )
         while True:
             capacity = (
                 (self.staleness_threshold + self.version + 1)

@@ -1046,7 +1046,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return model
 
-    def sync_model_to_rollout(self) -> None:
+    def sync_model_to_rollout(self, version: int) -> None:
         """
         Sync the model's full state dict to the rollout worker.
         """
@@ -1057,6 +1057,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_param_and_grad(self.device)
 
         state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
+        state_dict["version"] = version
         for rank in self._weight_dst_rank_in_rollout:
             self.send(
                 state_dict,
@@ -1473,9 +1474,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return mean_metric_dict
 
-    def set_global_step(self, global_step) -> None:
+    def set_global_step(self, global_step: int) -> None:
         """
         Set the global step for the model, if needed.
         """
+        self.version = global_step
         if hasattr(self.model, "set_global_step"):
             self.model.set_global_step(global_step)

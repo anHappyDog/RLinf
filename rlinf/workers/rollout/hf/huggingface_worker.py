@@ -89,6 +89,7 @@ class MultiStepRolloutWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.collect_versions = self.cfg.algorithm.loss_type == "decoupled_actor_critic"
         self.version = 0
+        self.finished_episodes = None
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -284,7 +285,7 @@ class MultiStepRolloutWorker(Worker):
 
         return dones, rewards
 
-    async def sync_model_from_actor(self, version: int | None = None):
+    async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
         param_state_dict = await self.recv(
             self.actor_group_name,
@@ -292,7 +293,7 @@ class MultiStepRolloutWorker(Worker):
             async_op=True,
             options=self._sync_weight_comm_options,
         ).async_wait()
-
+        version = param_state_dict.pop("version", None)
         self.hf_model.load_state_dict(param_state_dict)
         self.model_weights_id = (
             str(get_model_weights_id(self.hf_model)) + f"_{self.count_update}"
@@ -300,6 +301,13 @@ class MultiStepRolloutWorker(Worker):
         self.count_update += 1
         if version is not None:
             self.version = version
+        if self.finished_episodes is None:
+            assert version is not None, (
+                "Version must be provided in the first sync from actor."
+            )
+            self.finished_episodes = (
+                version * self.total_num_train_envs * self.rollout_epoch
+            )
         del param_state_dict
         gc.collect()
         self.torch_platform.empty_cache()

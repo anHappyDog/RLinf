@@ -107,8 +107,9 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         return {**env_metrics, **time_metrics}
 
     def update_rollout_weights(self) -> None:
-        self.rollout.sync_model_from_actor(self.global_step)
+        rollout_handle = self.rollout.sync_model_from_actor()
         self.actor.sync_model_to_rollout(self.global_step).wait()
+        rollout_handle.wait()
 
     def run(self) -> None:
         start_step = self.global_step
