@@ -300,13 +300,14 @@ class MultiStepRolloutWorker(Worker):
         )
         self.count_update += 1
         if version is not None:
-            self.version = version
+            assert isinstance(version, torch.Tensor), "version should be a tensor."
+            self.version = int(version.item())
         if self.finished_episodes is None:
             assert version is not None, (
                 "Version must be provided in the first sync from actor."
             )
             self.finished_episodes = (
-                version * self.total_num_train_envs * self.rollout_epoch
+                self.version * self.total_num_train_envs * self.rollout_epoch
             )
         del param_state_dict
         gc.collect()

@@ -1057,7 +1057,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_param_and_grad(self.device)
 
         state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
-        state_dict["version"] = version
+        state_dict["version"] = torch.tensor(version, dtype=torch.long)
         for rank in self._weight_dst_rank_in_rollout:
             self.send(
                 state_dict,
