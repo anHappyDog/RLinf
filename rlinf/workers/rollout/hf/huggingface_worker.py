@@ -293,22 +293,11 @@ class MultiStepRolloutWorker(Worker):
             async_op=True,
             options=self._sync_weight_comm_options,
         ).async_wait()
-        version = param_state_dict.pop("version", None)
         self.hf_model.load_state_dict(param_state_dict)
         self.model_weights_id = (
             str(get_model_weights_id(self.hf_model)) + f"_{self.count_update}"
         )
         self.count_update += 1
-        if version is not None:
-            assert isinstance(version, torch.Tensor), "version should be a tensor."
-            self.version = int(version.item())
-        if self.finished_episodes is None:
-            assert version is not None, (
-                "Version must be provided in the first sync from actor."
-            )
-            self.finished_episodes = (
-                self.version * self.total_num_train_envs * self.rollout_epoch
-            )
         del param_state_dict
         gc.collect()
         self.torch_platform.empty_cache()
@@ -577,5 +566,10 @@ class MultiStepRolloutWorker(Worker):
         return split_num
 
     def set_global_step(self, global_step: int):
+        self.version = global_step
+        if self.finished_episodes is None:
+            self.finished_episodes = (
+                self.version * self.total_num_train_envs * self.rollout_epoch
+            )
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)

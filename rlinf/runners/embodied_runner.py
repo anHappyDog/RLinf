@@ -135,7 +135,7 @@ class EmbodiedRunner:
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
-        actor_handle: Handle = self.actor.sync_model_to_rollout(self.global_step)
+        actor_handle: Handle = self.actor.sync_model_to_rollout()
         actor_handle.wait()
         rollout_handle.wait()
 

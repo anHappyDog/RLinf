@@ -1001,7 +1001,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
-
+        self.version = 0
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
@@ -1046,7 +1046,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return model
 
-    def sync_model_to_rollout(self, version: int) -> None:
+    def sync_model_to_rollout(self) -> None:
         """
         Sync the model's full state dict to the rollout worker.
         """
@@ -1057,7 +1057,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_param_and_grad(self.device)
 
         state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
-        state_dict["version"] = torch.tensor(version, dtype=torch.long)
         for rank in self._weight_dst_rank_in_rollout:
             self.send(
                 state_dict,
