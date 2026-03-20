@@ -16,9 +16,10 @@ import logging
 
 import einops
 import numpy as np
-from openpi import transforms
 from openpi.models import model as _model
 from typing_extensions import Dict, List, Union
+
+from openpi import transforms
 
 
 def make_robocasa_example() -> dict:

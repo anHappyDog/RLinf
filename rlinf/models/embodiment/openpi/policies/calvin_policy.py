@@ -15,8 +15,9 @@ import dataclasses
 
 import einops
 import numpy as np
-from openpi import transforms
 from openpi.models import model as _model
+
+from openpi import transforms
 
 
 def make_calvin_example() -> dict:

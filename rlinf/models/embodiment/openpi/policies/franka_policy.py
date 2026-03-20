@@ -16,8 +16,9 @@ import dataclasses
 import einops
 import numpy as np
 import torch
-from openpi import transforms
 from openpi.models import model as _model
+
+from openpi import transforms
 
 
 def make_franka_example() -> dict:
