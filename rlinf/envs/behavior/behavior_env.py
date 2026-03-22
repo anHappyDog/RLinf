@@ -19,14 +19,13 @@ from multiprocessing import get_context
 
 import gymnasium as gym
 import torch
-import yaml
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, OmegaConf
 
 from rlinf.envs.behavior.utils import (
-    R1PRO_PROPRIO_KEYS,
     apply_env_wrapper,
-    ensure_uint8_rgb,
+    convert_uint8_rgb,
     set_camera_resolution,
+    setup_omni_cfg,
 )
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 from rlinf.utils.logging import get_logger
@@ -34,34 +33,62 @@ from rlinf.utils.logging import get_logger
 __all__ = ["BehaviorEnv"]
 
 
-def _behavior_env_worker(conn, cfg_dict, num_envs, task_idx, wrapper_name, camera_cfg):
+def _behavior_env_worker(cfg: DictConfig, conn, num_envs: int):
     env = None
     try:
         from omnigibson.envs import VectorEnvironment
         from omnigibson.learning.utils.eval_utils import TASK_INDICES_TO_NAMES
         from omnigibson.macros import gm
 
-        # Make sure object states are enabled inside subprocess.
-        gm.HEADLESS = True
-        gm.ENABLE_FLATCACHE = True
-        gm.ENABLE_OBJECT_STATES = True
-        gm.USE_GPU_DYNAMICS = False
-        gm.ENABLE_TRANSITION_RULES = True
+        override_cfg = OmegaConf.select(cfg, "omni_config")
+        omni_cfg = setup_omni_cfg(override_cfg)
+        # setup omnigibson macros, according to configuration yaml
+        macro_cfg = OmegaConf.select(omni_cfg, "macro")
+        gm.HEADLESS = macro_cfg.headless
+        gm.ENABLE_FLATCACHE = macro_cfg.enable_flatcache
+        gm.ENABLE_OBJECT_STATES = macro_cfg.enable_object_states
+        gm.USE_GPU_DYNAMICS = macro_cfg.use_gpu_dynamics
+        gm.ENABLE_TRANSITION_RULES = macro_cfg.enable_transition_rules
+        gm.RENDER_VIEWER_CAMERA = macro_cfg.render_viewer_camera
+        gm.USE_NUMPY_CONTROLLER_BACKEND = macro_cfg.use_numpy_controller_backend
 
+        # setup head/wrist camera resolutions
+        camera_cfg = OmegaConf.select(omni_cfg, "camera")
         set_camera_resolution(camera_cfg)
-        cfg_dict["task"]["activity_name"] = TASK_INDICES_TO_NAMES[task_idx]
-        env = VectorEnvironment(num_envs, cfg_dict)
+
+        # set task idx
+        OmegaConf.update(
+            omni_cfg, "task.activity_name", TASK_INDICES_TO_NAMES[cfg.task_idx]
+        )
+
+        # create env and apply env wrapper if enabled
+        omni_cfg_dict = OmegaConf.to_container(
+            omni_cfg,
+            resolve=True,
+            throw_on_missing=True,
+        )
+        env = VectorEnvironment(num_envs, omni_cfg_dict)
+        wrapper_name = OmegaConf.select(omni_cfg, "env.env_wrapper")
         env = apply_env_wrapper(env, wrapper_name)
-        conn.send({"type": "ready", "activity_name": cfg_dict["task"]["activity_name"]})
+
+        conn.send(
+            {
+                "type": "ready",
+                "activity_name": OmegaConf.select(omni_cfg, "task.activity_name"),
+            }
+        )
 
         while True:
             cmd, payload = conn.recv()
+
             if cmd == "reset":
                 raw_obs, infos = env.reset()
                 conn.send({"type": "ok", "result": (raw_obs, infos)})
+
             elif cmd == "step":
                 result = env.step(payload)
                 conn.send({"type": "ok", "result": result})
+
             elif cmd == "chunk_step":
                 chunk_actions = payload["chunk_actions"]
                 chunk_size = chunk_actions.shape[1]
@@ -71,16 +98,19 @@ def _behavior_env_worker(conn, cfg_dict, num_envs, task_idx, wrapper_name, camer
                 raw_chunk_terminations = []
                 raw_chunk_truncations = []
                 infos_list = []
+
                 for i in range(chunk_size):
                     actions = chunk_actions[:, i]
                     raw_obs, step_rewards, terminations, truncations, infos = env.step(
                         actions
                     )
+
                     raw_obs_list.append(raw_obs)
                     chunk_rewards.append(to_tensor(step_rewards))
                     raw_chunk_terminations.append(to_tensor(terminations))
                     raw_chunk_truncations.append(to_tensor(truncations))
                     infos_list.append(infos)
+
                 conn.send(
                     {
                         "type": "ok",
@@ -93,16 +123,16 @@ def _behavior_env_worker(conn, cfg_dict, num_envs, task_idx, wrapper_name, camer
                         ),
                     }
                 )
+
             elif cmd == "close":
-                try:
-                    env.close()
-                finally:
-                    conn.send({"type": "ok", "result": None})
-                    break
+                env.close()
+                conn.send({"type": "ok", "result": None})
             else:
                 raise NotImplementedError(f"Unknown command: {cmd}")
+
     except Exception:
         conn.send({"type": "error", "traceback": traceback.format_exc()})
+
     finally:
         if env is not None:
             try:
@@ -138,153 +168,7 @@ class BehaviorEnv(gym.Env):
         self.auto_reset = cfg.auto_reset
         if self.record_metrics:
             self._init_metrics()
-
-        # record total number and success number of trials and trial time
-        self.n_trials = 0
-        self.n_success_trials = 0
-        self.total_time = 0
-
-        self.omnigibson_cfg = self.setup_omni_cfg()
         self._init_env()
-
-        # manually reset environment episode number
-
-    def setup_omni_cfg(self) -> dict:
-        """Build omnigibson config for subprocess env with local overrides."""
-        import omnigibson
-
-        self.env_wrapper = self.cfg.get("env_wrapper", None)
-        self.camera_cfg = None
-        top_level_head_resolution = self.cfg.get("head_resolution", None)
-        top_level_wrist_resolution = self.cfg.get("wrist_resolution", None)
-        if (
-            top_level_head_resolution is not None
-            or top_level_wrist_resolution is not None
-        ):
-            self.camera_cfg = {}
-            if top_level_head_resolution is not None:
-                self.camera_cfg["head_resolution"] = list(top_level_head_resolution)
-            if top_level_wrist_resolution is not None:
-                self.camera_cfg["wrist_resolution"] = list(top_level_wrist_resolution)
-
-        cfg_name = self.cfg.base_config_name
-        assert cfg_name == "r1pro_behavior", (
-            f"Only r1pro_behavior is supported for now, but got {cfg_name}"
-        )
-
-        cfg_path = os.path.join(omnigibson.example_config_path, f"{cfg_name}.yaml")
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            omni_cfg = OmegaConf.create(yaml.load(f, Loader=yaml.FullLoader))
-
-        override_omni_cfg: DictConfig | None = self.cfg.get("omni_config", None)
-        if override_omni_cfg is None:
-            return OmegaConf.to_container(omni_cfg, resolve=True)
-
-        override_wrapper = OmegaConf.select(
-            override_omni_cfg, "env_wrapper", default=None
-        )
-        if override_wrapper is not None:
-            self.env_wrapper = override_wrapper
-
-        camera_cfg = OmegaConf.select(override_omni_cfg, "camera", default=None)
-        if camera_cfg is None:
-            # Backward compatibility for historical typo key.
-            camera_cfg = OmegaConf.select(override_omni_cfg, "carema", default=None)
-        else:
-            self.camera_cfg = {}
-            head_resolution = OmegaConf.select(
-                camera_cfg, "head_resolution", default=None
-            )
-            wrist_resolution = OmegaConf.select(
-                camera_cfg, "wrist_resolution", default=None
-            )
-            if head_resolution is not None:
-                self.camera_cfg["head_resolution"] = list(head_resolution)
-            if wrist_resolution is not None:
-                self.camera_cfg["wrist_resolution"] = list(wrist_resolution)
-
-        robot_name = OmegaConf.select(override_omni_cfg, "robot.name", default="R1Pro")
-        default_proprio_obs = R1PRO_PROPRIO_KEYS if robot_name == "R1Pro" else None
-
-        with open_dict(omni_cfg):
-            for robot_cfg in omni_cfg.robots:
-                obs_modalities = OmegaConf.select(
-                    override_omni_cfg, "robot.obs_modalities", default=None
-                )
-                if obs_modalities is not None:
-                    robot_cfg.obs_modalities = list(obs_modalities)
-                    if "proprio" not in robot_cfg.obs_modalities:
-                        robot_cfg.obs_modalities.append("proprio")
-
-                proprio_obs = OmegaConf.select(
-                    override_omni_cfg, "robot.proprio_obs", default=None
-                )
-                if proprio_obs is not None:
-                    robot_cfg.proprio_obs = list(proprio_obs)
-                elif (
-                    default_proprio_obs is not None
-                    and "proprio" in robot_cfg.obs_modalities
-                ):
-                    robot_cfg.proprio_obs = default_proprio_obs
-
-                for key in (
-                    "action_normalize",
-                    "action_type",
-                    "grasping_mode",
-                    "self_collision",
-                    "self_collisions",
-                    "default_reset_mode",
-                    "reset_joint_pos",
-                    "position",
-                    "orientation",
-                    "include_sensor_names",
-                    "exclude_sensor_names",
-                    "scale",
-                ):
-                    value = OmegaConf.select(
-                        override_omni_cfg, f"robot.{key}", default=None
-                    )
-                    if value is not None:
-                        setattr(robot_cfg, key, value)
-
-                controller_cfg = OmegaConf.select(
-                    override_omni_cfg, "robot.controller_config", default=None
-                )
-                if controller_cfg is not None:
-                    base_controller_cfg = getattr(
-                        robot_cfg, "controller_config", OmegaConf.create({})
-                    )
-                    robot_cfg.controller_config = OmegaConf.merge(
-                        base_controller_cfg, controller_cfg
-                    )
-
-                sensor_cfg = OmegaConf.select(
-                    override_omni_cfg, "robot.sensor_config", default=None
-                )
-                if sensor_cfg is not None:
-                    base_sensor_cfg = getattr(
-                        robot_cfg, "sensor_config", OmegaConf.create({})
-                    )
-                    robot_cfg.sensor_config = OmegaConf.merge(
-                        base_sensor_cfg, sensor_cfg
-                    )
-
-            for key in (
-                "action_frequency",
-                "physics_frequency",
-                "rendering_frequency",
-                "device",
-                "automatic_reset",
-                "flatten_obs_space",
-                "flatten_action_space",
-                "use_external_obs",
-                "external_sensors",
-            ):
-                value = OmegaConf.select(override_omni_cfg, f"env.{key}", default=None)
-                if value is not None:
-                    setattr(omni_cfg.env, key, value)
-
-        return OmegaConf.to_container(omni_cfg, resolve=True)
 
     def _load_tasks_cfg(self, activity_name: str):
         # Read task description
@@ -307,12 +191,9 @@ class BehaviorEnv(gym.Env):
         self._env_process = self._ctx.Process(
             target=_behavior_env_worker,
             args=(
+                self.cfg,
                 child_conn,
-                self.omnigibson_cfg,
                 self.num_envs,
-                self.cfg.task_idx,
-                self.env_wrapper,
-                self.camera_cfg,
             ),
             daemon=True,
         )
@@ -341,11 +222,11 @@ class BehaviorEnv(gym.Env):
             assert isinstance(sensor_data, dict)
             for k, v in sensor_data.items():
                 if "left_realsense_link:Camera:0" in k:
-                    left_image = ensure_uint8_rgb(v["rgb"])
+                    left_image = convert_uint8_rgb(v["rgb"])
                 elif "right_realsense_link:Camera:0" in k:
-                    right_image = ensure_uint8_rgb(v["rgb"])
+                    right_image = convert_uint8_rgb(v["rgb"])
                 elif "zed_link:Camera:0" in k:
-                    zed_image = ensure_uint8_rgb(v["rgb"])
+                    zed_image = convert_uint8_rgb(v["rgb"])
                 elif "proprio" in k:
                     state = v
         assert state is not None, (

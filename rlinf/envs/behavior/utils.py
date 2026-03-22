@@ -13,10 +13,14 @@
 # limitations under the License.
 
 import inspect
+import os
 
 import torch
+import yaml
+from omegaconf import DictConfig, OmegaConf
 
-# Order follows omnigibson.learning.utils.eval_utils.PROPRIOCEPTION_INDICES["R1Pro"].
+SUPPORTED_ENV_WRAPPERS = ("default", "rgb_lowres", "rich_obs")
+
 R1PRO_PROPRIO_KEYS = [
     "joint_qpos",
     "joint_qpos_sin",
@@ -55,11 +59,8 @@ R1PRO_PROPRIO_KEYS = [
     "base_qvel",
 ]
 
-SUPPORTED_ENV_WRAPPERS = ("default", "rgb_lowres", "rich_obs", "comet_rgb")
-
 
 def set_camera_resolution(camera_cfg: dict | None) -> None:
-    """Apply BEHAVIOR camera resolution overrides to OmniGibson eval constants."""
     if camera_cfg is None:
         return
 
@@ -86,69 +87,12 @@ def get_env_wrapper(wrapper_name: str):
         from omnigibson.learning.wrappers.rich_obs_wrapper import RichObservationWrapper
 
         return RichObservationWrapper
-    if wrapper_name == "comet_rgb":
-        from omnigibson.envs import EnvironmentWrapper
-
-        class CometRGBWrapper(EnvironmentWrapper):
-            """Match openpi-comet RGB wrapper behavior for BEHAVIOR eval."""
-
-            def __init__(self, env):
-                super().__init__(env=env)
-                import omnigibson.learning.utils.eval_utils as eval_utils
-
-                robot = env.robots[0]
-                for camera_id, camera_name in eval_utils.ROBOT_CAMERA_NAMES[
-                    "R1Pro"
-                ].items():
-                    sensor_name = camera_name.split("::")[1]
-                    if camera_id == "head":
-                        robot.sensors[sensor_name].horizontal_aperture = 40.0
-                        robot.sensors[
-                            sensor_name
-                        ].image_height = eval_utils.HEAD_RESOLUTION[0]
-                        robot.sensors[
-                            sensor_name
-                        ].image_width = eval_utils.HEAD_RESOLUTION[1]
-                    else:
-                        robot.sensors[
-                            sensor_name
-                        ].image_height = eval_utils.WRIST_RESOLUTION[0]
-                        robot.sensors[
-                            sensor_name
-                        ].image_width = eval_utils.WRIST_RESOLUTION[1]
-                env.load_observation_space()
-
-        return CometRGBWrapper
     raise ValueError(
         f"Unsupported wrapper name: {wrapper_name}, expected one of {SUPPORTED_ENV_WRAPPERS}"
     )
 
 
-def build_eval_utils_omni_cfg(task_idx: int) -> dict:
-    """Build task-specific BEHAVIOR env config consistent with omnigibson.learning.eval."""
-    from gello.robots.sim_robot.og_teleop_utils import (
-        generate_robot_config,
-        load_available_tasks,
-    )
-    from omnigibson.learning.utils.eval_utils import (
-        PROPRIOCEPTION_INDICES,
-        TASK_INDICES_TO_NAMES,
-        generate_basic_environment_config,
-    )
-
-    task_name = TASK_INDICES_TO_NAMES[task_idx]
-    task_cfg = load_available_tasks()[task_name][0]
-
-    cfg = generate_basic_environment_config(task_name=task_name, task_cfg=task_cfg)
-    cfg["robots"] = [generate_robot_config(task_name=task_name, task_cfg=task_cfg)]
-    cfg["robots"][0]["obs_modalities"] = ["proprio", "rgb"]
-    cfg["robots"][0]["proprio_obs"] = list(PROPRIOCEPTION_INDICES["R1Pro"].keys())
-    cfg["task"]["include_obs"] = False
-    return cfg
-
-
-def ensure_uint8_rgb(image: torch.Tensor) -> torch.Tensor:
-    """Convert RGB image tensor to uint8 while preserving float [0,1] / [0,255] semantics."""
+def convert_uint8_rgb(image: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(image):
         image = torch.as_tensor(image)
 
@@ -166,44 +110,7 @@ def ensure_uint8_rgb(image: torch.Tensor) -> torch.Tensor:
     return image[..., :3]
 
 
-def find_sensor_by_suffix(sensor_names: list[str], suffix: str) -> str:
-    if suffix in sensor_names:
-        return suffix
-    candidates = [name for name in sensor_names if name.endswith(suffix)]
-    if not candidates:
-        candidates = [name for name in sensor_names if suffix in name]
-    if not candidates:
-        raise KeyError(
-            f"Cannot find sensor suffix '{suffix}' from available sensors: {sensor_names}"
-        )
-    if len(candidates) == 1:
-        return candidates[0]
-    return min(candidates, key=len)
-
-
-def sync_r1pro_camera_names_with_env(env) -> None:
-    """Align eval camera-name mapping with actual sensor names from this env."""
-    import omnigibson.learning.utils.eval_utils as eval_utils
-
-    robot = env.robots[0]
-    sensor_names = list(robot.sensors.keys())
-    camera_suffix = {
-        "left_wrist": "left_realsense_link:Camera:0",
-        "right_wrist": "right_realsense_link:Camera:0",
-        "head": "zed_link:Camera:0",
-    }
-    resolved = {
-        camera_id: find_sensor_by_suffix(sensor_names, suffix)
-        for camera_id, suffix in camera_suffix.items()
-    }
-    eval_utils.ROBOT_CAMERA_NAMES["R1Pro"] = {
-        camera_id: f"{robot.name}::{sensor_name}"
-        for camera_id, sensor_name in resolved.items()
-    }
-
-
 def patch_omnigibson_wrapper_reset_signature() -> None:
-    """Patch old OmniGibson wrapper reset to tolerate kwargs like get_obs."""
     from omnigibson.envs.env_wrapper import EnvironmentWrapper
 
     reset_fn = EnvironmentWrapper.reset
@@ -230,6 +137,49 @@ def apply_env_wrapper(vec_env, wrapper_name: str | None):
     patch_omnigibson_wrapper_reset_signature()
     wrapper_cls = get_env_wrapper(wrapper_name)
     for i in range(vec_env.num_envs):
-        sync_r1pro_camera_names_with_env(vec_env.envs[i])
         vec_env.envs[i] = wrapper_cls(vec_env.envs[i])
     return vec_env
+
+
+def override_sub_cfg(omni_cfg: DictConfig, override_cfg: DictConfig, sub_attr: str):
+    omni_sub_cfg = OmegaConf.select(omni_cfg, sub_attr)
+    override_sub_cfg = OmegaConf.select(override_cfg, sub_attr)
+    if override_sub_cfg is not None:
+        setattr(
+            omni_cfg,
+            sub_attr,
+            override_sub_cfg
+            if omni_sub_cfg is None
+            else OmegaConf.merge(omni_sub_cfg, override_sub_cfg),
+        )
+
+
+def setup_omni_cfg(override_cfg: DictConfig) -> DictConfig:
+    import omnigibson as og
+
+    cfg_path = os.path.join(og.example_config_path, "r1pro_behavior.yaml")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        omni_cfg = OmegaConf.create(yaml.load(f, Loader=yaml.FullLoader))
+    # override env/render/camera/robots config
+    override_sub_cfg(omni_cfg, override_cfg, "env")
+    # override_sub_cfg(omni_cfg, override_cfg, "render")
+    override_sub_cfg(omni_cfg, override_cfg, "camera")
+    override_sub_cfg(omni_cfg, override_cfg, "macro")
+    # here actually we only needs one robot config (and Behavior actually does do that)
+    # we must use update rather than merge to keep default robot config fields.
+    robot_override = OmegaConf.select(override_cfg, "robots[0]", default=None)
+    assert robot_override is not None, (
+        "OmniGibson config must contain a non-empty robots list, but robots[0] config is None"
+    )
+    OmegaConf.update(omni_cfg, "robots[0]", robot_override, merge=True)
+
+    override_proprio_obs = OmegaConf.select(
+        override_cfg, "robots[0].proprio_obs", default=None
+    )
+    if override_proprio_obs is None:
+        override_proprio_obs = R1PRO_PROPRIO_KEYS
+    OmegaConf.update(
+        omni_cfg, "robots[0].proprio_obs", override_proprio_obs, merge=True
+    )
+
+    return omni_cfg
