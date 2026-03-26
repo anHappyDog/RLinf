@@ -61,6 +61,19 @@ def _behavior_env_worker(cfg: DictConfig, conn, num_envs: int):
             omni_cfg, "task.activity_name", TASK_INDICES_TO_NAMES[cfg.task_idx]
         )
 
+        # Align OmniGibson task truncation/termination horizon with RLinf.
+        # Otherwise, `EnvWorker` may not see `terminations/truncations` within
+        # the configured `max_episode_steps`, leading to 0 counted trajectories.
+        max_episode_steps_raw = OmegaConf.select(cfg, "max_episode_steps", default=0)
+        try:
+            max_episode_steps = int(max_episode_steps_raw or 0)
+        except (TypeError, ValueError):
+            max_episode_steps = 0
+        if max_episode_steps > 0:
+            OmegaConf.update(
+                omni_cfg, "task.termination_config.max_steps", max_episode_steps
+            )
+
         # create env and apply env wrapper if enabled
         omni_cfg_dict = OmegaConf.to_container(
             omni_cfg,
@@ -327,6 +340,29 @@ class BehaviorEnv(gym.Env):
 
         past_terminations = raw_terminations.any(dim=1)
         past_truncations = raw_truncations.any(dim=1)
+
+        # Some OmniGibson builds may report episode completion primarily via
+        # `info["done"]` while leaving `terminations`/`truncations` booleans
+        # as all-False for the whole chunk. RLinf's evaluation metrics gate on
+        # `terminations|truncations`, so we fall back to info-done here.
+        #
+        # `raw_infos_list[i]` is a list of per-env info dicts for chunk step i.
+        info_done_flags = []
+        for i in range(chunk_size):
+            step_infos = raw_infos_list[i]
+            step_done = [
+                bool(info.get("done", {})) if isinstance(info, dict) else False
+                for info in step_infos
+            ]
+            info_done_flags.append(torch.tensor(step_done, dtype=torch.bool))
+        past_info_dones = torch.stack(info_done_flags, dim=1).any(dim=1)
+
+        # If the config asks to ignore terminations, map info-done into
+        # truncations; otherwise map it into terminations.
+        if self.ignore_terminations:
+            past_truncations = torch.logical_or(past_truncations, past_info_dones)
+        else:
+            past_terminations = torch.logical_or(past_terminations, past_info_dones)
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
         if past_dones.any() and self.auto_reset:
