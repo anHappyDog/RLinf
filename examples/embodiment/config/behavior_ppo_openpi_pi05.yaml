@@ -98,7 +98,8 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/openpi-comet" # e.g. pi05 comet checkpoint
+    
+    model_path: "/path/to/model/pi05"
     precision: ${actor.model.precision}
 
 actor:
@@ -111,7 +112,7 @@ actor:
   enable_offload: True
 
   model:
-    model_path: "/path/to/model/openpi-comet" # e.g. pi05 comet checkpoint
+    model_path: "/path/to/model/pi05"
     add_value_head: True
     num_images_in_input: 3
     proprio_dim: 32
