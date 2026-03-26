@@ -80,12 +80,6 @@ class EnvWorker(Worker):
         )
         self.actor_split_num = self.get_actor_split_num()
 
-    def close(self):
-        for env in self.env_list + self.eval_env_list:
-            close_fn = getattr(env, "close", None)
-            if callable(close_fn):
-                close_fn()
-
     def init_worker(self):
         self.dst_ranks = {
             "train": self._setup_dst_ranks(

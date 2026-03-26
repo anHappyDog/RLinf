@@ -154,17 +154,29 @@ def override_sub_cfg(omni_cfg: DictConfig, override_cfg: DictConfig, sub_attr: s
         )
 
 
-def setup_omni_cfg(override_cfg: DictConfig) -> DictConfig:
-    import omnigibson as og
+def setup_omni_cfg(cfg: DictConfig) -> DictConfig:
+    """
+    Setup OmniGibson's config, overrided by user-set config
 
+    Args:
+        cfg(DictConfig): rlinf's env config, must have `omni_config` field
+
+    Returns:
+        (DictConfig): overrided OmniGibson config
+    """
+    import omnigibson as og
+    from omnigibson.macros import gm
+
+    override_cfg = OmegaConf.select(cfg, "omni_config")
     cfg_path = os.path.join(og.example_config_path, "r1pro_behavior.yaml")
     with open(cfg_path, "r", encoding="utf-8") as f:
         omni_cfg = OmegaConf.create(yaml.load(f, Loader=yaml.FullLoader))
-    # override env/render/camera/robots config
+    # override env/render/camera/robots/task config
     override_sub_cfg(omni_cfg, override_cfg, "env")
-    # override_sub_cfg(omni_cfg, override_cfg, "render")
+    override_sub_cfg(omni_cfg, override_cfg, "render")
     override_sub_cfg(omni_cfg, override_cfg, "camera")
     override_sub_cfg(omni_cfg, override_cfg, "macro")
+    override_sub_cfg(omni_cfg, override_cfg, "task")
     # here actually we only needs one robot config (and Behavior actually does do that)
     # we must use update rather than merge to keep default robot config fields.
     robot_override = OmegaConf.select(override_cfg, "robots[0]", default=None)
@@ -182,4 +194,41 @@ def setup_omni_cfg(override_cfg: DictConfig) -> DictConfig:
         omni_cfg, "robots[0].proprio_obs", override_proprio_obs, merge=True
     )
 
+    # setup omnigibson macros, according to configuration yaml
+    macro_cfg = OmegaConf.select(omni_cfg, "macro")
+    gm.HEADLESS = macro_cfg.headless
+    gm.ENABLE_FLATCACHE = macro_cfg.enable_flatcache
+    gm.ENABLE_OBJECT_STATES = macro_cfg.enable_object_states
+    gm.USE_GPU_DYNAMICS = macro_cfg.use_gpu_dynamics
+    gm.ENABLE_TRANSITION_RULES = macro_cfg.enable_transition_rules
+    gm.RENDER_VIEWER_CAMERA = macro_cfg.render_viewer_camera
+    gm.USE_NUMPY_CONTROLLER_BACKEND = macro_cfg.use_numpy_controller_backend
+
+    # setup head/wrist camera resolutions
+    camera_cfg = OmegaConf.select(omni_cfg, "camera")
+    set_camera_resolution(camera_cfg)
+
+    # override behavior's termination config `max_steps` field
+    max_episode_steps = OmegaConf.select(cfg, "max_episode_steps")
+    assert max_episode_steps is not None, "must set max_episode_steps in config."
+    OmegaConf.update(
+        omni_cfg,
+        "task.termination_config.max_steps",
+        max_episode_steps,
+    )
+
     return omni_cfg
+
+
+def resample_task(vec_env, omni_task_cfg: DictConfig, num_envs: int):
+    online_object_sampling = OmegaConf.select(omni_task_cfg, "online_object_sampling")
+    use_presampled_robot_pose = OmegaConf.select(
+        omni_task_cfg, "use_presampled_robot_pose"
+    )
+
+    assert online_object_sampling and not use_presampled_robot_pose, (
+        f"online_object_sampling should be True and use_presampled_robot_pose should be False, but got {online_object_sampling} and  {use_presampled_robot_pose}"
+    )
+
+    for i in range(num_envs):
+        vec_env.envs[i].update_task(task_config=omni_task_cfg)

@@ -24,7 +24,7 @@ from omegaconf import DictConfig, OmegaConf
 from rlinf.envs.behavior.utils import (
     apply_env_wrapper,
     convert_uint8_rgb,
-    set_camera_resolution,
+    resample_task,
     setup_omni_cfg,
 )
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
@@ -37,42 +37,14 @@ def _behavior_env_worker(cfg: DictConfig, conn, num_envs: int):
     env = None
     try:
         from omnigibson.envs import VectorEnvironment
-        from omnigibson.learning.utils.eval_utils import TASK_INDICES_TO_NAMES
-        from omnigibson.macros import gm
 
-        override_cfg = OmegaConf.select(cfg, "omni_config")
-        omni_cfg = setup_omni_cfg(override_cfg)
-        # setup omnigibson macros, according to configuration yaml
-        macro_cfg = OmegaConf.select(omni_cfg, "macro")
-        gm.HEADLESS = macro_cfg.headless
-        gm.ENABLE_FLATCACHE = macro_cfg.enable_flatcache
-        gm.ENABLE_OBJECT_STATES = macro_cfg.enable_object_states
-        gm.USE_GPU_DYNAMICS = macro_cfg.use_gpu_dynamics
-        gm.ENABLE_TRANSITION_RULES = macro_cfg.enable_transition_rules
-        gm.RENDER_VIEWER_CAMERA = macro_cfg.render_viewer_camera
-        gm.USE_NUMPY_CONTROLLER_BACKEND = macro_cfg.use_numpy_controller_backend
+        omni_cfg = setup_omni_cfg(cfg)
 
-        # setup head/wrist camera resolutions
-        camera_cfg = OmegaConf.select(omni_cfg, "camera")
-        set_camera_resolution(camera_cfg)
-
-        # set task idx
-        OmegaConf.update(
-            omni_cfg, "task.activity_name", TASK_INDICES_TO_NAMES[cfg.task_idx]
+        #
+        omni_task_cfg = OmegaConf.select(omni_cfg, "task")
+        resample_task_when_reset = OmegaConf.select(
+            omni_cfg, "task.resample_task_when_reset"
         )
-
-        # Align OmniGibson task truncation/termination horizon with RLinf.
-        # Otherwise, `EnvWorker` may not see `terminations/truncations` within
-        # the configured `max_episode_steps`, leading to 0 counted trajectories.
-        max_episode_steps_raw = OmegaConf.select(cfg, "max_episode_steps", default=0)
-        try:
-            max_episode_steps = int(max_episode_steps_raw or 0)
-        except (TypeError, ValueError):
-            max_episode_steps = 0
-        if max_episode_steps > 0:
-            OmegaConf.update(
-                omni_cfg, "task.termination_config.max_steps", max_episode_steps
-            )
 
         # create env and apply env wrapper if enabled
         omni_cfg_dict = OmegaConf.to_container(
@@ -95,6 +67,8 @@ def _behavior_env_worker(cfg: DictConfig, conn, num_envs: int):
             cmd, payload = conn.recv()
 
             if cmd == "reset":
+                if resample_task_when_reset:
+                    resample_task(env, omni_task_cfg, num_envs)
                 raw_obs, infos = env.reset()
                 conn.send({"type": "ok", "result": (raw_obs, infos)})
 
@@ -140,6 +114,7 @@ def _behavior_env_worker(cfg: DictConfig, conn, num_envs: int):
             elif cmd == "close":
                 env.close()
                 conn.send({"type": "ok", "result": None})
+                break
             else:
                 raise NotImplementedError(f"Unknown command: {cmd}")
 

@@ -291,6 +291,12 @@ Using behavior as an example:
 - ``task_idx``:
   Current task id (0-49). RLinf maps it to the concrete task name and writes it
   into ``task.activity_name`` (see ``rlinf/envs/behavior/behavior_env.py``).
+- ``omni_config.task.resample_task_when_reset: True``:
+  Before each ``env.reset()``, RLinf calls ``update_task`` to resample, so scene
+  and object layouts can change across episodes under the same
+  ``activity_name``. This requires ``online_object_sampling: True`` and
+  ``use_presampled_robot_pose: False`` (otherwise an assertion is raised). Set
+  it to ``False`` if you need fixed scenes for strict A/B comparisons.
 - ``camera.head_resolution`` / ``camera.wrist_resolution``:
   Head / wrist camera resolutions. RLinf overrides default values in
   ``omnigibson.learning.utils.eval_utils`` (default 720x720 and 480x480), then
