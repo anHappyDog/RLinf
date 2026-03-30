@@ -23,6 +23,7 @@ def install_patch() -> None:
         return
 
     import importlib
+
     import omnigibson as og
 
     if og.__version__ != SUPPORTED_OMNIGIBSON_VERSION:

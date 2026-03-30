@@ -293,9 +293,11 @@ Using behavior as an example:
   RLinf ships a lightweight BEHAVIOR compatibility patch for
   ``omnigibson==3.7.1``. Keep these two types in
   ``examples/embodiment/config/env/behavior_r1pro.yaml`` when using RLinf's
-  BEHAVIOR setup. The patch is installed automatically by
+  BEHAVIOR setup. ``install_patch()`` is still called automatically by
   ``rlinf/envs/behavior/behavior_env.py`` before ``VectorEnvironment`` is
-  created, so no manual patch call is needed in user scripts.
+  created, but it only registers the RLinf classes and applies monkey patches.
+  It does not rewrite ``task.type`` or ``scene.type`` anymore, so these two
+  YAML entries must be set explicitly.
 - RLinf BEHAVIOR patch contents:
   The patch fixes several multi-environment issues observed with
   OmniGibson 3.7.1, including cross-scene ``BehaviorTask`` callbacks,

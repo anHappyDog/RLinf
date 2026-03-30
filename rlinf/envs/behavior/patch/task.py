@@ -82,7 +82,9 @@ class RLinfBehaviorTask(BehaviorTask):
                 "please set use_presampled_robot_pose to False in task config"
             )
             poses = presampled_poses[robot.model_name]
-            robot_pose = random.choice(poses) if self.randomize_presampled_pose else poses[0]
+            robot_pose = (
+                random.choice(poses) if self.randomize_presampled_pose else poses[0]
+            )
             robot.set_position_orientation(
                 robot_pose["position"],
                 robot_pose["orientation"],
@@ -97,7 +99,11 @@ class RLinfBehaviorTask(BehaviorTask):
         if not self._callback_matches_scene(obj, "object.add"):
             return
         for entity in self.object_scope.values():
-            if not entity.exists and not entity.is_system and obj.category in set(entity.og_categories):
+            if (
+                not entity.exists
+                and not entity.is_system
+                and obj.category in set(entity.og_categories)
+            ):
                 entity.set_entity(entity=obj)
                 return
 
@@ -113,7 +119,11 @@ class RLinfBehaviorTask(BehaviorTask):
         if not self._callback_matches_scene(system, "system.init"):
             return
         for entity in self.object_scope.values():
-            if not entity.exists and entity.is_system and entity.og_categories[0] == system.name:
+            if (
+                not entity.exists
+                and entity.is_system
+                and entity.og_categories[0] == system.name
+            ):
                 entity.set_entity(entity=system)
                 return
 

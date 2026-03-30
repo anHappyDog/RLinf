@@ -23,7 +23,9 @@ from omnigibson.utils.python_utils import recursively_convert_to_torch
 
 class RLinfInteractiveTraversableScene(InteractiveTraversableScene):
     def restore(self, scene_file, update_initial_file=False):
-        assert not og.sim.is_stopped(), "Simulator cannot be stopped when restoring scene!"
+        assert not og.sim.is_stopped(), (
+            "Simulator cannot be stopped when restoring scene!"
+        )
 
         if isinstance(scene_file, str):
             if not scene_file.endswith(".json"):
@@ -61,7 +63,8 @@ class RLinfInteractiveTraversableScene(InteractiveTraversableScene):
         load_obj_names = set(scene_info["objects_info"]["init_info"].keys())
 
         objects_to_remove = [
-            self.object_registry("name", name) for name in current_obj_names - load_obj_names
+            self.object_registry("name", name)
+            for name in current_obj_names - load_obj_names
         ]
         og.sim.batch_remove_objects(objects_to_remove)
 

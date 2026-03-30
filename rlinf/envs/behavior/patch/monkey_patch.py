@@ -65,6 +65,8 @@ def apply() -> None:
                 if entity.exists and not entity.is_system:
                     entity.keep_still()
 
-    ControllableObjectViewAPI._get_pattern_from_prim_path = classmethod(_get_pattern_from_prim_path)
+    ControllableObjectViewAPI._get_pattern_from_prim_path = classmethod(
+        _get_pattern_from_prim_path
+    )
     ControllableObjectViewAPI.__rlinf_patched__ = True
     Evaluator.load_task_instance = _load_task_instance
