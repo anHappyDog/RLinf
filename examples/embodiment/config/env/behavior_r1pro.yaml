@@ -112,8 +112,13 @@ omni_config:
     # activity_instance_id is only used when online object sampling is False.
     activity_instance_id: 0
     predefined_problem: null
-    # resample_task_when_reset is True when behavior will reset their env scene during reset.
-    resample_task_when_reset: False
+    # activity_instance_dir should point to a directory of cached *-tro_state.json files.
+    # If set and instance_resample_mode is disabled, RLinf loads activity_instance_id from this directory.
+    activity_instance_dir: null
+    # Reset-time instance resampling mode: disabled | offline | online.
+    # offline: sample cached instances from activity_instance_dir without reloading the scene.
+    # online: use BDDL online object sampling during reset.
+    instance_resample_mode: disabled
     online_object_sampling: False
     debug_object_sampling: null
     highlight_task_relevant_objects: False

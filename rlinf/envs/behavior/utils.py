@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import inspect
+import json
 import os
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import yaml
@@ -58,6 +61,26 @@ R1PRO_PROPRIO_KEYS = [
     "base_qpos_cos",
     "base_qvel",
 ]
+
+TASK_INSTANCE_FILE_SUFFIX = "_template-tro_state.json"
+TASK_INSTANCE_TEMPLATE_FILE_SUFFIX = "_template.json"
+SUPPORTED_INSTANCE_RESAMPLE_MODES = ("disabled", "offline", "online")
+
+
+@dataclass(frozen=True)
+class BehaviorActivityInstanceFile:
+    instance_id: int
+    path: str
+    file_format: str
+
+
+@dataclass(frozen=True)
+class BehaviorInstanceResampleConfig:
+    activity_name: str
+    activity_instance_id: int
+    activity_instance_dir: str | None
+    instance_resample_mode: str
+    cached_activity_instances: tuple[BehaviorActivityInstanceFile, ...] = ()
 
 
 def set_camera_resolution(camera_cfg: dict | None) -> None:
@@ -219,6 +242,294 @@ def setup_omni_cfg(cfg: DictConfig) -> DictConfig:
     )
 
     return omni_cfg
+
+
+def build_instance_resample_config(
+    omni_cfg: DictConfig,
+) -> BehaviorInstanceResampleConfig:
+    activity_name = OmegaConf.select(omni_cfg, "task.activity_name")
+    activity_definition_id = OmegaConf.select(
+        omni_cfg, "task.activity_definition_id"
+    )
+    activity_instance_id = OmegaConf.select(omni_cfg, "task.activity_instance_id")
+    activity_instance_dir = OmegaConf.select(omni_cfg, "task.activity_instance_dir")
+    instance_resample_mode = OmegaConf.select(
+        omni_cfg, "task.instance_resample_mode", default="disabled"
+    )
+    instance_resample_mode = str(instance_resample_mode).lower()
+    online_object_sampling = OmegaConf.select(omni_cfg, "task.online_object_sampling")
+
+    assert instance_resample_mode in SUPPORTED_INSTANCE_RESAMPLE_MODES, (
+        "task.instance_resample_mode must be one of "
+        f"{SUPPORTED_INSTANCE_RESAMPLE_MODES}, got {instance_resample_mode!r}."
+    )
+
+    if activity_instance_dir is not None:
+        assert not online_object_sampling and instance_resample_mode != "online", (
+            "task.activity_instance_dir only supports offline task "
+            "instances, please disable online reset-time resampling."
+        )
+
+    cached_activity_instances: tuple[BehaviorActivityInstanceFile, ...] = ()
+    if activity_instance_dir is not None:
+        cached_activity_instances = tuple(
+            discover_activity_instance_files(
+                activity_instance_dir=activity_instance_dir,
+                activity_name=activity_name,
+                activity_definition_id=activity_definition_id,
+            )
+        )
+
+    if instance_resample_mode == "offline":
+        assert activity_instance_dir is not None, (
+            "task.activity_instance_dir must be set when "
+            "task.instance_resample_mode is 'offline'."
+        )
+    elif instance_resample_mode == "online":
+        use_presampled_robot_pose = OmegaConf.select(
+            omni_cfg, "task.use_presampled_robot_pose"
+        )
+        assert online_object_sampling, (
+            "task.instance_resample_mode='online' requires "
+            "task.online_object_sampling to be True."
+        )
+        assert not use_presampled_robot_pose, (
+            "task.instance_resample_mode='online' requires "
+            "task.use_presampled_robot_pose to be False."
+        )
+    elif activity_instance_dir is not None:
+        instance_ids = {entry.instance_id for entry in cached_activity_instances}
+        assert activity_instance_id in instance_ids, (
+            f"task.activity_instance_id={activity_instance_id} is not present in "
+            f"task.activity_instance_dir={activity_instance_dir}."
+        )
+
+    return BehaviorInstanceResampleConfig(
+        activity_name=activity_name,
+        activity_instance_id=activity_instance_id,
+        activity_instance_dir=activity_instance_dir,
+        instance_resample_mode=instance_resample_mode,
+        cached_activity_instances=cached_activity_instances,
+    )
+
+
+def parse_activity_instance_filename(
+    filename: str,
+    activity_name: str,
+) -> tuple[int, int, str] | None:
+    file_format = None
+    suffix = None
+    if filename.endswith(TASK_INSTANCE_FILE_SUFFIX):
+        file_format = "tro_state"
+        suffix = TASK_INSTANCE_FILE_SUFFIX
+    elif filename.endswith(TASK_INSTANCE_TEMPLATE_FILE_SUFFIX):
+        file_format = "template"
+        suffix = TASK_INSTANCE_TEMPLATE_FILE_SUFFIX
+    if suffix is None:
+        return None
+
+    infix = f"_task_{activity_name}_"
+    if infix not in filename:
+        return None
+
+    stem = filename[: -len(suffix)]
+    _, suffix_stem = stem.split(infix, 1)
+    definition_and_instance = suffix_stem.split("_")
+    if len(definition_and_instance) != 2:
+        return None
+
+    definition_id, instance_id = definition_and_instance
+    if not definition_id.isdigit() or not instance_id.isdigit():
+        return None
+
+    return int(definition_id), int(instance_id), file_format
+
+
+def discover_activity_instance_files(
+    activity_instance_dir: str | os.PathLike[str],
+    activity_name: str,
+    activity_definition_id: int,
+) -> list[BehaviorActivityInstanceFile]:
+    instance_dir = Path(activity_instance_dir)
+    if not instance_dir.is_dir():
+        raise ValueError(
+            f"activity_instance_dir must be an existing directory, got: {instance_dir}"
+        )
+
+    instance_files = {}
+    for entry in instance_dir.iterdir():
+        if not entry.is_file():
+            continue
+        parsed = parse_activity_instance_filename(
+            entry.name,
+            activity_name=activity_name,
+        )
+        if parsed is None:
+            continue
+
+        definition_id, instance_id, file_format = parsed
+        if definition_id != activity_definition_id:
+            continue
+
+        if instance_id in instance_files:
+            raise ValueError(
+                f"Duplicate activity instance id {instance_id} found in {instance_dir}."
+            )
+        instance_files[instance_id] = BehaviorActivityInstanceFile(
+            instance_id=instance_id,
+            path=str(entry),
+            file_format=file_format,
+        )
+
+    if not instance_files:
+        raise ValueError(
+            "No cached BEHAVIOR task instances were found in "
+            f"{instance_dir} for activity_name={activity_name}, "
+            f"activity_definition_id={activity_definition_id}."
+        )
+
+    return [instance_files[k] for k in sorted(instance_files)]
+
+
+def get_activity_instance_file(
+    activity_instances: tuple[BehaviorActivityInstanceFile, ...],
+    instance_id: int,
+) -> BehaviorActivityInstanceFile:
+    for instance_file in activity_instances:
+        if instance_file.instance_id == instance_id:
+            return instance_file
+    raise ValueError(f"Activity instance id {instance_id} was not discovered.")
+
+
+def get_activity_instance_dir(env, activity_instance_dir: str | None = None) -> str:
+    if activity_instance_dir is not None:
+        return activity_instance_dir
+
+    from omnigibson.utils.asset_utils import get_task_instance_path
+
+    scene_model = env.task.scene_name
+    return os.path.join(
+        get_task_instance_path(scene_model),
+        f"json/{scene_model}_task_{env.task.activity_name}_instances",
+    )
+
+
+def get_activity_instance_file_path(
+    env,
+    instance_id: int,
+    activity_instance_dir: str | None = None,
+) -> str:
+    scene_model = env.task.scene_name
+    tro_filename = env.task.get_cached_activity_scene_filename(
+        scene_model=scene_model,
+        activity_name=env.task.activity_name,
+        activity_definition_id=env.task.activity_definition_id,
+        activity_instance_id=instance_id,
+    )
+    return os.path.join(
+        get_activity_instance_dir(env, activity_instance_dir),
+        f"{tro_filename}-tro_state.json",
+    )
+
+
+def load_cached_activity_instance(
+    env,
+    instance_id: int,
+    activity_instance_dir: str | None = None,
+    reset_scene: bool = False,
+) -> None:
+    tro_file_path = get_activity_instance_file_path(
+        env,
+        instance_id=instance_id,
+        activity_instance_dir=activity_instance_dir,
+    )
+    load_activity_instance_tro_state(
+        env,
+        instance_id=instance_id,
+        tro_file_path=tro_file_path,
+        reset_scene=reset_scene,
+    )
+
+
+def load_activity_instance_tro_state(
+    env,
+    instance_id: int,
+    tro_file_path: str,
+    reset_scene: bool = False,
+) -> None:
+    import omnigibson as og
+    from omnigibson.utils.python_utils import recursively_convert_to_torch
+
+    env.task.activity_instance_id = instance_id
+    with open(tro_file_path, "r", encoding="utf-8") as f:
+        tro_state = recursively_convert_to_torch(json.load(f))
+    robot = env.task.get_agent(env)
+    robot_name = getattr(robot, "model_name", getattr(robot, "model", None))
+    assert robot_name is not None, (
+        "Robot model name is required to load task instances."
+    )
+
+    for tro_key, state in tro_state.items():
+        if tro_key == "robot_poses":
+            assert robot_name in state, (
+                f"{robot_name} presampled pose is not found in {tro_file_path}"
+            )
+            robot_pose = state[robot_name][0]
+            robot.set_position_orientation(
+                robot_pose["position"],
+                robot_pose["orientation"],
+                frame="scene",
+            )
+            env.scene.write_task_metadata(key=tro_key, data=state)
+        else:
+            env.task.object_scope[tro_key].load_state(state, serialized=False)
+
+    for _ in range(25):
+        og.sim.step_physics()
+        for entity in env.task.object_scope.values():
+            if entity.exists and not entity.is_system:
+                entity.keep_still()
+
+    env.scene.update_initial_file()
+    if reset_scene:
+        env.scene.reset()
+
+
+def load_activity_instance_template(
+    env,
+    instance_id: int,
+    template_path: str,
+    reset_scene: bool = False,
+) -> None:
+    env.task.activity_instance_id = instance_id
+    env.scene.restore(scene_file=template_path, update_initial_file=True)
+    if reset_scene:
+        env.scene.reset()
+
+
+def load_activity_instance_file(
+    env,
+    instance_file: BehaviorActivityInstanceFile,
+    reset_scene: bool = False,
+) -> None:
+    if instance_file.file_format == "tro_state":
+        load_activity_instance_tro_state(
+            env,
+            instance_id=instance_file.instance_id,
+            tro_file_path=instance_file.path,
+            reset_scene=reset_scene,
+        )
+        return
+    if instance_file.file_format == "template":
+        load_activity_instance_template(
+            env,
+            instance_id=instance_file.instance_id,
+            template_path=instance_file.path,
+            reset_scene=reset_scene,
+        )
+        return
+
+    raise ValueError(f"Unsupported activity instance format: {instance_file.file_format}")
 
 
 def resample_task(vec_env, omni_task_cfg: DictConfig, num_envs: int):

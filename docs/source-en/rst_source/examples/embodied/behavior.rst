@@ -311,12 +311,25 @@ Using behavior as an example:
 - ``task_idx``:
   Current task id (0-49). RLinf maps it to the concrete task name and writes it
   into ``task.activity_name`` (see ``rlinf/envs/behavior/behavior_env.py``).
-- ``omni_config.task.resample_task_when_reset: True``:
-  Before each ``env.reset()``, RLinf calls ``update_task`` to resample, so scene
-  and object layouts can change across episodes under the same
-  ``activity_name``. This requires ``online_object_sampling: True`` and
-  ``use_presampled_robot_pose: False`` (otherwise an assertion is raised). Set
-  it to ``False`` if you need fixed scenes for strict A/B comparisons.
+- ``omni_config.task.instance_resample_mode``:
+  Controls reset-time instance switching. Supported modes are
+  ``disabled``, ``offline``, and ``online``.
+  In ``offline`` mode, RLinf scans ``omni_config.task.activity_instance_dir``
+  once at startup, parses cached instance ids from
+  OmniGibson's standard ``<scene>_task_<activity>_<definition>_<instance>_template-tro_state.json``
+  filenames, and samples one cached offline instance before each ``env.reset()``
+  without reloading the scene. This is useful when you want more reset-time
+  diversity than a fixed ``activity_instance_id`` but lower overhead than
+  ``online_object_sampling``.
+  In ``online`` mode, RLinf reuses the online task-resampling path and requires
+  ``online_object_sampling: True`` plus ``use_presampled_robot_pose: False``.
+  In ``disabled`` mode, if ``activity_instance_dir`` is set RLinf loads the
+  configured ``activity_instance_id`` from that directory before each reset.
+- ``omni_config.task.activity_instance_dir``:
+  Optional directory containing cached ``*-tro_state.json`` files following
+  OmniGibson's standard naming convention. Used by ``instance_resample_mode:
+  offline`` and by fixed ``activity_instance_id`` loading when the mode is
+  ``disabled``.
 - ``camera.head_resolution`` / ``camera.wrist_resolution``:
   Head / wrist camera resolutions. RLinf overrides default values in
   ``omnigibson.learning.utils.eval_utils`` (default 720x720 and 480x480), then
