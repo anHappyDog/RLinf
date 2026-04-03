@@ -249,11 +249,6 @@ def load_activity_instance_tro_state(
         tro_file_path: Path to a ``*_template-tro_state.json`` file.
         reset_scene: Whether to call ``env.scene.reset()`` after applying the
             cached state.
-
-    Raises:
-        AssertionError: If the robot model name is unavailable, the cached file
-            contains an unknown task-relevant object key, or the cached robot
-            poses do not contain the current robot.
     """
     import omnigibson as og
     from omnigibson.utils.python_utils import recursively_convert_to_torch
@@ -471,10 +466,6 @@ class ActivityInstanceLoader:
         Args:
             vec_env: Vectorized OmniGibson environment whose child envs should be
                 updated before ``vec_env.reset()``.
-
-        Raises:
-            ValueError: If the selected cached instances are invalid for the
-                current reset.
         """
         if self.instance_resample_mode == "online":
             task_cfg = OmegaConf.select(self.omni_cfg, "task")
