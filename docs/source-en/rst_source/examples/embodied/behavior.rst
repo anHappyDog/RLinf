@@ -343,6 +343,46 @@ Using behavior as an example:
   presampled pose override. When converting from
   ``template.json``, omitting ``robot_poses`` is usually safer than writing the
   current simulator robot pose into the cache.
+- Generating cached instances with RLinf's generator:
+  RLinf provides ``toolkits/behavior_generate_activity_instances.py`` to
+  generate ``*_template.json`` and ``*_template-tro_state.json`` files directly
+  from ``examples/embodiment/config/env/behavior_r1pro.yaml``.
+  The script reads ``omni_config.scene.scene_model``,
+  ``omni_config.task.activity_name``,
+  ``omni_config.task.activity_definition_id``, the robot config, and room
+  loading settings from the yaml, then temporarily switches the task to online
+  object sampling for cached-instance generation.
+  It writes into ``omni_config.task.activity_instance_dir`` when that field is
+  set; otherwise it falls back to RLinf's default
+  ``2025-challenge-task-instances`` directory. Use ``--output-dir`` to override
+  either behavior.
+
+  .. code-block:: bash
+
+     cd /path/to/RLinf
+
+     python toolkits/behavior_generate_activity_instances.py \
+       --config examples/embodiment/config/env/behavior_r1pro.yaml \
+       --output-format template \
+       --start-idx 1 \
+       --end-idx 50
+
+     python toolkits/behavior_generate_activity_instances.py \
+       --config examples/embodiment/config/env/behavior_r1pro.yaml \
+       --output-format tro_state \
+       --start-idx 1 \
+       --end-idx 50
+
+  The generated filenames follow
+  ``<scene_model>_task_<activity_name>_<activity_definition_id>_<activity_instance_id>_template(.json|-tro_state.json)``.
+  ``--start-idx`` and ``--end-idx`` therefore control the generated
+  ``activity_instance_id`` range. ``tro_state`` outputs include top-level
+  ``robot_poses`` when the task metadata provides them; otherwise the key is
+  omitted so RLinf reset falls back to the task's default robot reset pose.
+  BEHAVIOR-1K's upstream
+  ``OmniGibson/omnigibson/sampling/multiply_b1k_tasks.py`` is still usable, but
+  RLinf's generator is the recommended path because it reads the RLinf yaml
+  directly and preserves ``activity_definition_id`` from that config.
 - ``camera.head_resolution`` / ``camera.wrist_resolution``:
   Head / wrist camera resolutions. RLinf overrides default values in
   ``omnigibson.learning.utils.eval_utils`` (default 720x720 and 480x480), then
