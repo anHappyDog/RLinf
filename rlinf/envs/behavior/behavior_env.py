@@ -14,7 +14,6 @@
 
 import json
 import os
-import random
 import traceback
 from multiprocessing import get_context
 
@@ -22,13 +21,11 @@ import gymnasium as gym
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.envs.behavior.instance_loader import ActivityInstanceLoader
 from rlinf.envs.behavior.utils import (
     apply_env_wrapper,
-    build_instance_resample_config,
     convert_uint8_rgb,
-    get_activity_instance_file,
-    load_activity_instance_file,
-    resample_task,
+    infer_done_from_omnigibson_info,
     setup_omni_cfg,
 )
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
@@ -46,9 +43,7 @@ def _behavior_env_worker(cfg: DictConfig, conn, num_envs: int):
         from omnigibson.envs import VectorEnvironment
 
         omni_cfg = setup_omni_cfg(cfg)
-
-        omni_task_cfg = OmegaConf.select(omni_cfg, "task")
-        instance_resample_cfg = build_instance_resample_config(omni_cfg)
+        instance_loader = ActivityInstanceLoader.from_omni_cfg(omni_cfg)
 
         # create env and apply env wrapper if enabled
         omni_cfg_dict = OmegaConf.to_container(
@@ -63,7 +58,7 @@ def _behavior_env_worker(cfg: DictConfig, conn, num_envs: int):
         conn.send(
             {
                 "type": "ready",
-                "activity_name": instance_resample_cfg.activity_name,
+                "activity_name": instance_loader.activity_name,
             }
         )
 
@@ -71,28 +66,7 @@ def _behavior_env_worker(cfg: DictConfig, conn, num_envs: int):
             cmd, payload = conn.recv()
 
             if cmd == "reset":
-                if instance_resample_cfg.instance_resample_mode == "offline":
-                    for i in range(num_envs):
-                        load_activity_instance_file(
-                            env.envs[i],
-                            instance_file=random.choice(
-                                instance_resample_cfg.cached_activity_instances
-                            ),
-                            reset_scene=False,
-                        )
-                elif instance_resample_cfg.activity_instance_dir is not None:
-                    instance_file = get_activity_instance_file(
-                        instance_resample_cfg.cached_activity_instances,
-                        instance_id=instance_resample_cfg.activity_instance_id,
-                    )
-                    for i in range(num_envs):
-                        load_activity_instance_file(
-                            env.envs[i],
-                            instance_file=instance_file,
-                            reset_scene=False,
-                        )
-                if instance_resample_cfg.instance_resample_mode == "online":
-                    resample_task(env, omni_task_cfg, num_envs)
+                instance_loader.prepare_reset(env)
                 raw_obs, infos = env.reset()
                 conn.send({"type": "ok", "result": (raw_obs, infos)})
 
@@ -350,7 +324,9 @@ class BehaviorEnv(gym.Env):
         for i in range(chunk_size):
             step_infos = raw_infos_list[i]
             step_done = [
-                bool(info.get("done", {})) if isinstance(info, dict) else False
+                infer_done_from_omnigibson_info(info)
+                if isinstance(info, dict)
+                else False
                 for info in step_infos
             ]
             info_done_flags.append(torch.tensor(step_done, dtype=torch.bool))

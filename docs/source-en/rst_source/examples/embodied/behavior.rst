@@ -316,20 +316,33 @@ Using behavior as an example:
   ``disabled``, ``offline``, and ``online``.
   In ``offline`` mode, RLinf scans ``omni_config.task.activity_instance_dir``
   once at startup, parses cached instance ids from
-  OmniGibson's standard ``<scene>_task_<activity>_<definition>_<instance>_template-tro_state.json``
-  filenames, and samples one cached offline instance before each ``env.reset()``
-  without reloading the scene. This is useful when you want more reset-time
-  diversity than a fixed ``activity_instance_id`` but lower overhead than
-  ``online_object_sampling``.
+  filenames in that directory, and samples one cached offline instance before
+  each ``env.reset()``. ``*_template.json`` files are treated as full cached
+  templates and are reloaded through the heavier scene-reload path, while
+  ``*_template-tro_state.json`` files are treated as task-relevant-only cached
+  states and are applied through the lighter in-place path. This is useful
+  when you want more reset-time diversity than a fixed
+  ``activity_instance_id`` but lower overhead than ``online_object_sampling``.
   In ``online`` mode, RLinf reuses the online task-resampling path and requires
   ``online_object_sampling: True`` plus ``use_presampled_robot_pose: False``.
   In ``disabled`` mode, if ``activity_instance_dir`` is set RLinf loads the
   configured ``activity_instance_id`` from that directory before each reset.
 - ``omni_config.task.activity_instance_dir``:
-  Optional directory containing cached ``*-tro_state.json`` files following
-  OmniGibson's standard naming convention. Used by ``instance_resample_mode:
-  offline`` and by fixed ``activity_instance_id`` loading when the mode is
-  ``disabled``.
+  Optional directory containing cached task instance JSON files. RLinf
+  recognizes official ``*_template.json`` instances and
+  ``*_template-tro_state.json`` files. Used by
+  ``instance_resample_mode: offline`` and by fixed ``activity_instance_id``
+  loading when the mode is ``disabled``.
+- ``omni_config.task.instance_file_format``:
+  Optional cached-instance format selector. Supported values are ``template``
+  and ``tro_state``. Use ``template`` to force full cached-template reloads, or
+  ``tro_state`` to force light-weight task-relevant-only reloads. RLinf also
+  accepts official ``tro_state`` files that do not include ``robot_poses``; in
+  that case, RLinf clears any stale cached robot-pose metadata and the
+  subsequent reset uses the task's default robot reset pose instead of a
+  presampled pose override. When converting from
+  ``template.json``, omitting ``robot_poses`` is usually safer than writing the
+  current simulator robot pose into the cache.
 - ``camera.head_resolution`` / ``camera.wrist_resolution``:
   Head / wrist camera resolutions. RLinf overrides default values in
   ``omnigibson.learning.utils.eval_utils`` (default 720x720 and 480x480), then

@@ -15,7 +15,7 @@
 from omnigibson.learning.eval import Evaluator
 from omnigibson.utils.usd_utils import ControllableObjectViewAPI
 
-from rlinf.envs.behavior.utils import load_cached_activity_instance
+from rlinf.envs.behavior.instance_loader import load_cached_activity_instance
 
 
 def apply() -> None:
