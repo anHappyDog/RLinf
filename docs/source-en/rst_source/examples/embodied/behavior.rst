@@ -344,7 +344,7 @@ Using behavior as an example:
   ``template.json``, omitting ``robot_poses`` is usually safer than writing the
   current simulator robot pose into the cache.
 - Generating cached instances with RLinf's generator:
-  RLinf provides ``toolkits/behavior_generate_activity_instances.py`` to
+  RLinf provides ``rlinf/envs/behavior/instance_generator.py`` to
   generate ``*_template.json`` and ``*_template-tro_state.json`` files directly
   from ``examples/embodiment/config/env/behavior_r1pro.yaml``.
   The script reads ``omni_config.scene.scene_model``,
@@ -353,7 +353,7 @@ Using behavior as an example:
   loading settings from the yaml, then temporarily switches the task to online
   object sampling for cached-instance generation.
   It writes into ``omni_config.task.activity_instance_dir`` when that field is
-  set; otherwise it falls back to RLinf's default
+  set; otherwise it falls back to ``OMNIGIBSON_DATA_PATH``'s default
   ``2025-challenge-task-instances`` directory. Use ``--output-dir`` to override
   either behavior.
 
@@ -361,13 +361,13 @@ Using behavior as an example:
 
      cd /path/to/RLinf
 
-     python toolkits/behavior_generate_activity_instances.py \
+     python rlinf/envs/behavior/instance_generator.py \
        --config examples/embodiment/config/env/behavior_r1pro.yaml \
        --output-format template \
        --start-idx 1 \
        --end-idx 50
 
-     python toolkits/behavior_generate_activity_instances.py \
+     python rlinf/envs/behavior/instance_generator.py \
        --config examples/embodiment/config/env/behavior_r1pro.yaml \
        --output-format tro_state \
        --start-idx 1 \
