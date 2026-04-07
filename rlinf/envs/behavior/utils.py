@@ -60,37 +60,6 @@ R1PRO_PROPRIO_KEYS = [
 ]
 
 
-def infer_done_from_omnigibson_info(info: dict | None) -> bool:
-    """Infer whether an OmniGibson step info payload represents completion.
-
-    Args:
-        info: Per-step OmniGibson info payload.
-
-    Returns:
-        ``True`` when the payload indicates the episode has finished. Returns
-        ``False`` otherwise.
-    """
-    if not isinstance(info, dict):
-        return False
-
-    done_info = info.get("done")
-    if done_info is None:
-        return False
-    if isinstance(done_info, bool):
-        return done_info
-    if not isinstance(done_info, dict):
-        return bool(done_info)
-
-    termination_conditions = done_info.get("termination_conditions")
-    if isinstance(termination_conditions, dict):
-        return any(
-            isinstance(tc_info, dict) and bool(tc_info.get("done", False))
-            for tc_info in termination_conditions.values()
-        )
-
-    return bool(done_info.get("success", False))
-
-
 def sync_robot_after_pose_override(robot) -> None:
     """Synchronize robot state after a direct pose override.
 

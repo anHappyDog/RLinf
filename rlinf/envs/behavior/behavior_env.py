@@ -25,7 +25,6 @@ from rlinf.envs.behavior.instance_loader import ActivityInstanceLoader
 from rlinf.envs.behavior.utils import (
     apply_env_wrapper,
     convert_uint8_rgb,
-    infer_done_from_omnigibson_info,
     setup_omni_cfg,
 )
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
@@ -324,9 +323,7 @@ class BehaviorEnv(gym.Env):
         for i in range(chunk_size):
             step_infos = raw_infos_list[i]
             step_done = [
-                infer_done_from_omnigibson_info(info)
-                if isinstance(info, dict)
-                else False
+                bool(info.get("done", {})) if isinstance(info, dict) else False
                 for info in step_infos
             ]
             info_done_flags.append(torch.tensor(step_done, dtype=torch.bool))

@@ -1,0 +1,31 @@
+--- a/OmniGibson/omnigibson/sampling/utils.py
++++ b/OmniGibson/omnigibson/sampling/utils.py
+@@ -466,7 +466,12 @@ def validate_task(task, task_scene_dict, default_scene_dict):
+             # Skip velocities if requested
+             if not check_vel and "vel" in key:
+                 continue
+-            obj_val = obj_dict["root_link"][key]
++            if key in obj_dict["root_link"]:
++                obj_val = obj_dict["root_link"][key]
++            elif "vel" in key:
++                obj_val = 0.0
++            else:
++                raise KeyError(f"{obj_name} root link is missing required key: {key}")
+             atol = 1.0 if "vel" in key else 0.05
+             # # TODO: Update ori value to be larger tolerance
+             # tol = 0.15 if "ori" in key else 0.05
+@@ -508,7 +513,13 @@ def validate_task(task, task_scene_dict, default_scene_dict):
+             if "joint_pos" in default_obj_dict.keys():
+                 for key in ("pos", "vel"):
+                     val = default_obj_dict[f"joint_{key}"]
+-                    obj_val = obj_dict[f"joint_{key}"]
++                    joint_key = f"joint_{key}"
++                    if joint_key in obj_dict:
++                        obj_val = obj_dict[joint_key]
++                    elif key == "vel":
++                        obj_val = 0.0
++                    else:
++                        raise KeyError(f"{obj_name} is missing required key: {joint_key}")
+                     atol = 1.0 if key == "vel" else 0.05
+                     if not _allclose_no_warning(val, obj_val, atol=atol, rtol=0.0):
+                         return (
