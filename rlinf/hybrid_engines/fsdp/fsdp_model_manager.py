@@ -18,7 +18,7 @@ from typing import ContextManager, Union
 
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
@@ -39,6 +39,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.scheduler import Worker
 from rlinf.utils.logging import get_logger
 from rlinf.utils.utils import warmup_optimizer_state
+from rlinf.utils.weight_syncer import WeightSyncer
 
 warnings.filterwarnings(
     "ignore",
@@ -97,6 +98,10 @@ class FSDPModelManager:
 
         # Bucket capacity for weight sync (in bytes), default 128MB
         self.bucket_capacity = cfg.get("sync_bucket_capacity", 128 * 1024 * 1024)
+
+        # create weight syncer
+        weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer")
+        self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
 
     def _create_amp_context(self) -> ContextManager:
         """

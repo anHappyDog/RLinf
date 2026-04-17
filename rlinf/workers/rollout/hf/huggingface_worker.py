@@ -15,7 +15,7 @@
 import copy
 import gc
 from typing import Any, Literal
-
+from functools import partial
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -25,6 +25,7 @@ from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
     RolloutResult,
 )
+from rlinf.utils.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
@@ -87,6 +88,16 @@ class MultiStepRolloutWorker(Worker):
         self.version = 0
         self.finished_episodes = None
 
+        weight_syncer_cfg = OmegaConf.select(cfg, "rollout.weight_syncer", default=None)
+        assert weight_syncer_cfg is not None, (
+            "rollout.weight_syncer config must be provided"
+        )
+        self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
+
+    def init_weight_syncer(self):
+        state_dict = self.hf_model.state_dict()
+        self.weight_syncer.init_receiver(state_dict=state_dict)
+
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
         with open_dict(rollout_model_config):
@@ -115,6 +126,8 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model.eval()
         if self.expert_model is not None:
             self.expert_model.eval()
+
+        self.init_weight_syncer()
 
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
@@ -348,42 +361,16 @@ class MultiStepRolloutWorker(Worker):
         preventing OOM on GPUs with limited memory.
         """
 
-        # Receive first bucket to get bucket_length
-        bucket_length = await self.recv(
-            self.actor_group_name,
-            src_rank=self.actor_weight_src_rank,
-            async_op=True,
-            options=self._sync_weight_comm_options,
-        ).async_wait()
-
-        if self.sync_weight_load_instant:
-            if self.enable_offload:
-                self.reload_model()
-        else:
-            cpu_buffer = {}
-
-        for _ in range(bucket_length):
-            bucket: dict[str, torch.Tensor] = await self.recv(
-                self.actor_group_name,
+        async def recv_func() -> Any:
+            data = await self.recv(
+                src_group_name=self.actor_group_name,
                 src_rank=self.actor_weight_src_rank,
                 async_op=True,
                 options=self._sync_weight_comm_options,
             ).async_wait()
-            if self.sync_weight_load_instant:
-                # load state dict instantly
-                self.hf_model.load_state_dict(bucket, strict=False)
-            else:
-                # save state dict to cpu buffer
-                for k, v in bucket.items():
-                    cpu_buffer[k] = v.to("cpu")
-            del bucket
+            return data
 
-        if not self.sync_weight_load_instant:
-            # load state dict after actor offload
-            if self.enable_offload:
-                self.reload_model()
-            self.hf_model.load_state_dict(cpu_buffer, strict=True)
-            del cpu_buffer
+        await self.weight_syncer.apply(self.hf_model, recv_func)
 
         gc.collect()
         self.torch_platform.empty_cache()

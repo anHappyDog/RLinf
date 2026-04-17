@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 import time
 from functools import partial
@@ -1014,12 +1015,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if i * actor_world_size + rank < rollout_world_size:
                 self._weight_dst_rank_in_rollout.append(i * actor_world_size + rank)
 
+    def init_weight_syncer(self):
+        state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
+        self.weight_syncer.init_sender(state_dict=state_dict)
+
     def init_worker(self) -> None:
         """
         Initialize the actor worker. build the model and use corresponding training backend,
         if needed, offload model parameters and optimizer states to CPU.
         """
         self.setup_model_and_optimizer()
+        self.init_weight_syncer()
 
         if self.enable_offload:
             self.offload_param_and_grad()
@@ -1039,11 +1045,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return model
 
     async def sync_model_to_rollout(self) -> None:
-        """
-        Sync the model's full state dict to the rollout worker using bucket-based sending.
-        This reduces peak memory usage by sending weights in smaller chunks instead of
-        all at once, preventing OOM on GPUs with limited memory.
-        """
         if self.enable_offload:
             if not self.is_optimizer_offloaded:
                 self.offload_optimizer()
@@ -1051,55 +1052,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if self.is_weight_offloaded:
                 self.load_param_and_grad(self.device, False)
 
-        rollout_dtype = None
-        if self._cfg.get("sync_precision", None) is not None:
-            rollout_dtype = torch_dtype_from_precision(self._cfg.sync_precision)
+        state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
 
-        rollout_state_dict = self.get_model_state_dict(
-            cpu_offload=False, full_state_dict=False
-        )
-        model_bucket_list = self.divide_model_to_bucket(rollout_state_dict)
-        del rollout_state_dict
-
-        handles = []
-        # Send weights bucket by bucket to reduce peak memory usage
-        for rank in self._weight_dst_rank_in_rollout:
-            handles.append(
-                self.send(
-                    len(model_bucket_list),
-                    self._rollout_group_name,
-                    rank,
-                    async_op=True,
-                    options=self._sync_weight_comm_options,
-                )
-            )
-        for bucket in model_bucket_list:
-            # Add bucket_length to first bucket for receiver to know total count
-            buffer = {}
-            for k, v in bucket.items():
-                if isinstance(v, DTensor):
-                    v = v.full_tensor()
-                if rollout_dtype is not None:
-                    v = v.to(rollout_dtype)
-                buffer[k] = v
-
-            for handle in handles:
-                await handle.async_wait()
-            handles = []
-
+        async def send_func(data):
+            handle = []
             for rank in self._weight_dst_rank_in_rollout:
-                handles.append(
+                handle.append(
                     self.send(
-                        buffer,
-                        self._rollout_group_name,
-                        rank,
+                        data,
+                        dst_group_name=self._rollout_group_name,
+                        dst_rank=rank,
                         async_op=True,
                         options=self._sync_weight_comm_options,
-                    )
+                    ).async_wait()
                 )
-        for handle in handles:
-            await handle.async_wait()
-        del buffer
+            await asyncio.gather(*handle)
+
+        # currently set 0 as a placeholder
+        await self.weight_syncer.sync(state_dict, send_func, version=0)
 
         if self.enable_offload:
             assert not self.is_weight_offloaded, (
