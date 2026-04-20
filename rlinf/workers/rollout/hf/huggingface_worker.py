@@ -88,15 +88,11 @@ class MultiStepRolloutWorker(Worker):
         self.version = 0
         self.finished_episodes = None
 
-        weight_syncer_cfg = OmegaConf.select(cfg, "rollout.weight_syncer", default=None)
+        weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer", default=None)
         assert weight_syncer_cfg is not None, (
             "rollout.weight_syncer config must be provided"
         )
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
-
-    def init_weight_syncer(self):
-        state_dict = self.hf_model.state_dict()
-        self.weight_syncer.init_receiver(state_dict=state_dict)
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -126,8 +122,6 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model.eval()
         if self.expert_model is not None:
             self.expert_model.eval()
-
-        self.init_weight_syncer()
 
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
@@ -370,6 +364,10 @@ class MultiStepRolloutWorker(Worker):
             ).async_wait()
             return data
 
+
+        if not self.weight_syncer.receiver_initialized():
+            await self.weight_syncer.init_receiver(state_dict=None, recv=recv_func)
+        
         await self.weight_syncer.apply(self.hf_model, recv_func)
 
         gc.collect()

@@ -87,7 +87,8 @@ from rlinf.utils.utils import (
     retrieve_model_state_dict_in_cpu,
 )
 from rlinf.workers.rollout.utils import RankMapper
-
+from rlinf.utils.weight_syncer import WeightSyncer
+from omegaconf import OmegaConf
 
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     """
@@ -997,6 +998,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
+        # create weight syncer
+        weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer")
+        self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
+
+
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """
         Setup destination ranks for weight communication.
@@ -1015,17 +1021,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if i * actor_world_size + rank < rollout_world_size:
                 self._weight_dst_rank_in_rollout.append(i * actor_world_size + rank)
 
-    def init_weight_syncer(self):
-        state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
-        self.weight_syncer.init_sender(state_dict=state_dict)
-
     def init_worker(self) -> None:
         """
         Initialize the actor worker. build the model and use corresponding training backend,
         if needed, offload model parameters and optimizer states to CPU.
         """
         self.setup_model_and_optimizer()
-        self.init_weight_syncer()
 
         if self.enable_offload:
             self.offload_param_and_grad()
@@ -1068,6 +1069,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
             await asyncio.gather(*handle)
 
+        if not self.weight_syncer.sender_initialized():
+            await self.weight_syncer.init_sender(state_dict=state_dict, send=send_func)
+        
         # currently set 0 as a placeholder
         await self.weight_syncer.sync(state_dict, send_func, version=0)
 

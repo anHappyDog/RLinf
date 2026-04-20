@@ -99,10 +99,6 @@ class FSDPModelManager:
         # Bucket capacity for weight sync (in bytes), default 128MB
         self.bucket_capacity = cfg.get("sync_bucket_capacity", 128 * 1024 * 1024)
 
-        # create weight syncer
-        weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer")
-        self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
-
     def _create_amp_context(self) -> ContextManager:
         """
         Create AMP context manager based on configuration.

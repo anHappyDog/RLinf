@@ -11,24 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import io
-import zlib
-import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from omegaconf import DictConfig, OmegaConf
 import torch
+from rlinf.utils.logging import get_logger
 from torch.distributed.tensor import DTensor
 
-
-def _bytes_to_uint8_tensor(data: bytes) -> torch.Tensor:
-    return torch.frombuffer(memoryview(data), dtype=torch.uint8).clone()
-
-
-def _uint8_tensor_to_bytes(tensor: torch.Tensor) -> bytes:
-    return tensor.detach().cpu().contiguous().numpy().tobytes()
-
+logger = get_logger()
 
 def downscale_nonnegative_indices(tensor: torch.Tensor) -> torch.Tensor:
     assert torch.all(tensor >= 0), "Delta encoded indices must be non-negative"
@@ -37,10 +28,8 @@ def downscale_nonnegative_indices(tensor: torch.Tensor) -> torch.Tensor:
     max_value = int(tensor.max().item())
     if max_value <= torch.iinfo(torch.uint8).max:
         return tensor.to(torch.uint8)
-    elif max_value <= torch.iinfo(torch.uint16).max:
-        return tensor.to(torch.uint16)
-    elif max_value <= torch.iinfo(torch.uint32).max:
-        return tensor.to(torch.uint32)
+    elif max_value <= torch.iinfo(torch.int32).max:
+        return tensor.to(torch.int32)
     else:
         return tensor.to(torch.int64)
 
@@ -63,8 +52,33 @@ def materialize_tensor(tensor: torch.Tensor | DTensor) -> torch.Tensor:
     assert isinstance(tensor, torch.Tensor), "Expected a torch.Tensor or DTensor"
     return tensor
 
+def normalize_dtype(dtype: torch.dtype | str) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        mapping = {
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+        }
+        key = dtype.lower()
+        if key in mapping:
+            return mapping[key]
+    raise TypeError(f"Unsupported dtype: {dtype}")
+
+def normalize_device(device: torch.device | str) -> torch.device:
+    return device if isinstance(device, torch.device) else torch.device(device)
+
 
 class WeightSyncer(ABC):
+    
+    def __init__(self):
+        self._sender_initialized: bool = False
+        self._receiver_initialized: bool = False
+
     @abstractmethod
     async def sync(
         self,
@@ -78,17 +92,19 @@ class WeightSyncer(ABC):
         self, model: torch.nn.Module, recv: Callable[[], Awaitable[Any]]
     ) -> None: ...
 
-    def init_sender(
+    async def init_sender(
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
-    ):
-        pass
-
-    def init_receiver(
-        self,
-        state_dict: dict[str, torch.Tensor | DTensor],
+        send: Callable[[Any], Awaitable[None]],
     ) -> None:
-        pass
+        self._sender_initialized = True
+
+    async def init_receiver(
+        self,
+        state_dict: dict[str, torch.Tensor | DTensor],
+    recv: Callable[[], Awaitable[Any]]
+    ) -> None:
+        self._receiver_initialized = True
 
     @classmethod
     def create(cls, config: DictConfig) -> "WeightSyncer":
@@ -133,6 +149,13 @@ class WeightSyncer(ABC):
         else:
             raise ValueError(f"Unsupported weight syncer type: {syncer_type}")
 
+    def sender_initialized(self) -> bool:
+        return self._sender_initialized
+
+    def receiver_initialized(self) -> bool:
+        return self._receiver_initialized
+
+
 
 class BucketWeightSyncer(WeightSyncer):
     def __init__(
@@ -143,9 +166,10 @@ class BucketWeightSyncer(WeightSyncer):
         is_agent: bool = False,
         load_instant: bool = True,
     ):
+        super().__init__()
         self.bucket_size = bucket_size
-        self.bucket_dtype = bucket_dtype
-        self.bucket_device = bucket_device
+        self.bucket_dtype = normalize_dtype(bucket_dtype)
+        self.bucket_device = normalize_device(bucket_device)
         self.is_agent = is_agent
         self.load_instant = load_instant
 
@@ -228,17 +252,28 @@ class BucketWeightSyncer(WeightSyncer):
 
 
 @dataclass
-class TensorPatch:
-    ordinal: torch.Tensor
-    row: torch.Tensor
-    col: torch.Tensor
-    values: torch.Tensor
-
-
-@dataclass
 class WeightPatch:
     version: torch.Tensor
-    tensors: list[TensorPatch]
+    ordinals: torch.Tensor
+    nnz_per_tensor: torch.Tensor
+    rows: torch.Tensor
+    cols: torch.Tensor
+    values: torch.Tensor
+
+    def to(
+        self, device: torch.device | str, non_blocking: bool = False
+    ) -> "WeightPatch":
+        device = normalize_device(device)
+        return WeightPatch(
+            version=self.version.to(device=device, non_blocking=non_blocking),
+            ordinals=self.ordinals.to(device=device, non_blocking=non_blocking),
+            nnz_per_tensor=self.nnz_per_tensor.to(
+                device=device, non_blocking=non_blocking
+            ),
+            rows=self.rows.to(device=device, non_blocking=non_blocking),
+            cols=self.cols.to(device=device, non_blocking=non_blocking),
+            values=self.values.to(device=device, non_blocking=non_blocking),
+        )
 
 
 class PatchWeightSyncer(WeightSyncer):
@@ -250,35 +285,40 @@ class PatchWeightSyncer(WeightSyncer):
         delta_encoding: bool = True,
         compression_algorithm: str = "none",
     ):
+        super().__init__()
         self.snapshot: None | dict[str, torch.Tensor] = None
         self.original_shapes: None | dict[str, torch.Size] = None
         self.ordered_keys: None | list[str] = None
         self.delta_encoding = delta_encoding
         self.compression_algorithm = compression_algorithm
-        self.transport_device = transport_device
-        self.snapshot_dtype = snapshot_dtype
-        self.snapshot_device = snapshot_device
+        self.transport_device = normalize_device(transport_device)
+        self.snapshot_dtype = normalize_dtype(snapshot_dtype)
+        self.snapshot_device = normalize_device(snapshot_device)
+        if self.compression_algorithm != "none":
+            logger.warning(
+                "PatchWeightSyncer uses flat tensor transport; "
+                f"compression_algorithm={self.compression_algorithm} is ignored for now."
+            )
 
-    def init_sender(
+    async def init_sender(
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
+        send: Callable[[Any], Awaitable[None]],
     ):
-        assert (
-            self.snapshot is None
-            and self.original_shapes is None
-            and self.ordered_keys is None
-        ), "Sender already initialized"
+        assert self.sender_initialized() is False, "Sender already initialized"
+
         snapshot: dict[str, torch.Tensor] = {}
         self.original_shapes = {}
         self.ordered_keys = []
         for key, value in state_dict.items():
             value, original_shape = as_coo_2d_view(materialize_tensor(value))
+            copy_non_blocking = self.snapshot_device.type != "cpu"
             snapshot[key] = (
                 value.detach()
                 .to(
                     device=self.snapshot_device,
                     dtype=self.snapshot_dtype,
-                    non_blocking=True,
+                    non_blocking=copy_non_blocking,
                     copy=True,
                 )
                 .pin_memory()
@@ -286,71 +326,32 @@ class PatchWeightSyncer(WeightSyncer):
                 else value.detach().to(
                     device=self.snapshot_device,
                     dtype=self.snapshot_dtype,
-                    non_blocking=True,
+                    non_blocking=copy_non_blocking,
                     copy=True,
                 )
             )
             self.original_shapes[key] = original_shape
             self.ordered_keys.append(key)
         self.snapshot = snapshot
-
-    def init_receiver(
+        
+        metadata = {
+            "ordered_keys": self.ordered_keys,
+            "original_shapes": self.original_shapes,
+        }
+        await send(metadata)
+        self._sender_initialized = True
+        
+        
+    async def init_receiver(
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
+        recv: Callable[[], Awaitable[Any]]
     ) -> None:
-        assert self.original_shapes is None and self.ordered_keys is None, (
-            "Receiver already initialized"
-        )
-        self.original_shapes = {
-            key: materialize_tensor(value).shape for key, value in state_dict.items()
-        }
-        self.ordered_keys = list(state_dict.keys())
-
-    def _serialize_patch(self, patch: WeightPatch) -> bytes:
-        buffer = io.BytesIO()
-        torch.save(patch, buffer)
-        return buffer.getvalue()
-
-    def _deserialize_patch(self, data: bytes) -> WeightPatch:
-        buffer = io.BytesIO(data)
-        return torch.load(buffer, map_location="cpu", weights_only=False)
-
-    def _compress_bytes(self, data: bytes) -> bytes:
-
-        if self.compression_algorithm == "none":
-            return data
-        elif self.compression_algorithm == "zstd":
-            import zstandard as zstd
-
-            return zstd.ZstdCompressor(level=1).compress(data)
-        elif self.compression_algorithm == "zlib":
-            return zlib.compress(data)
-        elif self.compression_algorithm == "lz4":
-            import lz4.frame
-
-            return lz4.frame.compress(data, compression_level=0)
-
-        raise ValueError(
-            f"Unsupported compression algorithm: {self.compression_algorithm}"
-        )
-
-    def _decompress_bytes(self, data: bytes) -> bytes:
-        if self.compression_algorithm == "none":
-            return data
-        elif self.compression_algorithm == "zstd":
-            import zstandard as zstd
-
-            return zstd.ZstdDecompressor().decompress(data)
-        elif self.compression_algorithm == "zlib":
-            return zlib.decompress(data)
-        elif self.compression_algorithm == "lz4":
-            import lz4.frame
-
-            return lz4.frame.decompress(data)
-
-        raise ValueError(
-            f"Unsupported compression algorithm: {self.compression_algorithm}"
-        )
+        assert self.receiver_initialized() is False, "Receiver already initialized"
+        metadata = await recv()
+        self.ordered_keys = metadata["ordered_keys"]
+        self.original_shapes = metadata["original_shapes"]
+        self._receiver_initialized = True
 
     def delta_encode(
         self, rows: torch.Tensor, cols: torch.Tensor
@@ -360,9 +361,7 @@ class PatchWeightSyncer(WeightSyncer):
             "Rows and columns must have the same number of elements"
         )
         if rows.numel() == 1:
-            return downscale_nonnegative_indices(rows), downscale_nonnegative_indices(
-                cols
-            )
+            return rows, cols
         row_deltas = torch.empty_like(rows)
         col_deltas = torch.empty_like(cols)
         row_deltas[0] = rows[0]
@@ -372,40 +371,31 @@ class PatchWeightSyncer(WeightSyncer):
         same_row = rows[1:] == rows[:-1]
         col_deltas[1:] = torch.where(same_row, cols[1:] - cols[:-1], cols[1:])
 
-        return downscale_nonnegative_indices(row_deltas), downscale_nonnegative_indices(
-            col_deltas
-        )
+        return row_deltas, col_deltas
 
     def delta_decode(
         self, rows_delta: torch.Tensor, cols_delta: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert rows_delta.numel() > 0, "No indices to decode"
-        assert rows_delta.numel() == cols_delta.numel(), (
-            "Rows and columns must have the same number of elements"
-        )
-        rows_delta, cols_delta = rows_delta.to(torch.int64), cols_delta.to(torch.int64)
-        rows = torch.empty_like(rows_delta)
-        cols = torch.empty_like(cols_delta)
-        rows[0] = rows_delta[0]
-        cols[0] = cols_delta[0]
-        for i in range(1, rows_delta.numel()):
-            rows[i] = rows[i - 1] + rows_delta[i]
-            if rows_delta[i] == 0:
-                cols[i] = cols[i - 1] + cols_delta[i]
-            else:
-                cols[i] = cols_delta[i]
+        assert rows_delta.numel() > 0
+        assert rows_delta.numel() == cols_delta.numel()
+
+        rows_delta = rows_delta.to(torch.int64)
+        cols_delta = cols_delta.to(torch.int64)
+
+        rows = torch.cumsum(rows_delta, dim=0)
+
+        start_mask = torch.zeros_like(rows_delta, dtype=torch.bool)
+        start_mask[0] = True
+        start_mask[1:] = rows_delta[1:] != 0
+
+        idx = torch.arange(rows_delta.numel(), device=rows_delta.device, dtype=torch.int64)
+        start_idx = torch.where(start_mask, idx, torch.zeros_like(idx))
+        start_idx = torch.cummax(start_idx, dim=0).values
+
+        cum_cols = torch.cumsum(cols_delta, dim=0)
+        base = (cum_cols - cols_delta)[start_idx]
+        cols = cum_cols - base
         return rows, cols
-
-    def compress(self, patch: WeightPatch) -> torch.Tensor:
-        data = self._serialize_patch(patch)
-        compressed_data = self._compress_bytes(data)
-        return _bytes_to_uint8_tensor(compressed_data)
-
-    def decompress(self, payload: torch.Tensor) -> WeightPatch:
-        compressed_data = _uint8_tensor_to_bytes(payload)
-        data = self._decompress_bytes(compressed_data)
-        patch = self._deserialize_patch(data)
-        return patch
 
     def create_patch(
         self,
@@ -419,24 +409,30 @@ class PatchWeightSyncer(WeightSyncer):
             "State dict keys do not match snapshot keys"
         )
 
-        tensor_patches = []
+        ordinals: list[torch.Tensor] = []
+        nnz_per_tensor: list[torch.Tensor] = []
+        row_chunks: list[torch.Tensor] = []
+        col_chunks: list[torch.Tensor] = []
+        value_chunks: list[torch.Tensor] = []
+        total_bytes = 0
         for ordinal, key in enumerate(self.ordered_keys):
             value, _ = as_coo_2d_view(materialize_tensor(state_dict[key]))
             value = value.to(
                 device=self.snapshot[key].device,
                 dtype=self.snapshot[key].dtype,
-                non_blocking=True,
+                non_blocking=self.snapshot[key].device.type != "cpu",
+                copy=True,
             )
 
             changed = value.ne(self.snapshot[key])
             if not torch.any(changed):
                 continue
 
+            # `nonzero` already returns indices in row-major lexicographic order,
+            # which is exactly what delta encoding expects here.
             rows, cols = changed.nonzero(as_tuple=True)
-
-            order = torch.argsort(rows * value.shape[1] + cols)
-            rows = rows[order].to(torch.int64)
-            cols = cols[order].to(torch.int64)
+            rows = rows.to(torch.int64)
+            cols = cols.to(torch.int64)
             values = value[rows, cols]
 
             self.snapshot[key][rows, cols] = values
@@ -444,17 +440,47 @@ class PatchWeightSyncer(WeightSyncer):
             if self.delta_encoding:
                 rows, cols = self.delta_encode(rows, cols)
 
-            tensor_patch = TensorPatch(
-                ordinal=torch.tensor(ordinal, dtype=torch.uint16),
-                row=rows,
-                col=cols,
-                values=values,
+            ordinals.append(
+                torch.tensor(ordinal, dtype=torch.int32, device=rows.device)
             )
-            tensor_patches.append(tensor_patch)
-
-        patch = WeightPatch(
-            version=torch.tensor(version, dtype=torch.uint64), tensors=tensor_patches
-        )
+            nnz_per_tensor.append(
+                torch.tensor(values.numel(), dtype=torch.int32, device=rows.device)
+            )
+            row_chunks.append(rows.contiguous())
+            col_chunks.append(cols.contiguous())
+            value_chunks.append(values.contiguous())
+            # logger.info(f"Sender: Key {key} has {values.numel()} changed elements")
+            total_bytes += (
+                rows.element_size() * rows.numel()
+                + cols.element_size() * cols.numel()
+                + values.element_size() * values.numel()
+            )
+        patch_device = self.snapshot_device
+        if row_chunks:
+            rows_tensor = torch.cat(row_chunks, dim=0)
+            cols_tensor = torch.cat(col_chunks, dim=0)
+            rows_tensor = downscale_nonnegative_indices(rows_tensor)
+            cols_tensor = downscale_nonnegative_indices(cols_tensor)
+            patch = WeightPatch(
+                version=torch.tensor(version, dtype=torch.int64, device=patch_device),
+                ordinals=torch.stack(ordinals),
+                nnz_per_tensor=torch.stack(nnz_per_tensor),
+                rows=rows_tensor,
+                cols=cols_tensor,
+                values=torch.cat(value_chunks, dim=0),
+            )
+        else:
+            patch = WeightPatch(
+                version=torch.tensor(version, dtype=torch.int64, device=patch_device),
+                ordinals=torch.empty(0, dtype=torch.int32, device=patch_device),
+                nnz_per_tensor=torch.empty(0, dtype=torch.int32, device=patch_device),
+                rows=torch.empty(0, dtype=torch.uint8, device=patch_device),
+                cols=torch.empty(0, dtype=torch.uint8, device=patch_device),
+                values=torch.empty(0, dtype=self.snapshot_dtype, device=patch_device),
+            )
+        # logger.info(
+        #     f"Total patch tensor size before transport: {total_bytes / (1024 ** 2):.2f} MB"
+        # )
         return patch
 
     async def sync(
@@ -464,10 +490,11 @@ class PatchWeightSyncer(WeightSyncer):
         version: int | torch.Tensor,
     ) -> None:
         patch = self.create_patch(state_dict, version)
-        compressed_patch = self.compress(patch).to(
-            device=self.transport_device, non_blocking=True
+        transport_patch = patch.to(
+            device=self.transport_device,
+            non_blocking=self.transport_device.type != "cpu",
         )
-        await send(compressed_patch)
+        await send(transport_patch)
 
     @torch.no_grad()
     async def apply(
@@ -477,33 +504,47 @@ class PatchWeightSyncer(WeightSyncer):
             "Snapshot Info not initialized"
         )
 
-        compressed_patch = await recv()
-        patch = self.decompress(compressed_patch)
+        patch: WeightPatch = await recv()
 
         state_dict = model.state_dict()
-
-        for tensor_patch in patch.tensors:
-            key = self.ordered_keys[tensor_patch.ordinal.item()]
+        # total_changed_elements = int(patch.values.numel())
+        # logger.info(
+        #     f"Applying patch version {patch.version.item()} "
+        #     f"with {total_changed_elements} changed elements"
+        # )
+        offset = 0
+        for patch_idx in range(patch.ordinals.numel()):
+            key = self.ordered_keys[patch.ordinals[patch_idx].item()]
             original_shape = self.original_shapes[key]
             value = state_dict[key]
             value_2dview, _ = as_coo_2d_view(value)
             assert value.shape == original_shape, (
                 f"Shape mismatch for key {key}: expected {original_shape}, got {value.shape}"
             )
+            nnz = int(patch.nnz_per_tensor[patch_idx].item())
+            next_offset = offset + nnz
+            row_slice = patch.rows[offset:next_offset]
+            col_slice = patch.cols[offset:next_offset]
+            value_slice = patch.values[offset:next_offset]
+            offset = next_offset
 
             if self.delta_encoding:
-                rows, cols = self.delta_decode(tensor_patch.row, tensor_patch.col)
+                row_delta = row_slice.to(
+                    value_2dview.device, dtype=torch.int64, non_blocking=True
+                )
+                col_delta = col_slice.to(
+                    value_2dview.device, dtype=torch.int64, non_blocking=True
+                )
+                rows, cols = self.delta_decode(row_delta, col_delta)
             else:
-                rows, cols = tensor_patch.row, tensor_patch.col
-            rows, cols = (
-                rows.to(
+                rows = row_slice.to(
                     device=value_2dview.device, dtype=torch.int64, non_blocking=True
-                ),
-                cols.to(
+                )
+                cols = col_slice.to(
                     device=value_2dview.device, dtype=torch.int64, non_blocking=True
-                ),
-            )
+                )
 
-            value_2dview[rows, cols] = tensor_patch.values.to(
+            value_2dview[rows, cols] = value_slice.to(
                 device=value_2dview.device, dtype=value_2dview.dtype, non_blocking=True
             )
+        assert offset == patch.rows.numel(), "Patch offsets do not match payload size"
