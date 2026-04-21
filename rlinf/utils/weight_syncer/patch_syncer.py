@@ -135,25 +135,22 @@ class PatchWeightSyncer(WeightSyncer):
         snapshot: dict[str, torch.Tensor] = {}
         self.original_shapes = {}
         self.ordered_keys = []
+        should_pin_snapshot = (
+            self.snapshot_device == torch.device("cpu")
+            and self.transport_device.type != "cpu"
+            and torch.cuda.is_available()
+        )
         for key, value in state_dict.items():
             value_2dview, original_shape = as_coo_2d_view(materialize_tensor(value))
             copy_non_blocking = self.snapshot_device.type != "cpu"
+            snapshot_value = value_2dview.detach().to(
+                device=self.snapshot_device,
+                dtype=self.snapshot_dtype,
+                non_blocking=copy_non_blocking,
+                copy=True,
+            )
             snapshot[key] = (
-                value_2dview.detach()
-                .to(
-                    device=self.snapshot_device,
-                    dtype=self.snapshot_dtype,
-                    non_blocking=copy_non_blocking,
-                    copy=True,
-                )
-                .pin_memory()
-                if self.snapshot_device == torch.device("cpu")
-                else value_2dview.detach().to(
-                    device=self.snapshot_device,
-                    dtype=self.snapshot_dtype,
-                    non_blocking=copy_non_blocking,
-                    copy=True,
-                )
+                snapshot_value.pin_memory() if should_pin_snapshot else snapshot_value
             )
             self.original_shapes[key] = original_shape
             self.ordered_keys.append(key)
