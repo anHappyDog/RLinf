@@ -15,7 +15,12 @@
 from .base import WeightSyncer
 from .bucket_syncer import BucketWeightSyncer
 from .compressor import IdentityCompressor, NVCompCompressor, PatchCompressor
-from .patch_syncer import CompressedWeightPatch, PatchWeightSyncer, WeightPatch, WeightPatchTransport
+from .patch_syncer import (
+    CompressedWeightPatch,
+    PatchWeightSyncer,
+    WeightPatch,
+    WeightPatchTransport,
+)
 
 __all__ = [
     "BucketWeightSyncer",

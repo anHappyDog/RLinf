@@ -20,7 +20,7 @@ from typing import Optional
 
 import numpy as np
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
@@ -86,9 +86,9 @@ from rlinf.utils.utils import (
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
 )
-from rlinf.workers.rollout.utils import RankMapper
 from rlinf.utils.weight_syncer import WeightSyncer
-from omegaconf import OmegaConf
+from rlinf.workers.rollout.utils import RankMapper
+
 
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     """
@@ -1002,7 +1002,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer")
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
 
-
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """
         Setup destination ranks for weight communication.
@@ -1071,7 +1070,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         if not self.weight_syncer.sender_initialized():
             await self.weight_syncer.init_sender(state_dict=state_dict, send=send_func)
-        
+
         await self.weight_syncer.sync(state_dict, send_func, version=self.version)
 
         if self.enable_offload:

@@ -19,7 +19,14 @@ from dataclasses import dataclass
 import torch
 from torch.distributed.tensor import DTensor
 
-from .base import RecvFn, SendFn, WeightSyncer, materialize_tensor, normalize_device, normalize_dtype
+from .base import (
+    RecvFn,
+    SendFn,
+    WeightSyncer,
+    materialize_tensor,
+    normalize_device,
+    normalize_dtype,
+)
 from .compressor import PatchCompressor
 
 

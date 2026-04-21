@@ -124,7 +124,9 @@ class WeightSyncer(ABC):
                 compression_algorithm=OmegaConf.select(
                     patch_config,
                     "compression_algorithm",
-                    default=OmegaConf.select(patch_config, "compression", default="none"),
+                    default=OmegaConf.select(
+                        patch_config, "compression", default="none"
+                    ),
                 ),
                 transport_device=OmegaConf.select(
                     patch_config, "transport_device", default="cuda"

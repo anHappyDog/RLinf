@@ -15,7 +15,7 @@
 import copy
 import gc
 from typing import Any, Literal
-from functools import partial
+
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -25,12 +25,12 @@ from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
     RolloutResult,
 )
-from rlinf.utils.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.weight_syncer import WeightSyncer
 
 
 class MultiStepRolloutWorker(Worker):
@@ -349,11 +349,7 @@ class MultiStepRolloutWorker(Worker):
         return final_values[:, :1].cpu().contiguous()
 
     async def sync_model_from_actor(self):
-        """Sync model parameters from the actor worker using bucket-based receiving.
-
-        This method receives weights in buckets to reduce peak memory usage,
-        preventing OOM on GPUs with limited memory.
-        """
+        """Sync model parameters from the actor worker."""
 
         async def recv_func() -> Any:
             data = await self.recv(
@@ -363,7 +359,6 @@ class MultiStepRolloutWorker(Worker):
                 options=self._sync_weight_comm_options,
             ).async_wait()
             return data
-
 
         if not self.weight_syncer.receiver_initialized():
             await self.weight_syncer.init_receiver(state_dict=None, recv=recv_func)

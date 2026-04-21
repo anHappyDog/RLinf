@@ -43,9 +43,7 @@ _NVCOMP_DTYPE_TO_CODE = {
     torch.float64: 7,
 }
 
-_NVCOMP_CODE_TO_DTYPE = {
-    code: dtype for dtype, code in _NVCOMP_DTYPE_TO_CODE.items()
-}
+_NVCOMP_CODE_TO_DTYPE = {code: dtype for dtype, code in _NVCOMP_DTYPE_TO_CODE.items()}
 
 _NVCOMP_CODE_TO_DECODE_TYPE = {
     _NVCOMP_DTYPE_TO_CODE[torch.uint8]: "|u1",
@@ -152,9 +150,7 @@ class NVCompCompressor(PatchCompressor):
             cuda_stream=int(stream.cuda_stream),
         )
 
-    def _get_nvcomp_tensor_spec(
-        self, tensor: torch.Tensor
-    ) -> tuple[torch.Tensor, int]:
+    def _get_nvcomp_tensor_spec(self, tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
         tensor = tensor.contiguous()
         dtype_code = _NVCOMP_DTYPE_TO_CODE.get(tensor.dtype)
         if dtype_code is None:
@@ -240,12 +236,8 @@ class NVCompCompressor(PatchCompressor):
         assert isinstance(payload, CompressedWeightPatch), (
             f"NVCompCompressor expected CompressedWeightPatch, got {type(payload)}"
         )
-        rows = self._decompress_tensor(
-            payload.rows_compressed, payload.rows_dtype_code
-        )
-        cols = self._decompress_tensor(
-            payload.cols_compressed, payload.cols_dtype_code
-        )
+        rows = self._decompress_tensor(payload.rows_compressed, payload.rows_dtype_code)
+        cols = self._decompress_tensor(payload.cols_compressed, payload.cols_dtype_code)
         values = self._decompress_tensor(
             payload.values_compressed, payload.values_dtype_code
         )

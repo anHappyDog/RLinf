@@ -18,7 +18,7 @@ from typing import ContextManager, Union
 
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
@@ -39,7 +39,6 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.scheduler import Worker
 from rlinf.utils.logging import get_logger
 from rlinf.utils.utils import warmup_optimizer_state
-from rlinf.utils.weight_syncer import WeightSyncer
 
 warnings.filterwarnings(
     "ignore",
