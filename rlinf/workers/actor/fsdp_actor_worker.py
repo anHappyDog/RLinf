@@ -1072,8 +1072,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if not self.weight_syncer.sender_initialized():
             await self.weight_syncer.init_sender(state_dict=state_dict, send=send_func)
         
-        # currently set 0 as a placeholder
-        await self.weight_syncer.sync(state_dict, send_func, version=0)
+        await self.weight_syncer.sync(state_dict, send_func, version=self.version)
 
         if self.enable_offload:
             assert not self.is_weight_offloaded, (

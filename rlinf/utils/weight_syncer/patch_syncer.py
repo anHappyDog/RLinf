@@ -304,12 +304,13 @@ class PatchWeightSyncer(WeightSyncer):
         await send(self.compressor.compress(transport_patch))
 
     @torch.no_grad()
-    async def apply(self, model: torch.nn.Module, recv: RecvFn) -> None:
+    async def apply(self, model: torch.nn.Module, recv: RecvFn) -> int:
         assert self.ordered_keys is not None and self.original_shapes is not None, (
             "Snapshot info not initialized"
         )
 
         patch = self.compressor.decompress(await recv())
+        applied_version = int(patch.version.item())
         state_dict = model.state_dict()
 
         offset = 0
@@ -360,3 +361,4 @@ class PatchWeightSyncer(WeightSyncer):
             )
 
         assert offset == patch.rows.numel(), "Patch offsets do not match payload size"
+        return applied_version

@@ -367,8 +367,15 @@ class MultiStepRolloutWorker(Worker):
 
         if not self.weight_syncer.receiver_initialized():
             await self.weight_syncer.init_receiver(state_dict=None, recv=recv_func)
-        
-        await self.weight_syncer.apply(self.hf_model, recv_func)
+
+        applied_version = await self.weight_syncer.apply(self.hf_model, recv_func)
+        self.version = applied_version
+        if self.finished_episodes is None:
+            self.finished_episodes = (
+                self.version * self.total_num_train_envs * self.rollout_epoch
+            )
+        if hasattr(self.hf_model, "set_global_step"):
+            self.hf_model.set_global_step(applied_version)
 
         gc.collect()
         self.torch_platform.empty_cache()
@@ -666,10 +673,5 @@ class MultiStepRolloutWorker(Worker):
             )
 
     def set_global_step(self, global_step: int):
-        self.version = global_step
-        if self.finished_episodes is None:
-            self.finished_episodes = (
-                self.version * self.total_num_train_envs * self.rollout_epoch
-            )
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)

@@ -37,7 +37,9 @@ class BucketWeightSyncer(WeightSyncer):
         self.load_instant = load_instant
 
     def divide_into_buckets(
-        self, state_dict: dict[str, torch.Tensor | DTensor]
+        self,
+        state_dict: dict[str, torch.Tensor | DTensor],
+        version: int | torch.Tensor,
     ) -> list[dict[str, torch.Tensor]]:
         buckets: list[dict[str, torch.Tensor]] = []
         currently_hold = 0
@@ -73,6 +75,9 @@ class BucketWeightSyncer(WeightSyncer):
         buckets[0]["total_buckets"] = torch.tensor(
             len(buckets), dtype=torch.int32, device=self.bucket_device
         )
+        buckets[0]["syncer_version"] = torch.as_tensor(
+            version, dtype=torch.int64, device=self.bucket_device
+        )
         return buckets
 
     async def sync(
@@ -81,14 +86,14 @@ class BucketWeightSyncer(WeightSyncer):
         send: SendFn,
         version: int | torch.Tensor,
     ) -> None:
-        del version
-        buckets = self.divide_into_buckets(state_dict)
+        buckets = self.divide_into_buckets(state_dict, version)
         for bucket in buckets:
             await send(bucket)
 
-    async def apply(self, model: torch.nn.Module, recv: RecvFn) -> None:
+    async def apply(self, model: torch.nn.Module, recv: RecvFn) -> int:
         bucket: dict[str, torch.Tensor] = await recv()
         total_buckets = int(bucket.pop("total_buckets").item())
+        applied_version = int(bucket.pop("syncer_version").item())
 
         if self.load_instant:
             model.load_state_dict(bucket, strict=False)
@@ -110,3 +115,5 @@ class BucketWeightSyncer(WeightSyncer):
         if not self.load_instant:
             model.load_state_dict(cpu_buffer, strict=False)
             del cpu_buffer
+
+        return applied_version
