@@ -132,28 +132,31 @@ class PatchWeightSyncer(WeightSyncer):
     ) -> None:
         assert not self.sender_initialized(), "Sender already initialized"
 
-        snapshot: dict[str, torch.Tensor] = {}
-        self.original_shapes = {}
-        self.ordered_keys = []
-        should_pin_snapshot = (
-            self.snapshot_device == torch.device("cpu")
-            and self.transport_device.type != "cpu"
-            and torch.cuda.is_available()
-        )
-        for key, value in state_dict.items():
-            value_2dview, original_shape = as_coo_2d_view(materialize_tensor(value))
-            copy_non_blocking = self.snapshot_device.type != "cpu"
-            snapshot_value = value_2dview.detach().to(
-                device=self.snapshot_device,
-                dtype=self.snapshot_dtype,
-                non_blocking=copy_non_blocking,
-                copy=True,
+        with torch.no_grad():
+            snapshot: dict[str, torch.Tensor] = {}
+            self.original_shapes = {}
+            self.ordered_keys = []
+            should_pin_snapshot = (
+                self.snapshot_device == torch.device("cpu")
+                and self.transport_device.type != "cpu"
+                and torch.cuda.is_available()
             )
-            snapshot[key] = (
-                snapshot_value.pin_memory() if should_pin_snapshot else snapshot_value
-            )
-            self.original_shapes[key] = original_shape
-            self.ordered_keys.append(key)
+            for key, value in state_dict.items():
+                value_2dview, original_shape = as_coo_2d_view(materialize_tensor(value))
+                copy_non_blocking = self.snapshot_device.type != "cpu"
+                snapshot_value = value_2dview.detach().to(
+                    device=self.snapshot_device,
+                    dtype=self.snapshot_dtype,
+                    non_blocking=copy_non_blocking,
+                    copy=True,
+                )
+                snapshot[key] = (
+                    snapshot_value.pin_memory()
+                    if should_pin_snapshot
+                    else snapshot_value
+                )
+                self.original_shapes[key] = original_shape
+                self.ordered_keys.append(key)
 
         self.snapshot = snapshot
         metadata = {
@@ -220,6 +223,7 @@ class PatchWeightSyncer(WeightSyncer):
         cols = cum_cols - base
         return rows, cols
 
+    @torch.no_grad()
     def create_patch(
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
