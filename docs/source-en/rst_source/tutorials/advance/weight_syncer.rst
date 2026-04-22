@@ -93,12 +93,12 @@ In embodied YAMLs, the recommended usage looks like this:
 
    defaults:
      - training_backend/fsdp@actor.fsdp_config
-     - weight_syncer/patch@weight_syncer
+     - weight_syncer/patch_syncer@weight_syncer
 
 The corresponding config files are:
 
-- ``examples/embodiment/config/weight_syncer/patch.yaml``
-- ``examples/embodiment/config/weight_syncer/bucket.yaml``
+- ``examples/embodiment/config/weight_syncer/patch_syncer.yaml``
+- ``examples/embodiment/config/weight_syncer/bucket_syncer.yaml``
 
 
 Patch Mode
@@ -322,12 +322,22 @@ Performance Suggestions
 If your priority is to reduce synchronization overhead, a good tuning order is:
 
 1. Start with ``patch`` and confirm the initial weights are identical.
-2. Keep ``snapshot_device: cuda`` so the main comparison path does not move to CPU.
+2. Keep ``snapshot_device: cuda`` when GPU memory is sufficient so the main
+   comparison path does not move to CPU.
 3. Keep ``delta_encoding: true``.
 4. First get the workflow stable with ``compression: none``, then evaluate
    whether ``nvcomp_lz4`` is worth enabling.
 5. If you truly need full sync or are debugging correctness, switch back to
    ``bucket``.
+
+Patch mode keeps an extra sender-side snapshot. When ``snapshot_device: cuda``,
+that snapshot consumes GPU memory roughly equal to the number of model
+parameters multiplied by the byte size of ``snapshot_dtype`` (for example,
+``bfloat16`` is about 2 bytes per parameter). For large models or memory-tight
+setups, reserve enough GPU memory for this snapshot to avoid OOM during
+training or synchronization. If GPU memory is insufficient, set
+``snapshot_device`` to ``cpu``; patch comparison and construction will be slower.
+In addition, ``nvcomp_lz4`` requires ``transport_device`` to be ``cuda``.
 
 
 Limitations And Caveats

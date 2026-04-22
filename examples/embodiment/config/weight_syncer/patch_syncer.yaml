@@ -1,0 +1,7 @@
+type: patch
+patch:
+  snapshot_dtype: bfloat16
+  snapshot_device: cpu
+  transport_device: cuda
+  delta_encoding: True
+  compression: nvcomp_lz4
