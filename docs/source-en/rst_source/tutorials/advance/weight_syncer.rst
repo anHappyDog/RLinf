@@ -112,8 +112,8 @@ A typical patch configuration looks like this:
      type: patch
      patch:
        snapshot_dtype: bfloat16
-       snapshot_device: cuda
-       transport_device: cuda
+       snapshot_device: cpu
+       transport_device: cpu
        delta_encoding: true
        compression: none
 
@@ -127,12 +127,16 @@ The fields mean:
   recommended.
 
 ``patch.snapshot_device``
-  Device where the snapshot is stored. ``cuda`` is usually recommended because
-  patch comparison and patch creation are significantly faster there.
+  Device where the snapshot is stored. It can be either ``cpu`` or ``cuda``.
+  ``cpu`` is currently recommended as the default: it avoids keeping an
+  additional model-sized snapshot in GPU memory, and after GPU-side comparison,
+  asynchronous prefetching, and background snapshot flushing optimizations, its
+  synchronization latency is already close to ``snapshot_device: cuda``. If GPU
+  memory is very abundant, ``cuda`` remains the most direct low-latency path.
 
 ``patch.transport_device``
-  Device used before sending the patch. If you want GPU-side compression or GPU
-  transport, this is typically ``cuda``.
+  Device used before sending the patch. The default can be ``cpu``. If you want
+  GPU-side compression or GPU transport, this is typically ``cuda``.
 
 ``patch.delta_encoding``
   Whether to delta-encode COO coordinates. Enabled by default and recommended.
@@ -167,6 +171,44 @@ Patch mode is roughly split into two stages:
    - The sender compares the current ``state_dict`` with the snapshot.
    - The changed entries are packed into a patch and sent.
    - The receiver applies those changes directly to local model parameters.
+
+
+CPU Snapshot Optimization Path
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When ``snapshot_device: cpu``, the sender-side snapshot stays on CPU while the
+current ``state_dict`` remains on GPU. To avoid moving the patch-building hot
+path back to CPU, RLinf applies several optimizations for this case:
+
+- The CPU snapshot is stored in pinned memory to enable asynchronous CPU-GPU copies.
+- Before comparing each tensor, the corresponding CPU snapshot tensor is
+  asynchronously prefetched to the GPU where the state tensor lives.
+- Snapshot prefetch uses a dedicated CUDA copy stream so it can overlap as much
+  as possible with GPU-side comparison of other tensors.
+- Difference comparison, ``nonzero``, and new-value gathering all run on GPU,
+  avoiding CPU-side element scanning.
+- The ``rows``, ``cols``, and ``values`` needed by the patch are asynchronously
+  copied into pinned CPU staging buffers, and ``torch.cuda.Event`` is used to
+  mark when those copies complete.
+- After patch construction finishes, the sender can return immediately and
+  continue with the following transfer steps; CPU snapshot flushing is handled
+  by a background thread.
+- Before the next patch construction starts, RLinf waits for the previous
+  background flush to finish, which preserves snapshot consistency.
+
+Therefore, ``snapshot_device: cpu`` no longer means "compare on CPU". The
+effective path is:
+
+.. code-block:: text
+
+   CPU snapshot -> GPU prefetch -> GPU compare/nonzero/gather
+   -> pinned CPU staging -> background snapshot flush
+
+This trades a small amount of extra asynchronous copy and background flushing
+for much lower GPU memory usage. In current embodied VLA training
+configurations, CPU snapshot synchronization latency can already be close to GPU
+snapshot latency. When GPU memory is tight, ``snapshot_device: cpu`` is usually
+the safer default.
 
 
 Patch Data Layout
@@ -322,12 +364,15 @@ Performance Suggestions
 If your priority is to reduce synchronization overhead, a good tuning order is:
 
 1. Start with ``patch`` and confirm the initial weights are identical.
-2. Keep ``snapshot_device: cuda`` when GPU memory is sufficient so the main
-   comparison path does not move to CPU.
+2. Prefer ``snapshot_device: cpu`` by default, which avoids an extra
+   model-sized GPU-memory snapshot while providing synchronization latency close
+   to GPU snapshot.
 3. Keep ``delta_encoding: true``.
 4. First get the workflow stable with ``compression: none``, then evaluate
    whether ``nvcomp_lz4`` is worth enabling.
-5. If you truly need full sync or are debugging correctness, switch back to
+5. If GPU memory is very abundant and you are pursuing the lowest possible sync
+   latency, evaluate ``snapshot_device: cuda``.
+6. If you truly need full sync or are debugging correctness, switch back to
    ``bucket``.
 
 Patch mode keeps an extra sender-side snapshot. When ``snapshot_device: cuda``,
@@ -335,9 +380,15 @@ that snapshot consumes GPU memory roughly equal to the number of model
 parameters multiplied by the byte size of ``snapshot_dtype`` (for example,
 ``bfloat16`` is about 2 bytes per parameter). For large models or memory-tight
 setups, reserve enough GPU memory for this snapshot to avoid OOM during
-training or synchronization. If GPU memory is insufficient, set
-``snapshot_device`` to ``cpu``; patch comparison and construction will be slower.
-In addition, ``nvcomp_lz4`` requires ``transport_device`` to be ``cuda``.
+training or synchronization.
+
+When ``snapshot_device: cpu``, this snapshot does not consume GPU memory, but it
+does consume one model-sized CPU pinned-memory copy. Its size is also roughly the
+number of model parameters multiplied by the byte size of ``snapshot_dtype``.
+In this mode, patch comparison still runs on GPU, and CPU snapshot overhead is
+reduced through prefetching, event synchronization, and background flushing. For
+memory-tight training jobs, this is the currently recommended configuration. In
+addition, ``nvcomp_lz4`` requires ``transport_device`` to be ``cuda``.
 
 
 Limitations And Caveats

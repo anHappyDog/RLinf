@@ -99,8 +99,8 @@ Patch 模式
      type: patch
      patch:
        snapshot_dtype: bfloat16
-       snapshot_device: cuda
-       transport_device: cuda
+       snapshot_device: cpu
+       transport_device: cpu
        delta_encoding: true
        compression: none
 
@@ -113,10 +113,14 @@ Patch 模式
   发送端 snapshot 的存储精度。当前推荐 ``bfloat16``。
 
 ``patch.snapshot_device``
-  snapshot 所在设备。通常推荐 ``cuda``，可以获得更快的比较与 patch 构建速度。
+  snapshot 所在设备。可选 ``cpu`` 或 ``cuda``。当前推荐优先使用 ``cpu``：
+  它可以避免 sender 侧额外占用一份模型大小的 GPU 显存，并且经过 GPU 侧比较、
+  异步预取与后台写回等优化后，同步耗时已经接近 ``snapshot_device: cuda``。
+  如果 GPU 显存非常充足，``cuda`` 仍然是最直接的低延迟路径。
 
 ``patch.transport_device``
-  patch 发送前所搬运到的设备。若需要 GPU 上压缩或 GPU 通信，通常设为 ``cuda``。
+  patch 发送前所搬运到的设备。默认可设为 ``cpu``。若需要 GPU 上压缩或 GPU 通信，
+  通常设为 ``cuda``。
 
 ``patch.delta_encoding``
   是否对 COO 坐标做 delta encoding。默认建议开启。
@@ -150,6 +154,33 @@ Patch 模式大致分为两个阶段：
    - 发送端比较当前 ``state_dict`` 与 snapshot 的差异。
    - 将变化项组织成 patch 后发送。
    - 接收端收到 patch 后，直接把变化应用到本地模型参数。
+
+
+CPU Snapshot 的优化路径
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+当 ``snapshot_device: cpu`` 时，发送端 snapshot 常驻 CPU，但当前 ``state_dict``
+仍然位于 GPU。为了避免把 patch 构建主路径退回到 CPU，RLinf 对这一场景做了专门优化：
+
+- CPU snapshot 使用 pinned memory 保存，便于 CPU 与 GPU 之间进行异步拷贝。
+- 每个 tensor 在比较前，会先把对应的 CPU snapshot 异步预取到 state tensor 所在 GPU。
+- snapshot 预取使用独立 CUDA copy stream，与其他 tensor 的 GPU 侧比较尽量重叠。
+- 差异比较、``nonzero`` 以及新值收集都在 GPU 上完成，避免 CPU 逐元素扫描。
+- 生成 patch 所需的 ``rows``、``cols`` 和 ``values`` 会异步拷贝到 pinned CPU staging buffer，
+  并通过 ``torch.cuda.Event`` 标记拷贝完成时刻。
+- sender 会在 patch 构造完成后立即返回并继续执行后续传输；CPU snapshot 的写回由后台线程完成。
+- 下一次 patch 构建开始前，会等待上一轮后台写回完成，从而保证 snapshot 一致性。
+
+因此，``snapshot_device: cpu`` 不再意味着“在 CPU 上做比较”。它的实际路径是：
+
+.. code-block:: text
+
+   CPU snapshot -> GPU prefetch -> GPU compare/nonzero/gather
+   -> pinned CPU staging -> background snapshot flush
+
+这种方式用少量额外的异步拷贝和后台写回，换取了显著更低的 GPU 显存占用。
+在当前具身 VLA 训练配置中，CPU snapshot 的权重同步耗时已经可以接近 GPU snapshot；
+因此当 GPU 显存紧张时，优先选择 ``snapshot_device: cpu`` 通常是更稳妥的默认配置。
 
 
 Patch 的数据组织方式
@@ -292,17 +323,24 @@ rollout 再据此更新自身版本状态。
 如果你的目标是优先优化同步耗时，建议按下面顺序调：
 
 1. 先使用 ``patch``，确认初始权重一致。
-2. 在显存充足时保持 ``snapshot_device: cuda``，避免把 patch 比较主路径放到 CPU。
+2. 默认优先使用 ``snapshot_device: cpu``，在不额外占用一份模型大小 GPU 显存的前提下，
+   获得接近 GPU snapshot 的同步耗时。
 3. 保持 ``delta_encoding: true``。
 4. 先用 ``compression: none`` 跑通，再评估是否需要 ``nvcomp_lz4``。
-5. 若确实需要 full sync 或排查问题，再切回 ``bucket``。
+5. 如果 GPU 显存非常充足且追求最低同步延迟，可以评估 ``snapshot_device: cuda``。
+6. 若确实需要 full sync 或排查问题，再切回 ``bucket``。
 
 需要注意的是，patch 模式会额外保存一份 sender 侧 snapshot。若
 ``snapshot_device: cuda``，这部分会占用 GPU 显存，大小约为模型参数量乘以
 ``snapshot_dtype`` 的字节数（例如 ``bfloat16`` 约为 2 bytes / parameter）。
 因此在大模型或显存较紧张的配置下，需要为 snapshot 预留显存，避免训练或同步时
-OOM。如果 GPU 显存不足，可以把 ``snapshot_device`` 改为 ``cpu``，但 patch
-比较和构建会变慢一些。此外，``nvcomp_lz4`` 需要 ``transport_device`` 为 ``cuda``。
+OOM。
+
+若 ``snapshot_device: cpu``，这部分 snapshot 不占用 GPU 显存，但会占用一份
+CPU pinned memory。其大小同样约为模型参数量乘以 ``snapshot_dtype`` 的字节数。
+该模式下 patch 比较仍在 GPU 上完成，并通过预取、事件同步和后台写回减少 CPU snapshot
+带来的额外延迟。对于显存紧张的训练任务，这是当前更推荐的配置。此外，
+``nvcomp_lz4`` 需要 ``transport_device`` 为 ``cuda``。
 
 限制与注意事项
 ------------------------------

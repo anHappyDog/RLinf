@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 import torch
@@ -31,7 +33,6 @@ from .compressor import PatchCompressor
 
 
 def downscale_nonnegative_indices(tensor: torch.Tensor) -> torch.Tensor:
-    assert torch.all(tensor >= 0), "Delta encoded indices must be non-negative"
     if tensor.numel() == 0:
         return tensor.to(torch.uint8)
     max_value = int(tensor.max().item())
@@ -116,6 +117,453 @@ class CompressedWeightPatch:
 WeightPatchTransport = EmptyWeightPatch | WeightPatch | CompressedWeightPatch
 
 
+class PatchBuilder(ABC):
+    def __init__(
+        self,
+        snapshot: dict[str, torch.Tensor],
+        ordered_keys: list[str],
+        original_shapes: dict[str, torch.Size],
+        delta_encoding: bool,
+    ):
+        self.snapshot = snapshot
+        self.ordered_keys = ordered_keys
+        self.original_shapes = original_shapes
+        self.delta_encoding = delta_encoding
+
+    @staticmethod
+    def delta_encode(
+        rows: torch.Tensor, cols: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert rows.numel() > 0, "No indices to encode"
+        assert rows.numel() == cols.numel(), (
+            "Rows and columns must have the same number of elements"
+        )
+        if rows.numel() == 1:
+            return rows, cols
+
+        row_deltas = torch.empty_like(rows)
+        col_deltas = torch.empty_like(cols)
+        row_deltas[0] = rows[0]
+        col_deltas[0] = cols[0]
+        row_deltas[1:] = rows[1:] - rows[:-1]
+
+        same_row = rows[1:] == rows[:-1]
+        col_deltas[1:] = torch.where(same_row, cols[1:] - cols[:-1], cols[1:])
+        return row_deltas, col_deltas
+
+    @staticmethod
+    def delta_decode(
+        rows_delta: torch.Tensor, cols_delta: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert rows_delta.numel() > 0
+        assert rows_delta.numel() == cols_delta.numel()
+
+        rows = torch.cumsum(rows_delta, dim=0, dtype=torch.int64)
+
+        start_mask = torch.zeros_like(rows_delta, dtype=torch.bool)
+        start_mask[0] = True
+        start_mask[1:] = rows_delta[1:] != 0
+
+        idx = torch.arange(
+            rows_delta.numel(), device=rows_delta.device, dtype=torch.int64
+        )
+        start_idx = torch.where(start_mask, idx, torch.zeros_like(idx))
+        start_idx = torch.cummax(start_idx, dim=0).values
+
+        cum_cols = torch.cumsum(cols_delta, dim=0, dtype=torch.int64)
+        base = (cum_cols - cols_delta)[start_idx]
+        cols = cum_cols - base
+        return rows, cols
+
+    @classmethod
+    def create(
+        cls,
+        snapshot: dict[str, torch.Tensor],
+        ordered_keys: list[str],
+        original_shapes: dict[str, torch.Size],
+        snapshot_device: torch.device,
+        delta_encoding: bool,
+    ) -> PatchBuilder:
+        if snapshot_device.type == "cpu":
+            return CPUSnapshotPatchBuilder(
+                snapshot,
+                ordered_keys,
+                original_shapes,
+                delta_encoding,
+            )
+        elif snapshot_device.type == "cuda":
+            return GPUSnapshotPatchBuilder(
+                snapshot,
+                ordered_keys,
+                original_shapes,
+                delta_encoding,
+            )
+        else:
+            raise ValueError(f"Unsupported snapshot device: {snapshot_device}")
+
+    @abstractmethod
+    def create_patch(
+        self,
+        state_dict: dict[str, torch.Tensor | DTensor],
+        version: torch.Tensor | int,
+    ) -> EmptyWeightPatch | WeightPatch: ...
+
+
+@dataclass
+class _PrefetchedCPUSnapshot:
+    ordinal: int
+    key: str
+    state_2dview: torch.Tensor
+    snapshot_value: torch.Tensor
+    snapshot_on_state_device: torch.Tensor
+    copy_done: torch.cuda.Event
+
+
+@dataclass
+class _PendingSnapshotUpdate:
+    snapshot_value: torch.Tensor
+    rows: torch.Tensor
+    cols: torch.Tensor
+    values: torch.Tensor
+    copy_done: torch.cuda.Event
+
+
+class CPUSnapshotPatchBuilder(PatchBuilder):
+    def __init__(
+        self,
+        snapshot: dict[str, torch.Tensor],
+        ordered_keys: list[str],
+        original_shapes: dict[str, torch.Size],
+        delta_encoding: bool,
+    ):
+        super().__init__(
+            snapshot=snapshot,
+            ordered_keys=ordered_keys,
+            original_shapes=original_shapes,
+            delta_encoding=delta_encoding,
+        )
+        self._copy_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._snapshot_flush_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="patch-snapshot-flush",
+        )
+        self._pending_snapshot_flush: Future[None] | None = None
+
+    def create_patch(
+        self,
+        state_dict: dict[str, torch.Tensor | DTensor],
+        version: torch.Tensor | int,
+    ) -> EmptyWeightPatch | WeightPatch:
+        self._wait_pending_snapshot_flush()
+        if list(state_dict.keys()) != self.ordered_keys:
+            raise ValueError("State dict keys do not match snapshot keys")
+
+        ordinals: list[torch.Tensor] = []
+        nnz_per_tensor: list[torch.Tensor] = []
+        row_chunks: list[torch.Tensor] = []
+        col_chunks: list[torch.Tensor] = []
+        value_chunks: list[torch.Tensor] = []
+        pending_snapshot_updates: list[_PendingSnapshotUpdate] = []
+        patch_device: torch.device | None = None
+
+        if not self.ordered_keys:
+            raise RuntimeError("Snapshot contains no tensors")
+
+        prefetched = self._prefetch_snapshot(state_dict, 0)
+        for ordinal in range(len(self.ordered_keys)):
+            current = prefetched
+            prefetched = (
+                self._prefetch_snapshot(state_dict, ordinal + 1)
+                if ordinal + 1 < len(self.ordered_keys)
+                else None
+            )
+
+            if patch_device is None:
+                patch_device = current.state_2dview.device
+            elif patch_device != current.state_2dview.device:
+                raise ValueError(
+                    "CPUSnapshotPatchBuilder requires all sender state_dict tensors "
+                    "to be on the same CUDA device. "
+                    f"Expected {patch_device}, got {current.state_2dview.device} "
+                    f"for key={current.key}."
+                )
+
+            compute_stream = torch.cuda.current_stream(current.state_2dview.device)
+            compute_stream.wait_event(current.copy_done)
+            current.snapshot_on_state_device.record_stream(compute_stream)
+
+            compare_value = current.state_2dview.to(
+                device=current.state_2dview.device,
+                dtype=current.snapshot_value.dtype,
+                non_blocking=True,
+                copy=False,
+            )
+            changed = compare_value.ne(current.snapshot_on_state_device)
+            rows, cols = changed.nonzero(as_tuple=True)
+            if rows.numel() == 0:
+                continue
+
+            rows = rows.to(torch.int64)
+            cols = cols.to(torch.int64)
+            values = compare_value[rows, cols]
+
+            pending_snapshot_updates.append(
+                self._stage_snapshot_update(
+                    snapshot_value=current.snapshot_value,
+                    rows=rows,
+                    cols=cols,
+                    values=values,
+                )
+            )
+
+            if self.delta_encoding:
+                patch_rows, patch_cols = self.delta_encode(rows, cols)
+            else:
+                patch_rows, patch_cols = rows, cols
+
+            ordinals.append(
+                torch.tensor(current.ordinal, dtype=torch.int32, device=rows.device)
+            )
+            nnz_per_tensor.append(
+                torch.tensor(values.numel(), dtype=torch.int32, device=rows.device)
+            )
+            row_chunks.append(patch_rows.contiguous())
+            col_chunks.append(patch_cols.contiguous())
+            value_chunks.append(values.contiguous())
+
+        if row_chunks:
+            rows_tensor = downscale_nonnegative_indices(torch.cat(row_chunks, dim=0))
+            cols_tensor = downscale_nonnegative_indices(torch.cat(col_chunks, dim=0))
+            patch = WeightPatch(
+                version=torch.tensor(
+                    version,
+                    dtype=torch.int64,
+                    device=row_chunks[0].device,
+                ),
+                ordinals=torch.stack(ordinals),
+                nnz_per_tensor=torch.stack(nnz_per_tensor),
+                rows=rows_tensor,
+                cols=cols_tensor,
+                values=torch.cat(value_chunks, dim=0),
+            )
+            self._submit_snapshot_updates(pending_snapshot_updates)
+            return patch
+
+        if patch_device is None:
+            raise RuntimeError("Snapshot contains no tensors")
+        patch = EmptyWeightPatch(
+            version=torch.tensor(version, dtype=torch.int64, device=patch_device)
+        )
+        self._submit_snapshot_updates(pending_snapshot_updates)
+        return patch
+
+    def _wait_pending_snapshot_flush(self) -> None:
+        if self._pending_snapshot_flush is None:
+            return
+        self._pending_snapshot_flush.result()
+        self._pending_snapshot_flush = None
+
+    def _submit_snapshot_updates(
+        self,
+        pending_snapshot_updates: list[_PendingSnapshotUpdate],
+    ) -> None:
+        if not pending_snapshot_updates:
+            return
+        self._pending_snapshot_flush = self._snapshot_flush_executor.submit(
+            self._flush_snapshot,
+            pending_snapshot_updates,
+        )
+
+    def _get_copy_stream(self, device: torch.device) -> torch.cuda.Stream:
+        if device.index is None:
+            device = torch.device(device.type, torch.cuda.current_device())
+        copy_stream = self._copy_streams.get(device)
+        if copy_stream is None:
+            copy_stream = torch.cuda.Stream(device=device)
+            self._copy_streams[device] = copy_stream
+        return copy_stream
+
+    def _prefetch_snapshot(
+        self,
+        state_dict: dict[str, torch.Tensor | DTensor],
+        ordinal: int,
+    ) -> _PrefetchedCPUSnapshot:
+        key = self.ordered_keys[ordinal]
+        value = materialize_tensor(state_dict[key])
+        expected_shape = self.original_shapes[key]
+        if value.shape != expected_shape:
+            raise ValueError(
+                f"Shape mismatch for key {key}: "
+                f"expected {expected_shape}, got {value.shape}"
+            )
+        state_2dview, _ = as_coo_2d_view(value)
+        if state_2dview.device.type != "cuda":
+            raise ValueError(
+                "CPUSnapshotPatchBuilder requires sender state_dict tensors "
+                f"to be on CUDA. Got key={key}, device={state_2dview.device}."
+            )
+
+        snapshot_value = self.snapshot[key]
+        if snapshot_value.device.type != "cpu":
+            raise ValueError(
+                "CPUSnapshotPatchBuilder requires snapshots to be on CPU. "
+                f"Got key={key}, device={snapshot_value.device}."
+            )
+
+        copy_stream = self._get_copy_stream(state_2dview.device)
+        with torch.cuda.stream(copy_stream):
+            snapshot_on_state_device = snapshot_value.to(
+                device=state_2dview.device,
+                non_blocking=True,
+                copy=True,
+            )
+            copy_done = torch.cuda.Event()
+            copy_done.record(copy_stream)
+
+        return _PrefetchedCPUSnapshot(
+            ordinal=ordinal,
+            key=key,
+            state_2dview=state_2dview,
+            snapshot_value=snapshot_value,
+            snapshot_on_state_device=snapshot_on_state_device,
+            copy_done=copy_done,
+        )
+
+    def _stage_snapshot_update(
+        self,
+        snapshot_value: torch.Tensor,
+        rows: torch.Tensor,
+        cols: torch.Tensor,
+        values: torch.Tensor,
+    ) -> _PendingSnapshotUpdate:
+        rows_cpu = torch.empty_like(rows, device="cpu", pin_memory=True)
+        cols_cpu = torch.empty_like(cols, device="cpu", pin_memory=True)
+        values_cpu = torch.empty_like(values, device="cpu", pin_memory=True)
+
+        with torch.cuda.device(values.device):
+            stream = torch.cuda.current_stream(values.device)
+            rows_cpu.copy_(rows, non_blocking=True)
+            cols_cpu.copy_(cols, non_blocking=True)
+            values_cpu.copy_(values, non_blocking=True)
+            copy_done = torch.cuda.Event()
+            copy_done.record(stream)
+
+        return _PendingSnapshotUpdate(
+            snapshot_value=snapshot_value,
+            rows=rows_cpu,
+            cols=cols_cpu,
+            values=values_cpu,
+            copy_done=copy_done,
+        )
+
+    def _flush_snapshot(
+        self,
+        pending_snapshot_updates: list[_PendingSnapshotUpdate],
+    ) -> None:
+        for update in pending_snapshot_updates:
+            update.copy_done.synchronize()
+            update.snapshot_value[update.rows, update.cols] = update.values
+
+
+class GPUSnapshotPatchBuilder(PatchBuilder):
+    def create_patch(
+        self,
+        state_dict: dict[str, torch.Tensor | DTensor],
+        version: torch.Tensor | int,
+    ) -> EmptyWeightPatch | WeightPatch:
+        if list(state_dict.keys()) != self.ordered_keys:
+            raise ValueError("State dict keys do not match snapshot keys")
+
+        ordinals: list[torch.Tensor] = []
+        nnz_per_tensor: list[torch.Tensor] = []
+        row_chunks: list[torch.Tensor] = []
+        col_chunks: list[torch.Tensor] = []
+        value_chunks: list[torch.Tensor] = []
+        patch_device: torch.device | None = None
+
+        for ordinal, key in enumerate(self.ordered_keys):
+            value = materialize_tensor(state_dict[key])
+            expected_shape = self.original_shapes[key]
+            if value.shape != expected_shape:
+                raise ValueError(
+                    f"Shape mismatch for key {key}: "
+                    f"expected {expected_shape}, got {value.shape}"
+                )
+            value_2dview, _ = as_coo_2d_view(value)
+            if value_2dview.device.type != "cuda":
+                raise ValueError(
+                    "GPUSnapshotPatchBuilder requires sender state_dict tensors "
+                    f"to be on CUDA. Got key={key}, device={value_2dview.device}."
+                )
+
+            snapshot_value = self.snapshot[key]
+            if snapshot_value.device.type != "cuda":
+                raise ValueError(
+                    "GPUSnapshotPatchBuilder requires snapshots to be on CUDA. "
+                    f"Got key={key}, device={snapshot_value.device}."
+                )
+            if snapshot_value.device != value_2dview.device:
+                raise ValueError(
+                    "GPU snapshot and state tensor must be on the same CUDA device. "
+                    f"Got key={key}, snapshot={snapshot_value.device}, "
+                    f"state={value_2dview.device}."
+                )
+            if patch_device is None:
+                patch_device = snapshot_value.device
+
+            compare_value = value_2dview.to(
+                device=snapshot_value.device,
+                dtype=snapshot_value.dtype,
+                non_blocking=True,
+                copy=False,
+            )
+            changed = compare_value.ne(snapshot_value)
+            rows, cols = changed.nonzero(as_tuple=True)
+            if rows.numel() == 0:
+                continue
+
+            rows = rows.to(torch.int64)
+            cols = cols.to(torch.int64)
+            values = compare_value[rows, cols]
+
+            snapshot_value[rows, cols] = values
+
+            if self.delta_encoding:
+                rows, cols = self.delta_encode(rows, cols)
+
+            ordinals.append(
+                torch.tensor(ordinal, dtype=torch.int32, device=rows.device)
+            )
+            nnz_per_tensor.append(
+                torch.tensor(values.numel(), dtype=torch.int32, device=rows.device)
+            )
+            row_chunks.append(rows.contiguous())
+            col_chunks.append(cols.contiguous())
+            value_chunks.append(values.contiguous())
+
+        if row_chunks:
+            rows_tensor = downscale_nonnegative_indices(torch.cat(row_chunks, dim=0))
+            cols_tensor = downscale_nonnegative_indices(torch.cat(col_chunks, dim=0))
+            return WeightPatch(
+                version=torch.tensor(
+                    version,
+                    dtype=torch.int64,
+                    device=row_chunks[0].device,
+                ),
+                ordinals=torch.stack(ordinals),
+                nnz_per_tensor=torch.stack(nnz_per_tensor),
+                rows=rows_tensor,
+                cols=cols_tensor,
+                values=torch.cat(value_chunks, dim=0),
+            )
+
+        if patch_device is None:
+            raise RuntimeError("Snapshot contains no tensors")
+        return EmptyWeightPatch(
+            version=torch.tensor(version, dtype=torch.int64, device=patch_device)
+        )
+
+
 class PatchWeightSyncer(WeightSyncer):
     def __init__(
         self,
@@ -129,6 +577,7 @@ class PatchWeightSyncer(WeightSyncer):
         self.snapshot: dict[str, torch.Tensor] | None = None
         self.original_shapes: dict[str, torch.Size] | None = None
         self.ordered_keys: list[str] | None = None
+        self.patch_builder: PatchBuilder | None = None
         self.delta_encoding = delta_encoding
         self.transport_device = normalize_device(transport_device)
         self.snapshot_dtype = normalize_dtype(snapshot_dtype)
@@ -149,16 +598,26 @@ class PatchWeightSyncer(WeightSyncer):
             snapshot: dict[str, torch.Tensor] = {}
             self.original_shapes = {}
             self.ordered_keys = []
-            should_pin_snapshot = (
-                self.snapshot_device == torch.device("cpu")
-                and self.transport_device.type != "cpu"
-                and torch.cuda.is_available()
-            )
             for key, value in state_dict.items():
                 value_2dview, original_shape = as_coo_2d_view(materialize_tensor(value))
+                if (
+                    self.snapshot_device.type == "cpu"
+                    and value_2dview.device.type != "cuda"
+                ):
+                    raise ValueError(
+                        "CPU snapshot patch sync requires sender state_dict tensors "
+                        f"to be on CUDA. Got key={key}, device={value_2dview.device}."
+                    )
                 copy_non_blocking = self.snapshot_device.type != "cpu"
+                should_pin_snapshot = self.snapshot_device.type == "cpu"
+                snapshot_device = (
+                    value_2dview.device
+                    if self.snapshot_device.type == "cuda"
+                    and self.snapshot_device.index is None
+                    else self.snapshot_device
+                )
                 snapshot_value = value_2dview.detach().to(
-                    device=self.snapshot_device,
+                    device=snapshot_device,
                     dtype=self.snapshot_dtype,
                     non_blocking=copy_non_blocking,
                     copy=True,
@@ -172,6 +631,13 @@ class PatchWeightSyncer(WeightSyncer):
                 self.ordered_keys.append(key)
 
         self.snapshot = snapshot
+        self.patch_builder = PatchBuilder.create(
+            self.snapshot,
+            self.ordered_keys,
+            self.original_shapes,
+            self.snapshot_device,
+            self.delta_encoding,
+        )
         metadata = {
             "ordered_keys": self.ordered_keys,
             "original_shapes": self.original_shapes,
@@ -194,45 +660,12 @@ class PatchWeightSyncer(WeightSyncer):
     def delta_encode(
         self, rows: torch.Tensor, cols: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert rows.numel() > 0, "No indices to encode"
-        assert rows.numel() == cols.numel(), (
-            "Rows and columns must have the same number of elements"
-        )
-        if rows.numel() == 1:
-            return rows, cols
-
-        row_deltas = torch.empty_like(rows)
-        col_deltas = torch.empty_like(cols)
-        row_deltas[0] = rows[0]
-        col_deltas[0] = cols[0]
-        row_deltas[1:] = rows[1:] - rows[:-1]
-
-        same_row = rows[1:] == rows[:-1]
-        col_deltas[1:] = torch.where(same_row, cols[1:] - cols[:-1], cols[1:])
-        return row_deltas, col_deltas
+        return PatchBuilder.delta_encode(rows, cols)
 
     def delta_decode(
         self, rows_delta: torch.Tensor, cols_delta: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert rows_delta.numel() > 0
-        assert rows_delta.numel() == cols_delta.numel()
-
-        rows = torch.cumsum(rows_delta, dim=0, dtype=torch.int64)
-
-        start_mask = torch.zeros_like(rows_delta, dtype=torch.bool)
-        start_mask[0] = True
-        start_mask[1:] = rows_delta[1:] != 0
-
-        idx = torch.arange(
-            rows_delta.numel(), device=rows_delta.device, dtype=torch.int64
-        )
-        start_idx = torch.where(start_mask, idx, torch.zeros_like(idx))
-        start_idx = torch.cummax(start_idx, dim=0).values
-
-        cum_cols = torch.cumsum(cols_delta, dim=0, dtype=torch.int64)
-        base = (cum_cols - cols_delta)[start_idx]
-        cols = cum_cols - base
-        return rows, cols
+        return PatchBuilder.delta_decode(rows_delta, cols_delta)
 
     @torch.no_grad()
     def create_patch(
@@ -240,69 +673,9 @@ class PatchWeightSyncer(WeightSyncer):
         state_dict: dict[str, torch.Tensor | DTensor],
         version: torch.Tensor | int,
     ) -> EmptyWeightPatch | WeightPatch:
-        assert self.snapshot is not None and self.ordered_keys is not None, (
-            "Snapshot not initialized"
-        )
-        assert list(state_dict.keys()) == self.ordered_keys, (
-            "State dict keys do not match snapshot keys"
-        )
-
-        ordinals: list[torch.Tensor] = []
-        nnz_per_tensor: list[torch.Tensor] = []
-        row_chunks: list[torch.Tensor] = []
-        col_chunks: list[torch.Tensor] = []
-        value_chunks: list[torch.Tensor] = []
-        patch_device = self.snapshot_device
-
-        for ordinal, key in enumerate(self.ordered_keys):
-            value_2dview, _ = as_coo_2d_view(materialize_tensor(state_dict[key]))
-            snapshot_value = self.snapshot[key]
-            value_2dview = value_2dview.to(
-                device=snapshot_value.device,
-                dtype=snapshot_value.dtype,
-                non_blocking=snapshot_value.device.type != "cpu",
-                copy=True,
-            )
-
-            changed = value_2dview.ne(snapshot_value)
-            if not torch.any(changed):
-                continue
-
-            rows, cols = changed.nonzero(as_tuple=True)
-            rows = rows.to(torch.int64)
-            cols = cols.to(torch.int64)
-            values = value_2dview[rows, cols]
-
-            self.snapshot[key][rows, cols] = values
-
-            if self.delta_encoding:
-                rows, cols = self.delta_encode(rows, cols)
-
-            ordinals.append(
-                torch.tensor(ordinal, dtype=torch.int32, device=rows.device)
-            )
-            nnz_per_tensor.append(
-                torch.tensor(values.numel(), dtype=torch.int32, device=rows.device)
-            )
-            row_chunks.append(rows.contiguous())
-            col_chunks.append(cols.contiguous())
-            value_chunks.append(values.contiguous())
-
-        if row_chunks:
-            rows_tensor = downscale_nonnegative_indices(torch.cat(row_chunks, dim=0))
-            cols_tensor = downscale_nonnegative_indices(torch.cat(col_chunks, dim=0))
-            return WeightPatch(
-                version=torch.tensor(version, dtype=torch.int64, device=patch_device),
-                ordinals=torch.stack(ordinals),
-                nnz_per_tensor=torch.stack(nnz_per_tensor),
-                rows=rows_tensor,
-                cols=cols_tensor,
-                values=torch.cat(value_chunks, dim=0),
-            )
-
-        return EmptyWeightPatch(
-            version=torch.tensor(version, dtype=torch.int64, device=patch_device)
-        )
+        if self.patch_builder is None:
+            raise RuntimeError("Snapshot not initialized")
+        return self.patch_builder.create_patch(state_dict, version)
 
     async def sync(
         self,
@@ -377,7 +750,7 @@ class PatchWeightSyncer(WeightSyncer):
                         device=value_2dview.device,
                         non_blocking=False,
                     )
-                rows, cols = self.delta_decode(row_delta, col_delta)
+                rows, cols = PatchBuilder.delta_decode(row_delta, col_delta)
             else:
                 rows = row_slice.to(
                     device=value_2dview.device,

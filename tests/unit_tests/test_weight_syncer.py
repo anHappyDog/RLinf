@@ -145,7 +145,8 @@ def test_patch_delta_encode_decode_roundtrip():
 
 
 def test_patch_weight_syncer_roundtrip_delta_enabled():
-    sender_model = _TinyWeightSyncModel()
+    device = _get_cuda_device()
+    sender_model = _make_model(device)
     receiver_model = copy.deepcopy(sender_model)
     transport = _InMemoryTransport()
 
@@ -187,7 +188,8 @@ def test_patch_weight_syncer_roundtrip_delta_enabled():
 
 
 def test_patch_weight_syncer_roundtrip_delta_disabled():
-    sender_model = _TinyWeightSyncModel()
+    device = _get_cuda_device()
+    sender_model = _make_model(device)
     receiver_model = copy.deepcopy(sender_model)
     transport = _InMemoryTransport()
 
@@ -310,6 +312,58 @@ def test_patch_weight_syncer_roundtrip_cuda_delta_disabled():
     )
 
 
+def test_patch_weight_syncer_cpu_snapshot_cuda_state_roundtrip():
+    device = _get_cuda_device()
+    sender_model = _make_model(device)
+    receiver_model = copy.deepcopy(sender_model)
+    transport = _InMemoryTransport()
+
+    sender_syncer = PatchWeightSyncer(
+        snapshot_dtype=torch.float32,
+        snapshot_device="cpu",
+        transport_device="cpu",
+        delta_encoding=True,
+        compression_algorithm="none",
+    )
+    receiver_syncer = PatchWeightSyncer(
+        snapshot_dtype=torch.float32,
+        snapshot_device="cpu",
+        transport_device="cpu",
+        delta_encoding=True,
+        compression_algorithm="none",
+    )
+
+    async def _run() -> int:
+        await sender_syncer.init_sender(_clone_state_dict(sender_model), transport.send)
+        await receiver_syncer.init_receiver(None, transport.recv)
+
+        with torch.no_grad():
+            sender_model.linear.weight[0, 2] = 123.0
+            sender_model.linear.bias[0] -= 6.0
+            sender_model.tensor3d[1, 0, 3] += 13.0
+            sender_model.scalar_buf.add_(2.5)
+            sender_model.vector_buf[1] = -42.0
+
+        await sender_syncer.sync(sender_model.state_dict(), transport.send, version=37)
+        first_applied_version = await receiver_syncer.apply(
+            receiver_model, transport.recv
+        )
+
+        await sender_syncer.sync(sender_model.state_dict(), transport.send, version=38)
+        second_applied_version = await receiver_syncer.apply(
+            receiver_model, transport.recv
+        )
+        return first_applied_version, second_applied_version
+
+    first_applied_version, second_applied_version = asyncio.run(_run())
+
+    assert first_applied_version == 37
+    assert second_applied_version == 38
+    _assert_state_dict_equal(
+        _clone_state_dict(sender_model), _clone_state_dict(receiver_model)
+    )
+
+
 def test_patch_weight_syncer_roundtrip_cuda_nvcomp():
     device = _get_cuda_device()
     pytest.importorskip("nvidia.nvcomp")
@@ -356,7 +410,8 @@ def test_patch_weight_syncer_roundtrip_cuda_nvcomp():
 
 
 def test_patch_weight_syncer_empty_patch_still_applies_version():
-    sender_model = _TinyWeightSyncModel()
+    device = _get_cuda_device()
+    sender_model = _make_model(device)
     receiver_model = copy.deepcopy(sender_model)
     transport = _InMemoryTransport()
 
@@ -390,7 +445,8 @@ def test_patch_weight_syncer_empty_patch_still_applies_version():
 
 
 def test_patch_weight_syncer_rejects_mismatched_key_order():
-    model = _TinyWeightSyncModel()
+    device = _get_cuda_device()
+    model = _make_model(device)
     syncer = PatchWeightSyncer(
         snapshot_dtype=torch.float32,
         snapshot_device="cpu",
@@ -406,9 +462,7 @@ def test_patch_weight_syncer_rejects_mismatched_key_order():
     asyncio.run(_init())
 
     reversed_state_dict = OrderedDict(reversed(list(_clone_state_dict(model).items())))
-    with pytest.raises(
-        AssertionError, match="State dict keys do not match snapshot keys"
-    ):
+    with pytest.raises(ValueError, match="State dict keys do not match snapshot keys"):
         syncer.create_patch(reversed_state_dict, version=1)
 
 
