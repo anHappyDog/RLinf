@@ -2,6 +2,6 @@ type: patch
 patch:
   snapshot_dtype: bfloat16
   snapshot_device: cuda
-  transport_device: cuda
-  delta_encoding: true
+  transport_device: cpu
+  delta_encoding: True
   compression: none

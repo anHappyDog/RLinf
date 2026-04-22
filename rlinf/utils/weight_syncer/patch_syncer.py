@@ -63,6 +63,19 @@ def as_coo_2d_view(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Size]:
 
 
 @dataclass
+class EmptyWeightPatch:
+    version: torch.Tensor
+
+    def to(
+        self, device: torch.device | str, non_blocking: bool = False
+    ) -> "EmptyWeightPatch":
+        device = normalize_device(device)
+        return EmptyWeightPatch(
+            version=self.version.to(device=device, non_blocking=non_blocking),
+        )
+
+
+@dataclass
 class WeightPatch:
     version: torch.Tensor
     ordinals: torch.Tensor
@@ -100,7 +113,7 @@ class CompressedWeightPatch:
     values_dtype_code: torch.Tensor
 
 
-WeightPatchTransport = WeightPatch | CompressedWeightPatch
+WeightPatchTransport = EmptyWeightPatch | WeightPatch | CompressedWeightPatch
 
 
 class PatchWeightSyncer(WeightSyncer):
@@ -204,9 +217,7 @@ class PatchWeightSyncer(WeightSyncer):
         assert rows_delta.numel() > 0
         assert rows_delta.numel() == cols_delta.numel()
 
-        rows_delta = rows_delta.to(torch.int64)
-        cols_delta = cols_delta.to(torch.int64)
-        rows = torch.cumsum(rows_delta, dim=0)
+        rows = torch.cumsum(rows_delta, dim=0, dtype=torch.int64)
 
         start_mask = torch.zeros_like(rows_delta, dtype=torch.bool)
         start_mask[0] = True
@@ -218,7 +229,7 @@ class PatchWeightSyncer(WeightSyncer):
         start_idx = torch.where(start_mask, idx, torch.zeros_like(idx))
         start_idx = torch.cummax(start_idx, dim=0).values
 
-        cum_cols = torch.cumsum(cols_delta, dim=0)
+        cum_cols = torch.cumsum(cols_delta, dim=0, dtype=torch.int64)
         base = (cum_cols - cols_delta)[start_idx]
         cols = cum_cols - base
         return rows, cols
@@ -228,7 +239,7 @@ class PatchWeightSyncer(WeightSyncer):
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
         version: torch.Tensor | int,
-    ) -> WeightPatch:
+    ) -> EmptyWeightPatch | WeightPatch:
         assert self.snapshot is not None and self.ordered_keys is not None, (
             "Snapshot not initialized"
         )
@@ -289,13 +300,8 @@ class PatchWeightSyncer(WeightSyncer):
                 values=torch.cat(value_chunks, dim=0),
             )
 
-        return WeightPatch(
-            version=torch.tensor(version, dtype=torch.int64, device=patch_device),
-            ordinals=torch.empty(0, dtype=torch.int32, device=patch_device),
-            nnz_per_tensor=torch.empty(0, dtype=torch.int32, device=patch_device),
-            rows=torch.empty(0, dtype=torch.uint8, device=patch_device),
-            cols=torch.empty(0, dtype=torch.uint8, device=patch_device),
-            values=torch.empty(0, dtype=self.snapshot_dtype, device=patch_device),
+        return EmptyWeightPatch(
+            version=torch.tensor(version, dtype=torch.int64, device=patch_device)
         )
 
     async def sync(
@@ -309,7 +315,10 @@ class PatchWeightSyncer(WeightSyncer):
             device=self.transport_device,
             non_blocking=self.transport_device.type != "cpu",
         )
-        await send(self.compressor.compress(transport_patch))
+        if isinstance(transport_patch, EmptyWeightPatch):
+            await send(transport_patch)
+        else:
+            await send(self.compressor.compress(transport_patch))
 
     @torch.no_grad()
     async def apply(self, model: torch.nn.Module, recv: RecvFn) -> int:
@@ -317,8 +326,23 @@ class PatchWeightSyncer(WeightSyncer):
             "Snapshot info not initialized"
         )
 
-        patch = self.compressor.decompress(await recv())
+        payload = await recv()
+
+        if isinstance(payload, EmptyWeightPatch):
+            return int(payload.version.item())
+        patch = self.compressor.decompress(payload)
         applied_version = int(patch.version.item())
+        total_nnz = int(patch.nnz_per_tensor.to(torch.int64).sum().item())
+        assert patch.rows.numel() == patch.cols.numel() == patch.values.numel(), (
+            "Patch rows/cols/values must have the same number of elements: "
+            f"rows={patch.rows.numel()}, cols={patch.cols.numel()}, "
+            f"values={patch.values.numel()}"
+        )
+        assert patch.rows.numel() == total_nnz, (
+            "Patch payload size does not match nnz_per_tensor: "
+            f"payload_nnz={patch.rows.numel()}, nnz_sum={total_nnz}"
+        )
+
         state_dict = model.state_dict()
 
         offset = 0
@@ -332,40 +356,44 @@ class PatchWeightSyncer(WeightSyncer):
             )
 
             nnz = int(patch.nnz_per_tensor[patch_idx].item())
-            next_offset = offset + nnz
-            row_slice = patch.rows[offset:next_offset]
-            col_slice = patch.cols[offset:next_offset]
-            value_slice = patch.values[offset:next_offset]
+            start_offset = offset
+            next_offset = start_offset + nnz
+
+            row_slice = patch.rows[start_offset:next_offset].clone()
+            col_slice = patch.cols[start_offset:next_offset].clone()
+            value_slice = patch.values[start_offset:next_offset]
             offset = next_offset
 
             if self.delta_encoding:
-                row_delta = row_slice.to(
-                    device=value_2dview.device,
-                    dtype=torch.int64,
-                    non_blocking=True,
-                )
-                col_delta = col_slice.to(
-                    device=value_2dview.device,
-                    dtype=torch.int64,
-                    non_blocking=True,
-                )
+                row_delta = row_slice
+                col_delta = col_slice
+                if row_delta.device != value_2dview.device:
+                    row_delta = row_delta.to(
+                        device=value_2dview.device,
+                        non_blocking=False,
+                    )
+                if col_delta.device != value_2dview.device:
+                    col_delta = col_delta.to(
+                        device=value_2dview.device,
+                        non_blocking=False,
+                    )
                 rows, cols = self.delta_decode(row_delta, col_delta)
             else:
                 rows = row_slice.to(
                     device=value_2dview.device,
                     dtype=torch.int64,
-                    non_blocking=True,
+                    non_blocking=False,
                 )
                 cols = col_slice.to(
                     device=value_2dview.device,
                     dtype=torch.int64,
-                    non_blocking=True,
+                    non_blocking=False,
                 )
 
             value_2dview[rows, cols] = value_slice.to(
                 device=value_2dview.device,
                 dtype=value_2dview.dtype,
-                non_blocking=True,
+                non_blocking=False,
             )
 
         assert offset == patch.rows.numel(), "Patch offsets do not match payload size"
