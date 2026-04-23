@@ -27,7 +27,6 @@ from .base import (
     WeightSyncer,
     materialize_tensor,
     normalize_device,
-    normalize_dtype,
 )
 from .compressor import PatchCompressor
 
@@ -208,6 +207,13 @@ class PatchBuilder(ABC):
         version: torch.Tensor | int,
     ) -> EmptyWeightPatch | WeightPatch: ...
 
+    def _validate_state_dict_keys(
+        self,
+        state_dict: dict[str, torch.Tensor | DTensor],
+    ) -> None:
+        if set(state_dict.keys()) != set(self.ordered_keys):
+            raise ValueError("State dict keys do not match snapshot keys")
+
 
 @dataclass
 class _PrefetchedCPUSnapshot:
@@ -255,8 +261,7 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
         version: torch.Tensor | int,
     ) -> EmptyWeightPatch | WeightPatch:
         self._wait_pending_snapshot_flush()
-        if list(state_dict.keys()) != self.ordered_keys:
-            raise ValueError("State dict keys do not match snapshot keys")
+        self._validate_state_dict_keys(state_dict)
 
         ordinals: list[torch.Tensor] = []
         nnz_per_tensor: list[torch.Tensor] = []
@@ -471,8 +476,7 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
         state_dict: dict[str, torch.Tensor | DTensor],
         version: torch.Tensor | int,
     ) -> EmptyWeightPatch | WeightPatch:
-        if list(state_dict.keys()) != self.ordered_keys:
-            raise ValueError("State dict keys do not match snapshot keys")
+        self._validate_state_dict_keys(state_dict)
 
         ordinals: list[torch.Tensor] = []
         nnz_per_tensor: list[torch.Tensor] = []
@@ -567,7 +571,6 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
 class PatchWeightSyncer(WeightSyncer):
     def __init__(
         self,
-        snapshot_dtype: torch.dtype | str = torch.bfloat16,
         snapshot_device: torch.device | str = "cpu",
         transport_device: torch.device | str = "cuda",
         delta_encoding: bool = True,
@@ -580,7 +583,6 @@ class PatchWeightSyncer(WeightSyncer):
         self.patch_builder: PatchBuilder | None = None
         self.delta_encoding = delta_encoding
         self.transport_device = normalize_device(transport_device)
-        self.snapshot_dtype = normalize_dtype(snapshot_dtype)
         self.snapshot_device = normalize_device(snapshot_device)
         self.compressor = PatchCompressor.create(
             compression_algorithm=compression_algorithm,
@@ -591,15 +593,31 @@ class PatchWeightSyncer(WeightSyncer):
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
         send: SendFn,
+        recv: RecvFn | None = None,
     ) -> None:
         assert not self.sender_initialized(), "Sender already initialized"
+        del send
+        if recv is None:
+            raise ValueError("PatchWeightSyncer sender init requires a recv function")
+
+        metadata = await recv()
+        self.ordered_keys = metadata["ordered_keys"]
+        self.original_shapes = metadata["original_shapes"]
+        receiver_dtypes = metadata["receiver_dtypes"]
+        if set(state_dict.keys()) != set(self.ordered_keys):
+            raise ValueError("Sender state dict keys do not match receiver keys")
 
         with torch.no_grad():
             snapshot: dict[str, torch.Tensor] = {}
-            self.original_shapes = {}
-            self.ordered_keys = []
-            for key, value in state_dict.items():
-                value_2dview, original_shape = as_coo_2d_view(materialize_tensor(value))
+            for key in self.ordered_keys:
+                value_2dview, original_shape = as_coo_2d_view(
+                    materialize_tensor(state_dict[key])
+                )
+                if original_shape != self.original_shapes[key]:
+                    raise ValueError(
+                        f"Shape mismatch for key {key}: "
+                        f"expected {self.original_shapes[key]}, got {original_shape}"
+                    )
                 if (
                     self.snapshot_device.type == "cpu"
                     and value_2dview.device.type != "cuda"
@@ -608,8 +626,6 @@ class PatchWeightSyncer(WeightSyncer):
                         "CPU snapshot patch sync requires sender state_dict tensors "
                         f"to be on CUDA. Got key={key}, device={value_2dview.device}."
                     )
-                copy_non_blocking = self.snapshot_device.type != "cpu"
-                should_pin_snapshot = self.snapshot_device.type == "cpu"
                 snapshot_device = (
                     value_2dview.device
                     if self.snapshot_device.type == "cuda"
@@ -618,17 +634,15 @@ class PatchWeightSyncer(WeightSyncer):
                 )
                 snapshot_value = value_2dview.detach().to(
                     device=snapshot_device,
-                    dtype=self.snapshot_dtype,
-                    non_blocking=copy_non_blocking,
+                    dtype=receiver_dtypes[key],
+                    non_blocking=self.snapshot_device.type != "cpu",
                     copy=True,
                 )
                 snapshot[key] = (
                     snapshot_value.pin_memory()
-                    if should_pin_snapshot
+                    if self.snapshot_device.type == "cpu"
                     else snapshot_value
                 )
-                self.original_shapes[key] = original_shape
-                self.ordered_keys.append(key)
 
         self.snapshot = snapshot
         self.patch_builder = PatchBuilder.create(
@@ -638,23 +652,37 @@ class PatchWeightSyncer(WeightSyncer):
             self.snapshot_device,
             self.delta_encoding,
         )
-        metadata = {
-            "ordered_keys": self.ordered_keys,
-            "original_shapes": self.original_shapes,
-        }
-        await send(metadata)
         self._sender_initialized = True
 
     async def init_receiver(
         self,
         state_dict: dict[str, torch.Tensor | DTensor] | None,
         recv: RecvFn,
+        send: SendFn | None = None,
     ) -> None:
-        del state_dict
         assert not self.receiver_initialized(), "Receiver already initialized"
-        metadata = await recv()
-        self.ordered_keys = metadata["ordered_keys"]
-        self.original_shapes = metadata["original_shapes"]
+        del recv
+        if state_dict is None:
+            raise ValueError("PatchWeightSyncer receiver init requires a state_dict")
+        if send is None:
+            raise ValueError("PatchWeightSyncer receiver init requires a send function")
+
+        self.ordered_keys = []
+        self.original_shapes = {}
+        receiver_dtypes: dict[str, torch.dtype] = {}
+        for key, tensor in state_dict.items():
+            value_2dview, original_shape = as_coo_2d_view(materialize_tensor(tensor))
+            self.ordered_keys.append(key)
+            self.original_shapes[key] = original_shape
+            receiver_dtypes[key] = value_2dview.dtype
+
+        await send(
+            {
+                "ordered_keys": self.ordered_keys,
+                "original_shapes": self.original_shapes,
+                "receiver_dtypes": receiver_dtypes,
+            }
+        )
         self._receiver_initialized = True
 
     def delta_encode(

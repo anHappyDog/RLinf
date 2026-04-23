@@ -111,7 +111,6 @@ A typical patch configuration looks like this:
    weight_syncer:
      type: patch
      patch:
-       snapshot_dtype: bfloat16
        snapshot_device: cpu
        transport_device: cpu
        delta_encoding: true
@@ -121,10 +120,6 @@ The fields mean:
 
 ``type``
   Fixed to ``patch`` to enable incremental synchronization.
-
-``patch.snapshot_dtype``
-  Storage dtype of the sender-side snapshot. ``bfloat16`` is currently
-  recommended.
 
 ``patch.snapshot_device``
   Device where the snapshot is stored. It can be either ``cpu`` or ``cuda``.
@@ -155,16 +150,21 @@ Patch mode is roughly split into two stages:
 
 1. One-time initialization
 
-   - The sender creates its snapshot in ``init_sender(...)``.
-   - The receiver obtains metadata in ``init_receiver(...)``.
+   - The receiver sends local model metadata in ``init_receiver(...)``.
+   - The sender receives the metadata in ``init_sender(...)`` and creates its
+     snapshot from it.
 
    The metadata currently includes:
 
    - a fixed parameter order ``ordered_keys``
    - the original shape of each tensor in ``original_shapes``
+   - the dtype of each receiver-side tensor
 
    The receiver **does not store the sender-side snapshot**. It only stores the
    structural information needed to apply patches correctly to its local model.
+   The sender-side snapshot uses the same dtype as the corresponding
+   receiver-side weight, so mixed-precision models with both ``bfloat16`` and
+   ``float32`` weights are handled correctly.
 
 2. Per-sync update
 
@@ -377,14 +377,14 @@ If your priority is to reduce synchronization overhead, a good tuning order is:
 
 Patch mode keeps an extra sender-side snapshot. When ``snapshot_device: cuda``,
 that snapshot consumes GPU memory roughly equal to the number of model
-parameters multiplied by the byte size of ``snapshot_dtype`` (for example,
-``bfloat16`` is about 2 bytes per parameter). For large models or memory-tight
-setups, reserve enough GPU memory for this snapshot to avoid OOM during
-training or synchronization.
+parameters multiplied by the byte size of the corresponding receiver-side
+weight dtype. For large models or memory-tight setups, reserve enough GPU memory
+for this snapshot to avoid OOM during training or synchronization.
 
 When ``snapshot_device: cpu``, this snapshot does not consume GPU memory, but it
 does consume one model-sized CPU pinned-memory copy. Its size is also roughly the
-number of model parameters multiplied by the byte size of ``snapshot_dtype``.
+number of model parameters multiplied by the byte size of the corresponding
+receiver-side weight dtype.
 In this mode, patch comparison still runs on GPU, and CPU snapshot overhead is
 reduced through prefetching, event synchronization, and background flushing. For
 memory-tight training jobs, this is the currently recommended configuration. In

@@ -1068,8 +1068,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
             await asyncio.gather(*handle)
 
+        async def recv_func():
+            handle = []
+            for rank in self._weight_dst_rank_in_rollout:
+                handle.append(
+                    self.recv(
+                        src_group_name=self._rollout_group_name,
+                        src_rank=rank,
+                        async_op=True,
+                        options=self._sync_weight_comm_options,
+                    ).async_wait()
+                )
+            metadata_list = await asyncio.gather(*handle)
+            metadata = metadata_list[0]
+            for other_metadata in metadata_list[1:]:
+                if other_metadata != metadata:
+                    raise ValueError("Patch metadata differs across rollout ranks")
+            return metadata
+
         if not self.weight_syncer.sender_initialized():
-            await self.weight_syncer.init_sender(state_dict=state_dict, send=send_func)
+            await self.weight_syncer.init_sender(
+                state_dict=state_dict,
+                send=send_func,
+                recv=recv_func,
+            )
 
         await self.weight_syncer.sync(state_dict, send_func, version=self.version)
 

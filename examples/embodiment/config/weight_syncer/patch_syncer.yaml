@@ -1,6 +1,5 @@
 type: patch
 patch:
-  snapshot_dtype: bfloat16
   snapshot_device: cpu
   transport_device: cpu
   delta_encoding: True

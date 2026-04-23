@@ -98,7 +98,6 @@ Patch 模式
    weight_syncer:
      type: patch
      patch:
-       snapshot_dtype: bfloat16
        snapshot_device: cpu
        transport_device: cpu
        delta_encoding: true
@@ -108,9 +107,6 @@ Patch 模式
 
 ``type``
   固定为 ``patch``，表示使用增量同步。
-
-``patch.snapshot_dtype``
-  发送端 snapshot 的存储精度。当前推荐 ``bfloat16``。
 
 ``patch.snapshot_device``
   snapshot 所在设备。可选 ``cpu`` 或 ``cuda``。当前推荐优先使用 ``cpu``：
@@ -139,15 +135,18 @@ Patch 模式大致分为两个阶段：
 
 1. 一次性初始化阶段
 
-   - 发送端在 ``init_sender(...)`` 中建立 snapshot。
-   - 接收端在 ``init_receiver(...)`` 中接收 metadata。
+   - 接收端在 ``init_receiver(...)`` 中发送本地模型 metadata。
+   - 发送端在 ``init_sender(...)`` 中接收 metadata，并据此建立 snapshot。
 
    当前 metadata 主要包括：
 
    - 参数键的固定顺序 ``ordered_keys``
    - 每个张量的原始形状 ``original_shapes``
+   - 每个张量在接收端的 dtype
 
    接收端 **不会保存发送端 snapshot** ，它只保存足够把 patch 正确落到本地模型上的结构信息。
+   发送端 snapshot 的 dtype 与接收端对应权重的 dtype 保持一致，因此可以正确支持
+   ``bfloat16`` 与 ``float32`` 混合精度模型。
 
 2. 每次同步阶段
 
@@ -332,12 +331,12 @@ rollout 再据此更新自身版本状态。
 
 需要注意的是，patch 模式会额外保存一份 sender 侧 snapshot。若
 ``snapshot_device: cuda``，这部分会占用 GPU 显存，大小约为模型参数量乘以
-``snapshot_dtype`` 的字节数（例如 ``bfloat16`` 约为 2 bytes / parameter）。
+接收端对应权重 dtype 的字节数。
 因此在大模型或显存较紧张的配置下，需要为 snapshot 预留显存，避免训练或同步时
 OOM。
 
 若 ``snapshot_device: cpu``，这部分 snapshot 不占用 GPU 显存，但会占用一份
-CPU pinned memory。其大小同样约为模型参数量乘以 ``snapshot_dtype`` 的字节数。
+CPU pinned memory。其大小同样约为模型参数量乘以接收端对应权重 dtype 的字节数。
 该模式下 patch 比较仍在 GPU 上完成，并通过预取、事件同步和后台写回减少 CPU snapshot
 带来的额外延迟。对于显存紧张的训练任务，这是当前更推荐的配置。此外，
 ``nvcomp_lz4`` 需要 ``transport_device`` 为 ``cuda``。

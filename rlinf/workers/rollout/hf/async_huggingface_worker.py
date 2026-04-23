@@ -116,8 +116,21 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 options=self._sync_weight_comm_options,
             ).async_wait()
 
+        async def send_func(data):
+            await self.send(
+                data,
+                dst_group_name=self.actor_group_name,
+                dst_rank=self.actor_weight_src_rank,
+                async_op=True,
+                options=self._sync_weight_comm_options,
+            ).async_wait()
+
         if not self.weight_syncer.receiver_initialized():
-            await self.weight_syncer.init_receiver(state_dict=None, recv=recv_func)
+            await self.weight_syncer.init_receiver(
+                state_dict=self.hf_model.state_dict(),
+                recv=recv_func,
+                send=send_func,
+            )
 
         applied_version = await self.weight_syncer.apply(self.hf_model, recv_func)
         self.version = applied_version

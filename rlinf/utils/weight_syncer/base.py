@@ -74,14 +74,18 @@ class WeightSyncer(ABC):
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
         send: SendFn,
+        recv: RecvFn | None = None,
     ) -> None:
+        del state_dict, send, recv
         self._sender_initialized = True
 
     async def init_receiver(
         self,
         state_dict: dict[str, torch.Tensor | DTensor] | None,
         recv: RecvFn,
+        send: SendFn | None = None,
     ) -> None:
+        del state_dict, recv, send
         self._receiver_initialized = True
 
     @classmethod
@@ -112,9 +116,6 @@ class WeightSyncer(ABC):
                 "Patch config must be provided for patch weight syncer"
             )
             return PatchWeightSyncer(
-                snapshot_dtype=OmegaConf.select(
-                    patch_config, "snapshot_dtype", default=torch.bfloat16
-                ),
                 snapshot_device=OmegaConf.select(
                     patch_config, "snapshot_device", default="cpu"
                 ),
