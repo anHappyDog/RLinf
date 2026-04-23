@@ -59,6 +59,33 @@ RLinf currently provides two strategies:
   sent sequentially.
 
 
+State Dict Device Requirements
+------------------------------
+
+Different ``weight_syncer`` implementations have different requirements for
+the sender-side ``state_dict`` device:
+
+``bucket``
+  There is no special device requirement for the sender-side ``state_dict``
+  passed to ``sync(...)``. Parameters can live on either CPU or GPU, and the
+  bucket syncer stages them according to ``bucket_device`` and ``bucket_dtype``
+  before sending. On the receiver side, ``apply(...)`` uses ``load_state_dict``;
+  PyTorch copies input tensors to the target model parameter device and casts
+  them to the target parameter dtype.
+
+``patch``
+  The sender-side ``state_dict`` passed to ``init_sender(...)`` and ``sync(...)``
+  is expected to be on GPU. Even when ``snapshot_device: cpu`` is used, only the
+  sender-side snapshot stays on CPU; difference comparison, ``nonzero``, and
+  new-value gathering still run on GPU. Providing a CPU sender ``state_dict``
+  would turn patch construction into CPU scanning, which cannot use the current
+  optimized path and is not the intended patch-mode design.
+
+On the receiver side, ``apply(...)`` moves patch payload tensors to the target
+model parameter device before writing them. The receiver model must still match
+the metadata and initial-weight assumptions required by patch mode.
+
+
 Recommendation
 ------------------------------
 
@@ -298,7 +325,7 @@ A typical bucket configuration looks like this:
      type: bucket
      bucket:
        bucket_size: 536870912
-       bucket_dtype: bfloat16
+       bucket_dtype: null
        bucket_device: cuda
        is_agent: false
        load_instant: true
@@ -312,7 +339,10 @@ The fields mean:
   Maximum size in bytes of each bucket.
 
 ``bucket.bucket_dtype``
-  Dtype used when sending bucket payloads.
+  Dtype used when sending bucket payloads. If set to ``null``, each tensor keeps
+  its original dtype. If set to ``bfloat16``, ``float16``, or ``float32``, only
+  floating-point tensors are converted; non-floating buffers such as ``int`` and
+  ``bool`` keep their original dtype to avoid corrupting model state.
 
 ``bucket.bucket_device``
   Device where bucket tensors are staged, typically ``cuda``.

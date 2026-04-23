@@ -28,64 +28,112 @@ from .base import (
 
 
 class BucketWeightSyncer(WeightSyncer):
+    _TOTAL_BUCKETS_KEY = "total_buckets"
+    _SYNCER_VERSION_KEY = "syncer_version"
+
     def __init__(
         self,
         bucket_size: int,
-        bucket_dtype: torch.dtype | str,
+        bucket_dtype: torch.dtype | str | None,
         bucket_device: str | torch.device,
         is_agent: bool = False,
         load_instant: bool = True,
     ):
         super().__init__()
         self.bucket_size = bucket_size
-        self.bucket_dtype = normalize_dtype(bucket_dtype)
+        self.bucket_dtype = (
+            normalize_dtype(bucket_dtype) if bucket_dtype is not None else None
+        )
         self.bucket_device = normalize_device(bucket_device)
         self.is_agent = is_agent
         self.load_instant = load_instant
+
+    def _bucket_key(self, key: str, has_visual: bool) -> str | None:
+        if "_extra_state" in key:
+            return None
+        if has_visual and self.is_agent and key.startswith("model.language_model."):
+            return "model." + key[len("model.language_model.") :]
+        return key
+
+    def _transport_dtype(self, dtype: torch.dtype) -> torch.dtype:
+        if self.bucket_dtype is not None and dtype.is_floating_point:
+            return self.bucket_dtype
+        return dtype
+
+    def iter_buckets(
+        self,
+        state_dict: dict[str, torch.Tensor | DTensor],
+        version: int | torch.Tensor,
+    ):
+        metadata_keys = {self._TOTAL_BUCKETS_KEY, self._SYNCER_VERSION_KEY}
+        bucket_idx = 0
+        total_buckets = 0
+        currently_hold = 0
+        bucket: dict[str, torch.Tensor] = {}
+        has_visual = any("visual." in key for key in state_dict.keys())
+
+        for key, value in state_dict.items():
+            name = self._bucket_key(key, has_visual)
+            if name is None:
+                continue
+            if name in metadata_keys:
+                raise ValueError(
+                    f"Bucket payload key conflicts with metadata key: {name}"
+                )
+
+            dtype = self._transport_dtype(value.dtype)
+            currently_hold += (
+                value.numel() * torch.empty((), dtype=dtype).element_size()
+            )
+            if currently_hold >= self.bucket_size:
+                total_buckets += 1
+                currently_hold = 0
+
+        if currently_hold > 0:
+            total_buckets += 1
+        assert total_buckets > 0, "No parameters to sync"
+
+        metadata = {
+            self._TOTAL_BUCKETS_KEY: torch.tensor(
+                total_buckets, dtype=torch.int32, device=self.bucket_device
+            ),
+            self._SYNCER_VERSION_KEY: torch.as_tensor(
+                version, dtype=torch.int64, device=self.bucket_device
+            ),
+        }
+        currently_hold = 0
+        for key, value in state_dict.items():
+            name = self._bucket_key(key, has_visual)
+            if name is None:
+                continue
+
+            tensor = materialize_tensor(value)
+            bucket[name] = tensor.to(
+                device=self.bucket_device,
+                dtype=self._transport_dtype(tensor.dtype),
+                non_blocking=True,
+            )
+            currently_hold += bucket[name].numel() * bucket[name].element_size()
+
+            if currently_hold >= self.bucket_size:
+                if bucket_idx == 0:
+                    bucket.update(metadata)
+                yield bucket
+                bucket_idx += 1
+                bucket = {}
+                currently_hold = 0
+
+        if bucket:
+            if bucket_idx == 0:
+                bucket.update(metadata)
+            yield bucket
 
     def divide_into_buckets(
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
         version: int | torch.Tensor,
     ) -> list[dict[str, torch.Tensor]]:
-        buckets: list[dict[str, torch.Tensor]] = []
-        currently_hold = 0
-        bucket: dict[str, torch.Tensor] = {}
-        has_visual = any("visual." in key for key in state_dict.keys())
-        for key, value in state_dict.items():
-            name = key
-            if "_extra_state" in name:
-                continue
-            if (
-                has_visual
-                and self.is_agent
-                and name.startswith("model.language_model.")
-            ):
-                name = "model." + name[len("model.language_model.") :]
-
-            bucket[name] = materialize_tensor(value).to(
-                device=self.bucket_device,
-                dtype=self.bucket_dtype,
-                non_blocking=True,
-            )
-            currently_hold += bucket[name].numel() * bucket[name].element_size()
-
-            if currently_hold >= self.bucket_size:
-                buckets.append(bucket)
-                bucket = {}
-                currently_hold = 0
-
-        if bucket:
-            buckets.append(bucket)
-
-        assert buckets, "No parameters to sync"
-        buckets[0]["total_buckets"] = torch.tensor(
-            len(buckets), dtype=torch.int32, device=self.bucket_device
-        )
-        buckets[0]["syncer_version"] = torch.as_tensor(
-            version, dtype=torch.int64, device=self.bucket_device
-        )
-        return buckets
+        return list(self.iter_buckets(state_dict, version))
 
     async def sync(
         self,
@@ -93,14 +141,14 @@ class BucketWeightSyncer(WeightSyncer):
         send: SendFn,
         version: int | torch.Tensor,
     ) -> None:
-        buckets = self.divide_into_buckets(state_dict, version)
-        for bucket in buckets:
+        for bucket in self.iter_buckets(state_dict, version):
             await send(bucket)
+            del bucket
 
     async def apply(self, model: torch.nn.Module, recv: RecvFn) -> int:
         bucket: dict[str, torch.Tensor] = await recv()
-        total_buckets = int(bucket.pop("total_buckets").item())
-        applied_version = int(bucket.pop("syncer_version").item())
+        total_buckets = int(bucket.pop(self._TOTAL_BUCKETS_KEY).item())
+        applied_version = int(bucket.pop(self._SYNCER_VERSION_KEY).item())
 
         if self.load_instant:
             model.load_state_dict(bucket, strict=False)

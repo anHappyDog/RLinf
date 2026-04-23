@@ -55,6 +55,22 @@ class _MixedDtypeWeightSyncModel(torch.nn.Module):
         )
 
 
+class _BucketDtypeWeightSyncModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fp32_param = torch.nn.Parameter(
+            torch.arange(6, dtype=torch.float32).view(2, 3).clone()
+        )
+        self.bf16_param = torch.nn.Parameter(
+            torch.arange(6, dtype=torch.bfloat16).view(2, 3).clone()
+        )
+        self.register_buffer(
+            "int64_buf",
+            torch.tensor([2**40 + 123, -(2**39 + 17)], dtype=torch.int64),
+        )
+        self.register_buffer("bool_buf", torch.tensor([True, False, True]))
+
+
 class _InMemoryTransport:
     def __init__(self):
         self._queue: list[object] = []
@@ -101,6 +117,12 @@ def _make_mixed_dtype_model(
     return _MixedDtypeWeightSyncModel().to(device)
 
 
+def _make_bucket_dtype_model(
+    device: torch.device | str = "cpu",
+) -> _BucketDtypeWeightSyncModel:
+    return _BucketDtypeWeightSyncModel().to(device)
+
+
 def _get_cuda_device() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("CUDA tests require at least 1 CUDA GPU.")
@@ -113,6 +135,16 @@ def _assert_state_dict_equal(
     assert list(lhs.keys()) == list(rhs.keys())
     for key in lhs.keys():
         torch.testing.assert_close(lhs[key], rhs[key], msg=f"Mismatch at key={key}")
+
+
+def _assert_state_dict_equal_on_cpu(
+    lhs: OrderedDict[str, torch.Tensor], rhs: OrderedDict[str, torch.Tensor]
+) -> None:
+    assert list(lhs.keys()) == list(rhs.keys())
+    for key in lhs.keys():
+        torch.testing.assert_close(
+            lhs[key].cpu(), rhs[key].cpu(), msg=f"Mismatch at key={key}"
+        )
 
 
 async def _init_patch_syncers(
@@ -678,6 +710,153 @@ def test_bucket_weight_syncer_roundtrip_load_instant_false():
     _assert_state_dict_equal(
         _clone_state_dict(sender_model), _clone_state_dict(receiver_model)
     )
+
+
+def test_bucket_weight_syncer_preserves_original_dtypes_when_bucket_dtype_none():
+    sender_model = _make_bucket_dtype_model()
+    receiver_model = copy.deepcopy(sender_model)
+    transport = _InMemoryTransport()
+    syncer = BucketWeightSyncer(
+        bucket_size=32,
+        bucket_dtype=None,
+        bucket_device="cpu",
+        load_instant=False,
+    )
+
+    with torch.no_grad():
+        sender_model.fp32_param[0, 0] = 123.25
+        sender_model.bf16_param[1, 2] += torch.tensor(3.0, dtype=torch.bfloat16)
+        sender_model.int64_buf[0] = 2**42 + 999
+        sender_model.bool_buf.logical_not_()
+
+    buckets = syncer.divide_into_buckets(sender_model.state_dict(), version=11)
+    payload = {
+        key: value
+        for bucket in buckets
+        for key, value in bucket.items()
+        if key not in {"total_buckets", "syncer_version"}
+    }
+    assert payload["fp32_param"].dtype == torch.float32
+    assert payload["bf16_param"].dtype == torch.bfloat16
+    assert payload["int64_buf"].dtype == torch.int64
+    assert payload["bool_buf"].dtype == torch.bool
+
+    async def _run() -> int:
+        await syncer.sync(sender_model.state_dict(), transport.send, version=11)
+        return await syncer.apply(receiver_model, transport.recv)
+
+    applied_version = asyncio.run(_run())
+
+    assert applied_version == 11
+    _assert_state_dict_equal(
+        _clone_state_dict(sender_model), _clone_state_dict(receiver_model)
+    )
+
+
+def test_bucket_weight_syncer_preserves_nonfloating_dtypes_when_bucket_dtype_set():
+    model = _make_bucket_dtype_model()
+    syncer = BucketWeightSyncer(
+        bucket_size=32,
+        bucket_dtype=torch.bfloat16,
+        bucket_device="cpu",
+        load_instant=True,
+    )
+
+    buckets = syncer.divide_into_buckets(model.state_dict(), version=12)
+    payload = {
+        key: value
+        for bucket in buckets
+        for key, value in bucket.items()
+        if key not in {"total_buckets", "syncer_version"}
+    }
+
+    assert payload["fp32_param"].dtype == torch.bfloat16
+    assert payload["bf16_param"].dtype == torch.bfloat16
+    assert payload["int64_buf"].dtype == torch.int64
+    assert payload["bool_buf"].dtype == torch.bool
+
+
+def test_bucket_weight_syncer_loads_across_model_and_bucket_devices():
+    device = _get_cuda_device()
+
+    async def _run_case(
+        model_device: torch.device | str,
+        bucket_device: torch.device | str,
+        version: int,
+    ) -> tuple[int, torch.nn.Module, torch.nn.Module]:
+        sender_model = _make_bucket_dtype_model(model_device)
+        receiver_model = copy.deepcopy(sender_model)
+        transport = _InMemoryTransport()
+        syncer = BucketWeightSyncer(
+            bucket_size=32,
+            bucket_dtype=None,
+            bucket_device=bucket_device,
+            load_instant=True,
+        )
+
+        with torch.no_grad():
+            sender_model.fp32_param[0, 1] = 99.0
+            sender_model.bf16_param[0, 2] += torch.tensor(
+                2.0, dtype=torch.bfloat16, device=model_device
+            )
+            sender_model.int64_buf[1] = -(2**41 + 7)
+            sender_model.bool_buf[1] = True
+
+        await syncer.sync(sender_model.state_dict(), transport.send, version=version)
+        applied_version = await syncer.apply(receiver_model, transport.recv)
+        return applied_version, sender_model, receiver_model
+
+    cpu_bucket_version, cuda_sender, cuda_receiver = asyncio.run(
+        _run_case(device, "cpu", version=21)
+    )
+    assert cpu_bucket_version == 21
+    _assert_state_dict_equal_on_cpu(
+        _clone_state_dict(cuda_sender), _clone_state_dict(cuda_receiver)
+    )
+
+    cuda_bucket_version, cpu_sender, cpu_receiver = asyncio.run(
+        _run_case("cpu", device, version=22)
+    )
+    assert cuda_bucket_version == 22
+    _assert_state_dict_equal_on_cpu(
+        _clone_state_dict(cpu_sender), _clone_state_dict(cpu_receiver)
+    )
+
+
+def test_bucket_weight_syncer_rejects_metadata_key_collision():
+    model = _TinyWeightSyncModel()
+    syncer = BucketWeightSyncer(
+        bucket_size=32,
+        bucket_dtype=None,
+        bucket_device="cpu",
+        load_instant=True,
+    )
+    state_dict = _clone_state_dict(model)
+    state_dict["total_buckets"] = torch.tensor(1)
+
+    with pytest.raises(ValueError, match="conflicts with metadata key"):
+        syncer.divide_into_buckets(state_dict, version=1)
+
+
+def test_bucket_weight_syncer_sync_streams_without_prebuilding_buckets(monkeypatch):
+    model = _make_bucket_dtype_model()
+    transport = _InMemoryTransport()
+    syncer = BucketWeightSyncer(
+        bucket_size=32,
+        bucket_dtype=None,
+        bucket_device="cpu",
+        load_instant=True,
+    )
+
+    def _raise_if_called(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("sync should not prebuild all buckets")
+
+    monkeypatch.setattr(syncer, "divide_into_buckets", _raise_if_called)
+
+    asyncio.run(syncer.sync(model.state_dict(), transport.send, version=3))
+
+    assert len(transport._queue) == int(transport._queue[0]["total_buckets"].item())
 
 
 def test_bucket_weight_syncer_metadata_dtypes_are_nccl_safe():
