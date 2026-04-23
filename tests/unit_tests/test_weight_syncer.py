@@ -528,6 +528,55 @@ def test_patch_weight_syncer_uses_receiver_dtypes_for_snapshot():
     )
 
 
+def test_patch_weight_syncer_preserves_nonfloating_buffers():
+    device = _get_cuda_device()
+    sender_model = _make_bucket_dtype_model(device)
+    receiver_model = copy.deepcopy(sender_model)
+    transport = _InMemoryDuplexTransport()
+
+    sender_syncer = PatchWeightSyncer(
+        snapshot_device="cpu",
+        transport_device="cpu",
+        delta_encoding=True,
+        compression_algorithm="none",
+    )
+    receiver_syncer = PatchWeightSyncer(
+        snapshot_device="cpu",
+        transport_device="cpu",
+        delta_encoding=True,
+        compression_algorithm="none",
+    )
+
+    async def _run() -> int:
+        await _init_patch_syncers(
+            sender_syncer,
+            receiver_syncer,
+            sender_model,
+            receiver_model,
+            transport,
+        )
+
+        with torch.no_grad():
+            sender_model.fp32_param[0, 0] = 123.25
+            sender_model.bf16_param[1, 2] += torch.tensor(
+                3.0, dtype=torch.bfloat16, device=device
+            )
+            sender_model.int64_buf[0] = 2**42 + 999
+            sender_model.bool_buf.logical_not_()
+
+        await sender_syncer.sync(
+            sender_model.state_dict(), transport.sender_send, version=43
+        )
+        return await receiver_syncer.apply(receiver_model, transport.receiver_recv)
+
+    applied_version = asyncio.run(_run())
+
+    assert applied_version == 43
+    _assert_state_dict_equal(
+        _clone_state_dict(sender_model), _clone_state_dict(receiver_model)
+    )
+
+
 def test_patch_weight_syncer_roundtrip_cuda_nvcomp():
     device = _get_cuda_device()
     pytest.importorskip("nvidia.nvcomp")

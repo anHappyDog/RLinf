@@ -267,7 +267,7 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
         nnz_per_tensor: list[torch.Tensor] = []
         row_chunks: list[torch.Tensor] = []
         col_chunks: list[torch.Tensor] = []
-        value_chunks: list[torch.Tensor] = []
+        value_byte_chunks: list[torch.Tensor] = []
         pending_snapshot_updates: list[_PendingSnapshotUpdate] = []
         patch_device: torch.device | None = None
 
@@ -334,7 +334,7 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
             )
             row_chunks.append(patch_rows.contiguous())
             col_chunks.append(patch_cols.contiguous())
-            value_chunks.append(values.contiguous())
+            value_byte_chunks.append(values.contiguous().view(torch.uint8))
 
         if row_chunks:
             rows_tensor = downscale_nonnegative_indices(torch.cat(row_chunks, dim=0))
@@ -349,7 +349,7 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
                 nnz_per_tensor=torch.stack(nnz_per_tensor),
                 rows=rows_tensor,
                 cols=cols_tensor,
-                values=torch.cat(value_chunks, dim=0),
+                values=torch.cat(value_byte_chunks, dim=0),
             )
             self._submit_snapshot_updates(pending_snapshot_updates)
             return patch
@@ -482,7 +482,7 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
         nnz_per_tensor: list[torch.Tensor] = []
         row_chunks: list[torch.Tensor] = []
         col_chunks: list[torch.Tensor] = []
-        value_chunks: list[torch.Tensor] = []
+        value_byte_chunks: list[torch.Tensor] = []
         patch_device: torch.device | None = None
 
         for ordinal, key in enumerate(self.ordered_keys):
@@ -543,7 +543,7 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
             )
             row_chunks.append(rows.contiguous())
             col_chunks.append(cols.contiguous())
-            value_chunks.append(values.contiguous())
+            value_byte_chunks.append(values.contiguous().view(torch.uint8))
 
         if row_chunks:
             rows_tensor = downscale_nonnegative_indices(torch.cat(row_chunks, dim=0))
@@ -558,7 +558,7 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
                 nnz_per_tensor=torch.stack(nnz_per_tensor),
                 rows=rows_tensor,
                 cols=cols_tensor,
-                values=torch.cat(value_chunks, dim=0),
+                values=torch.cat(value_byte_chunks, dim=0),
             )
 
         if patch_device is None:
@@ -734,10 +734,9 @@ class PatchWeightSyncer(WeightSyncer):
         patch = self.compressor.decompress(payload)
         applied_version = int(patch.version.item())
         total_nnz = int(patch.nnz_per_tensor.to(torch.int64).sum().item())
-        assert patch.rows.numel() == patch.cols.numel() == patch.values.numel(), (
-            "Patch rows/cols/values must have the same number of elements: "
-            f"rows={patch.rows.numel()}, cols={patch.cols.numel()}, "
-            f"values={patch.values.numel()}"
+        assert patch.rows.numel() == patch.cols.numel(), (
+            "Patch rows/cols must have the same number of elements: "
+            f"rows={patch.rows.numel()}, cols={patch.cols.numel()}"
         )
         assert patch.rows.numel() == total_nnz, (
             "Patch payload size does not match nnz_per_tensor: "
@@ -747,6 +746,7 @@ class PatchWeightSyncer(WeightSyncer):
         state_dict = model.state_dict()
 
         offset = 0
+        value_byte_offset = 0
         for patch_idx in range(patch.ordinals.numel()):
             key = self.ordered_keys[patch.ordinals[patch_idx].item()]
             original_shape = self.original_shapes[key]
@@ -762,8 +762,13 @@ class PatchWeightSyncer(WeightSyncer):
 
             row_slice = patch.rows[start_offset:next_offset].clone()
             col_slice = patch.cols[start_offset:next_offset].clone()
-            value_slice = patch.values[start_offset:next_offset]
             offset = next_offset
+
+            value_nbytes = nnz * value_2dview.element_size()
+            value_byte_slice = patch.values[
+                value_byte_offset : value_byte_offset + value_nbytes
+            ]
+            value_byte_offset += value_nbytes
 
             if self.delta_encoding:
                 row_delta = row_slice
@@ -791,9 +796,9 @@ class PatchWeightSyncer(WeightSyncer):
                     non_blocking=False,
                 )
 
+            value_slice = value_byte_slice.clone().view(value_2dview.dtype)
             value_2dview[rows, cols] = value_slice.to(
                 device=value_2dview.device,
-                dtype=value_2dview.dtype,
                 non_blocking=False,
             )
 
