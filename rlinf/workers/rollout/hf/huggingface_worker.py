@@ -25,12 +25,12 @@ from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
     RolloutResult,
 )
+from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.weight_syncer import WeightSyncer
 
 
 class MultiStepRolloutWorker(Worker):

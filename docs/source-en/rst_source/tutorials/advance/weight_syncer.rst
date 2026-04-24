@@ -44,6 +44,10 @@ This means rollout code does not need to care whether the underlying mechanism
 is patch-based sync or bucket-based sync. After initialization, it only needs to
 call ``apply(...)`` through the common interface.
 
+The implementation lives in ``rlinf/hybrid_engines/weight_syncer/``, while the
+YAML entry point remains the same independent ``weight_syncer`` Hydra config
+group.
+
 
 Supported Sync Strategies
 ------------------------------

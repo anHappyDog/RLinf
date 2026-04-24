@@ -20,12 +20,12 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.utils.weight_syncer import (
+from rlinf.hybrid_engines.weight_syncer import (
     BucketWeightSyncer,
     PatchWeightSyncer,
     WeightSyncer,
 )
-from rlinf.utils.weight_syncer.patch_syncer import (
+from rlinf.hybrid_engines.weight_syncer.patch_syncer import (
     as_coo_2d_view,
     downscale_nonnegative_indices,
 )

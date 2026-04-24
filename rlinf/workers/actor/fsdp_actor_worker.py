@@ -43,6 +43,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
     unpack_fsdp_logprobs,
     unpack_sequences,
 )
+from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
@@ -86,7 +87,6 @@ from rlinf.utils.utils import (
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
 )
-from rlinf.utils.weight_syncer import WeightSyncer
 from rlinf.workers.rollout.utils import RankMapper
 
 
