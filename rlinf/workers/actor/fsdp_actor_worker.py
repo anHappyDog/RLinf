@@ -30,6 +30,7 @@ import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     kl_penalty,
+    safe_normalize,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
@@ -64,9 +65,12 @@ from rlinf.utils.distributed import (
 )
 from rlinf.utils.metric_utils import (
     append_to_dict,
-    compute_loss_mask,
     compute_rollout_metrics,
     compute_split_num,
+    compute_stream_expected_actor_recv_num,
+    compute_stream_micro_batch_env_size,
+    flatten_embodied_rollout_batch_for_train,
+    process_embodied_rollout_batch_for_adv,
 )
 from rlinf.utils.nested_dict_process import (
     put_tensor_device,
@@ -89,42 +93,8 @@ from rlinf.utils.utils import (
 )
 from rlinf.workers.rollout.utils import RankMapper
 
-
-def process_nested_dict_for_adv(nested_dict, rollout_epoch):
-    """
-    original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
-    target shape: [n_chunk_steps, rollout_epoch x bsz, num_action_chunks, ...]
-    """
-    ret_dict = {}
-    for key, value in nested_dict.items():
-        if isinstance(value, torch.Tensor):
-            new_value = value.reshape(
-                rollout_epoch, -1, *value.shape[1:]
-            )  # [rollout_epoch, n_chunk_step, bsz, ...]
-            new_value = new_value.transpose(
-                0, 1
-            )  # [n_chunk_step, rollout_epoch, bsz, ...]
-            new_value = new_value.reshape(new_value.shape[0], -1, *new_value.shape[3:])
-            ret_dict[key] = new_value
-        elif isinstance(value, dict):
-            ret_dict[key] = process_nested_dict_for_adv(value, rollout_epoch)
-    return ret_dict
-
-
 def process_nested_dict_for_train(nested_dict, shuffle_id):
-    ret_dict = {}
-    for key, value in nested_dict.items():
-        if key in ["dones", "terminations", "truncations", "prev_values"]:
-            value = value[:-1]
-        if "env_info" in key:
-            raise NotImplementedError
-        if value is None:
-            ret_dict[key] = None
-        if isinstance(value, torch.Tensor):
-            ret_dict[key] = value.reshape(-1, *value.shape[2:])[shuffle_id]
-        elif isinstance(value, dict):
-            ret_dict[key] = process_nested_dict_for_train(value, shuffle_id)
-    return ret_dict
+    return flatten_embodied_rollout_batch_for_train(nested_dict, shuffle_id)
 
 
 class FSDPActor(FSDPModelManager, Worker):
@@ -1141,75 +1111,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
         target shape: [n_chunk_steps, rollout_epoch x bsz, num_action_chunks, ...]
         """
-        rollout_epoch = self.cfg.algorithm.rollout_epoch
-        rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
-
-        if (
-            not self.cfg.env.train.auto_reset
-            and not self.cfg.env.train.ignore_terminations
-        ):
-            dones = rollout_batch[
-                "dones"
-            ]  # [n_chunk_step, rollout_epoch x bsz, num_action_chunks]
-            loss_mask, loss_mask_sum = compute_loss_mask(dones)
-
-            if self.cfg.algorithm.reward_type == "chunk_level":
-                loss_mask = loss_mask.any(dim=-1, keepdim=True)
-                loss_mask_sum = loss_mask_sum[..., -1:]
-
-            rollout_batch["loss_mask"] = loss_mask
-            rollout_batch["loss_mask_sum"] = loss_mask_sum
-
-        # filter data by rewards
-        if self.cfg.algorithm.get("filter_rewards", False):
-            rewards = rollout_batch[
-                "rewards"
-            ]  # [n_chunk_step, batch, num_action_chunks]
-            if rollout_batch.get("loss_mask", None) is not None:
-                rewards = rewards * rollout_batch["loss_mask"]
-            n_chunk_step, batch_size, num_action_chunks = rewards.shape
-
-            group_size = self.cfg.algorithm.group_size
-            assert batch_size % group_size == 0, (
-                f"batch {batch_size} not divisible by group_size {group_size}"
-            )
-            n_prompts = batch_size // group_size
-
-            # calculate rewards by prompt
-            rewards = rewards.transpose(
-                0, 1
-            )  # [batch, n_chunk_step, num_action_chunks]
-            rewards = rewards.reshape(rewards.shape[0], -1)  # [batch, n_step]
-            reward_matrix = rewards.reshape(
-                n_prompts, group_size, rewards.shape[-1]
-            )  # [n_prompts, group_size, n_step]
-            reward_matrix = reward_matrix.sum(dim=-1)  # [n_prompts, group_size]
-            mean_reward_in_group = reward_matrix.mean(dim=1)  # [n_prompts]
-
-            # mask
-            reward_filter_mask = (
-                mean_reward_in_group >= self.cfg.algorithm.rewards_lower_bound
-            ) & (
-                mean_reward_in_group <= self.cfg.algorithm.rewards_upper_bound
-            )  # [n_prompts]
-
-            # extend mask dimension
-            reward_filter_mask = reward_filter_mask.repeat_interleave(
-                group_size
-            )  # [batch]
-            reward_filter_mask = (
-                reward_filter_mask.unsqueeze(0).expand(n_chunk_step, -1).unsqueeze(-1)
-            )  # [n_chunk_step, batch, 1]
-
-            # update loss_mask
-            if rollout_batch.get("loss_mask", None) is not None:
-                rollout_batch["loss_mask"] = (
-                    reward_filter_mask & rollout_batch["loss_mask"]
-                )
-            else:
-                rollout_batch["loss_mask"] = reward_filter_mask
-
-        return rollout_batch
+        return process_embodied_rollout_batch_for_adv(
+            rollout_batch,
+            rollout_epoch=self.cfg.algorithm.rollout_epoch,
+            auto_reset=self.cfg.env.train.auto_reset,
+            ignore_terminations=self.cfg.env.train.ignore_terminations,
+            reward_type=self.cfg.algorithm.reward_type,
+            filter_rewards=self.cfg.algorithm.get("filter_rewards", False),
+            group_size=self.cfg.algorithm.group_size,
+            rewards_lower_bound=self.cfg.algorithm.get("rewards_lower_bound", None),
+            rewards_upper_bound=self.cfg.algorithm.get("rewards_upper_bound", None),
+        )
 
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
         """
@@ -1327,17 +1239,150 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"sft_loss_weight={self.sft_loss_weight:.6f}"
             )
 
-    @Worker.timer("run_training")
-    def run_training(self) -> None:
-        """
-        Run the training process using the received rollout batch.
-        """
+    def _prepare_embodied_training(self) -> None:
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
 
         self.model.train()
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        ), "global_batch_size is not divisible by micro_batch_size * world_size"
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
+        )
+
+    def _train_embodied_micro_batch(
+        self,
+        batch: dict[str, torch.Tensor],
+        metrics: dict[str, list[float]],
+        *,
+        is_last_micro_batch: bool,
+    ) -> None:
+        batch = put_tensor_device(
+            batch,
+            f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
+        )
+        backward_ctx = self.before_micro_batch(
+            self.model,
+            is_last_micro_batch=is_last_micro_batch,
+        )
+        advantages = batch["advantages"]
+        prev_logprobs = batch["prev_logprobs"]
+        returns = batch.get("returns", None)
+        prev_values = batch.get("prev_values", None)
+        loss_mask = batch.get("loss_mask", None)
+        loss_mask_sum = batch.get("loss_mask_sum", None)
+        forward_inputs = batch.get("forward_inputs", None)
+
+        kwargs = {}
+        if SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.OPENVLA,
+            SupportedModel.OPENVLA_OFT,
+        ]:
+            kwargs["temperature"] = self.cfg.algorithm.sampling_params.temperature_train
+            kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
+        elif SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.GR00T:
+            kwargs["prev_logprobs"] = prev_logprobs
+
+        compute_values = True if self.cfg.algorithm.adv_type == "gae" else False
+
+        with self.amp_context:
+            output_dict = self.model(
+                forward_inputs=forward_inputs,
+                compute_logprobs=True,
+                compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                compute_values=compute_values,
+                use_cache=False,
+                **kwargs,
+            )
+
+        if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.GR00T:
+            prev_logprobs = output_dict["prev_logprobs"]
+
+        loss_kwargs = {
+            "loss_type": self.cfg.algorithm.loss_type,
+            "logprob_type": self.cfg.algorithm.logprob_type,
+            "reward_type": self.cfg.algorithm.reward_type,
+            "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+            "logprobs": output_dict["logprobs"],
+            "values": output_dict.get("values", None),
+            "old_logprobs": prev_logprobs,
+            "advantages": advantages,
+            "returns": returns,
+            "prev_values": prev_values,
+            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+            "value_clip": self.cfg.algorithm.get("value_clip", None),
+            "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+            "loss_mask": loss_mask,
+            "loss_mask_sum": loss_mask_sum,
+            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+            "task_type": self.cfg.runner.task_type,
+            "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
+        }
+        loss, metrics_data = policy_loss(**loss_kwargs)
+
+        entropy_loss = torch.tensor(
+            0.0, device=Worker.torch_platform.current_device()
+        )
+        if self.cfg.algorithm.entropy_bonus > 0 and not loss_kwargs["critic_warmup"]:
+            entropy = output_dict["entropy"]
+            entropy = reshape_entropy(
+                entropy,
+                entropy_type=self.cfg.algorithm.entropy_type,
+                action_dim=self.cfg.actor.model.get("action_dim", 7),
+                batch_size=output_dict["logprobs"].shape[0],
+            )
+            entropy_loss = masked_mean(entropy, mask=loss_mask)
+            loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+        metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
+
+        if self.enable_sft_co_train:
+            self._train_sft_epoch(metrics_data, loss)
+
+        loss /= self.gradient_accumulation
+        with backward_ctx:
+            self.grad_scaler.scale(loss).backward()
+
+        metrics_data["actor/total_loss"] = loss.detach().item()
+        append_to_dict(metrics, metrics_data)
+
+    def _finish_embodied_global_batch(self, metrics: dict[str, list[float]]) -> None:
+        self.torch_platform.empty_cache()
+
+        grad_norm, lr_list = self.optimizer_step()
+        data = {
+            "actor/grad_norm": grad_norm,
+            "actor/lr": lr_list[0],
+        }
+        if len(lr_list) > 1:
+            data["critic/lr"] = lr_list[1]
+        append_to_dict(metrics, data)
+
+    def _finalize_embodied_training_metrics(
+        self, metrics: dict[str, list[float]]
+    ) -> dict[str, float]:
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
+        clear_memory()
+        mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        mean_metric_dict = all_reduce_dict(
+            mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+        )
+        return mean_metric_dict
+
+    @Worker.timer("run_training")
+    def run_training(self) -> None:
+        """
+        Run the training process using the received rollout batch.
+        """
+        self._prepare_embodied_training()
         rollout_size = (
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
@@ -1350,18 +1395,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
             )
-
-        assert (
-            self.cfg.actor.global_batch_size
-            % (self.cfg.actor.micro_batch_size * self._world_size)
-            == 0
-        ), "global_batch_size is not divisible by micro_batch_size * world_size"
-
-        self.gradient_accumulation = (
-            self.cfg.actor.global_batch_size
-            // self.cfg.actor.micro_batch_size
-            // self._world_size
-        )
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -1396,130 +1429,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                 self.optimizer.zero_grad()
                 for idx, batch in enumerate(train_micro_batch):
-                    batch = put_tensor_device(
+                    self._train_embodied_micro_batch(
                         batch,
-                        f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
-                    )
-                    backward_ctx = self.before_micro_batch(
-                        self.model,
+                        metrics,
                         is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
                     )
-                    advantages = batch["advantages"]
-                    prev_logprobs = batch["prev_logprobs"]
-                    returns = batch.get("returns", None)
-                    prev_values = batch.get("prev_values", None)
-                    loss_mask = batch.get("loss_mask", None)
-                    loss_mask_sum = batch.get("loss_mask_sum", None)
 
-                    forward_inputs = batch.get("forward_inputs", None)
+                self._finish_embodied_global_batch(metrics)
 
-                    kwargs = {}
-                    if SupportedModel(self.cfg.actor.model.model_type) in [
-                        SupportedModel.OPENVLA,
-                        SupportedModel.OPENVLA_OFT,
-                    ]:
-                        kwargs["temperature"] = (
-                            self.cfg.algorithm.sampling_params.temperature_train
-                        )
-                        kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
-                    elif (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
-                    ):
-                        kwargs["prev_logprobs"] = prev_logprobs
-
-                    compute_values = (
-                        True if self.cfg.algorithm.adv_type == "gae" else False
-                    )
-
-                    with self.amp_context:
-                        output_dict = self.model(
-                            forward_inputs=forward_inputs,
-                            compute_logprobs=True,
-                            compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
-                            compute_values=compute_values,
-                            use_cache=False,
-                            **kwargs,
-                        )
-
-                    if (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
-                    ):
-                        prev_logprobs = output_dict["prev_logprobs"]
-
-                    kwargs = {
-                        "loss_type": self.cfg.algorithm.loss_type,
-                        "logprob_type": self.cfg.algorithm.logprob_type,
-                        "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-                        "logprobs": output_dict["logprobs"],
-                        "values": output_dict.get("values", None),
-                        "old_logprobs": prev_logprobs,
-                        "advantages": advantages,
-                        "returns": returns,
-                        "prev_values": prev_values,
-                        "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                        "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-                        "value_clip": self.cfg.algorithm.get("value_clip", None),
-                        "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-                        "loss_mask": loss_mask,
-                        "loss_mask_sum": loss_mask_sum,
-                        "max_episode_steps": self.cfg.env.train.max_episode_steps,
-                        "task_type": self.cfg.runner.task_type,
-                        "critic_warmup": self.optimizer_steps
-                        < self.critic_warmup_steps,
-                    }
-                    loss, metrics_data = policy_loss(**kwargs)
-
-                    entropy_loss = torch.tensor(
-                        0.0, device=Worker.torch_platform.current_device()
-                    )
-                    if (
-                        self.cfg.algorithm.entropy_bonus > 0
-                        and not kwargs["critic_warmup"]
-                    ):
-                        entropy = output_dict["entropy"]
-                        entropy = reshape_entropy(
-                            entropy,
-                            entropy_type=self.cfg.algorithm.entropy_type,
-                            action_dim=self.cfg.actor.model.get("action_dim", 7),
-                            batch_size=output_dict["logprobs"].shape[0],
-                        )
-                        entropy_loss = masked_mean(entropy, mask=loss_mask)
-                        loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
-                    metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
-
-                    if self.enable_sft_co_train:
-                        self._train_sft_epoch(metrics_data, loss)
-
-                    loss /= self.gradient_accumulation
-                    with backward_ctx:
-                        self.grad_scaler.scale(loss).backward()
-
-                    metrics_data["actor/total_loss"] = loss.detach().item()
-                    append_to_dict(metrics, metrics_data)
-
-                self.torch_platform.empty_cache()
-
-                grad_norm, lr_list = self.optimizer_step()
-                data = {
-                    "actor/grad_norm": grad_norm,
-                    "actor/lr": lr_list[0],
-                }
-                if len(lr_list) > 1:
-                    data["critic/lr"] = lr_list[1]
-                append_to_dict(metrics, data)
-        # put LR scheduler step here
-        self.lr_scheduler.step()
-        self.optimizer.zero_grad()
-        clear_memory()
-        mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
-        mean_metric_dict = all_reduce_dict(
-            mean_metric_dict, op=torch.distributed.ReduceOp.AVG
-        )
-
-        return mean_metric_dict
+        return self._finalize_embodied_training_metrics(metrics)
 
     def set_global_step(self, global_step: int) -> None:
         """
@@ -1528,3 +1446,280 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.version = global_step
         if hasattr(self.model, "set_global_step"):
             self.model.set_global_step(global_step)
+
+
+def _merge_stream_rollout_batches(batches: list):
+    valid_batches = [batch for batch in batches if batch is not None]
+    if not valid_batches:
+        return None
+
+    first_batch = valid_batches[0]
+    if isinstance(first_batch, torch.Tensor):
+        assert first_batch.ndim >= 2, (
+            "Streamed rollout tensors are expected to keep both the time and "
+            "batch dimensions."
+        )
+        return torch.cat(valid_batches, dim=1)
+    if isinstance(first_batch, dict):
+        reference_keys = set(first_batch.keys())
+        assert all(
+            set(batch.keys()) == reference_keys for batch in valid_batches[1:]
+        ), "All batches must have the same nested keys."
+        return {
+            key: _merge_stream_rollout_batches([batch[key] for batch in valid_batches])
+            for key in reference_keys
+        }
+    raise NotImplementedError(
+        f"Unsupported rollout batch type for merging: {type(first_batch)}"
+    )
+
+
+def _normalize_stream_rollout_advantages(
+    rollout_batch: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    advantages = rollout_batch["advantages"]
+    num_chunk, batch_size, chunk_size = advantages.shape
+    flat_advantages = advantages.transpose(1, 2).reshape(
+        num_chunk * chunk_size, batch_size
+    )
+
+    loss_mask = rollout_batch.get("loss_mask", None)
+    if loss_mask is not None:
+        flat_loss_mask = loss_mask.transpose(1, 2).reshape(
+            num_chunk * chunk_size, batch_size
+        )
+        flat_advantages = safe_normalize(flat_advantages, loss_mask=flat_loss_mask)
+    else:
+        flat_advantages = (flat_advantages - flat_advantages.mean()) / (
+            flat_advantages.std() + 1e-5
+        )
+
+    rollout_batch["advantages"] = (
+        flat_advantages.reshape(num_chunk, chunk_size, batch_size)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    return rollout_batch
+
+
+def _merge_stream_train_batches(batches: list):
+    valid_batches = [batch for batch in batches if batch is not None]
+    if not valid_batches:
+        return None
+
+    first_batch = valid_batches[0]
+    if isinstance(first_batch, torch.Tensor):
+        assert first_batch.ndim >= 1, (
+            "Streamed train tensors are expected to keep at least one batch dimension."
+        )
+        return torch.cat(valid_batches, dim=0)
+    if isinstance(first_batch, dict):
+        reference_keys = set(first_batch.keys())
+        assert all(
+            set(batch.keys()) == reference_keys for batch in valid_batches[1:]
+        ), "All batches must have the same nested keys."
+        return {
+            key: _merge_stream_train_batches([batch[key] for batch in valid_batches])
+            for key in reference_keys
+        }
+    raise NotImplementedError(
+        f"Unsupported streamed train batch type for merging: {type(first_batch)}"
+    )
+
+
+class TestEmbodedFSDPActor(EmbodiedFSDPActor):
+    """Experimental embodied actor with env-side adv precompute."""
+
+    def _get_stream_n_train_chunk_steps(self) -> int:
+        return (
+            self.cfg.env.train.max_steps_per_rollout_epoch
+            // self.cfg.actor.model.num_action_chunks
+        )
+
+    def _get_stream_rollout_epochs_per_flush(self) -> int:
+        return 1
+
+    def _get_expected_stream_split_num(self) -> int:
+        return compute_stream_expected_actor_recv_num(
+            total_num_envs=self.cfg.env.train.total_num_envs,
+            actor_world_size=self._world_size,
+            micro_batch_size=self.cfg.actor.micro_batch_size,
+            rollout_epoch=self.cfg.algorithm.get("rollout_epoch", 1),
+            n_train_chunk_steps=self._get_stream_n_train_chunk_steps(),
+        )
+
+    def _prepare_stream_training_state(self) -> None:
+        self._prepare_embodied_training()
+        self.optimizer.zero_grad()
+        self._stream_train_batches: list[dict[str, torch.Tensor]] = []
+        self._stream_training_metrics: dict[str, list[float]] = {}
+        self._stream_training_state = {
+            "micro_batches_in_current_global_batch": 0,
+            "streamed_train_micro_batches": 0.0,
+            "streamed_train_global_batches": 0.0,
+        }
+
+    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
+        """Receive train-ready micro-batches and stream the first epoch."""
+        clear_memory(sync=False)
+
+        assert self.cfg.algorithm.adv_type == "gae", (
+            "TestEmbodedFSDPActor currently only supports adv_type == 'gae' because "
+            "env-side streamed precomputation currently only supports GAE."
+        )
+        assert self.cfg.algorithm.get("group_size", 1) == 1, (
+            "TestEmbodedFSDPActor currently only supports group_size == 1 because "
+            "streamed env micro-batches do not preserve grouped prompt semantics."
+        )
+
+        expected_split_num = self._get_expected_stream_split_num()
+        stream_local_env_batch = compute_stream_micro_batch_env_size(
+            micro_batch_size=self.cfg.actor.micro_batch_size,
+            rollout_epoch=self.cfg.algorithm.get("rollout_epoch", 1),
+            n_train_chunk_steps=self._get_stream_n_train_chunk_steps(),
+            rollout_epochs_per_flush=self._get_stream_rollout_epochs_per_flush(),
+        )
+        if expected_split_num == 1:
+            self.log_warning(
+                "TestEmbodedFSDPActor only received one trajectory split per step. "
+                "This topology cannot produce meaningful env->actor and "
+                "adv-compute overlap."
+            )
+
+        if self.cfg.algorithm.normalize_advantages:
+            self.log_warning(
+                "TestEmbodedFSDPActor ignores algorithm.normalize_advantages during "
+                "env-side streamed train-overlap experiments."
+            )
+        if self.cfg.algorithm.get("shuffle_rollout", True):
+            self.log_warning(
+                "TestEmbodedFSDPActor ignores algorithm.shuffle_rollout during "
+                "env-side streamed train-overlap experiments."
+            )
+
+        self._prepare_stream_training_state()
+        self._stream_rollout_metadata = {
+            "stream_expected_splits": float(expected_split_num),
+            "stream_local_env_batch": float(stream_local_env_batch),
+            "stream_rollout_epochs_per_flush": float(
+                self._get_stream_rollout_epochs_per_flush()
+            ),
+            "stream_received_splits": 0.0,
+            "stream_overlap_ignored_normalize_advantages": float(
+                bool(self.cfg.algorithm.normalize_advantages)
+            ),
+            "stream_overlap_ignored_shuffle_rollout": float(
+                bool(self.cfg.algorithm.get("shuffle_rollout", True))
+            ),
+        }
+
+        for _ in range(expected_split_num):
+            with self.worker_timer("wait_stream_rollout_batch"):
+                train_micro_batch = await input_channel.get(async_op=True).async_wait()
+
+            self._stream_train_batches.append(train_micro_batch)
+            micro_batch_in_global_batch = (
+                self._stream_training_state["micro_batches_in_current_global_batch"] + 1
+            )
+            is_last_micro_batch = micro_batch_in_global_batch == self.gradient_accumulation
+
+            with self.worker_timer("stream_train_micro_batch"):
+                self._train_embodied_micro_batch(
+                    train_micro_batch,
+                    self._stream_training_metrics,
+                    is_last_micro_batch=is_last_micro_batch,
+                )
+
+            self._stream_training_state["micro_batches_in_current_global_batch"] = (
+                micro_batch_in_global_batch
+            )
+            self._stream_training_state["streamed_train_micro_batches"] += 1.0
+
+            if is_last_micro_batch:
+                with self.worker_timer("stream_train_global_batch_step"):
+                    self._finish_embodied_global_batch(self._stream_training_metrics)
+                self.optimizer.zero_grad()
+                self._stream_training_state["streamed_train_global_batches"] += 1.0
+                self._stream_training_state["micro_batches_in_current_global_batch"] = 0
+
+        assert (
+            self._stream_training_state["micro_batches_in_current_global_batch"] == 0
+        ), "Incomplete streamed gradient accumulation detected at the end of recv."
+        self._stream_rollout_metadata["stream_received_splits"] = float(
+            len(self._stream_train_batches)
+        )
+        self._stream_rollout_metadata.update(self._stream_training_state)
+
+    def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+        if not getattr(self, "_stream_train_batches", None):
+            return super().compute_advantages_and_returns()
+
+        with self.worker_timer("merge_stream_train_batches"):
+            self.rollout_batch = _merge_stream_train_batches(self._stream_train_batches)
+
+        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        rollout_metrics.update(getattr(self, "_stream_rollout_metadata", {}))
+        return rollout_metrics
+
+    @Worker.timer("run_training")
+    def run_training(self) -> dict[str, float]:
+        if not getattr(self, "_stream_train_batches", None):
+            return super().run_training()
+
+        self._prepare_embodied_training()
+        update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+        if update_epoch > 1:
+            rollout_size = self.rollout_batch["prev_logprobs"].size(0)
+            batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
+            assert rollout_size % batch_size_per_rank == 0, (
+                f"{rollout_size} is not divisible by {batch_size_per_rank}"
+            )
+
+            for _ in range(update_epoch - 1):
+                rollout_dataloader_iter = split_dict_to_chunk(
+                    self.rollout_batch,
+                    rollout_size // batch_size_per_rank,
+                )
+                for train_global_batch in rollout_dataloader_iter:
+                    train_global_batch_size = train_global_batch["prev_logprobs"].shape[
+                        0
+                    ]
+                    assert (
+                        train_global_batch_size
+                        == self.cfg.actor.global_batch_size
+                        // torch.distributed.get_world_size()
+                    )
+                    assert (
+                        train_global_batch_size % self.cfg.actor.micro_batch_size == 0
+                    ), (
+                        f"{train_global_batch_size=}, "
+                        f"{self.cfg.actor.micro_batch_size}"
+                    )
+
+                    train_micro_batches = split_dict_to_chunk(
+                        train_global_batch,
+                        train_global_batch_size // self.cfg.actor.micro_batch_size,
+                    )
+                    self.optimizer.zero_grad()
+                    for idx, batch in enumerate(train_micro_batches):
+                        self._train_embodied_micro_batch(
+                            batch,
+                            self._stream_training_metrics,
+                            is_last_micro_batch=(
+                                idx + 1
+                            )
+                            == train_global_batch_size // self.cfg.actor.micro_batch_size,
+                        )
+                    self._finish_embodied_global_batch(self._stream_training_metrics)
+
+        mean_metric_dict = self._finalize_embodied_training_metrics(
+            self._stream_training_metrics
+        )
+        self._stream_train_batches = []
+        self._stream_training_metrics = {}
+        self._stream_training_state = {}
+        self._stream_rollout_metadata = {}
+        return mean_metric_dict
+
+
+TestEmbodiedFSDPActor = TestEmbodedFSDPActor

@@ -19,7 +19,7 @@ import torch.multiprocessing as mp
 from omegaconf.omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
-from rlinf.runners.embodied_runner import EmbodiedRunner
+from rlinf.runners.embodied_runner import EmbodiedRunner, TestEmbodiedRunner
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
@@ -35,6 +35,9 @@ mp.set_start_method("spawn", force=True)
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
+    use_test_stream_adv_pipeline = cfg.runner.get(
+        "use_test_stream_adv_pipeline", False
+    )
 
     cluster = Cluster(
         cluster_cfg=cfg.cluster, distributed_log_dir=cfg.runner.per_worker_log_path
@@ -59,9 +62,14 @@ def main(cfg) -> None:
 
         actor_worker_cls = EmbodiedNFTFSDPPolicy
     else:
-        from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+        if use_test_stream_adv_pipeline:
+            from rlinf.workers.actor.fsdp_actor_worker import TestEmbodiedFSDPActor
 
-        actor_worker_cls = EmbodiedFSDPActor
+            actor_worker_cls = TestEmbodiedFSDPActor
+        else:
+            from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+            actor_worker_cls = EmbodiedFSDPActor
     actor_group = actor_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
     )
@@ -88,7 +96,10 @@ def main(cfg) -> None:
             cluster, name=cfg.reward.group_name, placement_strategy=reward_placement
         )
 
-    runner = EmbodiedRunner(
+    runner_cls = (
+        TestEmbodiedRunner if use_test_stream_adv_pipeline else EmbodiedRunner
+    )
+    runner = runner_cls(
         cfg=cfg,
         actor=actor_group,
         rollout=rollout_group,

@@ -475,3 +475,10 @@ class EmbodiedRunner:
     @property
     def epoch(self):
         return self.global_step // self.num_steps_per_epoch
+
+
+class TestEmbodiedRunner(EmbodiedRunner):
+    """Experimental runner alias for streamed embodied actor tests."""
+
+
+TestEmbodedRunner = TestEmbodiedRunner
