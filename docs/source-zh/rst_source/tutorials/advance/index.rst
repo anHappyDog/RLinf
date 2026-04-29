@@ -43,6 +43,10 @@
    介绍具身训练中 actor 到 rollout 的权重同步优化机制，
    包括 ``patch`` 与 ``bucket`` 两种同步模式、配置方法、适用场景以及性能注意事项。
 
+- :doc:`embodied_training_pipeline`
+   介绍同步具身训练中的 ``use_training_pipeline`` 模式，
+   包括其实现思路、适用场景、配置方法和当前限制。
+
 
 .. toctree::
    :hidden:
@@ -57,3 +61,4 @@
    cloud-edge
    logger
    weight_syncer
+   embodied_training_pipeline

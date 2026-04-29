@@ -44,6 +44,11 @@ offering practical guidance to help you fully optimize your RL post-training wor
    embodied training, including the ``patch`` and ``bucket`` modes, their
    configuration, recommended use cases, and performance considerations.
 
+- :doc:`embodied_training_pipeline`
+   Introduces the ``use_training_pipeline`` mode for synchronous embodied
+   training, including the design goal, when to use it, how to enable it, and
+   its current limitations.
+
 
 .. toctree::
    :hidden:
@@ -58,3 +63,4 @@ offering practical guidance to help you fully optimize your RL post-training wor
    cloud-edge
    logger
    weight_syncer
+   embodied_training_pipeline
