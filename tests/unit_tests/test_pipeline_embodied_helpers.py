@@ -7,6 +7,8 @@ from rlinf.utils.metric_utils import (
     compute_pipeline_expected_actor_recv_num,
     compute_pipeline_micro_batch_env_size,
     flatten_embodied_rollout_batch_for_train,
+    pack_pipeline_train_batch_for_transport,
+    unpack_pipeline_train_batch_from_transport,
 )
 from rlinf.workers.actor.fsdp_actor_worker import _merge_pipeline_train_batches
 
@@ -62,6 +64,33 @@ def test_flatten_embodied_rollout_batch_for_train_drops_bootstrap_step():
     assert flattened["dones"].shape == (4, 1)
     assert flattened["prev_values"].shape == (4, 1)
     assert flattened["forward_inputs"]["action"].shape == (4, 3)
+
+
+def test_pipeline_train_batch_transport_round_trip():
+    train_batch = {
+        "advantages": torch.arange(4, dtype=torch.float32).reshape(4, 1),
+        "forward_inputs": {
+            "action": torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        },
+        "returns": None,
+    }
+
+    packed_batch = pack_pipeline_train_batch_for_transport(train_batch)
+
+    assert set(packed_batch.keys()) == {
+        "advantages",
+        "forward_inputs::action",
+    }
+    assert all(isinstance(value, torch.Tensor) for value in packed_batch.values())
+
+    unpacked_batch = unpack_pipeline_train_batch_from_transport(packed_batch)
+
+    assert torch.equal(unpacked_batch["advantages"], train_batch["advantages"])
+    assert torch.equal(
+        unpacked_batch["forward_inputs"]["action"],
+        train_batch["forward_inputs"]["action"],
+    )
+    assert "returns" not in unpacked_batch
 
 
 def test_compute_pipeline_micro_batch_env_size():
