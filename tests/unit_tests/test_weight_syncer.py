@@ -598,7 +598,9 @@ def test_patch_weight_syncer_init_sync_bootstraps_selected_prefixes():
         sender_model.value_head[2].weight, receiver_model.value_head[2].weight
     )
     with pytest.raises(AssertionError):
-        torch.testing.assert_close(sender_model.backbone.weight, receiver_model.backbone.weight)
+        torch.testing.assert_close(
+            sender_model.backbone.weight, receiver_model.backbone.weight
+        )
 
 
 def test_patch_weight_syncer_init_sync_bootstraps_full_state_dict():
