@@ -14,6 +14,7 @@
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from rlinf.scheduler import Cluster, ComponentPlacement, NodePlacementStrategy, Worker
 from rlinf.scheduler.cluster.cluster import ClusterEnvVar, PathEnvMergeMode
-from rlinf.scheduler.cluster.config import ClusterConfig
+from rlinf.scheduler.cluster.config import ClusterConfig, NsightConfig
 from rlinf.scheduler.hardware.robots.franka import FrankaConfig
 
 
@@ -448,6 +449,174 @@ def test_cluster_config_num_nodes_must_be_positive():
 
     with pytest.raises(AssertionError, match="'num_nodes' must be a positive integer"):
         ClusterConfig.from_dict_cfg(config)
+
+
+def test_cluster_config_parses_nsight_settings():
+    config = DictConfig(
+        {
+            "num_nodes": 1,
+            "component_placement": {},
+            "nsight": {
+                "worker_groups": ["actor", "rollout"],
+                "options": {
+                    "t": "cuda,cudnn,cublas,nvtx",
+                    "capture-range": "nvtx",
+                    "stop-on-range-end": True,
+                },
+            },
+        }
+    )
+
+    cluster_cfg = ClusterConfig.from_dict_cfg(config)
+
+    assert cluster_cfg.nsight is not None
+    assert cluster_cfg.nsight.enabled is True
+    assert cluster_cfg.nsight.worker_groups == ["actor", "rollout"]
+    assert cluster_cfg.nsight.options == {
+        "t": "cuda,cudnn,cublas,nvtx",
+        "capture-range": "nvtx",
+        "capture-range-end": "stop",
+    }
+
+
+def test_cluster_config_parses_disabled_nsight_settings():
+    config = DictConfig(
+        {
+            "num_nodes": 1,
+            "component_placement": {},
+            "nsight": {
+                "enabled": False,
+                "worker_groups": ["actor"],
+                "options": {"t": "cuda,cudnn,cublas,nvtx"},
+            },
+        }
+    )
+
+    cluster_cfg = ClusterConfig.from_dict_cfg(config)
+
+    assert cluster_cfg.nsight is not None
+    assert cluster_cfg.nsight.enabled is False
+    assert cluster_cfg.nsight.worker_groups == ["actor"]
+    assert cluster_cfg.nsight.options == {"t": "cuda,cudnn,cublas,nvtx"}
+
+
+def test_cluster_config_nsight_rejects_duplicate_range_end_options():
+    config = DictConfig(
+        {
+            "num_nodes": 1,
+            "component_placement": {},
+            "nsight": {
+                "options": {
+                    "stop-on-range-end": True,
+                    "capture-range-end": "stop",
+                },
+            },
+        }
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="must not specify both 'stop-on-range-end' and 'capture-range-end'",
+    ):
+        ClusterConfig.from_dict_cfg(config)
+
+
+def test_cluster_config_nsight_options_must_be_mapping():
+    config = DictConfig(
+        {
+            "num_nodes": 1,
+            "component_placement": {},
+            "nsight": {
+                "options": ["BAD"],
+            },
+        }
+    )
+
+    with pytest.raises(AssertionError, match="Nsight options must be a dictionary"):
+        ClusterConfig.from_dict_cfg(config)
+
+
+def test_build_worker_py_executable_wraps_nsight_for_matching_group():
+    py_executable = Cluster.build_worker_py_executable(
+        python_interpreter_path=sys.executable,
+        worker_name="actor:0",
+        worker_rank=0,
+        nsight_cfg=NsightConfig(
+            worker_groups=["actor"],
+            options={"t": "cuda,cudnn,cublas,nvtx", "sample": "none"},
+        ),
+    )
+
+    assert py_executable.startswith("nsys profile ")
+    assert "-t cuda,cudnn,cublas,nvtx" in py_executable
+    assert "--sample=none" in py_executable
+    expected_prefix = os.path.join(
+        tempfile.gettempdir(), "rlinf_nsight_actor_0_rank0_%p"
+    )
+    assert f"-o {expected_prefix}" in py_executable
+    assert py_executable.endswith(sys.executable)
+
+
+def test_build_worker_py_executable_skips_non_matching_group():
+    py_executable = Cluster.build_worker_py_executable(
+        python_interpreter_path=sys.executable,
+        worker_name="actor:0",
+        worker_rank=0,
+        nsight_cfg=NsightConfig(
+            worker_groups=["rollout"],
+            options={"t": "cuda,cudnn,cublas,nvtx"},
+        ),
+    )
+
+    assert py_executable == sys.executable
+
+
+def test_build_worker_py_executable_skips_disabled_nsight():
+    py_executable = Cluster.build_worker_py_executable(
+        python_interpreter_path=sys.executable,
+        worker_name="actor:0",
+        worker_rank=0,
+        nsight_cfg=NsightConfig(
+            enabled=False,
+            worker_groups=["actor"],
+            options={"t": "cuda,cudnn,cublas,nvtx"},
+        ),
+    )
+
+    assert py_executable == sys.executable
+
+
+def test_build_worker_py_executable_preserves_custom_output(tmp_path):
+    custom_output = tmp_path / "custom-profile-output"
+    py_executable = Cluster.build_worker_py_executable(
+        python_interpreter_path=sys.executable,
+        worker_name="actor:0",
+        worker_rank=0,
+        nsight_cfg=NsightConfig(
+            worker_groups="all",
+            options={"o": str(custom_output), "sample": "none"},
+        ),
+    )
+
+    assert f"-o {custom_output}" in py_executable
+    assert "rlinf_nsight_actor_0_rank0_%p" not in py_executable
+
+
+def test_build_worker_py_executable_uses_custom_nsight_output_dir(tmp_path):
+    output_dir = tmp_path / "nsights"
+    py_executable = Cluster.build_worker_py_executable(
+        python_interpreter_path=sys.executable,
+        worker_name="actor:0",
+        worker_rank=0,
+        nsight_cfg=NsightConfig(
+            worker_groups=["actor"],
+            options={"sample": "none"},
+        ),
+        nsight_output_dir=str(output_dir),
+    )
+
+    assert f"-o {output_dir}/rlinf_nsight_actor_0_rank0_%p" in py_executable
+    assert output_dir.is_dir()
 
 
 def test_path_env_merge_mode_default_is_append():
