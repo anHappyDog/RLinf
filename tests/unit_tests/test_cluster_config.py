@@ -14,7 +14,6 @@
 
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -536,32 +535,69 @@ def test_cluster_config_nsight_options_must_be_mapping():
         ClusterConfig.from_dict_cfg(config)
 
 
-def test_build_worker_py_executable_wraps_nsight_for_matching_group():
-    py_executable = Cluster.build_worker_py_executable(
-        python_interpreter_path=sys.executable,
-        worker_name="actor:0",
-        worker_rank=0,
-        nsight_cfg=NsightConfig(
-            worker_groups=["actor"],
-            options={"t": "cuda,cudnn,cublas,nvtx", "sample": "none"},
-        ),
+def test_cluster_config_parses_nsight_flags():
+    config = DictConfig(
+        {
+            "num_nodes": 1,
+            "component_placement": {},
+            "nsight": {
+                "flags": ["python-backtrace"],
+            },
+        }
     )
 
-    assert py_executable.startswith("nsys profile ")
-    assert "-t cuda,cudnn,cublas,nvtx" in py_executable
-    assert "--sample=none" in py_executable
-    expected_prefix = os.path.join(
-        tempfile.gettempdir(), "rlinf_nsight_actor_0_rank0_%p"
+    cluster_cfg = ClusterConfig.from_dict_cfg(config)
+
+    assert cluster_cfg.nsight is not None
+    assert cluster_cfg.nsight.flags == ["python-backtrace"]
+
+
+def test_cluster_config_rejects_duplicate_nsight_flag_and_option():
+    config = DictConfig(
+        {
+            "num_nodes": 1,
+            "component_placement": {},
+            "nsight": {
+                "flags": ["python-backtrace"],
+                "options": {"python-backtrace": "cuda"},
+            },
+        }
     )
-    assert f"-o {expected_prefix}" in py_executable
-    assert py_executable.endswith(sys.executable)
+
+    with pytest.raises(
+        AssertionError, match="Nsight flags and options must not specify the same names"
+    ):
+        ClusterConfig.from_dict_cfg(config)
+
+
+def test_nsight_default_preset_enables_cpu_sampling_and_cuda_backtrace():
+    preset_path = (
+        Path(__file__).resolve().parents[2]
+        / "examples"
+        / "embodiment"
+        / "config"
+        / "nsight"
+        / "default.yaml"
+    )
+    preset_cfg = OmegaConf.load(preset_path)
+    nsight_cfg = NsightConfig(**OmegaConf.to_container(preset_cfg, resolve=True))
+
+    assert nsight_cfg.options is not None
+    assert nsight_cfg.options["sample"] == "process-tree"
+    assert nsight_cfg.options["cudabacktrace"] == "all"
+    assert nsight_cfg.flags == []
+
+
+def test_nsight_to_cli_tokens_supports_flags():
+    nsight_cfg = NsightConfig(flags=["python-backtrace"])
+
+    assert nsight_cfg.to_cli_tokens() == ["--python-backtrace"]
 
 
 def test_build_worker_py_executable_skips_non_matching_group():
     py_executable = Cluster.build_worker_py_executable(
         python_interpreter_path=sys.executable,
         worker_name="actor:0",
-        worker_rank=0,
         nsight_cfg=NsightConfig(
             worker_groups=["rollout"],
             options={"t": "cuda,cudnn,cublas,nvtx"},
@@ -575,7 +611,6 @@ def test_build_worker_py_executable_skips_disabled_nsight():
     py_executable = Cluster.build_worker_py_executable(
         python_interpreter_path=sys.executable,
         worker_name="actor:0",
-        worker_rank=0,
         nsight_cfg=NsightConfig(
             enabled=False,
             worker_groups=["actor"],
@@ -584,39 +619,6 @@ def test_build_worker_py_executable_skips_disabled_nsight():
     )
 
     assert py_executable == sys.executable
-
-
-def test_build_worker_py_executable_preserves_custom_output(tmp_path):
-    custom_output = tmp_path / "custom-profile-output"
-    py_executable = Cluster.build_worker_py_executable(
-        python_interpreter_path=sys.executable,
-        worker_name="actor:0",
-        worker_rank=0,
-        nsight_cfg=NsightConfig(
-            worker_groups="all",
-            options={"o": str(custom_output), "sample": "none"},
-        ),
-    )
-
-    assert f"-o {custom_output}" in py_executable
-    assert "rlinf_nsight_actor_0_rank0_%p" not in py_executable
-
-
-def test_build_worker_py_executable_uses_custom_nsight_output_dir(tmp_path):
-    output_dir = tmp_path / "nsights"
-    py_executable = Cluster.build_worker_py_executable(
-        python_interpreter_path=sys.executable,
-        worker_name="actor:0",
-        worker_rank=0,
-        nsight_cfg=NsightConfig(
-            worker_groups=["actor"],
-            options={"sample": "none"},
-        ),
-        nsight_output_dir=str(output_dir),
-    )
-
-    assert f"-o {output_dir}/rlinf_nsight_actor_0_rank0_%p" in py_executable
-    assert output_dir.is_dir()
 
 
 def test_path_env_merge_mode_default_is_append():

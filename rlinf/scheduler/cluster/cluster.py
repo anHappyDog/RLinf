@@ -161,11 +161,6 @@ class Cluster:
             nsight_output_dir (Optional[str]): Default directory for Nsight reports when ``cluster.nsight`` is enabled and no explicit ``o``/``output`` option is configured.
         """
         if self._has_initialized:
-            if (
-                nsight_output_dir is not None
-                and getattr(self, "_nsight_output_dir", None) is None
-            ):
-                self._nsight_output_dir = nsight_output_dir
             return
         self._setup_logger()
         self._distributed_log_collector: Optional[DistributedRayLogCollector] = None
@@ -519,11 +514,6 @@ class Cluster:
         return self._nodes[node_rank].node_ip
 
     @staticmethod
-    def _get_worker_group_name(worker_name: str) -> str:
-        """Extract the root worker group name from a worker address string."""
-        return worker_name.split(":", 1)[0]
-
-    @staticmethod
     def _sanitize_worker_name_for_path(worker_name: str) -> str:
         """Sanitize worker names for use in output filenames."""
         return re.sub(r"[^A-Za-z0-9._-]", "_", worker_name)
@@ -532,39 +522,18 @@ class Cluster:
     def _get_default_nsight_output_prefix(
         cls,
         worker_name: str,
-        worker_rank: int,
         output_dir: Optional[str] = None,
     ) -> str:
         safe_worker_name = cls._sanitize_worker_name_for_path(worker_name)
         if output_dir is None:
             output_dir = tempfile.gettempdir()
-        else:
-            os.makedirs(output_dir, exist_ok=True)
-        return os.path.join(
-            output_dir,
-            f"rlinf_nsight_{safe_worker_name}_rank{worker_rank}_%p",
-        )
-
-    @staticmethod
-    def _build_nsight_option_tokens(nsight_options: dict[str, str]) -> list[str]:
-        option_tokens = []
-        for option_name, option_value in nsight_options.items():
-            option_name = str(option_name)
-            option_value = str(option_value)
-            if option_name == "":
-                raise ValueError("Nsight option names must not be empty.")
-            if len(option_name) > 1:
-                option_tokens.append(f"--{option_name}={option_value}")
-            else:
-                option_tokens.extend([f"-{option_name}", option_value])
-        return option_tokens
+        return os.path.join(output_dir, f"rlinf_nsight_{safe_worker_name}_%p")
 
     @classmethod
     def build_worker_py_executable(
         cls,
         python_interpreter_path: str,
         worker_name: str,
-        worker_rank: int,
         nsight_cfg: Optional[NsightConfig],
         nsight_output_dir: Optional[str] = None,
     ) -> str:
@@ -572,22 +541,23 @@ class Cluster:
         if nsight_cfg is None:
             return python_interpreter_path
 
-        worker_group_name = cls._get_worker_group_name(worker_name)
+        from ..manager import WorkerAddress
+
+        worker_group_name = WorkerAddress.from_name(worker_name).root_group_name
         if not nsight_cfg.profiles_worker_group(worker_group_name):
             return python_interpreter_path
 
-        nsight_options = dict(nsight_cfg.options or {})
-        if "o" not in nsight_options and "output" not in nsight_options:
-            nsight_options["o"] = cls._get_default_nsight_output_prefix(
-                worker_name,
-                worker_rank,
-                output_dir=nsight_output_dir,
-            )
+        output_dir = nsight_output_dir or tempfile.gettempdir()
+        os.makedirs(output_dir, exist_ok=True)
+        default_output_prefix = cls._get_default_nsight_output_prefix(
+            worker_name,
+            output_dir=output_dir,
+        )
 
         nsight_cmd = [
             "nsys",
             "profile",
-            *cls._build_nsight_option_tokens(nsight_options),
+            *nsight_cfg.to_cli_tokens(default_output_prefix=default_output_prefix),
             python_interpreter_path,
         ]
         return " ".join(shlex.quote(token) for token in nsight_cmd)
@@ -656,7 +626,6 @@ class Cluster:
         python_interpreter_path = self.build_worker_py_executable(
             python_interpreter_path=python_interpreter_path,
             worker_name=worker_name,
-            worker_rank=worker_rank,
             nsight_cfg=self._cluster_cfg.nsight
             if self._cluster_cfg is not None
             else None,

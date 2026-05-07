@@ -37,7 +37,9 @@ CPU runtime 相关时间线。
      t: cuda,cudnn,cublas,nvtx,osrt
      sample: process-tree
      cpuctxsw: process-tree
+     cudabacktrace: all
      osrt-threshold: 1000
+   flags: []
 
 这份默认配置会优先采样具身训练里最常见的计算 worker 和通信 worker：
 
@@ -50,6 +52,9 @@ CPU runtime 相关时间线。
 
 这里的名字必须和真实的 worker group 名一致，例如 ``actor.group_name``、
 ``rollout.group_name``，而不是组件别名 ``actor`` 或 ``rollout``。
+
+这份 preset 默认会保留 CPU sampling，并额外开启 ``cudabacktrace``，因此第一轮
+profiling 时就能同时看到 CUDA 侧时间线和 CUDA API 调用栈。
 
 
 ``enabled`` 开关
@@ -68,10 +73,6 @@ CPU runtime 相关时间线。
 - RLinf 不会用 ``nsys profile`` 包装 worker
 - RLinf 不会预留默认的 Nsight 输出目录
 - 其余 profiling 配置可以保留，方便后续再次开启
-
-因此不需要单独维护一份 ``disabled.yaml``，直接在主 YAML 里覆盖
-``cluster.nsight.enabled: false`` 即可。
-
 
 如何覆盖 worker_groups
 ------------------------------
@@ -99,11 +100,26 @@ CPU runtime 相关时间线。
 覆盖 ``Actor`` 这个 channel worker；如果你想看 channel 本身，需要把这些名字
 显式加进 ``worker_groups``。
 
+对于内置的具身 runner，这几类名字和实际含义可以直接对应起来：
+
+- ``ActorGroup``: actor 计算 worker
+- ``RolloutGroup``: rollout 计算 worker
+- ``EnvGroup``: env 计算 worker
+- ``Actor``: 由 ``Channel.create("Actor")`` 创建出来的 channel worker
+- ``Rollout``: 由 ``Channel.create("Rollout")`` 创建出来的 channel worker
+- ``Env``: 由 ``Channel.create("Env")`` 创建出来的 channel worker
+
+所以 ``worker_groups: [Actor]`` 的含义是“profile Actor 这个 channel worker”，
+而不是“profile 所有 actor 侧计算”。当前这套匹配机制本来就是按 worker group
+name 做判断，因此这里必须填写真实的 group name。若你在自定义 runner 里创建了
+别的 channel 名字，也应当把那个精确名字写进 ``worker_groups``。
+
 
 如何覆盖 Nsight 参数
 ------------------------------
 
-``cluster.nsight.options`` 会被直接映射到 ``nsys profile`` 的 CLI 参数：
+``cluster.nsight.options`` 会被直接映射到那些“带值”的 ``nsys profile`` 参数，
+而 ``cluster.nsight.flags`` 则用于输出裸 flag：
 
 .. code-block:: yaml
 
@@ -113,17 +129,87 @@ CPU runtime 相关时间线。
          t: cuda,cudnn,cublas,nvtx,osrt
          sample: process-tree
          cpuctxsw: process-tree
+         cudabacktrace: all
 
 常用参数包括：
 
 - ``t``: 需要采集的 API，例如 ``cuda``、``cudnn``、``cublas``、``nvtx``、``osrt``
 - ``sample``: CPU sampling 模式
+- ``backtrace``: CPU sampling 搭配使用的回溯方式，例如 ``lbr``、``fp``、``dwarf``
 - ``cpuctxsw``: CPU 线程调度时间线
+- ``cudabacktrace``: 采集 CUDA API 调用栈；它依赖 CPU sampling，并且可能明显增加 overhead
 - ``capture-range`` 和 ``capture-range-end``: 用 NVTX 或 CUDA profiler API 控制采样窗口
 - ``o`` 或 ``output``: 显式指定输出前缀
 
 如果你开启了 ``capture-range: nvtx``，请确认代码里确实发出了 NVTX range；
 否则 Nsight 很可能只会生成几乎没有内容的空 report。
+
+你并不局限于 ``nsight/default`` 里已经出现的那些 key。RLinf 会把
+``cluster.nsight.options`` 中的任意新增项继续透传给 ``nsys profile``：
+
+.. code-block:: yaml
+
+   cluster:
+     nsight:
+       options:
+         t: cuda,cudnn,cublas,nvtx,osrt
+         sample: process-tree
+         backtrace: fp
+         capture-range: cudaProfilerApi
+         capture-range-end: stop
+         samples-per-backtrace: 4
+       flags: [python-backtrace]
+
+这是因为 RLinf 会把 ``cluster.nsight.options`` 当作一个自由字典来渲染：
+
+- 单字符 key 会被渲染成 ``-t cuda,...`` 这种形式
+- 多字符 key 会被渲染成 ``--backtrace=fp`` 这种形式
+- ``flags`` 里的项会被渲染成 ``--python-backtrace`` 这种形式
+
+如果你想输出一个“不带值”的 flag，可以把它写进 ``cluster.nsight.flags``：
+
+.. code-block:: yaml
+
+   cluster:
+     nsight:
+       flags: [python-backtrace]
+
+同样也可以通过 Hydra CLI 覆盖：
+
+.. code-block:: bash
+
+   python ... 'cluster.nsight.flags=[python-backtrace]'
+
+这对那些“值是可选的”，并且裸 flag 形式有特殊语义的 ``nsys`` 参数尤其有用。
+
+不同 Nsight Systems 版本、不同主机平台支持的参数和推荐取值并不完全一致。尤其是
+``backtrace`` 的可用模式和效果，可能需要按机器调整。如果目标节点上的某个参数
+不被接受，或者 ``lbr`` 效果不好，请直接在目标节点执行 ``nsys profile --help``，
+然后覆盖 ``cluster.nsight.options``，例如把 ``backtrace`` 改成 ``fp`` 或
+``dwarf``。
+
+
+如何打 NVTX Range
+------------------------------
+
+RLinf 已经提供了一个现成的 NVTX helper：
+
+.. code-block:: python
+
+   from rlinf.utils.utils import nvtx_range
+
+   with nvtx_range("actor.forward", color="green"):
+       run_actor_forward()
+
+如果你准备开启 ``capture-range: nvtx``，或者只是希望在 Nsight 时间线里看到更高层
+的命名区间，这通常是最方便的用法。
+
+这个 helper 会优先尝试可选的 ``nvtx`` Python 包；如果没装这个包，则会在 CUDA
+可用时回退到 ``torch.cuda.nvtx``；如果两者都不可用，它就会退化成 no-op。因此把
+它留在同时支持“带 NVTX / 不带 NVTX”两种环境的代码路径里通常也是安全的。
+
+如果你使用了 ``capture-range: nvtx``，请确认被 profile 的 worker 确实会执行到
+这些 range；否则 Nsight 可能只会采到很少的数据，甚至得到几乎为空的 report。
 
 
 输出路径

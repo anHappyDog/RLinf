@@ -171,6 +171,9 @@ class NsightConfig:
     options: Optional[dict[str, str]] = None
     """Additional ``nsys profile`` options keyed by flag name."""
 
+    flags: Optional[list[str] | str] = None
+    """Additional bare ``nsys profile`` flags emitted without values."""
+
     @staticmethod
     def _stringify_option_value(option_value: object) -> str:
         if isinstance(option_value, bool):
@@ -178,7 +181,10 @@ class NsightConfig:
         return str(option_value)
 
     @staticmethod
-    def _normalize_capture_range_end_alias(option_value: str) -> str:
+    def _normalize_capture_range_end_alias(option_value: object) -> str:
+        assert option_value is not None, (
+            "Nsight option 'stop-on-range-end' must have an explicit value."
+        )
         normalized_value = str(option_value).strip().lower()
         if normalized_value in {"true", "1", "yes", "on"}:
             return "stop"
@@ -187,7 +193,7 @@ class NsightConfig:
         return str(option_value)
 
     def __post_init__(self):
-        """Normalize Nsight worker groups and CLI options after parsing YAML."""
+        """Normalize Nsight worker groups, options, and flags after parsing YAML."""
         if self.worker_groups is not None:
             worker_groups = self.worker_groups
             if isinstance(worker_groups, str):
@@ -199,6 +205,21 @@ class NsightConfig:
                     f"But got {type(worker_groups)}: {worker_groups}"
                 )
                 self.worker_groups = [str(group_name) for group_name in worker_groups]
+
+        if self.flags is not None:
+            flags = self.flags
+            if isinstance(flags, str):
+                self.flags = [flags]
+            else:
+                assert isinstance(flags, (list, ListConfig)), (
+                    "flags must be a list of strings or a single string "
+                    "in cluster nsight config. "
+                    f"But got {type(flags)}: {flags}"
+                )
+                self.flags = [str(flag_name) for flag_name in flags]
+            assert all(flag_name != "" for flag_name in self.flags), (
+                "Nsight flags must not contain empty names."
+            )
 
         if self.options is not None:
             assert hasattr(self.options, "keys"), (
@@ -222,6 +243,12 @@ class NsightConfig:
             assert not ("o" in self.options and "output" in self.options), (
                 "Nsight options must not specify both 'o' and 'output'."
             )
+        if self.flags is not None and self.options is not None:
+            overlapping_names = sorted(set(self.flags).intersection(self.options))
+            assert not overlapping_names, (
+                "Nsight flags and options must not specify the same names. "
+                f"Got duplicates: {overlapping_names}"
+            )
 
     def profiles_worker_group(self, worker_group_name: str) -> bool:
         """Return whether this config should profile the given worker group."""
@@ -236,6 +263,29 @@ class NsightConfig:
             "all" in normalized_group_names
             or worker_group_name.lower() in normalized_group_names
         )
+
+    def to_cli_tokens(self, default_output_prefix: Optional[str] = None) -> list[str]:
+        """Render ``nsys profile`` options into CLI tokens."""
+        flags = list(self.flags or [])
+        options = dict(self.options or {})
+        if default_output_prefix is not None:
+            options.setdefault("o", default_output_prefix)
+
+        option_tokens = []
+        for flag_name in flags:
+            if flag_name == "":
+                raise ValueError("Nsight option names must not be empty.")
+            option_tokens.append(
+                f"--{flag_name}" if len(flag_name) > 1 else f"-{flag_name}"
+            )
+        for option_name, option_value in options.items():
+            if option_name == "":
+                raise ValueError("Nsight option names must not be empty.")
+            if len(option_name) > 1:
+                option_tokens.append(f"--{option_name}={option_value}")
+            else:
+                option_tokens.extend([f"-{option_name}", option_value])
+        return option_tokens
 
 
 @dataclass
@@ -345,7 +395,9 @@ class ClusterConfig:
 
             - `enabled` controls whether RLinf wraps matching workers with `nsys profile`.
             - `worker_groups` matches worker group names such as `cfg.actor.group_name`. If omitted, all worker groups are profiled.
-            - `options` maps directly to `nsys profile` CLI flags. Use `capture-range-end: stop` with `capture-range: nvtx` when you want collection to stop after the profiled NVTX range ends.
+            - `options` maps directly to `nsys profile` CLI flags that take explicit values.
+            - `flags` emits bare `nsys profile` flags without values.
+            - Use `capture-range-end: stop` with `capture-range: nvtx` when you want collection to stop after the profiled NVTX range ends.
             - `o` or `output` overrides the default report filename prefix.
 
         **Multi-node-group placement**: A worker group can be placed across multiple node groups with heterogeneous hardware types by specifying multiple node group labels. For example:

@@ -39,7 +39,9 @@ The built-in default preset looks like this:
      t: cuda,cudnn,cublas,nvtx,osrt
      sample: process-tree
      cpuctxsw: process-tree
+     cudabacktrace: all
      osrt-threshold: 1000
+   flags: []
 
 This preset targets the most common embodied compute and communication workers by default:
 
@@ -53,6 +55,10 @@ This preset targets the most common embodied compute and communication workers b
 These names must match real worker group names such as ``actor.group_name`` and
 ``rollout.group_name``. They are not the component aliases ``actor`` or
 ``rollout``.
+
+The preset also keeps CPU sampling enabled and turns on ``cudabacktrace`` by
+default, so the resulting report includes both CUDA-side activity and CUDA API
+backtraces during the first profiling pass.
 
 
 The ``enabled`` Flag
@@ -102,11 +108,27 @@ usually ``Env``, ``Rollout``, or ``Actor``. So profiling ``ActorGroup`` does
 not automatically include the ``Actor`` channel worker. If you want channel-side
 traces, add those channel group names explicitly to ``worker_groups``.
 
+For the built-in embodied runners, these channel worker group names are created
+directly from the channel names in code:
+
+- ``ActorGroup``: actor compute workers
+- ``RolloutGroup``: rollout compute workers
+- ``EnvGroup``: environment compute workers
+- ``Actor``: the channel worker behind ``Channel.create("Actor")``
+- ``Rollout``: the channel worker behind ``Channel.create("Rollout")``
+- ``Env``: the channel worker behind ``Channel.create("Env")``
+
+So ``worker_groups: [Actor]`` means "profile the Actor channel worker", not
+"profile all actor-side compute". The current matching rule is by worker group
+name, which is why the channel names matter here. If you create your own
+channels with other names, use those exact channel names in ``worker_groups``.
+
 
 How To Override Nsight Options
 ------------------------------
 
-``cluster.nsight.options`` maps directly to ``nsys profile`` CLI flags:
+``cluster.nsight.options`` maps directly to ``nsys profile`` flags that take
+values, while ``cluster.nsight.flags`` emits bare flags:
 
 .. code-block:: yaml
 
@@ -116,17 +138,93 @@ How To Override Nsight Options
          t: cuda,cudnn,cublas,nvtx,osrt
          sample: process-tree
          cpuctxsw: process-tree
+         cudabacktrace: all
 
 Useful options include:
 
 - ``t``: traced APIs such as ``cuda``, ``cudnn``, ``cublas``, ``nvtx``, and ``osrt``
 - ``sample``: CPU sampling mode
+- ``backtrace``: CPU backtrace method used with sampling, for example ``lbr``, ``fp``, or ``dwarf``
 - ``cpuctxsw``: CPU thread scheduling trace
+- ``cudabacktrace``: collect CUDA API backtraces; this requires CPU sampling to stay enabled and can add noticeable overhead
 - ``capture-range`` and ``capture-range-end``: restrict collection to NVTX or CUDA-profiler-controlled ranges
 - ``o`` or ``output``: explicit output prefix
 
 If you enable ``capture-range: nvtx``, make sure your code actually emits NVTX
 ranges. Otherwise Nsight may generate an almost empty report.
+
+You are not limited to the keys shown in ``nsight/default``. RLinf forwards
+arbitrary entries in ``cluster.nsight.options`` to ``nsys profile``:
+
+.. code-block:: yaml
+
+   cluster:
+     nsight:
+       options:
+         t: cuda,cudnn,cublas,nvtx,osrt
+         sample: process-tree
+         backtrace: fp
+         capture-range: cudaProfilerApi
+         capture-range-end: stop
+         samples-per-backtrace: 4
+       flags: [python-backtrace]
+
+This works because RLinf treats ``cluster.nsight.options`` as a free-form
+mapping:
+
+- one-character keys are rendered like ``-t cuda,...``
+- longer keys are rendered like ``--backtrace=fp``
+- ``flags`` entries are rendered like ``--python-backtrace``
+
+To emit a flag without a value, put it in ``cluster.nsight.flags``:
+
+.. code-block:: yaml
+
+   cluster:
+     nsight:
+       flags: [python-backtrace]
+
+You can do the same from the Hydra CLI:
+
+.. code-block:: bash
+
+   python ... 'cluster.nsight.flags=[python-backtrace]'
+
+This is especially useful for ``nsys`` options whose value is optional and where
+the bare flag form has special meaning.
+
+Nsight Systems options are not perfectly stable across versions and host
+platforms. In particular, the supported or recommended ``backtrace`` mode may
+vary between machines. If a flag is rejected on your target node, or if
+``lbr``-style backtraces do not work well on that machine, check
+``nsys profile --help`` on the target node and override
+``cluster.nsight.options`` accordingly, for example by switching
+``backtrace`` to ``fp`` or ``dwarf``.
+
+
+How To Emit NVTX Ranges
+------------------------------
+
+RLinf already provides a small helper for emitting NVTX ranges:
+
+.. code-block:: python
+
+   from rlinf.utils.utils import nvtx_range
+
+   with nvtx_range("actor.forward", color="green"):
+       run_actor_forward()
+
+This is the easiest way to mark higher-level phases before you turn on
+``capture-range: nvtx`` or when you want named ranges in the Nsight timeline.
+
+The helper first tries the optional ``nvtx`` Python package. If that package is
+not installed, it falls back to ``torch.cuda.nvtx`` when CUDA is available. If
+neither backend is available, the context manager becomes a no-op, so it is
+safe to leave in code paths that also run without NVTX support.
+
+When you use ``capture-range: nvtx``, make sure the profiled workers actually
+execute code inside these ranges. Otherwise Nsight may collect very little or no
+data.
 
 
 Output Path
