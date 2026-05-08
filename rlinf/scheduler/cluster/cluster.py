@@ -522,11 +522,9 @@ class Cluster:
     def _get_default_nsight_output_prefix(
         cls,
         worker_name: str,
-        output_dir: Optional[str] = None,
+        output_dir: str,
     ) -> str:
         safe_worker_name = cls._sanitize_worker_name_for_path(worker_name)
-        if output_dir is None:
-            output_dir = tempfile.gettempdir()
         return os.path.join(output_dir, f"rlinf_nsight_{safe_worker_name}_%p")
 
     @classmethod
@@ -547,7 +545,16 @@ class Cluster:
         if not nsight_cfg.profiles_worker_group(worker_group_name):
             return python_interpreter_path
 
-        output_dir = nsight_output_dir or tempfile.gettempdir()
+        if nsight_output_dir is None:
+            output_dir = tempfile.gettempdir()
+
+            from rlinf.utils.logging import get_logger
+
+            get_logger().warning(
+                f"Nsight profiling is enabled for worker group '{worker_group_name}' but no output directory is configured. Nsight reports will be saved to the system temporary directory: {output_dir}."
+            )
+        else:
+            output_dir = nsight_output_dir
         os.makedirs(output_dir, exist_ok=True)
         default_output_prefix = cls._get_default_nsight_output_prefix(
             worker_name,
