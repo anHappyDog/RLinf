@@ -145,6 +145,13 @@ def nvtx_range(name: str, color: str | int | None = None):
             yield
         return
 
+    from rlinf.utils.logging import get_logger
+
+    get_logger().warning(
+        "nvtx_range: NVTX module not found, NVTX annotations are disabled. "
+        "Using torch.cuda.nvtx instead",
+    )
+
     if hasattr(torch.cuda, "nvtx") and torch.cuda.is_available():
         torch.cuda.nvtx.range_push(name)
         try:
@@ -152,7 +159,9 @@ def nvtx_range(name: str, color: str | int | None = None):
         finally:
             torch.cuda.nvtx.range_pop()
         return
-
+    get_logger().warning(
+        "nvtx_range: torch.cuda.nvtx is not available, NVTX annotations are disabled."
+    )
     yield
 
 

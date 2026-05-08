@@ -530,7 +530,7 @@ class Cluster:
         return os.path.join(output_dir, f"rlinf_nsight_{safe_worker_name}_%p")
 
     @classmethod
-    def build_worker_py_executable(
+    def maybe_prepend_nsight_to_py_executable(
         cls,
         python_interpreter_path: str,
         worker_name: str,
@@ -623,7 +623,7 @@ class Cluster:
         cfg_python_path = node_group.get_node_python_interpreter_path(node_rank)
         if cfg_python_path is not None:
             python_interpreter_path = cfg_python_path
-        python_interpreter_path = self.build_worker_py_executable(
+        python_interpreter_path = self.maybe_prepend_nsight_to_py_executable(
             python_interpreter_path=python_interpreter_path,
             worker_name=worker_name,
             nsight_cfg=self._cluster_cfg.nsight
