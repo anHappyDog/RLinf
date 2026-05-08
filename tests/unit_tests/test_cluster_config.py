@@ -594,8 +594,8 @@ def test_nsight_to_cli_tokens_supports_flags():
     assert nsight_cfg.to_cli_tokens() == ["--python-backtrace"]
 
 
-def test_build_worker_py_executable_skips_non_matching_group():
-    py_executable = Cluster.build_worker_py_executable(
+def test_maybe_prepend_nsight_to_py_executable_skips_non_matching_group():
+    py_executable = Cluster.maybe_prepend_nsight_to_py_executable(
         python_interpreter_path=sys.executable,
         worker_name="actor:0",
         nsight_cfg=NsightConfig(
@@ -607,8 +607,8 @@ def test_build_worker_py_executable_skips_non_matching_group():
     assert py_executable == sys.executable
 
 
-def test_build_worker_py_executable_skips_disabled_nsight():
-    py_executable = Cluster.build_worker_py_executable(
+def test_maybe_prepend_nsight_to_py_executable_skips_disabled_nsight():
+    py_executable = Cluster.maybe_prepend_nsight_to_py_executable(
         python_interpreter_path=sys.executable,
         worker_name="actor:0",
         nsight_cfg=NsightConfig(
