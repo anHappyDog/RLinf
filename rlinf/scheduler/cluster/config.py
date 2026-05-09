@@ -252,10 +252,8 @@ class NsightConfig:
 
     def profiles_worker_group(self, worker_group_name: str) -> bool:
         """Return whether this config should profile the given worker group."""
-        if not self.enabled:
+        if not self.enabled or not self.worker_groups:
             return False
-        if self.worker_groups is None:
-            return True
         normalized_group_names = {
             group_name.lower() for group_name in self.worker_groups
         }
