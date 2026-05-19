@@ -20,13 +20,14 @@ from typing import Any, Literal
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
-
+from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
     EnvOutput,
     RolloutResult,
     Trajectory,
+    convert_trajectories_to_batch,
 )
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
@@ -40,6 +41,7 @@ from rlinf.utils.nested_dict_process import (
     split_dict,
     update_nested_cfg,
 )
+from rlinf.utils.utils import pack_batch, preprocess_embodied_batch, unpack_batch, flatten_embodied_batch
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.history_manager import HistoryManager
 
@@ -1284,3 +1286,56 @@ class EnvWorker(Worker):
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(recv_num, send_num)
         return split_num
+
+    def compute_advantages_and_returns(self, rollout_batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        kwargs = {
+            "task_type": self.cfg.runner.task_type,
+            "adv_type": self.cfg.algorithm.adv_type,
+            "rewards": rollout_batch["rewards"],
+            "dones": rollout_batch["dones"],
+            "values": rollout_batch.get("prev_values", None),
+            "gamma": self.cfg.algorithm.get("gamma", 1),
+            "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
+            "group_size": self.cfg.algorithm.get("group_size", 8),
+            "reward_type": self.cfg.algorithm.reward_type,
+            "loss_mask": rollout_batch.get("loss_mask", None),
+            "loss_mask_sum": rollout_batch.get("loss_mask_sum", None),
+            "normalize_advantages": False,
+        }
+        advantages_and_returns = calculate_adv_and_returns(**kwargs)
+        rollout_batch.update(advantages_and_returns)
+        if kwargs["loss_mask"] is not None:
+            rollout_batch["loss_mask"] = kwargs["loss_mask"]
+        if kwargs["loss_mask_sum"] is not None:
+            rollout_batch["loss_mask_sum"] = kwargs["loss_mask_sum"]
+        return rollout_batch
+    
+    def prepare_training_batch(self, trajectory: Trajectory) -> dict[str, torch.Tensor]:
+        batch = convert_trajectories_to_batch([trajectory])
+        batch = preprocess_embodied_batch(batch, rollout_epoch=1,
+                                          auto_reset=self.cfg.env.train.auto_reset,
+                                          ignore_terminations=self.cfg.env.train.ignore_terminations,
+                                          reward_type=self.cfg.algorithm.reward_type,
+                                          filter_rewards=self.cfg.algorithm.get("filter_rewards", False),
+                                          group_size=self.cfg.algorithm.group_size,
+                                          rewards_lower_bound=self.cfg.algorithm.get("rewards_lower_bound", None),
+                                          rewards_upper_bound=self.cfg.algorithm.get("rewards_upper_bound", None),
+                                          )
+        
+        
+        batch = self.compute_advantages_and_returns(batch)
+        # T*B
+        batch_size = batch["prev_logprobs"].shape[0] * batch["prev_logprobs"].shape[1]
+        return pack_batch(flatten_embodied_batch(batch, torch.arange(batch_size)))
+
+    async def send_rollout_trajectories_pipeline(
+        self, rollout_result: EmbodiedRolloutResult, channel: Channel
+    ) -> None:
+        trajectories: list[Trajectory] = rollout_result.to_splited_trajectories(
+            self.actor_split_num
+        )
+        for trajectory in trajectories:
+            with self.worker_timer("prepare_training_batch"):
+                training_batch = self.prepare_training_batch(trajectory)
+            with self.worker_timer("send_training_batch"):
+                channel.put(training_batch, async_op=True)
