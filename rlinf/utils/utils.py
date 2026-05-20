@@ -20,16 +20,16 @@ import random
 import sys
 from contextlib import contextmanager
 from functools import partial, wraps
-from typing import Callable, Literal, Optional, Any
+from typing import Any, Callable, Literal, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
-from rlinf.utils.metric_utils import compute_loss_mask
 
 from rlinf.scheduler import Worker
+from rlinf.utils.metric_utils import compute_loss_mask
 
 
 def clear_memory(sync=True):
@@ -602,7 +602,7 @@ def merge_rollout_epochs(batch: dict[str, Any], rollout_epoch: int) -> dict[str,
         if isinstance(value, torch.Tensor):
             # here to merge the batch for embodied data
             # which is originally in shape [rollout_epoch, B, ...] to [rollout_epoch*B, ...]
-            new_value = value.reshape(rollout_epoch, -1, *value.shape[2:]).transpose(
+            new_value = value.reshape(rollout_epoch, -1, *value.shape[1:]).transpose(
                 0, 1
             )
             new_value = new_value.reshape(new_value.shape[0], -1, *new_value.shape[3:])
