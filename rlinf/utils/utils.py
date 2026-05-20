@@ -544,12 +544,13 @@ def set_rng_state(rng_state: dict) -> None:
 
 PIPELINE_BATCH_KEY_SEPARATOR = "::"
 
-def pack_batch(
-    batch: dict[str, Any], prefix: str =""
-) -> dict[str, Any]:
+
+def pack_batch(batch: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     packed_batch: dict[str, Any] = {}
     for key, value in batch.items():
-        packed_key = key if not prefix else f"{prefix}{PIPELINE_BATCH_KEY_SEPARATOR}{key}"
+        packed_key = (
+            key if not prefix else f"{prefix}{PIPELINE_BATCH_KEY_SEPARATOR}{key}"
+        )
         if value is None:
             continue
         if isinstance(value, torch.Tensor):
@@ -557,13 +558,14 @@ def pack_batch(
         elif isinstance(value, dict):
             packed_batch.update(pack_batch(value, prefix=packed_key))
         else:
-            raise ValueError(f"Unsupported value type in batch: {type(value)} for key: {key}")
+            raise ValueError(
+                f"Unsupported value type in batch: {type(value)} for key: {key}"
+            )
     return packed_batch
 
-def unpack_batch(
-    batch: dict[str, Any]
-) -> dict[str, Any]:
-    unpack_batch : dict[str,Any] = {}
+
+def unpack_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    unpack_batch: dict[str, Any] = {}
     for packed_key, value in batch.items():
         cursor = unpack_batch
         key_parts = packed_key.split(PIPELINE_BATCH_KEY_SEPARATOR)
@@ -572,10 +574,13 @@ def unpack_batch(
         cursor[key_parts[-1]] = value
     return unpack_batch
 
-def flatten_embodied_batch(batch: dict[str, Any], shuffle_id: torch.Tensor) -> dict[str,Any]:
-    # here to flatten the batch for embodied data, which is originally 
+
+def flatten_embodied_batch(
+    batch: dict[str, Any], shuffle_id: torch.Tensor
+) -> dict[str, Any]:
+    # here to flatten the batch for embodied data, which is originally
     # in shape [T, B, ...] to [T*B, ...], and also shuffle the batch according to shuffle_id
-    ret_dict : dict[str,Any] = {}
+    ret_dict: dict[str, Any] = {}
     for key, value in batch.items():
         if key in ["dones", "terminations", "truncations", "prev_values"]:
             value = value[:-1]
@@ -591,19 +596,25 @@ def flatten_embodied_batch(batch: dict[str, Any], shuffle_id: torch.Tensor) -> d
     return ret_dict
 
 
-def merge_rollout_epochs(batch: dict[str, Any], rollout_epoch: int) -> dict[str,Any]:
-    ret_dict : dict[str,Any] = {}
+def merge_rollout_epochs(batch: dict[str, Any], rollout_epoch: int) -> dict[str, Any]:
+    ret_dict: dict[str, Any] = {}
     for key, value in batch.items():
-        if isinstance(value, torch.Tnesor):       
+        if isinstance(value, torch.Tensor):
             # here to merge the batch for embodied data
             # which is originally in shape [rollout_epoch, B, ...] to [rollout_epoch*B, ...]
-            new_value = value.reshape(rollout_epoch, -1, *value.shape[2:]).transpose(0,1)
+            new_value = value.reshape(rollout_epoch, -1, *value.shape[2:]).transpose(
+                0, 1
+            )
             new_value = new_value.reshape(new_value.shape[0], -1, *new_value.shape[3:])
+            ret_dict[key] = new_value
         elif isinstance(value, dict):
-            new_value = merge_rollout_epochs(value, rollout_epoch)
+            ret_dict[key] = merge_rollout_epochs(value, rollout_epoch)
         else:
-            raise ValueError(f"Unsupported value type in batch: {type(value)} for key: {key}")
+            raise ValueError(
+                f"Unsupported value type in batch: {type(value)} for key: {key}"
+            )
     return ret_dict
+
 
 def preprocess_embodied_batch(
     batch: dict[str, Any],
@@ -615,10 +626,10 @@ def preprocess_embodied_batch(
     filter_rewards: bool,
     group_size: int,
     rewards_lower_bound: float | None = None,
-    rewards_upper_bound: float | None = None
-    ) -> dict[str, torch.Tensor]:
+    rewards_upper_bound: float | None = None,
+) -> dict[str, torch.Tensor]:
     batch = merge_rollout_epochs(batch, rollout_epoch)
-    
+
     if not auto_reset and not ignore_terminations:
         dones = batch["dones"]
         loss_mask, loss_mask_sum = compute_loss_mask(dones)
@@ -629,7 +640,6 @@ def preprocess_embodied_batch(
 
         batch["loss_mask"] = loss_mask
         batch["loss_mask_sum"] = loss_mask_sum
-
 
     if filter_rewards:
         rewards = batch["rewards"]
