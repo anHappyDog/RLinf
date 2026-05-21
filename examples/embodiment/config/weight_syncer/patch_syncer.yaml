@@ -1,6 +1,5 @@
 type: patch
 patch:
   snapshot_device: cpu
-  transport_device: cpu
   delta_encoding: True
   compression: none
