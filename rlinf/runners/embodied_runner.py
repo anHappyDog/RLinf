@@ -670,7 +670,6 @@ class EmbodiedRunner:
         self.log_queue.join()  # Wait for all queued logs to be processed
         self.log_thread.join(timeout=1.0)
 
-
     def _save_checkpoint(self):
         self.logger.info(f"Saving checkpoint at step {self.global_step}.")
         base_output_dir = os.path.join(

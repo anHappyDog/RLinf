@@ -19,9 +19,8 @@ from rlinf.scheduler.worker.worker import Worker
 
 def get_actor_worker(cfg: DictConfig) -> Worker:
     if cfg.actor.training_backend == "fsdp":
-        if (
-            cfg.runner.get("task_type", None) == "embodied"
-            and cfg.runner.get("use_training_pipeline", False)
+        if cfg.runner.get("task_type", None) == "embodied" and cfg.runner.get(
+            "use_training_pipeline", False
         ):
             if cfg.algorithm.loss_type in {
                 "embodied_sac",

@@ -39,6 +39,7 @@ from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
     split_dict,
+    split_dict_to_chunk,
     update_nested_cfg,
 )
 from rlinf.utils.utils import (
@@ -1382,7 +1383,9 @@ class EnvWorker(Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": rollout_batch.get("loss_mask", None),
             "loss_mask_sum": rollout_batch.get("loss_mask_sum", None),
-            "normalize_advantages": False,
+            "normalize_advantages": self.cfg.algorithm.get(
+                "normalize_advantages", True
+            ),
         }
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
         rollout_batch.update(advantages_and_returns)
@@ -1392,7 +1395,9 @@ class EnvWorker(Worker):
             rollout_batch["loss_mask_sum"] = kwargs["loss_mask_sum"]
         return rollout_batch
 
-    def prepare_training_batch(self, trajectory: Trajectory) -> dict[str, torch.Tensor]:
+    def prepare_micro_batches(
+        self, trajectory: Trajectory
+    ) -> list[dict[str, torch.Tensor]]:
         batch = convert_trajectories_to_batch([trajectory])
         batch = preprocess_embodied_batch(
             batch,
@@ -1407,9 +1412,16 @@ class EnvWorker(Worker):
         )
 
         batch = self.compute_advantages_and_returns(batch)
-        # T*B
+
         batch_size = batch["prev_logprobs"].shape[0] * batch["prev_logprobs"].shape[1]
-        return pack_batch(flatten_embodied_batch(batch, torch.arange(batch_size)))
+        flatten_batch = flatten_embodied_batch(batch, torch.arange(batch_size))
+        micro_batch_size = self.cfg.actor.micro_batch_size
+        assert batch_size % micro_batch_size == 0, (
+            f"Batch size {batch_size} is not divisible by micro_batch_size {micro_batch_size}."
+        )
+        num_micro_batches = batch_size // micro_batch_size
+        micro_batches = split_dict_to_chunk(flatten_batch, num_micro_batches, dim=0)
+        return [pack_batch(micro_batch) for micro_batch in micro_batches]
 
     async def send_rollout_trajectories_pipeline(
         self, rollout_result: EmbodiedRolloutResult, channel: Channel
@@ -1418,6 +1430,7 @@ class EnvWorker(Worker):
             self.actor_split_num
         )
         for trajectory in trajectories:
-            with self.worker_timer("prepare_training_batch"):
-                training_batch = self.prepare_training_batch(trajectory)
-            channel.put(training_batch, async_op=True)
+            with self.worker_timer("prepare_micro_batches"):
+                micro_batches = self.prepare_micro_batches(trajectory)
+                for micro_batch in micro_batches:
+                    channel.put(micro_batch, async_op=True)

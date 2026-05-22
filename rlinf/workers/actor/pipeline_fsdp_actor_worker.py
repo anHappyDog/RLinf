@@ -56,7 +56,6 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
         send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")
         self.recv_split_num = compute_split_num(recv_num, send_num)
-        self.current_recv_data: list[dict[str, torch.Tensor]] = []
 
     def try_recv_micro_batch(
         self,
@@ -64,12 +63,8 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
     ) -> dict[str, torch.Tensor] | None:
         micro_batch = None
         try:
-            for _ in range(self.recv_split_num - len(self.current_recv_data)):
-                packed_batch = input_channel.get_nowait()
-                self.current_recv_data.append(unpack_batch(packed_batch))
-
-            micro_batch = cat_list_of_dict_tensor(self.current_recv_data, 0)
-            self.current_recv_data = []
+            packed_batch = input_channel.get_nowait()
+            micro_batch = unpack_batch(packed_batch)
             return micro_batch
         except asyncio.QueueEmpty:
             return None
@@ -77,7 +72,7 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
     def select_global_batch(
         self, global_batches: dict[int, list[GlobalBatchState]]
     ) -> GlobalBatchState | None:
-        for epoch in range(1, self.update_epoch + 1):
+        for epoch in range(1, self.update_epoch):
             if global_batches[epoch]:
                 return global_batches[epoch].pop(0)
         return None
@@ -147,9 +142,12 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.lr_scheduler.step()
 
         rollout_metric_batch = {
-            key: torch.cat([batch[key] for batch in received_rollout_micro_batches], dim=0)
+            key: torch.cat(
+                [batch[key] for batch in received_rollout_micro_batches], dim=0
+            )
             for key in ("rewards", "advantages", "returns")
-            if received_rollout_micro_batches and key in received_rollout_micro_batches[0]
+            if received_rollout_micro_batches
+            and key in received_rollout_micro_batches[0]
         }
         rollout_metrics = compute_rollout_metrics(rollout_metric_batch)
 
