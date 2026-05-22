@@ -22,15 +22,13 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from rlinf.scheduler import Worker
-from rlinf.utils.utils import synchronize_pending_accel_copies
-
-from .base import (
-    RecvFn,
-    SendFn,
-    WeightSyncer,
+from rlinf.utils.utils import (
     materialize_tensor,
     normalize_device,
+    synchronize_pending_accel_copies,
 )
+
+from .base import RecvFn, SendFn, WeightSyncer
 from .bucket_syncer import BucketWeightSyncer, iter_named_tensor_buckets
 from .compressor import PatchCompressor
 

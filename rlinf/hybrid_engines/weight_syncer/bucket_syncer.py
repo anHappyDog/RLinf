@@ -20,16 +20,14 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from rlinf.scheduler import Worker
-from rlinf.utils.utils import synchronize_pending_accel_copies
-
-from .base import (
-    RecvFn,
-    SendFn,
-    WeightSyncer,
+from rlinf.utils.utils import (
     materialize_tensor,
     normalize_device,
     normalize_dtype,
+    synchronize_pending_accel_copies,
 )
+
+from .base import RecvFn, SendFn, WeightSyncer
 
 
 def iter_named_tensor_buckets(
@@ -156,11 +154,11 @@ class BucketWeightSyncer(WeightSyncer):
     ):
         has_visual = any("visual." in key for key in state_dict.keys())
         named_items: list[tuple[str, torch.Tensor | DTensor]] = []
-        assert hasattr(self, "param_names_need_sync"), (
+        assert hasattr(self, "param_names_need_sync_set"), (
             "init_sender must be called before iter_buckets"
         )
-        assert self.param_names_need_sync, (
-            "param_names_need_sync must be set and not empty"
+        assert self.param_names_need_sync_set, (
+            "param_names_need_sync_set must be set and not empty"
         )
         for key, value in state_dict.items():
             if key not in self.param_names_need_sync_set:

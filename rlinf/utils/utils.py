@@ -54,6 +54,40 @@ cpu_dict = partial(apply_func_to_dict, partial(move_to_device_if_tensor, "cpu"))
 _UINT32_MOD = 2**32
 
 
+def materialize_tensor(tensor: torch.Tensor | DTensor) -> torch.Tensor:
+    """Materialize a DTensor into a dense tensor, or return tensors as-is."""
+    if isinstance(tensor, DTensor):
+        return tensor.full_tensor()
+    assert isinstance(tensor, torch.Tensor), "Expected a torch.Tensor or DTensor"
+    return tensor
+
+
+def normalize_dtype(dtype: torch.dtype | str) -> torch.dtype:
+    """Normalize string dtype aliases into torch.dtype values."""
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        mapping = {
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+        }
+        key = dtype.lower()
+        if key in mapping:
+            return mapping[key]
+    raise TypeError(f"Unsupported dtype: {dtype}")
+
+
+def normalize_device(device: torch.device | str | None) -> torch.device:
+    """Convert a device string into torch.device, defaulting to the worker device."""
+    if device is None:
+        device = Worker.torch_device_type
+    return device if isinstance(device, torch.device) else torch.device(device)
+
+
 def collect_param_names_need_sync(module: torch.nn.Module) -> list[str]:
     """Collect trainable parameters and persistent buffers for selective sync."""
     trainable_param_names = [
