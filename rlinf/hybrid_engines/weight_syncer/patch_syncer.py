@@ -133,6 +133,11 @@ class PatchBuilder(ABC):
         self.param_names_need_sync_set = set(param_names_need_sync)
         self.original_shapes = original_shapes
         self.delta_encoding = delta_encoding
+        self.param_names_need_sync_ordinals: dict[str, int] = {
+            name: ordinal
+            for ordinal, name in enumerate(self.ordered_keys)
+            if name in self.param_names_need_sync_set
+        }
 
         if not self.param_names_need_sync:
             raise ValueError("param_names_need_sync must not be empty")
@@ -264,11 +269,6 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
             thread_name_prefix="patch-snapshot-flush",
         )
         self._pending_snapshot_flush: Future[None] | None = None
-        self.param_names_need_sync_ordinals: dict[str, int] = {
-            name: ordinal
-            for ordinal, name in enumerate(self.ordered_keys)
-            if name in self.param_names_need_sync_set
-        }
 
     def create_patch(
         self,
@@ -499,33 +499,32 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
         value_byte_chunks: list[torch.Tensor] = []
         patch_device: torch.device | None = None
 
-        for ordinal, key in enumerate(self.ordered_keys):
-            if key not in self.param_names_need_sync_set:
-                continue
-            value = materialize_tensor(state_dict[key])
-            expected_shape = self.original_shapes[key]
+        for param_name in self.param_names_need_sync:
+            ordinal = self.param_names_need_sync_ordinals[param_name]
+            value = materialize_tensor(state_dict[param_name])
+            expected_shape = self.original_shapes[param_name]
             if value.shape != expected_shape:
                 raise ValueError(
-                    f"Shape mismatch for key {key}: "
+                    f"Shape mismatch for key {param_name}: "
                     f"expected {expected_shape}, got {value.shape}"
                 )
             value_2dview, _ = as_coo_2d_view(value)
             if value_2dview.device.type != Worker.torch_device_type:
                 raise ValueError(
                     "GPUSnapshotPatchBuilder requires sender state_dict tensors "
-                    f"to be on accelerator. Got key={key}, device={value_2dview.device}."
+                    f"to be on accelerator. Got key={param_name}, device={value_2dview.device}."
                 )
 
-            snapshot_value = self.snapshot[key]
+            snapshot_value = self.snapshot[param_name]
             if snapshot_value.device.type != Worker.torch_device_type:
                 raise ValueError(
                     "GPUSnapshotPatchBuilder requires snapshots to be on accelerator. "
-                    f"Got key={key}, device={snapshot_value.device}."
+                    f"Got key={param_name}, device={snapshot_value.device}."
                 )
             if snapshot_value.device != value_2dview.device:
                 raise ValueError(
                     "GPU snapshot and state tensor must be on the same accelerator. "
-                    f"Got key={key}, snapshot={snapshot_value.device}, "
+                    f"Got key={param_name}, snapshot={snapshot_value.device}, "
                     f"state={value_2dview.device}."
                 )
             if patch_device is None:

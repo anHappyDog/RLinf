@@ -154,14 +154,12 @@ class BucketWeightSyncer(WeightSyncer):
     ):
         has_visual = any("visual." in key for key in state_dict.keys())
         named_items: list[tuple[str, torch.Tensor | DTensor]] = []
-        assert hasattr(self, "param_names_need_sync_set"), (
-            "init_sender must be called before iter_buckets"
-        )
-        assert self.param_names_need_sync_set, (
-            "param_names_need_sync_set must be set and not empty"
+
+        assert self.param_names_need_sync, (
+            "param_names_need_sync must be set and not empty"
         )
         for key, value in state_dict.items():
-            if key not in self.param_names_need_sync_set:
+            if key not in self.param_names_need_sync:
                 continue
             name = self._bucket_key(key, has_visual)
             if name is None:
@@ -191,8 +189,7 @@ class BucketWeightSyncer(WeightSyncer):
         recv: RecvFn | None = None,
     ) -> None:
         del state_dict, send, recv
-        self.param_names_need_sync = param_names_need_sync
-        self.param_names_need_sync_set = set(param_names_need_sync)
+        self.param_names_need_sync = set(param_names_need_sync)
         self._sender_initialized = True
 
     async def sync(
