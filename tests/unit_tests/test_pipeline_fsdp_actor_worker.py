@@ -13,17 +13,16 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
+import importlib.util
+import sys
 from collections import defaultdict, deque
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
-
-from rlinf.workers.actor.pipeline_fsdp_actor_worker import (
-    GlobalBatchState,
-    PipelineEmbodiedFSDPActor,
-)
 
 
 class _FakeChannel:
@@ -36,6 +35,32 @@ class _FakeChannel:
         return self._items.popleft()
 
 
+@pytest.fixture
+def pipeline_actor_module(monkeypatch):
+    actor_dir = Path(__file__).resolve().parents[2] / "rlinf/workers/actor"
+    fake_fsdp_module = ModuleType("rlinf.workers.actor.fsdp_actor_worker")
+
+    class FakeEmbodiedFSDPActor:
+        pass
+
+    fake_fsdp_module.EmbodiedFSDPActor = FakeEmbodiedFSDPActor
+    monkeypatch.setitem(
+        sys.modules,
+        "rlinf.workers.actor.fsdp_actor_worker",
+        fake_fsdp_module,
+    )
+
+    module_name = "pipeline_fsdp_actor_worker_under_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        actor_dir / "pipeline_fsdp_actor_worker.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _make_micro_batch(batch_id: int) -> dict[str, torch.Tensor]:
     value = torch.tensor([float(batch_id)], dtype=torch.float32)
     return {
@@ -46,9 +71,10 @@ def _make_micro_batch(batch_id: int) -> dict[str, torch.Tensor]:
     }
 
 
-def _build_actor() -> PipelineEmbodiedFSDPActor:
-    actor = object.__new__(PipelineEmbodiedFSDPActor)
+def _build_actor(pipeline_actor_module):
+    actor = object.__new__(pipeline_actor_module.PipelineEmbodiedFSDPActor)
     actor._timer_metrics = {}
+    actor.worker_timer = lambda tag: contextlib.nullcontext()
     actor.is_weight_offloaded = False
     actor.is_optimizer_offloaded = False
     actor.model = SimpleNamespace(train=MagicMock())
@@ -60,12 +86,16 @@ def _build_actor() -> PipelineEmbodiedFSDPActor:
     return actor
 
 
-def test_select_global_batch_never_reuses_done_bucket():
-    actor = object.__new__(PipelineEmbodiedFSDPActor)
+def test_select_global_batch_never_reuses_done_bucket(pipeline_actor_module):
+    actor = object.__new__(pipeline_actor_module.PipelineEmbodiedFSDPActor)
     actor.update_epoch = 2
 
-    ready_batch = GlobalBatchState(micro_batches=[_make_micro_batch(0)], train_count=1)
-    done_batch = GlobalBatchState(micro_batches=[_make_micro_batch(1)], train_count=2)
+    ready_batch = pipeline_actor_module.GlobalBatchState(
+        micro_batches=[_make_micro_batch(0)], train_count=1
+    )
+    done_batch = pipeline_actor_module.GlobalBatchState(
+        micro_batches=[_make_micro_batch(1)], train_count=2
+    )
     global_batches = defaultdict(deque)
     global_batches[1].append(ready_batch)
     global_batches[2].append(done_batch)
@@ -79,8 +109,8 @@ def test_select_global_batch_never_reuses_done_bucket():
     assert selected is None
 
 
-def test_compute_micro_batches_requires_exact_divisibility():
-    actor = object.__new__(PipelineEmbodiedFSDPActor)
+def test_compute_micro_batches_requires_exact_divisibility(pipeline_actor_module):
+    actor = object.__new__(pipeline_actor_module.PipelineEmbodiedFSDPActor)
 
     assert (
         actor.compute_micro_batches(
@@ -106,8 +136,10 @@ def test_compute_micro_batches_requires_exact_divisibility():
         )
 
 
-def test_run_training_replays_each_global_batch_exactly_update_epoch_times():
-    actor = _build_actor()
+def test_run_training_replays_each_global_batch_exactly_update_epoch_times(
+    pipeline_actor_module, monkeypatch
+):
+    actor = _build_actor(pipeline_actor_module)
     channel = _FakeChannel([_make_micro_batch(i) for i in range(4)])
 
     train_order = []
@@ -124,17 +156,17 @@ def test_run_training_replays_each_global_batch_exactly_update_epoch_times():
     actor.train_micro_batch = train_micro_batch
     actor.finish_global_batch = finish_global_batch
 
-    with (
-        patch(
-            "rlinf.workers.actor.pipeline_fsdp_actor_worker.compute_rollout_metrics",
-            side_effect=lambda batch: {"received_rows": int(batch["rewards"].shape[0])},
-        ),
-        patch(
-            "rlinf.workers.actor.pipeline_fsdp_actor_worker.all_reduce_dict",
-            side_effect=lambda metric_dict, op=None: metric_dict,
-        ),
-    ):
-        result = actor.run_training(channel)
+    monkeypatch.setattr(
+        pipeline_actor_module,
+        "compute_rollout_metrics",
+        lambda batch: {"received_rows": int(batch["rewards"].shape[0])},
+    )
+    monkeypatch.setattr(
+        pipeline_actor_module,
+        "all_reduce_dict",
+        lambda metric_dict, op=None: metric_dict,
+    )
+    result = actor.run_training(channel)
 
     assert train_order == [
         (0, False),
