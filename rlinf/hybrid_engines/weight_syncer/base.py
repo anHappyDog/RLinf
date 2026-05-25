@@ -27,35 +27,6 @@ SendFn = Callable[[Any], Awaitable[None]]
 RecvFn = Callable[[], Awaitable[Any]]
 
 
-def materialize_tensor(tensor: torch.Tensor | DTensor) -> torch.Tensor:
-    if isinstance(tensor, DTensor):
-        return tensor.full_tensor()
-    assert isinstance(tensor, torch.Tensor), "Expected a torch.Tensor or DTensor"
-    return tensor
-
-
-def normalize_dtype(dtype: torch.dtype | str) -> torch.dtype:
-    if isinstance(dtype, torch.dtype):
-        return dtype
-    if isinstance(dtype, str):
-        mapping = {
-            "float32": torch.float32,
-            "fp32": torch.float32,
-            "float16": torch.float16,
-            "fp16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "bf16": torch.bfloat16,
-        }
-        key = dtype.lower()
-        if key in mapping:
-            return mapping[key]
-    raise TypeError(f"Unsupported dtype: {dtype}")
-
-
-def normalize_device(device: torch.device | str) -> torch.device:
-    return device if isinstance(device, torch.device) else torch.device(device)
-
-
 class WeightSyncer(ABC):
     def __init__(self):
         self._sender_initialized: bool = False
@@ -85,10 +56,11 @@ class WeightSyncer(ABC):
     async def init_sender(
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
+        param_names_need_sync: list[str],
         send: SendFn,
         recv: RecvFn | None = None,
     ) -> None:
-        del state_dict, send, recv
+        del state_dict, send, recv, param_names_need_sync
         self._sender_initialized = True
 
     async def init_receiver(
@@ -144,7 +116,22 @@ class WeightSyncer(ABC):
                     ),
                 ),
                 transport_device=OmegaConf.select(
-                    patch_config, "transport_device", default="cuda"
+                    patch_config, "transport_device", default=Worker.torch_device_type
+                ),
+                init_sync_enabled=OmegaConf.select(
+                    patch_config, "init_sync.enabled", default=False
+                ),
+                init_sync_prefixes=OmegaConf.select(
+                    patch_config, "init_sync.prefixes", default=None
+                ),
+                init_sync_bucket_size=OmegaConf.select(
+                    patch_config,
+                    "init_sync.bucket_size",
+                    default=OmegaConf.select(
+                        patch_config,
+                        "init_sync.buckets_size",
+                        default=128 * 1024 * 1024,
+                    ),
                 ),
             )
         else:
