@@ -14,7 +14,7 @@
 
 import json
 import os
-from typing import Optional, Union
+from typing import Any, Optional, TypeAlias, Union
 
 import gymnasium as gym
 import numpy as np
@@ -27,17 +27,21 @@ from rlinf.envs.utils import center_crop_image, list_of_dict_to_dict_of_list
 
 __all__ = ["RoboTwinEnv"]
 
+EnvObs: TypeAlias = dict[str, Any]
+EnvInfo: TypeAlias = dict[str, Any]
+ActionBatch: TypeAlias = Union[torch.Tensor, np.ndarray, dict[str, Any]]
+
 
 class RoboTwinEnv(gym.Env):
     def __init__(
         self,
-        cfg,
-        num_envs,
-        seed_offset,
-        total_num_processes,
-        worker_info,
-        record_metrics=True,
-    ):
+        cfg: Any,
+        num_envs: int,
+        seed_offset: int,
+        total_num_processes: int,
+        worker_info: Any,
+        record_metrics: bool = True,
+    ) -> None:
         env_seed = cfg.seed
         self.seed = env_seed + seed_offset
         self.num_envs = num_envs
@@ -69,17 +73,17 @@ class RoboTwinEnv(gym.Env):
         self.prev_step_reward = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
         )
+        self._elapsed_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
         if self.record_metrics:
             self._init_metrics()
-            self._elapsed_steps = torch.zeros(
-                self.num_envs, dtype=torch.long, device=self.device
-            )
 
-    def _init_env(self):
+    def _init_env(self) -> None:
         mp.set_start_method("spawn", force=True)
         os.environ["ASSETS_PATH"] = self.cfg.assets_path
 
-        from robotwin.envs.vector_env import VectorEnv
+        from robotwin.envs.vector_env import VectorEnv  # noqa: PLC0415
 
         env_seeds = self.reset_state_ids.tolist()
 
@@ -90,22 +94,26 @@ class RoboTwinEnv(gym.Env):
         )
 
     @property
-    def device(self):
+    def device(self) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @property
-    def elapsed_steps(self):
+    def elapsed_steps(self) -> torch.Tensor:
         return self._elapsed_steps
 
     @property
-    def is_start(self):
+    def info_logging_keys(self) -> list[str]:
+        return []
+
+    @property
+    def is_start(self) -> bool:
         return self._is_start
 
     @is_start.setter
-    def is_start(self, value):
+    def is_start(self, value: bool) -> None:
         self._is_start = value
 
-    def _init_metrics(self):
+    def _init_metrics(self) -> None:
         self.success_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -116,7 +124,9 @@ class RoboTwinEnv(gym.Env):
             self.num_envs, device=self.device, dtype=torch.float32
         )
 
-    def _reset_metrics(self, env_idx=None):
+    def _reset_metrics(
+        self, env_idx: Optional[Union[int, list[int], torch.Tensor]] = None
+    ) -> None:
         if env_idx is not None:
             mask = torch.zeros(self.num_envs, dtype=bool, device=self.device)
             mask[env_idx] = True
@@ -134,14 +144,11 @@ class RoboTwinEnv(gym.Env):
                 self.returns[:] = 0.0
                 self._elapsed_steps[:] = 0
 
-    def _record_metrics(self, step_reward, infos):
+    def _record_metrics(self, step_reward: torch.Tensor, infos: EnvInfo) -> EnvInfo:
         episode_info = {}
         self.returns += step_reward
         if "success" in infos:
-            if isinstance(infos["success"], list):
-                infos["success"] = torch.as_tensor(
-                    np.array(infos["success"]).reshape(-1), device=self.device
-                )
+            infos["success"] = self._to_1d_tensor(infos["success"], dtype=torch.bool)
             self.success_once = self.success_once | infos["success"]
             episode_info["success_once"] = self.success_once.clone()
         episode_info["return"] = self.returns.clone()
@@ -150,7 +157,9 @@ class RoboTwinEnv(gym.Env):
         infos["episode"] = episode_info
         return infos
 
-    def center_and_crop(self, image, center_crop=False):
+    def center_and_crop(
+        self, image: np.ndarray | Image.Image, center_crop: bool = False
+    ) -> np.ndarray:
         image = np.array(image)
 
         image = Image.fromarray(image).convert("RGB")
@@ -158,7 +167,7 @@ class RoboTwinEnv(gym.Env):
             image = center_crop_image(image)
         return np.array(image)
 
-    def _extract_obs_image(self, raw_obs):
+    def _extract_obs_image(self, raw_obs: list[dict[str, Any]]) -> EnvObs:
         batch_images = []
         batch_wrist_images = []
         batch_states = []
@@ -203,7 +212,18 @@ class RoboTwinEnv(gym.Env):
 
         return extracted_obs
 
-    def _calc_step_reward(self, terminations):
+    def _to_1d_tensor(
+        self,
+        value: Any,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value.to(device=self.device, dtype=dtype).reshape(-1)
+        return torch.as_tensor(
+            np.array(value).reshape(-1), dtype=dtype, device=self.device
+        )
+
+    def _calc_step_reward(self, terminations: torch.Tensor) -> torch.Tensor:
         reward = self.cfg.reward_coef * terminations
 
         reward_diff = reward - self.prev_step_reward
@@ -214,21 +234,27 @@ class RoboTwinEnv(gym.Env):
         else:
             return reward
 
-    def _cal_chunk_rewards(self, step_reward, chunk_step, terminations, infos):
-        n_steps_to_run = np.array(
-            [[0] for i in range(self.num_envs)]
-        )  # infos.get("n_steps_to_run", np.array([[0] for i in range(self.num_envs)]))
+    def _cal_chunk_rewards(
+        self,
+        step_reward: torch.Tensor,
+        chunk_step: int,
+        terminations: torch.Tensor,
+        infos: EnvInfo,
+    ) -> torch.Tensor:
+        n_steps_to_run = infos.get(
+            "n_steps_to_run", np.zeros((self.num_envs, 1), dtype=np.int64)
+        )
 
         n_steps_to_run = torch.as_tensor(
-            np.array(n_steps_to_run).reshape(-1), device=self.device
+            np.array(n_steps_to_run).reshape(-1), dtype=torch.long, device=self.device
         )
         chunk_rewards = torch.zeros(self.num_envs, chunk_step, device=self.device)
         for env_id in range(self.num_envs):
-            steps_left = n_steps_to_run[env_id]
+            steps_left = int(n_steps_to_run[env_id].item())
             reward = step_reward[env_id]
             start_idx = chunk_step - steps_left - 1
 
-            if terminations[env_id] and start_idx > 0:
+            if terminations[env_id] and start_idx >= 0:
                 if self.use_rel_reward:
                     chunk_rewards[env_id, start_idx] = reward
                 else:
@@ -239,8 +265,8 @@ class RoboTwinEnv(gym.Env):
     def reset(
         self,
         env_idx: Optional[Union[int, list[int]]] = None,
-        env_seeds=None,
-    ):
+        env_seeds: Optional[list[int]] = None,
+    ) -> tuple[EnvObs, EnvInfo]:
         if self._is_start:
             self._is_start = False
 
@@ -257,10 +283,15 @@ class RoboTwinEnv(gym.Env):
         return extracted_obs, infos
 
     def step(
-        self, actions: Union[torch.Tensor, np.ndarray, dict] = None, auto_reset=True
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        self, actions: Optional[ActionBatch] = None, auto_reset: bool = True
+    ) -> tuple[EnvObs, torch.Tensor, torch.Tensor, torch.Tensor, EnvInfo]:
         if actions is None:
-            assert self._is_start, "Actions must be provided after the first reset."
+            if not self._is_start:
+                raise ValueError("Actions must be provided after the first reset.")
+            obs, infos = self.reset()
+            zeros = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+            dones = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            return obs, zeros, dones, dones.clone(), infos
 
         if isinstance(actions, torch.Tensor):
             actions = actions.cpu().numpy()
@@ -278,30 +309,21 @@ class RoboTwinEnv(gym.Env):
         extracted_obs = self._extract_obs_image(raw_obs)
         infos = list_of_dict_to_dict_of_list(info_list)
 
-        if isinstance(terminations, list):
-            terminations = torch.as_tensor(
-                np.array(terminations).reshape(-1), device=self.device
-            )
-        if isinstance(truncations, list):
-            truncations = torch.as_tensor(
-                np.array(truncations).reshape(-1), device=self.device
-            )
+        terminations = self._to_1d_tensor(terminations, dtype=torch.bool)
+        truncations = self._to_1d_tensor(truncations, dtype=torch.bool)
 
         if self.use_custom_reward:
             step_reward = self._calc_step_reward(terminations)
         else:
-            if isinstance(step_reward, list):
-                step_reward = torch.as_tensor(
-                    np.array(step_reward, dtype=np.float32).reshape(-1),
-                    device=self.device,
-                )
+            step_reward = self._to_1d_tensor(step_reward, dtype=torch.float32)
 
         self._elapsed_steps += actions.shape[1]
         truncated = self._elapsed_steps >= self.cfg.max_episode_steps
         if truncated.any():
             truncations = torch.logical_or(truncated, truncations)
 
-        infos = self._record_metrics(step_reward, infos)
+        if self.record_metrics:
+            infos = self._record_metrics(step_reward, infos)
 
         if self.ignore_terminations:
             terminations[:] = False
@@ -317,7 +339,9 @@ class RoboTwinEnv(gym.Env):
 
         return extracted_obs, step_reward, terminations, truncations, infos
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(
+        self, chunk_actions: torch.Tensor | np.ndarray
+    ) -> tuple[list[EnvObs], torch.Tensor, torch.Tensor, torch.Tensor, list[EnvInfo]]:
         if isinstance(chunk_actions, torch.Tensor):
             chunk_actions = chunk_actions.cpu().numpy()
 
@@ -334,23 +358,13 @@ class RoboTwinEnv(gym.Env):
         infos = list_of_dict_to_dict_of_list(info_list)
         obs_list.append(extracted_obs)
         infos_list.append(infos)
-        if isinstance(terminations, list):
-            terminations = torch.as_tensor(
-                np.array(terminations).reshape(-1), device=self.device
-            )
-        if isinstance(truncations, list):
-            truncations = torch.as_tensor(
-                np.array(truncations).reshape(-1), device=self.device
-            )
+        terminations = self._to_1d_tensor(terminations, dtype=torch.bool)
+        truncations = self._to_1d_tensor(truncations, dtype=torch.bool)
 
         if self.use_custom_reward:
             step_reward = self._calc_step_reward(terminations)
         else:
-            if isinstance(step_reward, list):
-                step_reward = torch.as_tensor(
-                    np.array(step_reward, dtype=np.float32).reshape(-1),
-                    device=self.device,
-                )
+            step_reward = self._to_1d_tensor(step_reward, dtype=torch.float32)
 
         chunk_rewards = self._cal_chunk_rewards(
             step_reward, chunk_step, terminations, infos
@@ -361,7 +375,8 @@ class RoboTwinEnv(gym.Env):
         if truncated.any():
             truncations = torch.logical_or(truncated, truncations)
 
-        infos = self._record_metrics(step_reward, infos)
+        if self.record_metrics:
+            infos = self._record_metrics(step_reward, infos)
 
         if self.ignore_terminations:
             terminations[:] = False
@@ -375,10 +390,14 @@ class RoboTwinEnv(gym.Env):
                 past_dones, obs_list[-1], infos_list[-1]
             )
 
-        chunk_terminations = torch.zeros((num_envs, chunk_step), dtype=bool)
+        chunk_terminations = torch.zeros(
+            (num_envs, chunk_step), dtype=torch.bool, device=self.device
+        )
         chunk_terminations[:, -1] = terminations
 
-        chunk_truncations = torch.zeros((num_envs, chunk_step), dtype=bool)
+        chunk_truncations = torch.zeros(
+            (num_envs, chunk_step), dtype=torch.bool, device=self.device
+        )
         chunk_truncations[:, -1] = truncations
 
         return (
@@ -389,7 +408,9 @@ class RoboTwinEnv(gym.Env):
             infos_list,
         )
 
-    def _handle_auto_reset(self, dones, extracted_obs, infos):
+    def _handle_auto_reset(
+        self, dones: torch.Tensor, extracted_obs: EnvObs, infos: EnvInfo
+    ) -> tuple[EnvObs, EnvInfo]:
         final_obs = extracted_obs.copy()
         env_idx = torch.arange(0, self.num_envs, device=self.device)[dones]
         final_info = infos.copy()
@@ -405,18 +426,15 @@ class RoboTwinEnv(gym.Env):
         infos["_elapsed_steps"] = dones
         return extracted_obs, infos
 
-    def close(self, clear_cache=True):
+    def close(self, clear_cache: bool = True) -> None:
         if hasattr(self, "venv"):
             self.venv.close(clear_cache)
 
-    def sample_action_space(self):
-        return np.random.randn(self.num_envs, self.horizon, 14)
-
-    def _init_reset_state_ids(self):
+    def _init_reset_state_ids(self) -> None:
         if self.cfg.get("seeds_path", None) is not None and os.path.exists(
             self.cfg.seeds_path
         ):
-            with open(self.cfg.seeds_path, "r") as f:
+            with open(self.cfg.seeds_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             success_seeds = data[self.task_name].get("success_seeds", None)
             if success_seeds is not None:
@@ -444,7 +462,9 @@ class RoboTwinEnv(gym.Env):
             self._generator.manual_seed(self.seed)
         self.update_reset_state_ids()
 
-    def update_reset_state_ids(self, env_idx=None):
+    def update_reset_state_ids(
+        self, env_idx: Optional[Union[list[int], torch.Tensor]] = None
+    ) -> None:
         if self.use_fixed_reset_state_ids and hasattr(self, "reset_state_ids"):
             return
 
@@ -472,7 +492,8 @@ class RoboTwinEnv(gym.Env):
                 reset_state_ids = reset_state_ids.repeat_interleave(
                     repeats=self.group_size
                 )
-            for idx in env_idx:
+            env_idx = torch.as_tensor(env_idx, dtype=torch.long).reshape(-1)
+            for idx in env_idx.tolist():
                 self.reset_state_ids[idx] = reset_state_ids[idx]
         else:
             if self.success_seeds is not None:
@@ -500,7 +521,7 @@ class RoboTwinEnv(gym.Env):
                 )
             self.reset_state_ids = reset_state_ids
 
-    def check_seeds(self, seeds):
-        resutls = self.venv.check_seeds(seeds)
+    def check_seeds(self, seeds: list[int] | np.ndarray | torch.Tensor) -> Any:
+        results = self.venv.check_seeds(seeds)
 
-        return resutls
+        return results
