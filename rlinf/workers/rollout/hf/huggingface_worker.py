@@ -258,10 +258,7 @@ class MultiStepRolloutWorker(Worker):
     ) -> dict[str, list[int]]:
         """Compute batch_size for this rollout worker in decoupled mode."""
         if self._use_delayed_per_env_receive():
-            envs_per_rollout_worker = batch_size // self.placement.get_world_size(
-                "rollout"
-            )
-            return [1 for _ in range(envs_per_rollout_worker)]
+            return [1]
         return CommMapper.decoupled_get_batch_index(
             batch_size=batch_size,
             src_world_size=self.placement.get_world_size("rollout"),
