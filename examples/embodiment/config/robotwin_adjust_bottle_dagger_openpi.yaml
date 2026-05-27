@@ -81,6 +81,11 @@ algorithm:
 env:
   group_name: "EnvGroup"
   # enable_offload: False
+  delay_sampler:
+    type: uniform
+    min_delay: 0.11
+    max_delay: 0.20
+
   train:
     total_num_envs: 64
     reward_coef: ${algorithm.reward_coef}
