@@ -141,7 +141,7 @@ class MultiStepRolloutWorker(Worker):
                 assert self.placement.get_world_size("env") > 1, (
                     "when rollout worker num is greater than 1, env world size should be greater than 1 in decoupled mode, but got 1"
                 )
-            if self.rollout_queue_size > 0:
+            if self.rollout_queue_size > 0 and not self._use_delayed_per_env_receive():
                 assert self.placement.get_world_size(
                     "env"
                 ) > self.placement.get_world_size("rollout"), (
@@ -250,10 +250,18 @@ class MultiStepRolloutWorker(Worker):
                 f"Beta schedule {self._dagger_sampling_params['beta_schedule']} is not implemented"
             )
 
+    def _use_delayed_per_env_receive(self) -> bool:
+        return self.cfg.env.get("delay_sampler", None) is not None
+
     def _decoupled_env_mode_setup_batch_size(
         self, batch_size: int
     ) -> dict[str, list[int]]:
         """Compute batch_size for this rollout worker in decoupled mode."""
+        if self._use_delayed_per_env_receive():
+            envs_per_rollout_worker = batch_size // self.placement.get_world_size(
+                "rollout"
+            )
+            return [1 for _ in range(envs_per_rollout_worker)]
         return CommMapper.decoupled_get_batch_index(
             batch_size=batch_size,
             src_world_size=self.placement.get_world_size("rollout"),
