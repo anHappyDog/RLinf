@@ -57,13 +57,15 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
         self,
         input_channel: Channel,
     ) -> dict[str, torch.Tensor] | None:
-        micro_batch = None
         try:
             packed_batch = input_channel.get_nowait()
-            micro_batch = unpack_batch(packed_batch)
-            return micro_batch
+            return unpack_batch(packed_batch)
         except asyncio.QueueEmpty:
             return None
+
+    def recv_micro_batch(self, input_channel: Channel) -> dict[str, torch.Tensor]:
+        packed_batch = input_channel.get()
+        return unpack_batch(packed_batch)
 
     def select_global_batch(
         self, global_batches: dict[int, deque[GlobalBatchState]]
@@ -123,6 +125,11 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
                 break
 
             if not (global_batch := self.select_global_batch(global_batches)):
+                if received_micro_batch_count < self.micro_batches_per_step:
+                    micro_batch = self.recv_micro_batch(input_channel)
+                    pending_global_batch.append(micro_batch)
+                    received_rollout_micro_batches.append(micro_batch)
+                    received_micro_batch_count += 1
                 continue
 
             for idx, micro_batch in enumerate(global_batch.micro_batches):
