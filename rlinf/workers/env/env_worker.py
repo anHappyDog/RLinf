@@ -1313,6 +1313,9 @@ class EnvWorker(Worker):
     def compute_advantages_and_returns(
         self, rollout_batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        # Advantages/returns are rollout-level quantities, so compute them before
+        # splitting. After this point each channel item is an actor micro-batch that can
+        # be trained directly without reconstructing the full rollout batch on actor.
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
@@ -1340,6 +1343,9 @@ class EnvWorker(Worker):
     def prepare_micro_batches(
         self, trajectory: Trajectory
     ) -> list[dict[str, torch.Tensor]]:
+        # In training pipeline mode, send ready-to-train actor micro-batches instead of
+        # full rollout trajectories. This keeps nested observations out of the channel
+        # payload so packed tensors can use the channel tensor fast path.
         batch = convert_trajectories_to_batch([trajectory])
         batch = preprocess_embodied_batch(
             batch,
