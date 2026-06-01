@@ -1397,9 +1397,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             SupportedModel.OPENVLA,
             SupportedModel.OPENVLA_OFT,
         ]:
-            kwargs["temperature"] = (
-                self.cfg.algorithm.sampling_params.temperature_train
-            )
+            kwargs["temperature"] = self.cfg.algorithm.sampling_params.temperature_train
             kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
         elif SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.GR00T,
@@ -1446,9 +1444,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
         }
         loss, metrics_data = policy_loss(**loss_kwargs)
-        metrics_data["actor/entropy_loss"] = self.compute_entropy_loss(
-            output_dict, loss, loss_mask, critic_warmup=loss_kwargs["critic_warmup"]
-        )
+        if (
+            entropy_loss := self.compute_entropy_loss(
+                output_dict, loss_mask, critic_warmup=loss_kwargs["critic_warmup"]
+            )
+        ) is not None:
+            loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+            metrics_data["actor/entropy_loss"] = entropy_loss
+        else:
+            metrics_data["actor/entropy_loss"] = 0.0
+
         if self.enable_sft_co_train:
             self._train_sft_epoch(metrics_data, loss)
 
@@ -1462,10 +1467,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def compute_entropy_loss(
         self,
         output_dict: dict,
-        loss: torch.Tensor,
         loss_mask: torch.Tensor,
         critic_warmup: bool,
-    ) -> float:
+    ) -> float | None:
         if self.cfg.algorithm.entropy_bonus > 0 and not critic_warmup:
             entropy = reshape_entropy(
                 output_dict["entropy"],
@@ -1474,9 +1478,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 batch_size=output_dict["logprobs"].shape[0],
             )
             entropy_loss = masked_mean(entropy, mask=loss_mask)
-            loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
             return entropy_loss.detach().item()
-        return 0.0
+        return None
 
     def set_global_step(self, global_step: int) -> None:
         """
