@@ -50,10 +50,10 @@ def pipeline_actor_module(monkeypatch):
         fake_fsdp_module,
     )
 
-    module_name = "pipeline_fsdp_actor_worker_under_test"
+    module_name = "fsdp_actor_worker_pipeline_under_test"
     spec = importlib.util.spec_from_file_location(
         module_name,
-        actor_dir / "pipeline_fsdp_actor_worker.py",
+        actor_dir / "fsdp_actor_worker_pipeline.py",
     )
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)

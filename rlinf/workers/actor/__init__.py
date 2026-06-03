@@ -31,7 +31,7 @@ def get_actor_worker(cfg: DictConfig) -> type[Worker]:
                     "runner.use_training_pipeline=True is not supported for "
                     f"loss_type={cfg.algorithm.loss_type}."
                 )
-            from .pipeline_fsdp_actor_worker import PipelineEmbodiedFSDPActor
+            from .fsdp_actor_worker_pipeline import PipelineEmbodiedFSDPActor
 
             return PipelineEmbodiedFSDPActor
         from .fsdp_actor_worker import FSDPActor

@@ -73,7 +73,7 @@ def main(cfg) -> None:
         actor_worker_cls = EmbodiedNFTFSDPPolicy
     else:
         if use_training_pipeline:
-            from rlinf.workers.actor.pipeline_fsdp_actor_worker import (
+            from rlinf.workers.actor.fsdp_actor_worker_pipeline import (
                 PipelineEmbodiedFSDPActor,
             )
 

@@ -1445,7 +1445,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         }
         loss, metrics_data = policy_loss(**loss_kwargs)
         entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
-        if self.cfg.algorithm.entropy_bonus > 0 and not kwargs["critic_warmup"]:
+        if self.cfg.algorithm.entropy_bonus > 0 and not loss_kwargs["critic_warmup"]:
             entropy = output_dict["entropy"]
             entropy = reshape_entropy(
                 entropy,
