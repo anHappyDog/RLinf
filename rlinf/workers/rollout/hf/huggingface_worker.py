@@ -131,19 +131,54 @@ class MultiStepRolloutWorker(Worker):
                 eval_batch_size=self.eval_batch_size,
             )
 
-        self.dst_ranks = {}
-        self.src_ranks = {}
-        if not self.cfg.runner.only_eval:
-            self.dst_ranks = {
-                "train": self._setup_dst_ranks(
+        env_mode = self.cfg.env.train.get("env_mode", None)
+        assert env_mode in ["decoupled", None], f"{env_mode} is not supported"
+        self.env_decoupled_mode = env_mode == "decoupled"
+        self.rollout_queue_size = self.cfg.env.train.get("rollout_queue_size", 0)
+        if self.env_decoupled_mode:
+            if self.placement.get_world_size("rollout") > 1:
+                # when the rollout worker num is greater than 1, the env worker num should be greater than 1
+                assert self.placement.get_world_size("env") > 1, (
+                    "when rollout worker num is greater than 1, env world size should be greater than 1 in decoupled mode, but got 1"
+                )
+            if self.rollout_queue_size > 0:
+                assert self.placement.get_world_size(
+                    "env"
+                ) > self.placement.get_world_size("rollout"), (
+                    "when rollout queue size is greater than 0, env world size should be greater than rollout world size in decoupled mode, but got 1"
+                )
+            self.batch_size_map = {
+                "train": self._decoupled_env_mode_setup_batch_size(
                     self.total_num_train_envs // self.num_pipeline_stages
                 ),
-            }
-            self.src_ranks = {
-                "train": self._setup_src_ranks(
-                    self.total_num_train_envs // self.num_pipeline_stages
+                "eval": self._decoupled_env_mode_setup_batch_size(
+                    self.total_num_eval_envs // self.num_pipeline_stages
                 ),
             }
+            # save the run-time imformation in communicate channel for decoupled mode
+            self.batch_index_map = {
+                "train": [],
+            }
+            self.log_info(
+                f"decoupled model rollout worker initialized with batch_size_map: {self.batch_size_map}"
+            )
+
+            # use for evaluation
+            self.dst_ranks = {}
+            self.src_ranks = {}
+        else:
+            if not self.cfg.runner.only_eval:
+                self.dst_ranks = {
+                    "train": self._setup_dst_ranks(
+                        self.total_num_train_envs // self.num_pipeline_stages
+                    ),
+                }
+                self.src_ranks = {
+                    "train": self._setup_src_ranks(
+                        self.total_num_train_envs // self.num_pipeline_stages
+                    ),
+                }
+
         if self.enable_eval:
             self.dst_ranks["eval"] = self._setup_dst_ranks(
                 self.total_num_eval_envs // self.num_pipeline_stages
@@ -154,6 +189,7 @@ class MultiStepRolloutWorker(Worker):
 
         self.log_info(f"Rollout worker initialized with dst_ranks: {self.dst_ranks}")
         self.log_info(f"Rollout worker initialized with src_ranks: {self.src_ranks}")
+
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
@@ -213,6 +249,18 @@ class MultiStepRolloutWorker(Worker):
             raise NotImplementedError(
                 f"Beta schedule {self._dagger_sampling_params['beta_schedule']} is not implemented"
             )
+
+    def _decoupled_env_mode_setup_batch_size(
+        self, batch_size: int
+    ) -> dict[str, list[int]]:
+        """Compute batch_size for this rollout worker in decoupled mode."""
+        return CommMapper.decoupled_get_batch_index(
+            batch_size=batch_size,
+            src_world_size=self.placement.get_world_size("rollout"),
+            dst_world_size=self.placement.get_world_size("env"),
+            split_size=self.placement.get_world_size("env"),
+            queue_size=self.rollout_queue_size,
+        )
 
     def _setup_dst_ranks(self, batch_size: int) -> list[tuple[int, int]]:
         """Compute env peer ranks for this rollout worker.
