@@ -211,10 +211,6 @@ def setup_omni_cfg(cfg: DictConfig) -> DictConfig:
     base_config_name = OmegaConf.select(
         cfg, "base_config_name", default="r1pro_behavior"
     )
-    if base_config_name != "r1pro_behavior":
-        raise ValueError(
-            f"Only r1pro_behavior is supported for omnigibson, got {base_config_name}"
-        )
 
     import omnigibson as og
     from omnigibson.macros import gm

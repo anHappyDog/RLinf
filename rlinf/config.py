@@ -941,7 +941,13 @@ def validate_embodied_cfg(cfg):
             cfg.env.eval.init_params.control_mode = get_robot_control_mode(
                 cfg.actor.model.policy_setup
             )
-
+        elif (
+            SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.BEHAVIOR
+            or SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.BEHAVIOR
+        ):
+            assert cfg.env.train.base_config_name == "r1pro_behavior", (
+                f"Only r1pro_behavior is supported for omnigibson, got {cfg.env.train.base_config_name}"
+            )
     return cfg
 
 
