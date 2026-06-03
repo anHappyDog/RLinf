@@ -73,6 +73,7 @@ def _make_micro_batch(batch_id: int) -> dict[str, torch.Tensor]:
 
 def _build_actor(pipeline_actor_module):
     actor = object.__new__(pipeline_actor_module.PipelineEmbodiedFSDPActor)
+    actor._accelerator_type = pipeline_actor_module.Worker.accelerator_type
     actor._timer_metrics = {}
     actor.worker_timer = lambda tag: contextlib.nullcontext()
     actor.is_weight_offloaded = False
