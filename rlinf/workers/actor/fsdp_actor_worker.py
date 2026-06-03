@@ -1444,15 +1444,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
         }
         loss, metrics_data = policy_loss(**loss_kwargs)
-        if (
-            entropy_loss := self.compute_entropy_loss(
-                output_dict, loss_mask, critic_warmup=loss_kwargs["critic_warmup"]
+        entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
+        if self.cfg.algorithm.entropy_bonus > 0 and not kwargs["critic_warmup"]:
+            entropy = output_dict["entropy"]
+            entropy = reshape_entropy(
+                entropy,
+                entropy_type=self.cfg.algorithm.entropy_type,
+                action_dim=self.cfg.actor.model.get("action_dim", 7),
+                batch_size=output_dict["logprobs"].shape[0],
             )
-        ) is not None:
+            entropy_loss = masked_mean(entropy, mask=loss_mask)
             loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
-            metrics_data["actor/entropy_loss"] = entropy_loss
-        else:
-            metrics_data["actor/entropy_loss"] = 0.0
+        metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 
         if self.enable_sft_co_train:
             self._train_sft_epoch(metrics_data, loss)
@@ -1463,23 +1466,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         metrics_data["actor/total_loss"] = loss.detach().item()
         append_to_dict(metrics, metrics_data)
-
-    def compute_entropy_loss(
-        self,
-        output_dict: dict,
-        loss_mask: torch.Tensor,
-        critic_warmup: bool,
-    ) -> float | None:
-        if self.cfg.algorithm.entropy_bonus > 0 and not critic_warmup:
-            entropy = reshape_entropy(
-                output_dict["entropy"],
-                entropy_type=self.cfg.algorithm.entropy_type,
-                action_dim=self.cfg.actor.model.get("action_dim", 7),
-                batch_size=output_dict["logprobs"].shape[0],
-            )
-            entropy_loss = masked_mean(entropy, mask=loss_mask)
-            return entropy_loss.detach().item()
-        return None
 
     def set_global_step(self, global_step: int) -> None:
         """
