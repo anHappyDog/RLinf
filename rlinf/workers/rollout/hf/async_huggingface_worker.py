@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import gc
 from typing import Any, Literal
 
 import numpy as np
