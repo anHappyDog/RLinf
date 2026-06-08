@@ -148,16 +148,13 @@ class MultiStepRolloutWorker(Worker):
                     "when rollout queue size is greater than 0, env world size should be greater than rollout world size in decoupled mode, but got 1"
                 )
             self.batch_size_map = {
-                "train": self._decoupled_env_mode_setup_batch_size(
+                "rollout": self._decoupled_env_mode_setup_batch_size(
                     self.total_num_train_envs // self.num_pipeline_stages
-                ),
-                "eval": self._decoupled_env_mode_setup_batch_size(
-                    self.total_num_eval_envs // self.num_pipeline_stages
                 ),
             }
             # save the run-time imformation in communicate channel for decoupled mode
             self.batch_index_map = {
-                "train": [],
+                "rollout": [],
             }
             self.log_info(
                 f"decoupled model rollout worker initialized with batch_size_map: {self.batch_size_map}"

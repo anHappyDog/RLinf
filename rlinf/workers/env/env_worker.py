@@ -135,19 +135,14 @@ class EnvWorker(Worker):
             self.log_info(
                 f"decoupled model env worker initialized with batch_size_map: {self.batch_size_map}"
             )
-
-            self.dst_rank_map = {}
-            self.src_rank_map = {}
         else:
             self.dst_rank_map = self._setup_dst_rank_map()
             self.src_rank_map = self._setup_src_rank_map()
-
-        if self.enable_eval:
-            self.dst_rank_map.update(self._setup_eval_dst_rank_map())
-            self.src_rank_map.update(self._setup_eval_src_rank_map())
-
-        self.log_info(f"Env worker initialized with dst_rank_map: {self.dst_rank_map}")
-        self.log_info(f"Env worker initialized with src_rank_map: {self.src_rank_map}")
+            if self.enable_eval:
+                self.dst_rank_map.update(self._setup_eval_dst_rank_map())
+                self.src_rank_map.update(self._setup_eval_src_rank_map())
+            self.log_info(f"Env worker initialized with dst_rank_map: {self.dst_rank_map}")
+            self.log_info(f"Env worker initialized with src_rank_map: {self.src_rank_map}")
 
         # This is a barrier to ensure all envs' initial setup upon import is done
         # Essential for RealWorld env to ensure initial ROS node setup is done
@@ -964,7 +959,7 @@ class EnvWorker(Worker):
                     ),
                     "batch": batch,
                 },
-                key=CommMapper.build_channel_key(None, None, extra=f"{mode}_obs"),
+                key=CommMapper.build_channel_key(None, None, extra=f"rollout_obs"),
             )
 
     def send_reward_input(
@@ -1485,20 +1480,35 @@ class EnvWorker(Worker):
                         ),
                     )
                     env_batch = env_output.to_dict()
-                    self.send_env_batch(
-                        rollout_channel,
-                        {
-                            "obs": env_batch["obs"],
-                            "final_obs": env_batch["final_obs"],
-                        },
-                        mode="eval",
-                    )
+                    if self.env_decoupled_mode:
+                        self.send_env_batch_to_channel(
+                            rollout_channel,
+                            {
+                                "obs": env_batch["obs"],
+                                "final_obs": env_batch["final_obs"],
+                            },
+                            mode="eval",
+                        )
+                    else:
+                        self.send_env_batch(
+                            rollout_channel,
+                            {
+                                "obs": env_batch["obs"],
+                                "final_obs": env_batch["final_obs"],
+                            },
+                            mode="eval",
+                        )
 
             for eval_step in range(self.n_eval_chunk_steps):
                 for stage_id in range(self.stage_num):
-                    raw_chunk_actions = self.recv_chunk_actions(
-                        input_channel, mode="eval"
-                    )
+                    if self.env_decoupled_mode:
+                        raw_chunk_actions = self.recv_chunk_actions(
+                            input_channel, mode="eval"
+                        )
+                    else:
+                        raw_chunk_actions = self.recv_chunk_actions_from_channel(
+                            input_channel, model="eval"
+                        )
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )
@@ -1517,14 +1527,24 @@ class EnvWorker(Worker):
                         if eval_step == self.n_eval_chunk_steps - 1:
                             continue
                     env_batch = env_output.to_dict()
-                    self.send_env_batch(
-                        rollout_channel,
-                        {
-                            "obs": env_batch["obs"],
-                            "final_obs": env_batch["final_obs"],
-                        },
-                        mode="eval",
-                    )
+                    if self.env_decoupled_mode:
+                        self.send_env_batch_to_channel(
+                            rollout_channel,
+                            {
+                                "obs": env_batch["obs"],
+                                "final_obs": env_batch["final_obs"],
+                            },
+                            mode="eval",
+                        )
+                    else:
+                        self.send_env_batch(
+                            rollout_channel,
+                            {
+                                "obs": env_batch["obs"],
+                                "final_obs": env_batch["final_obs"],
+                            },
+                            mode="eval",
+                        )
 
             self.finish_rollout(mode="eval")
         for stage_id in range(self.stage_num):

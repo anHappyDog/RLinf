@@ -281,12 +281,9 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self,
         output_channel: Channel,
         rollout_result: RolloutResult,
-        mode: Literal["train", "eval"] = "train",
     ):
-        assert mode in ["train", "eval"], f"{mode=} is not supported"
-        assert mode == "train", "Now eval mode is not supported in env decoupled mode"
-        batch_size_map = self.batch_size_map[mode]
-        batch_index_map = self.batch_index_map[mode]
+        batch_size_map = self.batch_size_map["rollout"]
+        batch_index_map = self.batch_index_map["rollout"]
         assert len(batch_index_map) == len(batch_size_map), (
             f"batch_index_map and batch_size_map must have the same length, but got {len(batch_index_map)} and {len(batch_size_map)}."
         )
@@ -302,7 +299,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         )
         for i, shard_result in enumerate(split_rollout_results):
             batch_index = batch_index_map[i]
-            env_rank, batch_idx, _, last_run = _split_channel_message(batch_index)
+            env_rank, batch_idx, mode, last_run = _split_channel_message(batch_index)
 
             item = {
                 "batch_index": _build_channel_message(
@@ -319,11 +316,11 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 async_op=True,
             )
         # delete the batch index map
-        self.batch_index_map[mode] = []
+        self.batch_index_map["rollout"] = []
         return
 
     async def recv_env_output_from_channel(
-        self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
+        self, input_channel: Channel
     ) -> dict[str, Any]:
         """Receive env outputs from mapped env ranks and merge if needed.
 
@@ -335,11 +332,9 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             A single env output dict. When multiple env ranks are mapped to this
             rollout worker, outputs are merged on batch dimension.
         """
-        assert mode in ["train", "eval"], f"{mode=} is not supported"
-        assert mode == "train", "Now eval mode is not supported in env decoupled mode"
 
-        batch_size_map = self.batch_size_map[mode]
-        batch_index_map = self.batch_index_map[mode]
+        batch_size_map = self.batch_size_map["rollout"]
+        batch_index_map = self.batch_index_map["rollout"]
         assert len(batch_index_map) == 0, (
             f"batch_index_map must be empty, but got batch_index_map {batch_index_map}."
         )
@@ -347,7 +342,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         obs_batches = []
         for expected_size in batch_size_map:
             obs_batch = await input_channel.get(
-                key=CommMapper.build_channel_key(None, None, extra=f"{mode}_obs"),
+                key=CommMapper.build_channel_key(None, None, extra=f"rollout_obs"),
                 async_op=True,
             ).async_wait()
             batch_index = obs_batch["batch_index"]
@@ -401,7 +396,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 ),
             )
             self.send_rollout_result_to_channel(
-                output_channel, rollout_result, mode="train"
+                output_channel, rollout_result
             )
 
     def send_chunk_actions_to_channel(
