@@ -160,9 +160,6 @@ class MultiStepRolloutWorker(Worker):
                 f"decoupled model rollout worker initialized with batch_size_map: {self.batch_size_map}"
             )
 
-            # use for evaluation
-            self.dst_ranks = {}
-            self.src_ranks = {}
         else:
             if not self.cfg.runner.only_eval:
                 self.dst_ranks = {
@@ -176,16 +173,16 @@ class MultiStepRolloutWorker(Worker):
                     ),
                 }
 
-        if self.enable_eval:
-            self.dst_ranks["eval"] = self._setup_dst_ranks(
-                self.total_num_eval_envs // self.num_pipeline_stages
-            )
-            self.src_ranks["eval"] = self._setup_src_ranks(
-                self.total_num_eval_envs // self.num_pipeline_stages
-            )
+            if self.enable_eval:
+                self.dst_ranks["eval"] = self._setup_dst_ranks(
+                    self.total_num_eval_envs // self.num_pipeline_stages
+                )
+                self.src_ranks["eval"] = self._setup_src_ranks(
+                    self.total_num_eval_envs // self.num_pipeline_stages
+                )
 
-        self.log_info(f"Rollout worker initialized with dst_ranks: {self.dst_ranks}")
-        self.log_info(f"Rollout worker initialized with src_ranks: {self.src_ranks}")
+            self.log_info(f"Rollout worker initialized with dst_ranks: {self.dst_ranks}")
+            self.log_info(f"Rollout worker initialized with src_ranks: {self.src_ranks}")
 
         self.setup_sample_params()
         if self.enable_offload:

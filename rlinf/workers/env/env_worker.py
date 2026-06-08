@@ -727,30 +727,34 @@ class EnvWorker(Worker):
         """
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         batch_size_map = self.batch_size_map[f"rollout_{mode}"]
-        chunk_action_idx = []
+        idx_rollout_results = []
         for i, expected_size in enumerate(batch_size_map):
             item = input_channel.get(
                 key=CommMapper.build_channel_key(
-                    None, self._rank, extra=f"{mode}_actions"
+                    None, self._rank, extra=f"{mode}_rollout_results"
                 ),
             )
             batch_index = item["batch_index"]
-            action_i = item["batch"]
-            _, action_idx, _, _ = _split_channel_message(batch_index)
-            if isinstance(action_i, torch.Tensor):
-                action_i = action_i.detach().cpu().numpy()
-            else:
-                action_i = np.asarray(action_i)
-            assert action_i.shape[0] == expected_size, (
-                f"Expected action shard size {expected_size} get the batch index {i}, "
-                f"got shape {action_i.shape}."
+            rollout_result = item["batch"]
+
+            # the bug, in frankasim, the actions is a tensor with requires_grad=True
+            rollout_result.actions.requires_grad = False
+
+            _, rollout_result_idx, _, _ = _split_channel_message(batch_index)
+
+
+            actual_size = self._infer_rollout_batch_size(rollout_result)
+            assert actual_size == expected_size, (
+                f"Expected rollout result size {expected_size} get the batch index {i}, "
+                f"got {actual_size}."
             )
-            chunk_action_idx.append((action_idx, action_i))
+            idx_rollout_results.append((rollout_result_idx, rollout_result))
 
-        chunk_action_idx.sort(key=lambda x: x[0])
-        chunk_action = [x[1] for x in chunk_action_idx]
+        idx_rollout_results.sort(key=lambda x: x[0])
+        rollout_results = RolloutResult.merge_rollout_results([x[1] for x in idx_rollout_results])
+        
+        chunk_action = rollout_results.actions
 
-        chunk_action = np.concatenate(chunk_action, axis=0)
         expected_total_size = sum(size for size in batch_size_map)
         assert chunk_action.shape[0] == expected_total_size, (
             f"Expected concatenated action size {expected_total_size}, got {chunk_action.shape[0]}."
@@ -1502,12 +1506,12 @@ class EnvWorker(Worker):
             for eval_step in range(self.n_eval_chunk_steps):
                 for stage_id in range(self.stage_num):
                     if self.env_decoupled_mode:
-                        raw_chunk_actions = self.recv_chunk_actions(
+                        raw_chunk_actions = self.recv_chunk_actions_from_channel(
                             input_channel, mode="eval"
                         )
                     else:
-                        raw_chunk_actions = self.recv_chunk_actions_from_channel(
-                            input_channel, model="eval"
+                        raw_chunk_actions = self.recv_chunk_actions(
+                            input_channel, mode="eval"
                         )
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
