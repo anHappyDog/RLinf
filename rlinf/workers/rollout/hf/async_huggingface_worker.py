@@ -294,8 +294,12 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             _, _, _, last_run = _split_channel_message(batch_index)
             is_last_run.append(last_run)
 
+        split_size = self.batch_index_map["split_size"]
+        if len(split_size) == 0:
+            split_size = batch_size_map
+
         split_rollout_results = self._split_rollout_result_by_last_run(
-            rollout_result, batch_size_map, is_last_run
+            rollout_result, split_size, is_last_run
         )
         for i, shard_result in enumerate(split_rollout_results):
             batch_index = batch_index_map[i]
@@ -317,7 +321,70 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             )
         # delete the batch index map
         self.batch_index_map["rollout"] = []
+        self.batch_index_map["split_size"] = []
         return
+
+    async def recv_env_output_one_moment_from_channel(
+        self, input_channel: Channel
+    ) -> dict[str, Any]:
+        """Receive env outputs from mapped env ranks and merge if needed on one moment(eg. 0.2s).
+
+        Args:
+            input_channel: Channel carrying env->rollout outputs.
+            mode: Rollout mode, either ``"train"`` or ``"eval"``.
+
+        Returns:
+            A single env output dict. When multiple env ranks are mapped to this
+            rollout worker, outputs are merged on batch dimension.
+        """
+
+        batch_index_map = self.batch_index_map["rollout"]
+        assert len(batch_index_map) == 0, (
+            f"batch_index_map must be empty, but got batch_index_map {batch_index_map}."
+        )
+
+        obs_batches = []
+        import time
+        # the recv final time, recv the data time.
+        final_time = time.time() + 0.2
+        get_data_length = 0
+        need_data_length = len(self.batch_size_map["rollout"])
+        obs_batch = None
+        while get_data_length < need_data_length:
+            if obs_batch is None:
+                obs_batch = input_channel.get(
+                    key=CommMapper.build_channel_key(None, None, extra=f"rollout_obs"),
+                    async_op=True,
+                )
+            else:
+                await asyncio.sleep(0.001)
+            # wait the last task final
+            if obs_batch.done():
+                obs_batches.append(await obs_batch.async_wait())
+                obs_batch = None
+                get_data_length = get_data_length + 1
+
+            # timeout to set the get finish
+            if time.time() >= final_time:
+                need_data_length = get_data_length
+                if obs_batch is not None:
+                    obs_batches.append(await obs_batch.async_wait())
+                    obs_batch = None
+                    get_data_length = get_data_length + 1
+            
+        # handle the recv data
+        handle_obs_batches = []
+        split_size = []
+        for obs_batch in obs_batches:
+            batch_index = obs_batch["batch_index"]
+            batch_index_map.append(batch_index)
+            actual_size = self._infer_env_batch_size(obs_batch["batch"])
+            split_size.append(actual_size)
+            handle_obs_batches.append(obs_batch["batch"])
+
+        self.batch_index_map["split_size"] = split_size
+
+        return self._merge_obs_batches(handle_obs_batches)
 
     async def recv_env_output_from_channel(
         self, input_channel: Channel
@@ -368,7 +435,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     await self._poll_background_weight_sync()
                 await self.wait_if_stale()
                 decoupled_generate_time = decoupled_generate_time + 1
-            env_output = await self.recv_env_output_from_channel(input_channel)
+            # env_output = await self.recv_env_output_from_channel(input_channel)
+            env_output = await self.recv_env_output_one_moment_from_channel(input_channel)
             actions, result = self.predict(env_output["obs"])
             save_flags = None
             if result.get("expert_label_flag", False):
