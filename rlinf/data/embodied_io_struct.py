@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 from rlinf.utils.nested_dict_process import (
     cat_list_of_dict_tensor,
     put_tensor_device,
-    split_dict_by_sizes,
+    split_dict,
     split_dict_to_chunk,
     stack_list_of_dict_tensor,
 )
@@ -772,7 +772,7 @@ class EmbodiedRolloutResult:
                     setattr(split_trajectory, field_name, split_value.contiguous())
             elif isinstance(value, dict):
                 for split_trajectory, split_value in zip(
-                    trajectories, split_dict_by_sizes(value, split_sizes, dim=1)
+                    trajectories, split_dict(value, split_sizes, dim=1)
                 ):
                     setattr(split_trajectory, field_name, split_value)
             else:

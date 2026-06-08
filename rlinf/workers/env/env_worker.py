@@ -134,14 +134,6 @@ class EnvWorker(Worker):
             // self.cfg.actor.model.num_action_chunks
         )
         self.actor_split_num = self.get_actor_split_num()
-        self.pipeline_batch_size = 0
-        self.pipeline_actor_world_size = 0
-        self.pipeline_logical_env_world_size = 0
-        self.pipeline_actor_dsts: list[list[tuple[int, int]]] = []
-        self.pipeline_actor_ranks: list[list[int]] = []
-        self.pipeline_split_sizes: list[list[int]] = []
-        self.pipeline_actor_env_ranks: dict[int, list[int]] = {}
-        self.pipeline_actor_keys: dict[int, str] = {}
         if self.use_training_pipeline and not self.only_eval:
             self.pipeline_batch_size = self.cfg.env.train.total_num_envs
             self.pipeline_actor_world_size = self._component_placement.get_world_size(

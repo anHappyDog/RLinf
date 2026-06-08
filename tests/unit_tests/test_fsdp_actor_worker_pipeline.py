@@ -28,10 +28,16 @@ import torch
 class _FakeChannel:
     def __init__(self, items):
         self._items = deque(items)
+        self.keys = []
 
-    def get_nowait(self):
+    def get_nowait(self, key=None):
+        self.keys.append(key)
         if not self._items:
             raise asyncio.QueueEmpty
+        return self._items.popleft()
+
+    def get(self, key=None):
+        self.keys.append(key)
         return self._items.popleft()
 
 
@@ -73,6 +79,7 @@ def _make_micro_batch(batch_id: int) -> dict[str, torch.Tensor]:
 
 def _build_actor(pipeline_actor_module):
     actor = object.__new__(pipeline_actor_module.PipelineEmbodiedFSDPActor)
+    actor._rank = 1
     actor._accelerator_type = pipeline_actor_module.Worker.accelerator_type
     actor._timer_metrics = {}
     actor.worker_timer = lambda tag: contextlib.nullcontext()
@@ -168,6 +175,9 @@ def test_run_training_replays_each_global_batch_exactly_update_epoch_times(
         lambda metric_dict, op=None: metric_dict,
     )
     result = actor.run_training(channel)
+    expected_key = pipeline_actor_module.CommMapper.build_channel_key(
+        actor._rank, actor._rank, "pipeline_actor"
+    )
 
     assert train_order == [
         (0, False),
@@ -182,5 +192,6 @@ def test_run_training_replays_each_global_batch_exactly_update_epoch_times(
     assert finish_count == 4
     actor.model.train.assert_called_once_with()
     actor.lr_scheduler.step.assert_called_once_with()
+    assert channel.keys == [expected_key] * 4
     assert result["rollout_metrics"] == {"received_rows": 4}
     assert result["training_metrics"] == {"actor/loss": 1.5}
