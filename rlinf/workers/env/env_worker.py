@@ -135,48 +135,7 @@ class EnvWorker(Worker):
         )
         self.actor_split_num = self.get_actor_split_num()
         if self.use_training_pipeline and not self.only_eval:
-            self.pipeline_batch_size = self.cfg.env.train.total_num_envs
-            self.pipeline_actor_world_size = self._component_placement.get_world_size(
-                "actor"
-            )
-            self.pipeline_logical_env_world_size = self._world_size * self.stage_num
-            self.pipeline_actor_dsts = [
-                CommMapper.get_dst_ranks(
-                    batch_size=self.pipeline_batch_size,
-                    src_world_size=self.pipeline_logical_env_world_size,
-                    dst_world_size=self.pipeline_actor_world_size,
-                    src_rank=self._rank * self.stage_num + stage_id,
-                )
-                for stage_id in range(self.stage_num)
-            ]
-            self.pipeline_actor_ranks = [
-                [actor_rank for actor_rank, _ in actor_dsts]
-                for actor_dsts in self.pipeline_actor_dsts
-            ]
-            self.pipeline_split_sizes = [
-                [size for _, size in actor_dsts]
-                for actor_dsts in self.pipeline_actor_dsts
-            ]
-            self.pipeline_actor_env_ranks = {
-                actor_rank: sorted(
-                    {
-                        src_rank // self.stage_num
-                        for src_rank, _ in CommMapper.get_src_ranks(
-                            batch_size=self.pipeline_batch_size,
-                            src_world_size=self.pipeline_logical_env_world_size,
-                            dst_world_size=self.pipeline_actor_world_size,
-                            dst_rank=actor_rank,
-                        )
-                    }
-                )
-                for actor_rank in range(self.pipeline_actor_world_size)
-            }
-            self.pipeline_actor_keys = {
-                actor_rank: CommMapper.build_channel_key(
-                    actor_rank, actor_rank, "pipeline_actor"
-                )
-                for actor_rank in range(self.pipeline_actor_world_size)
-            }
+            self._init_pipeline_params()
 
         if not self.only_eval:
             self.train_prev_done: list[torch.Tensor] = [
@@ -277,6 +236,49 @@ class EnvWorker(Worker):
             base_eval_cfg = update_nested_cfg(base_eval_cfg, eval_override_cfg)
             setattr(self.cfg.env.eval, "override_cfg", OmegaConf.create(base_eval_cfg))
         self._inject_realworld_reward_cfg(self.cfg.env.eval)
+
+    def _init_pipeline_params(self):
+        self.pipeline_batch_size = self.cfg.env.train.total_num_envs
+        self.pipeline_actor_world_size = self._component_placement.get_world_size(
+            "actor"
+        )
+        self.pipeline_logical_env_world_size = self._world_size * self.stage_num
+        self.pipeline_actor_dsts = [
+            CommMapper.get_dst_ranks(
+                batch_size=self.pipeline_batch_size,
+                src_world_size=self.pipeline_logical_env_world_size,
+                dst_world_size=self.pipeline_actor_world_size,
+                src_rank=self._rank * self.stage_num + stage_id,
+            )
+            for stage_id in range(self.stage_num)
+        ]
+        self.pipeline_actor_ranks = [
+            [actor_rank for actor_rank, _ in actor_dsts]
+            for actor_dsts in self.pipeline_actor_dsts
+        ]
+        self.pipeline_split_sizes = [
+            [size for _, size in actor_dsts] for actor_dsts in self.pipeline_actor_dsts
+        ]
+        self.pipeline_actor_env_ranks = {
+            actor_rank: sorted(
+                {
+                    src_rank // self.stage_num
+                    for src_rank, _ in CommMapper.get_src_ranks(
+                        batch_size=self.pipeline_batch_size,
+                        src_world_size=self.pipeline_logical_env_world_size,
+                        dst_world_size=self.pipeline_actor_world_size,
+                        dst_rank=actor_rank,
+                    )
+                }
+            )
+            for actor_rank in range(self.pipeline_actor_world_size)
+        }
+        self.pipeline_actor_keys = {
+            actor_rank: CommMapper.build_channel_key(
+                actor_rank, actor_rank, "pipeline_actor"
+            )
+            for actor_rank in range(self.pipeline_actor_world_size)
+        }
 
     def _inject_realworld_reward_cfg(self, env_cfg: DictConfig):
         if not (self.use_reward_model and self.use_realworld_reward):
@@ -1398,37 +1400,6 @@ class EnvWorker(Worker):
         if kwargs["loss_mask_sum"] is not None:
             rollout_batch["loss_mask_sum"] = kwargs["loss_mask_sum"]
         return rollout_batch
-
-    def prepare_micro_batches(
-        self, trajectory: Trajectory
-    ) -> list[dict[str, torch.Tensor]]:
-        # In training pipeline mode, send ready-to-train actor micro-batches instead of
-        # full rollout trajectories. This keeps nested observations out of the channel
-        # payload so packed tensors can use the channel tensor fast path.
-        batch = convert_trajectories_to_batch([trajectory])
-        batch = preprocess_embodied_batch(
-            batch,
-            rollout_epoch=1,
-            auto_reset=self.cfg.env.train.auto_reset,
-            ignore_terminations=self.cfg.env.train.ignore_terminations,
-            reward_type=self.cfg.algorithm.reward_type,
-            filter_rewards=self.cfg.algorithm.get("filter_rewards", False),
-            group_size=self.cfg.algorithm.group_size,
-            rewards_lower_bound=self.cfg.algorithm.get("rewards_lower_bound", None),
-            rewards_upper_bound=self.cfg.algorithm.get("rewards_upper_bound", None),
-        )
-
-        batch = self.compute_advantages_and_returns(batch)
-
-        batch_size = batch["prev_logprobs"].shape[0] * batch["prev_logprobs"].shape[1]
-        flatten_batch = flatten_embodied_batch(batch, torch.arange(batch_size))
-        micro_batch_size = self.cfg.actor.micro_batch_size
-        assert batch_size % micro_batch_size == 0, (
-            f"Batch size {batch_size} is not divisible by micro_batch_size {micro_batch_size}."
-        )
-        num_micro_batches = batch_size // micro_batch_size
-        micro_batches = split_dict_to_chunk(flatten_batch, num_micro_batches, dim=0)
-        return [pack_batch(micro_batch) for micro_batch in micro_batches]
 
     def prepare_pipeline_batch(self, trajectory: Trajectory) -> dict[str, torch.Tensor]:
         batch = convert_trajectories_to_batch([trajectory])
