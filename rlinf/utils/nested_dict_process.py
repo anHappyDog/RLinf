@@ -103,6 +103,24 @@ def split_dict_to_chunk(data: dict, split_size, dim=0):
     return splited_list
 
 
+def split_dict_by_sizes(data: dict, split_sizes: list[int], dim=0):
+    splited_list = [{} for _ in split_sizes]
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor):
+            split_values = [
+                chunk.contiguous() for chunk in torch.split(value, split_sizes, dim=dim)
+            ]
+        elif value is None:
+            split_values = [None for _ in split_sizes]
+        elif isinstance(value, dict):
+            split_values = split_dict_by_sizes(value, split_sizes, dim)
+        else:
+            raise ValueError(f"{key=}, {type(value)} is not supported.")
+        for split_id, split_value in enumerate(split_values):
+            splited_list[split_id][key] = split_value
+    return splited_list
+
+
 def concat_batch(data1, data2):
     batch = {}
     for key, value in data1.items():
