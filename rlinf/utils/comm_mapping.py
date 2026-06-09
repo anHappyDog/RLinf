@@ -71,15 +71,10 @@ class CommMapper:
                         batch_size // split_size
                         for _ in range(dst_world_size // src_world_size // 2)
                     ]
-                if length >= 1: 
-                    return [
-                        batch_size // split_size
-                        for _ in range(length)
-                    ]
+                if length >= 1:
+                    return [batch_size // split_size for _ in range(length)]
                 else:
-                    return [
-                        batch_size // split_size
-                    ]
+                    return [batch_size // split_size]
             else:
                 return [batch_size // split_size for _ in range(queue_size)]
 

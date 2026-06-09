@@ -141,8 +141,12 @@ class EnvWorker(Worker):
             if self.enable_eval:
                 self.dst_rank_map.update(self._setup_eval_dst_rank_map())
                 self.src_rank_map.update(self._setup_eval_src_rank_map())
-            self.log_info(f"Env worker initialized with dst_rank_map: {self.dst_rank_map}")
-            self.log_info(f"Env worker initialized with src_rank_map: {self.src_rank_map}")
+            self.log_info(
+                f"Env worker initialized with dst_rank_map: {self.dst_rank_map}"
+            )
+            self.log_info(
+                f"Env worker initialized with src_rank_map: {self.src_rank_map}"
+            )
 
         # This is a barrier to ensure all envs' initial setup upon import is done
         # Essential for RealWorld env to ensure initial ROS node setup is done
@@ -742,7 +746,6 @@ class EnvWorker(Worker):
 
             _, rollout_result_idx, _, _ = _split_channel_message(batch_index)
 
-
             actual_size = self._infer_rollout_batch_size(rollout_result)
             assert actual_size == expected_size, (
                 f"Expected rollout result size {expected_size} get the batch index {i}, "
@@ -751,8 +754,10 @@ class EnvWorker(Worker):
             idx_rollout_results.append((rollout_result_idx, rollout_result))
 
         idx_rollout_results.sort(key=lambda x: x[0])
-        rollout_results = RolloutResult.merge_rollout_results([x[1] for x in idx_rollout_results])
-        
+        rollout_results = RolloutResult.merge_rollout_results(
+            [x[1] for x in idx_rollout_results]
+        )
+
         chunk_action = rollout_results.actions
 
         expected_total_size = sum(size for size in batch_size_map)
@@ -963,7 +968,7 @@ class EnvWorker(Worker):
                     ),
                     "batch": batch,
                 },
-                key=CommMapper.build_channel_key(None, None, extra=f"rollout_obs"),
+                key=CommMapper.build_channel_key(None, None, extra="rollout_obs"),
             )
 
     def send_reward_input(
