@@ -22,7 +22,10 @@ jobs:
         run: |
           export PYTHONPATH=$(pwd):$(pwd)/tests/unit_tests
           source .venv/bin/activate
-          pytest tests/unit_tests
+          for file in tests/unit_tests/test_*.py; do
+              pytest "$file"
+              ray stop
+          done
 
       - name: Run doctest
         timeout-minutes: 20
@@ -52,9 +55,74 @@ jobs:
       - name: Run pytest
         timeout-minutes: 20
         run: |
-          export PYTHONPATH=$(pwd):$(pwd)/tests/unit_tests 
+          export PYTHONPATH=$(pwd):$(pwd)/tests/unit_tests:$PYTHONPATH 
           source .venv/bin/activate
-          pytest tests/unit_tests
+          for file in tests/unit_tests/test_*.py; do
+              pytest "$file"
+              ray stop
+          done
+
+  scheduler-unit-tests-rocm:
+    runs-on: rocm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Create ROCm environment and install dependencies
+        run: |
+          unset UV_DEFAULT_INDEX
+          export UV_PATH=/workspace/dataset/.uv
+          export UV_CACHE_DIR=/workspace/dataset/.uv_cache
+          export UV_PYTHON_INSTALL_DIR=/workspace/dataset/.uv_python
+          bash requirements/install.sh --platform amd --no-flash-attn embodied --env dummy
+          source .venv/bin/activate
+          uv pip install "transformers<=5.9.0"
+
+      - name: Run scheduler unit tests
+        timeout-minutes: 20
+        run: |
+          export PYTHONPATH=$(pwd):$(pwd)/tests/unit_tests:$PYTHONPATH
+          source .venv/bin/activate
+          for file in tests/unit_tests/test_*.py; do
+              pytest "$file"
+              ray stop
+          done
+
+      - name: Clean up
+        run: |
+          rm -rf .venv
+          uv cache prune
+
+  scheduler-unit-tests-ascend:
+    runs-on: ascend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Create CANN environment and install dependencies
+        run: |
+          unset UV_DEFAULT_INDEX
+          export UV_PATH=/workspace/dataset/.uv
+          export UV_CACHE_DIR=/workspace/dataset/.uv_cache
+          export UV_PYTHON_INSTALL_DIR=/workspace/dataset/.uv_python
+          bash requirements/install.sh --platform ascend --no-flash-attn embodied --env dummy
+          source .venv/bin/activate
+          uv pip install "transformers<=5.9.0"
+
+      - name: Run scheduler unit tests
+        timeout-minutes: 30
+        run: |
+          export PYTHONPATH=$(pwd):$(pwd)/tests/unit_tests:$PYTHONPATH
+          source .venv/bin/activate
+          for file in tests/unit_tests/test_*.py; do
+              pytest "$file"
+              ray stop
+          done
+
+      - name: Clean up
+        run: |
+          rm -rf .venv
+          uv cache prune
 
   package-build-test:
     runs-on: self-hosted
