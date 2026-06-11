@@ -933,6 +933,23 @@ def validate_embodied_cfg(cfg):
             cfg.env.train.omnigibson_cfg = omnigibson_cfg
             cfg.env.eval.omnigibson_cfg = omnigibson_cfg
 
+    if OmegaConf.select(cfg, "actor.data_source", default="buffer") == "lerobot":
+        assert bool(
+            OmegaConf.select(cfg, "actor.lerobot.in_memory_mode", default=False)
+        ), (
+            "actor.data_source=lerobot requires actor.lerobot.in_memory_mode=True. "
+            "Online DAgger training samples received episodes from memory; "
+            "archived LeRobot shards may be reloaded into memory on actor resume."
+        )
+        lerobot_num_workers = OmegaConf.select(
+            cfg, "actor.lerobot_num_workers", default=0
+        )
+        assert int(lerobot_num_workers) >= 0, (
+            "actor.lerobot_num_workers must be a non-negative integer. "
+            "It controls parallel archived LeRobot resume loading; online "
+            "LeRobot DataLoader workers remain 0 because training samples "
+            "live in-process memory."
+        )
     return cfg
 
 
