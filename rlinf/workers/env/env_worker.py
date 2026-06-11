@@ -238,47 +238,50 @@ class EnvWorker(Worker):
         self._inject_realworld_reward_cfg(self.cfg.env.eval)
 
     def _init_pipeline_params(self):
-        self.pipeline_batch_size = self.cfg.env.train.total_num_envs
-        self.pipeline_actor_world_size = self._component_placement.get_world_size(
-            "actor"
-        )
-        self.pipeline_logical_env_world_size = self._world_size * self.stage_num
-        self.pipeline_actor_dsts = [
+        actor_ws = self._component_placement.get_world_size("actor")
+        logical_env_ws = self._world_size * self.stage_num
+        self.shuffle_rollout = self.cfg.algorithm.get("shuffle_rollout", True)
+        self.pipeline_stage_actor_splits = [
             CommMapper.get_dst_ranks(
-                batch_size=self.pipeline_batch_size,
-                src_world_size=self.pipeline_logical_env_world_size,
-                dst_world_size=self.pipeline_actor_world_size,
+                batch_size=self.cfg.env.train.total_num_envs,
+                src_world_size=logical_env_ws,
+                dst_world_size=actor_ws,
                 src_rank=self._rank * self.stage_num + stage_id,
             )
             for stage_id in range(self.stage_num)
         ]
-        self.pipeline_actor_ranks = [
-            [actor_rank for actor_rank, _ in actor_dsts]
-            for actor_dsts in self.pipeline_actor_dsts
-        ]
-        self.pipeline_split_sizes = [
-            [size for _, size in actor_dsts] for actor_dsts in self.pipeline_actor_dsts
-        ]
+        local_actor_ranks = {
+            actor_rank
+            for actor_splits in self.pipeline_stage_actor_splits
+            for actor_rank, _ in actor_splits
+        }
         self.pipeline_actor_env_ranks = {
             actor_rank: sorted(
                 {
-                    src_rank // self.stage_num
-                    for src_rank, _ in CommMapper.get_src_ranks(
-                        batch_size=self.pipeline_batch_size,
-                        src_world_size=self.pipeline_logical_env_world_size,
-                        dst_world_size=self.pipeline_actor_world_size,
+                    logical_src_rank // self.stage_num
+                    for logical_src_rank, _ in CommMapper.get_src_ranks(
+                        batch_size=self.cfg.env.train.total_num_envs,
+                        src_world_size=logical_env_ws,
+                        dst_world_size=actor_ws,
                         dst_rank=actor_rank,
                     )
                 }
             )
-            for actor_rank in range(self.pipeline_actor_world_size)
+            for actor_rank in range(actor_ws)
         }
         self.pipeline_actor_keys = {
             actor_rank: CommMapper.build_channel_key(
                 actor_rank, actor_rank, "pipeline_actor"
             )
-            for actor_rank in range(self.pipeline_actor_world_size)
+            for actor_rank in local_actor_ranks
         }
+        if self.shuffle_rollout:
+            self.shuffle_generators = {
+                actor_rank: torch.Generator().manual_seed(
+                    self.cfg.actor.seed + actor_rank + self._rank * actor_ws
+                )
+                for actor_rank in local_actor_ranks
+            }
 
     def _inject_realworld_reward_cfg(self, env_cfg: DictConfig):
         if not (self.use_reward_model and self.use_realworld_reward):
@@ -1416,9 +1419,18 @@ class EnvWorker(Worker):
         )
         return self.compute_advantages_and_returns(batch)
 
-    def pack_pipeline_micro_batches(self, batch: dict[str, torch.Tensor]) -> list[dict]:
+    def pack_pipeline_micro_batches(
+        self, batch: dict[str, torch.Tensor], actor_rank: int
+    ) -> list[dict]:
         batch_size = batch["prev_logprobs"].shape[0] * batch["prev_logprobs"].shape[1]
-        flatten_batch = flatten_embodied_batch(batch, torch.arange(batch_size))
+        if self.shuffle_rollout:
+            shuffle_id = torch.randperm(
+                batch_size, generator=self.shuffle_generators[actor_rank]
+            )
+        else:
+            shuffle_id = torch.arange(batch_size)
+
+        flatten_batch = flatten_embodied_batch(batch, shuffle_id)
         micro_batch_size = self.cfg.actor.micro_batch_size
         assert batch_size % micro_batch_size == 0, (
             f"Batch size {batch_size} is not divisible by micro_batch_size {micro_batch_size}."
@@ -1439,13 +1451,12 @@ class EnvWorker(Worker):
 
         with self.worker_timer("prepare_micro_batches"):
             for stage_id, rollout_result in enumerate(rollout_results):
+                actor_splits = self.pipeline_stage_actor_splits[stage_id]
                 trajectories = rollout_result.to_splited_trajectories_by_sizes(
-                    self.pipeline_split_sizes[stage_id]
+                    [split_size for _, split_size in actor_splits]
                 )
 
-                for actor_rank, trajectory in zip(
-                    self.pipeline_actor_ranks[stage_id], trajectories
-                ):
+                for (actor_rank, _), trajectory in zip(actor_splits, trajectories):
                     batch = self.prepare_pipeline_batch(trajectory)
                     pending_batches.append((actor_rank, batch))
                     batches_by_actor_rank[actor_rank].append(batch)
@@ -1471,7 +1482,7 @@ class EnvWorker(Worker):
                         )
 
             for actor_rank, batch in pending_batches:
-                for micro_batch in self.pack_pipeline_micro_batches(batch):
+                for micro_batch in self.pack_pipeline_micro_batches(batch, actor_rank):
                     channel.put(
                         micro_batch,
                         key=self.pipeline_actor_keys[actor_rank],
