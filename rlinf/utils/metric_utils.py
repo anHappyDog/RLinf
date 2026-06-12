@@ -136,7 +136,7 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
             min_value = torch.min(values).detach().item()
 
         reduce_sum_count = torch.stack([values_sum, count])
-        reduce_tensor = torch.as_tensor(
+        reduce_min_max = torch.as_tensor(
             [-min_value, max_value],
             device=device,
             dtype=torch.float32,
@@ -144,9 +144,9 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
         torch.distributed.all_reduce(
             reduce_sum_count, op=torch.distributed.ReduceOp.SUM
         )
-        torch.distributed.all_reduce(reduce_tensor, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(reduce_min_max, op=torch.distributed.ReduceOp.MAX)
         reduced_sum, reduced_count = reduce_sum_count.tolist()
-        reduced_min, reduced_max = reduce_tensor.tolist()
+        reduced_min, reduced_max = reduce_min_max.tolist()
 
         assert reduced_count > 0, (
             "Cannot compute rollout metrics with no globally valid values."
