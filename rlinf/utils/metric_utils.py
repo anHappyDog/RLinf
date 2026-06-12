@@ -122,16 +122,16 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
     def reduce_metrics(values: torch.Tensor) -> tuple[float, float, float]:
         device = Worker.torch_platform.current_device()
         if values.numel() == 0:
-            count = torch.tensor(0.0, device=device, dtype=torch.float64)
-            values_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
+            count = torch.tensor(0.0, device=device, dtype=torch.float32)
+            values_sum = torch.tensor(0.0, device=device, dtype=torch.float32)
             min_value = float("inf")
             max_value = float("-inf")
         else:
             values = values.to(device)
             count = torch.tensor(
-                values.numel(), device=values.device, dtype=torch.float64
+                values.numel(), device=values.device, dtype=torch.float32
             )
-            values_sum = values.to(dtype=torch.float64).sum()
+            values_sum = values.to(dtype=torch.float32).sum()
             max_value = torch.max(values).detach().item()
             min_value = torch.min(values).detach().item()
 
