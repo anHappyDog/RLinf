@@ -148,9 +148,8 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
         reduced_sum, reduced_count = reduce_sum_count.tolist()
         reduced_min, reduced_max = reduce_min_max.tolist()
 
-        assert reduced_count > 0, (
-            "Cannot compute rollout metrics with no globally valid values."
-        )
+        if reduced_count <= 0:
+            return float("nan"), float("nan"), float("nan")
         return reduced_sum / reduced_count, -reduced_min, reduced_max
 
     def valid_values(values: torch.Tensor) -> torch.Tensor:
