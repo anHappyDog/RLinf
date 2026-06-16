@@ -411,6 +411,9 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
     def _prepare_sft_batch(self, batch):
         """Prepare model-specific DAgger training inputs."""
         if self.data_source == "buffer":
+            # Replay-buffer samples store model inputs under forward_inputs.
+            if "forward_inputs" in batch:
+                batch = batch["forward_inputs"]
             return self.model.prepare_dagger_sft_batch(batch)
         elif self.data_source == "lerobot":
             return self.model.prepare_lerobot_sft_batch(batch)
