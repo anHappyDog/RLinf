@@ -274,6 +274,22 @@ validate_python_version() {
     fi
 }
 
+configure_model_env_versions() {
+    if [ "$TARGET" = "embodied" ] && [ "$MODEL" = "dreamzero" ] && [ "$ENV_NAME" = "behavior" ]; then
+        PYTHON_VERSION="3.10"
+        if [ -z "$TORCH_VERSION" ]; then
+            TORCH_VERSION="2.5.1"
+        fi
+    fi
+}
+
+validate_torch_version() {
+    if [ -n "$TORCH_VERSION" ] && [[ ! "$TORCH_VERSION" =~ ^2\.[0-9]+\.[0-9]+$ ]]; then
+        echo "--torch must be of form 2.Y.Z (got '$TORCH_VERSION')." >&2
+        exit 1
+    fi
+}
+
 #=======================PLATFORM CONFIG=======================
 # Per-platform runtime env-var configuration. Each configure_<platform> runs
 # before any uv operation, so set everything that affects how dependencies
@@ -1492,8 +1508,55 @@ install_abot_m0_model() {
     uv pip uninstall pynvml || true
 }
 
+install_dreamzero_behavior_deps() {
+    local dreamzero_path
+    dreamzero_path=$(clone_or_reuse_repo DREAMZERO_PATH "$VENV_DIR/dreamzero" https://github.com/dreamzero0/dreamzero.git)
+    if [ -z "${DREAMZERO_PATH:-}" ]; then
+        git -C "$dreamzero_path" checkout "${DREAMZERO_GIT_REF:-ab790c198fbce33503358efbbd4187ce9a89adf3}" >&2
+    fi
+
+    uv pip install \
+        numpy==1.26.4 \
+        tianshou==0.5.1 \
+        albumentations==2.0.8 \
+        ftfy==6.3.1 \
+        diffusers==0.38.0 \
+        peft==0.19.1 \
+        transformers==4.53.2 \
+        tokenizers==0.21.4 \
+        accelerate==1.13.0 \
+        safetensors==0.8.0rc1 \
+        timm==1.0.27 \
+        einops==0.8.2 \
+        sentencepiece==0.2.1 \
+        decord==0.6.0 \
+        protobuf==6.33.0 \
+        ml-dtypes==0.5.3 \
+        click==8.2.1 \
+        llvmlite==0.47.0 \
+        numba==0.65.1 \
+        hydra-core==1.4.0.dev1 \
+        omegaconf==2.4.0.dev11 \
+        datasets==3.6.0 \
+        pyarrow==24.0.0 \
+        pandas==2.3.3 \
+        websockets==16.0 \
+        msgpack==1.1.2 \
+        open3d==0.19.0
+    uv pip install torchcodec==0.2.1 --no-deps
+    uv pip install git+${GITHUB_PREFIX}https://github.com/huggingface/lerobot@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5 --no-deps
+    uv pip install -e "$dreamzero_path" --no-deps --ignore-requires-python
+}
+
 install_dreamzero_model() {
     case "$ENV_NAME" in
+        behavior)
+            create_and_sync_venv
+            install_common_embodied_deps
+            install_behavior_env
+            install_dreamzero_behavior_deps
+            install_flash_attn
+            ;;
         maniskill_libero|libero)
             create_and_sync_venv
             install_common_embodied_deps
@@ -2101,7 +2164,9 @@ install_docs() {
 
 main() {
     parse_args "$@"
+    configure_model_env_versions
     validate_python_version
+    validate_torch_version
     configure_platform
     setup_mirror
     apply_torch_override
