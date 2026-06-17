@@ -15,10 +15,11 @@
 import json
 import os
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from rlinf.envs.behavior.utils import sync_robot_after_pose_override
 
@@ -171,6 +172,21 @@ def load_activity_instance_tro_state(
     import omnigibson as og
     from omnigibson.utils.python_utils import recursively_convert_to_torch
 
+    def _scoped_scene_context():
+        if os.environ.get("RLINF_BEHAVIOR_TRO_STATE_SCOPE_SETTLE", "0") != "1":
+            return nullcontext()
+
+        class _ScopedScene:
+            def __enter__(self):
+                self._all_scenes = og.sim._scenes
+                og.sim._scenes = [env.scene]
+
+            def __exit__(self, exc_type, exc, tb):
+                og.sim._scenes = self._all_scenes
+                return False
+
+        return _ScopedScene()
+
     env.task.activity_instance_id = instance_id
     with open(tro_file_path, "r", encoding="utf-8") as f:
         tro_state = recursively_convert_to_torch(json.load(f))
@@ -224,11 +240,13 @@ def load_activity_instance_tro_state(
     else:
         env.scene.write_task_metadata(key="robot_poses", data=None)
 
-    for _ in range(25):
-        og.sim.step_physics()
-        for entity in env.task.object_scope.values():
-            if entity.exists and not entity.is_system:
-                entity.keep_still()
+    settle_steps = int(os.environ.get("RLINF_BEHAVIOR_TRO_STATE_SETTLE_STEPS", "25"))
+    with _scoped_scene_context():
+        for _ in range(settle_steps):
+            og.sim.step_physics()
+            for entity in env.task.object_scope.values():
+                if entity.exists and not entity.is_system:
+                    entity.keep_still()
 
     env.scene.update_initial_file()
     if reset_scene:
@@ -245,12 +263,14 @@ class ActivityInstanceLoader:
         activity_instance_id: int,
         instance_resample_mode: str,
         activity_instances: tuple[ActivityInstanceFile, ...],
+        activity_instance_ids: tuple[int, ...] | None = None,
     ):
         self.omni_cfg = omni_cfg
         self.activity_name = activity_name
         self.activity_instance_id = activity_instance_id
         self.instance_resample_mode = instance_resample_mode
         self.activity_instances = activity_instances
+        self.activity_instance_ids = activity_instance_ids
 
     @classmethod
     def from_omni_cfg(cls, omni_cfg: DictConfig) -> "ActivityInstanceLoader":
@@ -327,6 +347,7 @@ class ActivityInstanceLoader:
                 activity_instance_id=activity_instance_id,
                 instance_resample_mode=instance_resample_mode,
                 activity_instances=(),
+                activity_instance_ids=None,
             )
 
         if activity_instance_dir is None:
@@ -341,6 +362,7 @@ class ActivityInstanceLoader:
                 activity_instance_id=activity_instance_id,
                 instance_resample_mode=instance_resample_mode,
                 activity_instances=(),
+                activity_instance_ids=None,
             )
 
         if online_object_sampling:
@@ -362,6 +384,29 @@ class ActivityInstanceLoader:
                 instance_file_format=instance_file_format,
             )
         )
+        activity_instance_ids = None
+        if isinstance(activity_instance_id, (list, tuple, ListConfig)):
+            activity_instance_ids = tuple(
+                int(instance_id) for instance_id in activity_instance_id
+            )
+        elif activity_instance_id is not None:
+            activity_instance_ids = (int(activity_instance_id),)
+
+        if instance_resample_mode == "offline" and activity_instance_ids:
+            allowed_ids = set(activity_instance_ids)
+            activity_instances = tuple(
+                entry
+                for entry in activity_instances
+                if entry.instance_id in allowed_ids
+            )
+            missing_ids = allowed_ids - {
+                entry.instance_id for entry in activity_instances
+            }
+            if missing_ids:
+                raise ValueError(
+                    f"task.activity_instance_id contains ids that were not discovered: "
+                    f"{sorted(missing_ids)}."
+                )
         if instance_resample_mode == "disabled":
             instance_ids = {entry.instance_id for entry in activity_instances}
             if activity_instance_id not in instance_ids:
@@ -376,6 +421,7 @@ class ActivityInstanceLoader:
             activity_instance_id=activity_instance_id,
             instance_resample_mode=instance_resample_mode,
             activity_instances=activity_instances,
+            activity_instance_ids=activity_instance_ids,
         )
 
     def prepare_reset(self, vec_env) -> None:
@@ -395,9 +441,22 @@ class ActivityInstanceLoader:
             return
 
         if self.instance_resample_mode == "offline":
-            instance_files = [
-                random.choice(self.activity_instances) for _ in range(len(vec_env.envs))
-            ]
+            if (
+                os.environ.get("RLINF_BEHAVIOR_TRO_STATE_INSTANCE_BY_GLOBAL_INDEX", "0")
+                == "1"
+            ):
+                instance_files = [
+                    self.activity_instances[
+                        int(getattr(env, "_rlinf_global_env_idx", idx))
+                        % len(self.activity_instances)
+                    ]
+                    for idx, env in enumerate(vec_env.envs)
+                ]
+            else:
+                instance_files = [
+                    random.choice(self.activity_instances)
+                    for _ in range(len(vec_env.envs))
+                ]
         else:
             instance_file = self._get_activity_instance(self.activity_instance_id)
             instance_files = [instance_file] * len(vec_env.envs)

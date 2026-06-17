@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import hashlib
 import inspect
 import json
 import os
@@ -22,7 +23,7 @@ from typing import ClassVar
 import gymnasium as gym
 import ray
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from rlinf.envs.behavior.instance_loader import ActivityInstanceLoader
 from rlinf.envs.behavior.utils import (
@@ -64,6 +65,8 @@ class BehaviorProcess:
         cfg: DictConfig,
         num_envs: int,
         pipeline_stage_num: int,
+        subproc_idx: int = 0,
+        num_env_subprocess: int = 1,
     ):
         _preload_numba_llvmlite()
         from omnigibson.envs import VectorEnvironment
@@ -79,6 +82,19 @@ class BehaviorProcess:
             resolve=True,
             throw_on_missing=True,
         )
+        task_cfg = omni_cfg_dict.get("task", {})
+        if task_cfg.get("instance_file_format") == "tro_state" and task_cfg.get(
+            "activity_instance_dir"
+        ):
+            task_cfg["activity_instance_id"] = 0
+        elif isinstance(
+            task_cfg.get("activity_instance_id"), (list, tuple, ListConfig)
+        ):
+            activity_instance_ids = task_cfg["activity_instance_id"]
+            if len(activity_instance_ids) == 0:
+                raise ValueError("task.activity_instance_id is an empty list.")
+            task_cfg["activity_instance_id"] = int(activity_instance_ids[0])
+
         # When pipeline stages > 1, each stage independently advances the
         # global physics per chunk step.  Divide physics_frequency so the
         # total physics rate stays at the configured value.
@@ -87,6 +103,8 @@ class BehaviorProcess:
                 omni_cfg_dict["env"]["physics_frequency"] / pipeline_stage_num
             )
         self.env = VectorEnvironment(num_envs, omni_cfg_dict)
+        for local_row, env in enumerate(getattr(self.env, "envs", [])):
+            env._rlinf_global_env_idx = local_row * num_env_subprocess + subproc_idx
         apply_runtime_renderer_settings()
         wrapper_name = OmegaConf.select(omni_cfg, "env.env_wrapper")
         self.env = apply_env_wrapper(self.env, wrapper_name)
@@ -146,6 +164,187 @@ class BehaviorProcess:
         if reset_indices is not None:
             kwargs["env_indices"] = reset_indices
         return self.env.reset(**kwargs)
+
+    @staticmethod
+    def _debug_hash_value(value) -> str:
+        """Return a stable short digest for nested simulator state values."""
+
+        hasher = hashlib.sha256()
+
+        def update(item) -> None:
+            if item is None or isinstance(item, (bool, int, float, str)):
+                hasher.update(repr(item).encode("utf-8"))
+                return
+            if isinstance(item, torch.Tensor):
+                tensor = item.detach().cpu().contiguous()
+                hasher.update(str(tuple(tensor.shape)).encode("utf-8"))
+                hasher.update(str(tensor.dtype).encode("utf-8"))
+                hasher.update(tensor.numpy().tobytes())
+                return
+            if isinstance(item, dict):
+                hasher.update(b"{")
+                for key in sorted(item, key=lambda x: repr(x)):
+                    hasher.update(repr(key).encode("utf-8"))
+                    update(item[key])
+                hasher.update(b"}")
+                return
+            if isinstance(item, (list, tuple)):
+                hasher.update(b"[")
+                for child in item:
+                    update(child)
+                hasher.update(b"]")
+                return
+            if hasattr(item, "shape") and hasattr(item, "tobytes"):
+                hasher.update(str(getattr(item, "shape", None)).encode("utf-8"))
+                hasher.update(str(getattr(item, "dtype", None)).encode("utf-8"))
+                hasher.update(item.tobytes())
+                return
+            hasher.update(repr(item).encode("utf-8", errors="replace"))
+
+        update(value)
+        return hasher.hexdigest()[:16]
+
+    @staticmethod
+    def _debug_to_plain(value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        if isinstance(value, dict):
+            return {
+                str(k): BehaviorProcess._debug_to_plain(v) for k, v in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [BehaviorProcess._debug_to_plain(v) for v in value]
+        if hasattr(value, "tolist"):
+            return value.tolist()
+        return repr(value)
+
+    def _debug_vec_envs(self):
+        env = self.env
+        seen = set()
+        while env is not None and id(env) not in seen:
+            seen.add(id(env))
+            envs = getattr(env, "envs", None)
+            if envs is not None:
+                return list(envs)
+            next_env = None
+            for attr in ("env", "venv", "_env", "unwrapped"):
+                candidate = getattr(env, attr, None)
+                if candidate is not None and candidate is not env:
+                    next_env = candidate
+                    break
+            env = next_env
+        raise RuntimeError(
+            f"Could not find VectorEnvironment.envs through wrapper {type(self.env)!r}."
+        )
+
+    def debug_snapshot(self):
+        """Capture read-only reset-state fingerprints for each local env row."""
+        rows = []
+        for local_row, env in enumerate(self._debug_vec_envs()):
+            row = {"local_row": local_row}
+            try:
+                scene = getattr(env, "scene", None)
+                task = getattr(env, "task", None)
+                row["scene_idx"] = self._debug_to_plain(getattr(scene, "idx", None))
+                row["scene_model"] = self._debug_to_plain(
+                    getattr(scene, "scene_model", None)
+                )
+                row["activity_instance_id"] = self._debug_to_plain(
+                    getattr(task, "activity_instance_id", None)
+                )
+
+                initial_state_parts = {
+                    "scene_idx": row["scene_idx"],
+                    "scene_model": row["scene_model"],
+                    "activity_instance_id": row["activity_instance_id"],
+                }
+                try:
+                    robot = task.get_agent(env) if task is not None else None
+                    if robot is not None:
+                        pos, orn = robot.get_position_orientation()
+                        row["robot_pose"] = {
+                            "position": self._debug_to_plain(pos),
+                            "orientation": self._debug_to_plain(orn),
+                        }
+                        row["robot_pose_checksum"] = self._debug_hash_value((pos, orn))
+                        initial_state_parts["robot_pose"] = (pos, orn)
+                        try:
+                            scene_pos, scene_orn = robot.get_position_orientation(
+                                frame="scene"
+                            )
+                        except Exception:
+                            scene_pos, scene_orn = (
+                                scene.convert_world_pose_to_scene_relative(
+                                    pos,
+                                    orn,
+                                )
+                            )
+                        row["robot_scene_pose"] = {
+                            "position": self._debug_to_plain(scene_pos),
+                            "orientation": self._debug_to_plain(scene_orn),
+                        }
+                        row["robot_scene_pose_checksum"] = self._debug_hash_value(
+                            (scene_pos, scene_orn)
+                        )
+                        initial_state_parts["robot_scene_pose"] = (
+                            scene_pos,
+                            scene_orn,
+                        )
+                except Exception as e:  # noqa: BLE001 - debug probe should continue
+                    row["robot_pose_error"] = repr(e)
+
+                object_scope = getattr(task, "object_scope", {}) if task else {}
+                object_entries = []
+                object_scene_pose_entries = []
+                object_errors = {}
+                for name, obj in sorted(object_scope.items(), key=lambda item: item[0]):
+                    try:
+                        if hasattr(obj, "dump_state"):
+                            state = obj.dump_state(serialized=True)
+                        elif hasattr(obj, "get_position_orientation"):
+                            state = obj.get_position_orientation()
+                        else:
+                            state = repr(obj)
+                        object_entries.append((name, state))
+                    except Exception as e:  # noqa: BLE001 - debug probe should continue
+                        object_errors[name] = repr(e)
+                    try:
+                        if hasattr(obj, "get_position_orientation"):
+                            pos, orn = obj.get_position_orientation()
+                            scene_pos, scene_orn = (
+                                scene.convert_world_pose_to_scene_relative(
+                                    pos,
+                                    orn,
+                                )
+                            )
+                            object_scene_pose_entries.append(
+                                (name, scene_pos, scene_orn)
+                            )
+                    except Exception:
+                        pass
+                row["task_relevant_object_count"] = len(object_scope)
+                row["task_relevant_object_names"] = sorted(object_scope)[:32]
+                row["task_relevant_object_checksum"] = self._debug_hash_value(
+                    object_entries
+                )
+                row["task_relevant_object_scene_pose_checksum"] = (
+                    self._debug_hash_value(object_scene_pose_entries)
+                )
+                initial_state_parts["task_relevant_objects"] = object_entries
+                initial_state_parts["task_relevant_object_scene_poses"] = (
+                    object_scene_pose_entries
+                )
+                if object_errors:
+                    row["task_relevant_object_errors"] = object_errors
+                row["initial_state_checksum"] = self._debug_hash_value(
+                    initial_state_parts
+                )
+            except Exception as e:  # noqa: BLE001 - debug probe should continue
+                row["snapshot_error"] = repr(e)
+            rows.append(row)
+        return rows
 
     def _step_shard(
         self,
@@ -211,6 +410,14 @@ class BehaviorProcess:
 
     def reset(self, reset_indices=None, get_obs=True):
         self.instance_loader.prepare_reset(self.env)
+        pre_reset_debug = None
+        if os.environ.get("RLINF_BEHAVIOR_CAPTURE_PRE_RESET_SNAPSHOT", "0") == "1":
+            snapshot_rows = self.debug_snapshot()
+            if reset_indices is None:
+                pre_reset_debug = snapshot_rows
+            else:
+                by_local_row = {row["local_row"]: row for row in snapshot_rows}
+                pre_reset_debug = [by_local_row[idx] for idx in reset_indices]
         result = self._call_reset(
             reset_indices=reset_indices,
             get_obs=get_obs,
@@ -219,6 +426,9 @@ class BehaviorProcess:
             return None, None
 
         raw_obs, infos = result
+        if pre_reset_debug is not None:
+            for info, row in zip(infos, pre_reset_debug, strict=True):
+                info["rlinf_pre_reset_debug"] = row
         return list(raw_obs), list(infos)
 
     def close(self):
@@ -236,6 +446,20 @@ class BehaviorProcessPool:
     _shared_pool: ClassVar["BehaviorProcessPool | None"] = None
     _shared_refcount: ClassVar[int] = 0
     _pipeline_next_idx: ClassVar[int] = 0
+    _RUNTIME_ENV_KEYS: ClassVar[tuple[str, ...]] = (
+        "OMNIGIBSON_DATA_PATH",
+        "OMNIGIBSON_HEADLESS",
+        "OMNIGIBSON_NO_OMNI_LOGS",
+        "OMNIGIBSON_DEBUG",
+        "MUJOCO_GL",
+        "PYOPENGL_PLATFORM",
+        "EXP_PATH",
+        "CARB_APP_PATH",
+        "RLINF_BEHAVIOR_TRO_STATE_SCOPE_SETTLE",
+        "RLINF_BEHAVIOR_TRO_STATE_SETTLE_STEPS",
+        "RLINF_BEHAVIOR_TRO_STATE_INSTANCE_BY_GLOBAL_INDEX",
+        "RLINF_BEHAVIOR_CAPTURE_PRE_RESET_SNAPSHOT",
+    )
 
     @classmethod
     def acquire_shared(
@@ -321,12 +545,16 @@ class BehaviorProcessPool:
         for attempt in range(1, max_attempts + 1):
             try:
                 self.env_processes = [
-                    BehaviorProcess.remote(
+                    BehaviorProcess.options(
+                        runtime_env=self._subprocess_runtime_env(sp)
+                    ).remote(
                         self.cfg,
                         self.num_env_shard,
                         pipeline_stage_num,
+                        sp,
+                        self.num_env_subprocess,
                     )
-                    for _ in range(self.num_env_subprocess)
+                    for sp in range(self.num_env_subprocess)
                 ]
 
                 # Wait for all instances to initialize and fetch their activity name
@@ -369,6 +597,38 @@ class BehaviorProcessPool:
             )
         self.activity_name = activity_names[0]
 
+    def _subprocess_runtime_env(self, subproc_idx: int) -> dict:
+        env_vars = {
+            key: os.environ[key] for key in self._RUNTIME_ENV_KEYS if key in os.environ
+        }
+        device_override = os.environ.get(
+            "RLINF_BEHAVIOR_SUBPROCESS_CUDA_VISIBLE_DEVICES"
+        )
+        visible_devices = device_override or os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible_devices:
+            devices = [
+                device.strip()
+                for device in visible_devices.split(",")
+                if device.strip()
+            ]
+            if devices:
+                selected_device = devices[subproc_idx % len(devices)]
+                env_vars["CUDA_VISIBLE_DEVICES"] = selected_device
+                self.logger.info(
+                    "BehaviorProcess %d using CUDA_VISIBLE_DEVICES=%s "
+                    "(source=%s, parent CUDA_VISIBLE_DEVICES=%s)",
+                    subproc_idx,
+                    selected_device,
+                    "RLINF_BEHAVIOR_SUBPROCESS_CUDA_VISIBLE_DEVICES"
+                    if device_override
+                    else "CUDA_VISIBLE_DEVICES",
+                    os.environ.get("CUDA_VISIBLE_DEVICES"),
+                )
+        env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = os.environ.get(
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1"
+        )
+        return {"env_vars": env_vars}
+
     def _slice_plan(
         self, global_start: int, num_envs: int
     ) -> list[tuple[int, list[int], list[int]]]:
@@ -410,6 +670,27 @@ class BehaviorProcessPool:
                 all_raw_obs[pos] = obs
                 all_infos[pos] = info
         return all_raw_obs, all_infos
+
+    def debug_snapshot_slice(self, global_start: int, num_envs: int):
+        """Capture debug snapshots for ``[global_start, global_start + num_envs)``."""
+        if num_envs == 0:
+            return []
+        plan = self._slice_plan(global_start, num_envs)
+        shard_results = ray.get(
+            [self.env_processes[sp].debug_snapshot.remote() for sp, _, _ in plan]
+        )
+
+        rows: list[dict | None] = [None] * num_envs
+        for shard_rows, (sp, positions, local_rows) in zip(shard_results, plan):
+            by_local_row = {row["local_row"]: row for row in shard_rows}
+            for pos, local_row in zip(positions, local_rows):
+                row = dict(by_local_row[local_row])
+                row["global_row"] = global_start + pos
+                row["slice_position"] = pos
+                row["subproc"] = sp
+                row["local_row"] = local_row
+                rows[pos] = row
+        return rows
 
     def env_chunk_step_slice(
         self,
@@ -520,6 +801,7 @@ class BehaviorEnv(gym.Env):
         self.pool = None
         self.pool_offset = None
         self.task_description = None
+        self._last_pre_reset_debug = None
         if total_num_processes % worker_info.group_world_size != 0:
             raise ValueError(
                 f"total_num_processes ({total_num_processes}) must be divisible by "
@@ -576,6 +858,10 @@ class BehaviorEnv(gym.Env):
             chunk_actions,
         )
 
+    def debug_snapshot(self):
+        self._ensure_pool()
+        return self.pool.debug_snapshot_slice(self.pool_offset, self.num_envs)
+
     def _extract_obs_image(self, raw_obs):
         state = None
         for sensor_data in raw_obs.values():
@@ -628,6 +914,13 @@ class BehaviorEnv(gym.Env):
         if self.enable_offload and self.pool is None:
             self._init_env()
         raw_obs, infos = self.env_reset()
+        self._last_pre_reset_debug = [
+            info.get("rlinf_pre_reset_debug")
+            for info in infos
+            if isinstance(info, dict) and "rlinf_pre_reset_debug" in info
+        ]
+        if not self._last_pre_reset_debug:
+            self._last_pre_reset_debug = None
         obs = self._wrap_obs(raw_obs)
         rewards = torch.zeros(self.num_envs, dtype=bool)
         infos = self._record_metrics(rewards, infos)
