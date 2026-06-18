@@ -275,6 +275,7 @@ validate_python_version() {
 }
 
 configure_model_env_versions() {
+    # here behavior pins python to 3.10 and torch to 2.5
     if [ "$TARGET" = "embodied" ] && [ "$MODEL" = "dreamzero" ] && [ "$ENV_NAME" = "behavior" ]; then
         PYTHON_VERSION="3.10"
         if [ -z "$TORCH_VERSION" ]; then
