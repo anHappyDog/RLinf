@@ -25,6 +25,7 @@ from rlinf.scheduler import Worker
 from rlinf.utils.utils import (
     materialize_tensor,
     normalize_device,
+    record_async_copy_source,
     synchronize_pending_accel_copies,
 )
 
@@ -670,6 +671,7 @@ class PatchWeightSyncer(WeightSyncer):
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
         bucket: dict[str, torch.Tensor],
+        source_keepalive: list[torch.Tensor],
     ) -> set[torch.device]:
         pending_copy_devices: set[torch.device] = set()
         for key, value in bucket.items():
@@ -683,10 +685,11 @@ class PatchWeightSyncer(WeightSyncer):
                     "Patch init sync receiver does not support DTensor state_dict values"
                 )
             target.copy_(value, non_blocking=True)
+            if value.device.type == Worker.torch_device_type:
+                record_async_copy_source(value, source_keepalive)
+                pending_copy_devices.add(value.device)
             if target.device.type == Worker.torch_device_type:
                 pending_copy_devices.add(target.device)
-            elif value.device.type == Worker.torch_device_type:
-                pending_copy_devices.add(value.device)
         return pending_copy_devices
 
     async def _apply_init_weights(
@@ -704,7 +707,10 @@ class PatchWeightSyncer(WeightSyncer):
             first_bucket.pop(BucketWeightSyncer._TOTAL_BUCKETS_KEY).item()
         )
         first_bucket.pop(BucketWeightSyncer._SYNCER_VERSION_KEY)
-        pending_copy_devices = self._apply_init_weight_bucket(state_dict, first_bucket)
+        source_keepalive: list[torch.Tensor] = []
+        pending_copy_devices = self._apply_init_weight_bucket(
+            state_dict, first_bucket, source_keepalive
+        )
 
         for _ in range(total_buckets - 1):
             bucket = await recv()
@@ -713,9 +719,10 @@ class PatchWeightSyncer(WeightSyncer):
                     "Patch init sync receiver expected a bucket payload dictionary"
                 )
             pending_copy_devices.update(
-                self._apply_init_weight_bucket(state_dict, bucket)
+                self._apply_init_weight_bucket(state_dict, bucket, source_keepalive)
             )
         synchronize_pending_accel_copies(pending_copy_devices)
+        source_keepalive.clear()
 
     async def init_sender(
         self,

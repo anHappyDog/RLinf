@@ -20,7 +20,7 @@ import random
 import sys
 from contextlib import contextmanager
 from functools import partial, wraps
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Iterable, Literal, Optional
 
 import numpy as np
 import torch
@@ -133,6 +133,31 @@ def synchronize_pending_accel_copies(copy_devices: set[torch.device]) -> None:
 
     for event in events:
         event.synchronize()
+
+
+def record_async_copy_source(
+    value: torch.Tensor, fallback_keepalive: list[torch.Tensor]
+) -> torch.device | None:
+    """Keep accelerator storage alive until a queued async copy consumes it."""
+    if value.device.type != Worker.torch_device_type:
+        return None
+    try:
+        value.record_stream(Worker.torch_platform.current_stream(value.device))
+    except (AttributeError, RuntimeError, TypeError):
+        fallback_keepalive.append(value)
+    return value.device
+
+
+def record_async_copy_sources(
+    values: Iterable[torch.Tensor],
+) -> tuple[set[torch.device], list[torch.Tensor]]:
+    """Protect accelerator tensors that may be read by queued async copies."""
+    pending_copy_devices: set[torch.device] = set()
+    source_keepalive: list[torch.Tensor] = []
+    for value in values:
+        if (device := record_async_copy_source(value, source_keepalive)) is not None:
+            pending_copy_devices.add(device)
+    return pending_copy_devices, source_keepalive
 
 
 def seed_everything(seed: int) -> int:

@@ -24,6 +24,8 @@ from rlinf.utils.utils import (
     materialize_tensor,
     normalize_device,
     normalize_dtype,
+    record_async_copy_source,
+    record_async_copy_sources,
     synchronize_pending_accel_copies,
 )
 
@@ -209,14 +211,21 @@ class BucketWeightSyncer(WeightSyncer):
 
         if self.load_instant:
             model.load_state_dict(bucket, strict=False)
+            pending_copy_devices, source_keepalive = record_async_copy_sources(
+                bucket.values()
+            )
+            synchronize_pending_accel_copies(pending_copy_devices)
+            source_keepalive.clear()
         else:
             cpu_buffer: dict[str, torch.Tensor] = {}
             pending_copy_devices: set[torch.device] = set()
+            staged_source_tensors: list[torch.Tensor] = []
             for key, value in bucket.items():
                 if value.device.type == "cpu":
                     cpu_buffer[key] = value
                 else:
                     cpu_buffer[key] = value.to("cpu", non_blocking=True)
+                    record_async_copy_source(value, staged_source_tensors)
                     pending_copy_devices.add(value.device)
         del bucket
 
@@ -224,17 +233,24 @@ class BucketWeightSyncer(WeightSyncer):
             bucket = await recv()
             if self.load_instant:
                 model.load_state_dict(bucket, strict=False)
+                pending_copy_devices, source_keepalive = record_async_copy_sources(
+                    bucket.values()
+                )
+                synchronize_pending_accel_copies(pending_copy_devices)
+                source_keepalive.clear()
             else:
                 for key, value in bucket.items():
                     if value.device.type == "cpu":
                         cpu_buffer[key] = value
                     else:
                         cpu_buffer[key] = value.to("cpu", non_blocking=True)
+                        record_async_copy_source(value, staged_source_tensors)
                         pending_copy_devices.add(value.device)
             del bucket
 
         if not self.load_instant:
             synchronize_pending_accel_copies(pending_copy_devices)
+            staged_source_tensors.clear()
             model.load_state_dict(cpu_buffer, strict=False)
             del cpu_buffer
 
