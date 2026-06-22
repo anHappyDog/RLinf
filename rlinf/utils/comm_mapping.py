@@ -59,6 +59,7 @@ class CommMapper:
             # for example, src_world_size = 2, dst_world_size = 8, split_size = 8, batch_size = 32
             # the rank 0 [4, 4, 4, 4] rank1 [4, 4, 4, 4]
             if queue_size <= 0:
+                length = dst_world_size // src_world_size // 2
                 if src_world_size == 1:
                     # special case for src_world_size == 1 and env_worker > rollout_worker size case
                     # To avoid the rollout worker become deadlocked, the len(buffer) should be divisible by 2.
@@ -70,10 +71,9 @@ class CommMapper:
                         batch_size // split_size
                         for _ in range(dst_world_size // src_world_size // 2)
                     ]
-                return [
-                    batch_size // split_size
-                    for _ in range(dst_world_size // src_world_size)
-                ]
+                if length >= 1:
+                    return [batch_size // split_size for _ in range(length)]
+                return [batch_size // split_size]
             else:
                 return [batch_size // split_size for _ in range(queue_size)]
 

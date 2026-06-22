@@ -254,18 +254,16 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         assert mode == "train", "Now eval mode is not supported in env decoupled mode"
         batch_size_map = self.batch_size_map[mode]
         batch_index_map = self.batch_index_map[mode]
-        assert len(batch_index_map) == len(batch_size_map), (
-            f"batch_index_map and batch_size_map must have the same length, but got {len(batch_index_map)} and {len(batch_size_map)}."
-        )
 
         is_last_run = []
-        for i in range(len(batch_size_map)):
+        for i in range(len(batch_index_map)):
             batch_index = batch_index_map[i]
             _, _, _, last_run = _split_channel_message(batch_index)
             is_last_run.append(last_run)
 
+        split_sizes = self.batch_index_map["split_size"] or batch_size_map
         split_rollout_results = self._split_rollout_result_by_last_run(
-            rollout_result, batch_size_map, is_last_run
+            rollout_result, split_sizes, is_last_run
         )
         for i, shard_result in enumerate(split_rollout_results):
             batch_index = batch_index_map[i]
@@ -287,7 +285,57 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             )
         # delete the batch index map
         self.batch_index_map[mode] = []
+        self.batch_index_map["split_size"] = []
         return
+
+    async def recv_env_output_one_moment_from_channel(
+        self,
+        input_channel: Channel,
+        mode: Literal["train", "eval"] = "train",
+        timeout_time: float = 0.02,
+    ) -> dict[str, Any]:
+        """Receive and merge the env outputs available within a short window."""
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        assert mode == "train", "Now eval mode is not supported in env decoupled mode"
+
+        batch_index_map = self.batch_index_map[mode]
+        assert len(batch_index_map) == 0, (
+            f"batch_index_map must be empty, but got batch_index_map {batch_index_map}."
+        )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_time
+        obs_batches = []
+        pending_get = None
+        expected_count = len(self.batch_size_map[mode])
+        while len(obs_batches) < expected_count:
+            if pending_get is None:
+                pending_get = input_channel.get(
+                    key=CommMapper.build_channel_key(
+                        None, None, extra=f"{mode}_obs"
+                    ),
+                    async_op=True,
+                )
+            elif not pending_get.done():
+                await asyncio.sleep(0.0001)
+
+            if pending_get.done():
+                obs_batches.append(await pending_get.async_wait())
+                pending_get = None
+
+            if loop.time() >= deadline:
+                if pending_get is not None:
+                    obs_batches.append(await pending_get.async_wait())
+                break
+
+        split_sizes = []
+        merged_batches = []
+        for obs_batch in obs_batches:
+            batch_index_map.append(obs_batch["batch_index"])
+            split_sizes.append(self._infer_env_batch_size(obs_batch["batch"]))
+            merged_batches.append(obs_batch["batch"])
+        self.batch_index_map["split_size"] = split_sizes
+        return self._merge_obs_batches(merged_batches)
 
     async def recv_env_output_from_channel(
         self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
@@ -340,7 +388,9 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     await self._poll_background_weight_sync()
                 await self.wait_if_stale()
                 decoupled_generate_time = decoupled_generate_time + 1
-            env_output = await self.recv_env_output_from_channel(input_channel)
+            env_output = await self.recv_env_output_one_moment_from_channel(
+                input_channel
+            )
             actions, result = self.predict(env_output["obs"])
             save_flags = None
             if result.get("expert_label_flag", False):

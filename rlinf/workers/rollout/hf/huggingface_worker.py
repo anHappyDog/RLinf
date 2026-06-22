@@ -155,6 +155,7 @@ class MultiStepRolloutWorker(Worker):
             # save the run-time imformation in communicate channel for decoupled mode
             self.batch_index_map = {
                 "train": [],
+                "split_size": [],
             }
             self.log_info(
                 f"decoupled model rollout worker initialized with batch_size_map: {self.batch_size_map}"
