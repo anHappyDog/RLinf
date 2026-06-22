@@ -595,12 +595,9 @@ class MultiStepRolloutWorker(Worker):
     ):
         batch_size_map = self.batch_size_map["rollout"]
         batch_index_map = self.batch_index_map["rollout"]
-        assert len(batch_index_map) == len(batch_size_map), (
-            f"batch_index_map and batch_size_map must have the same length, but got {len(batch_index_map)} and {len(batch_size_map)}."
-        )
 
         is_last_run = []
-        for i in range(len(batch_size_map)):
+        for i in range(len(batch_index_map)):
             batch_index = batch_index_map[i]
             _, _, _, last_run = _split_channel_message(batch_index)
             is_last_run.append(last_run)
@@ -636,12 +633,13 @@ class MultiStepRolloutWorker(Worker):
         return
 
     async def recv_env_output_one_moment_from_channel(
-        self, input_channel: Channel
+        self, input_channel: Channel, timeout_time: float = 0.02,
     ) -> dict[str, Any]:
         """Receive env outputs from mapped env ranks and merge if needed on one moment(eg. 0.2s).
 
         Args:
             input_channel: Channel carrying env->rollout outputs.
+            mode: Rollout mode, either ``"train"`` or ``"eval"``.
 
         Returns:
             A single env output dict. When multiple env ranks are mapped to this
@@ -655,20 +653,19 @@ class MultiStepRolloutWorker(Worker):
 
         obs_batches = []
         import time
-
         # the recv final time, recv the data time.
-        final_time = time.time() + 0.2
+        final_time = time.time() + timeout_time
         get_data_length = 0
         need_data_length = len(self.batch_size_map["rollout"])
         obs_batch = None
         while get_data_length < need_data_length:
             if obs_batch is None:
                 obs_batch = input_channel.get(
-                    key=CommMapper.build_channel_key(None, None, extra="rollout_obs"),
+                    key=CommMapper.build_channel_key(None, None, extra=f"rollout_obs"),
                     async_op=True,
                 )
             else:
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(0.0001)
             # wait the last task final
             if obs_batch.done():
                 obs_batches.append(await obs_batch.async_wait())
