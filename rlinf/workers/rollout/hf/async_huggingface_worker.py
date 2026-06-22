@@ -311,9 +311,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         while len(obs_batches) < expected_count:
             if pending_get is None:
                 pending_get = input_channel.get(
-                    key=CommMapper.build_channel_key(
-                        None, None, extra=f"{mode}_obs"
-                    ),
+                    key=CommMapper.build_channel_key(None, None, extra=f"{mode}_obs"),
                     async_op=True,
                 )
             elif not pending_get.done():
