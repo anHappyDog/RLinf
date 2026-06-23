@@ -26,6 +26,7 @@ from rlinf.utils.utils import (
     materialize_tensor,
     normalize_device,
     record_async_copy_source,
+    record_async_copy_sources,
     synchronize_pending_accel_copies,
 )
 
@@ -875,6 +876,10 @@ class PatchWeightSyncer(WeightSyncer):
 
         payload = await recv()
 
+        pending_copy_devices, source_keepalive = record_async_copy_sources(
+            value for value in vars(payload).values() if torch.is_tensor(value)
+        )
+
         if isinstance(payload, EmptyWeightPatch):
             return int(payload.version.item())
         patch = self.compressor.decompress(payload)
@@ -949,4 +954,6 @@ class PatchWeightSyncer(WeightSyncer):
             )
 
         assert offset == patch.rows.numel(), "Patch offsets do not match payload size"
+        if source_keepalive:
+            synchronize_pending_accel_copies(pending_copy_devices)
         return applied_version
