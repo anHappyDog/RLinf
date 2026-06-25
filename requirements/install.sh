@@ -968,9 +968,15 @@ EOF
     local cu_tag="cu${cuda_major}"            # e.g. cu12
     local torch_tag="torch${torch_mm}"        # e.g. torch2.6
 
-    # We currently assume cxx11 abi FALSE and linux x86_64
+    # Match flash-attn wheel ABI to the currently installed torch build.
     local platform_tag="linux_x86_64"
-    local cxx_abi="cxx11abiFALSE"
+    local cxx_abi
+    cxx_abi=$(python - <<'EOF'
+import torch
+
+print("cxx11abiTRUE" if torch._C._GLIBCXX_USE_CXX11_ABI else "cxx11abiFALSE")
+EOF
+)
 
     uv pip uninstall flash-attn || true
     local prebuilt_ver base_url wheel_name
@@ -1123,7 +1129,9 @@ install_openvla_oft_model() {
             install_common_embodied_deps
             uv pip install git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git  --no-build-isolation
             install_behavior_env
+            pushd ~ >/dev/null
             install_flash_attn
+            popd >/dev/null
             ;;
         maniskill_libero|libero)
             create_and_sync_venv
@@ -1200,7 +1208,9 @@ install_openpi_model() {
             uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/openpi
             install_behavior_env
             uv pip install protobuf==6.33.0
+            pushd ~ >/dev/null
             install_flash_attn
+            popd >/dev/null
             ;;
         maniskill_libero|libero)
             create_and_sync_venv
@@ -1502,7 +1512,7 @@ install_dreamzero_deps() {
     fi
 
     uv pip install -r $SCRIPT_DIR/embodied/models/dreamzero.txt
-    pip install -e "$dreamzero_path" --no-deps --ignore-requires-python
+    python -m pip install -e "$dreamzero_path" --no-deps --ignore-requires-python
 }
 
 install_dreamzero_model() {
@@ -1515,7 +1525,9 @@ install_dreamzero_model() {
             install_common_embodied_deps
             install_behavior_env
             install_dreamzero_deps
+            pushd ~ >/dev/null
             install_flash_attn
+            popd >/dev/null
             ;;
         maniskill_libero|libero)
             create_and_sync_venv
