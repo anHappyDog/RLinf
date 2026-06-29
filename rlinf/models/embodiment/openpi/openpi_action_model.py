@@ -31,7 +31,6 @@ from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.logging import get_logger
-from rlinf.utils.nested_dict_process import copy_dict_tensor
 from rlinf.utils.pytree import register_pytree_dataclasses
 
 
@@ -639,12 +638,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 key: value for key, value in outputs.items() if key.startswith("nft_")
             }
             forward_inputs.update(nft_outputs)
-
-        # Clone observations to avoid cross-step reference issues.
-        cloned_obs = copy_dict_tensor(
-            {k: v for k, v in to_process_obs.items() if k != "prompt"}
-        )
-        forward_inputs.update(cloned_obs)
 
         result = {
             "prev_logprobs": prev_logprobs,
