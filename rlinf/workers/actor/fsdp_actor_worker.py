@@ -1086,6 +1086,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
     @Worker.timer("actor/sync_model_to_rollout")
     async def sync_model_to_rollout(self) -> None:
+        if not self._is_weight_sender:
+            return
+
         if self.enable_offload:
             if not self.is_optimizer_offloaded:
                 self.offload_optimizer()
@@ -1096,8 +1099,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         state_dict = self.get_rollout_state_dict()
 
         async def send_func(data):
-            if not self._is_weight_sender:
-                return
             await self.broadcast(
                 data,
                 groups=[
