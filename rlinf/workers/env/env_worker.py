@@ -1307,6 +1307,45 @@ class EnvWorker(Worker):
         )
         return sparse_rewards
 
+    def _update_openpi_forward_inputs_with_raw_obs(
+        self,
+        forward_inputs: dict[str, Any] | None,
+        curr_obs: dict[str, Any] | None,
+    ) -> None:
+        if self.cfg.actor.model.model_type != "openpi":
+            return
+        if not forward_inputs or curr_obs is None:
+            return
+
+        raw_obs = copy_dict_tensor(
+            {
+                key: value
+                for key, value in curr_obs.items()
+                if key != "task_descriptions"
+            }
+        )
+
+        # Normalize keys to match openpi obs_processor so downstream
+        # input_transform (which keeps only keys containing "/") can find them.
+        normalized: dict[str, Any] = {}
+        if "main_images" in raw_obs:
+            normalized["observation/image"] = raw_obs["main_images"]
+        if raw_obs.get("wrist_images") is not None:
+            normalized["observation/wrist_image"] = raw_obs["wrist_images"]
+        if raw_obs.get("extra_view_images") is not None:
+            normalized["observation/extra_view_image"] = raw_obs["extra_view_images"]
+        if "states" in raw_obs:
+            config_name = getattr(self.cfg.actor.model, "config_name", "") or ""
+            state = raw_obs["states"]
+            if "calvin" in config_name:
+                normalized["observation/state_ee_pos"] = state[..., :3]
+                normalized["observation/state_ee_rot"] = state[..., 3:6]
+                normalized["observation/state_gripper"] = state[..., 6:7]
+            else:
+                normalized["observation/state"] = state
+
+        forward_inputs.update(normalized)
+
     def bootstrap_step(self) -> list[EnvOutput]:
         def get_zero_dones() -> torch.Tensor:
             return (
@@ -1537,6 +1576,9 @@ class EnvWorker(Worker):
                         rollout_result = self.recv_rollout_results(
                             input_channel, mode="train"
                         )
+                    self._update_openpi_forward_inputs_with_raw_obs(
+                        rollout_result.forward_inputs, curr_obs
+                    )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
