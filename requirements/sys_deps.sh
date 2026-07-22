@@ -123,6 +123,8 @@ install_deps_apt() {
         libxi-dev \
         libaio-dev \
         libgomp1 \
+        liblz4-1 \
+        libzstd1 \
         libexpat1 \
         libfontconfig1-dev \
         libpython3-stdlib \

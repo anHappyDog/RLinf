@@ -1,0 +1,35 @@
+run_id: 20260720_sg15_openpi_libero
+created_on: '2026-07-20'
+repository: /mnt/public/daibo/timeline/0703/RLinf
+commit: c5ca51cc21c007a41d287159f9e1b14e0200000e
+dirty_diff_sha256: 645eaede58e448774cd4fd74d126ca00fb47498c3b98c7eb09b3caba341d7239
+benchmark_sha256: 53b08b14d3724b22e04c8ad2ecd08d41ea312d78e7f313d7bfaee2efb2c8b3ba
+compression_sha256: f08596a31740c5a7f2dbc8f09634caa8a47b3aa33a5c444f65a98c19d4d6f722
+hosts:
+- is-dc7kruhvtugdvm6w-devmachine-0
+- is-dc7qg3gpfwjevvh5-devmachine-0
+- bjd_dev_2
+workload:
+  profile: target
+  slots: 8
+  chunk_steps: 48
+  image_height: 256
+  image_width: 256
+  image_fields: 4
+  action_chunks: 5
+  action_dim: 7
+  denoise_steps: 4
+  action_horizon: 50
+  openpi_action_dim: 32
+  token_length: 48
+raw_bytes: 314511360
+warmup: 2
+repeats: 10
+gates:
+  bitwise_round_trip: passed during every benchmark warmup
+  raw_fallback_payload_growth: passed by compression implementation tests
+  recommended_default_mode: raw
+  default_mode_not_slower_than_raw: true
+  storage_process_probe_p99_delta_ms: 0.0017014704644680023
+  storage_process_probe_gate_ms: 0.5
+  storage_process_isolated: true

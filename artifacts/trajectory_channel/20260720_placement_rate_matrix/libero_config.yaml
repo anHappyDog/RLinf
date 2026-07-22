@@ -1,0 +1,5 @@
+assets: /opt/envs/LIBERO/libero/libero/./assets
+bddl_files: /opt/envs/LIBERO/libero/libero/./bddl_files
+benchmark_root: /opt/envs/LIBERO/libero/libero
+datasets: /opt/envs/LIBERO/libero/libero/../datasets
+init_states: /opt/envs/LIBERO/libero/libero/./init_files

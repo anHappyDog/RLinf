@@ -36,6 +36,13 @@ def main(cfg) -> None:
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
+    if cfg.get("trajectory", {}).get("enabled", False):
+        from rlinf.workers.trajectory.runtime import validate_trajectory_config
+
+        # Fail before launching component worker groups so unsupported modes do
+        # not leave a partially initialized training job behind.
+        validate_trajectory_config(cfg)
+
     cluster = Cluster(
         cluster_cfg=cfg.cluster, distributed_log_dir=cfg.runner.per_worker_log_path
     )
@@ -117,12 +124,26 @@ def main(cfg) -> None:
             cluster, name=cfg.reward.group_name, placement_strategy=reward_placement
         )
 
+    trajectory_runtime = None
+    if cfg.get("trajectory", {}).get("enabled", False):
+        from rlinf.workers.trajectory.runtime import launch_trajectory_workers
+
+        trajectory_runtime = launch_trajectory_workers(
+            cfg,
+            cluster,
+            component_placement,
+            env_group=env_group,
+            rollout_group=rollout_group,
+            actor_group=actor_group,
+        )
+
     runner = EmbodiedRunner(
         cfg=cfg,
         actor=actor_group,
         rollout=rollout_group,
         env=env_group,
         reward=reward_group,
+        trajectory_runtime=trajectory_runtime,
     )
 
     runner.init_workers()

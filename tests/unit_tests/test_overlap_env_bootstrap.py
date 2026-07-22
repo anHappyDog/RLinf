@@ -225,6 +225,21 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
             torch.equal(env_metrics["episode_len"][1], torch.tensor([7, 8]))
         )
 
+    def test_metric_sampling_matches_episode_mode(self):
+        """Non-auto-reset runs should sample metrics only at the epoch tail."""
+        self.worker.cfg.env.train.auto_reset = False
+        self.worker.cfg.env.train.ignore_terminations = False
+
+        self.assertFalse(self.worker._should_record_env_metrics(0))
+        self.assertTrue(self.worker._should_record_env_metrics(1))
+
+        self.worker.cfg.env.train.auto_reset = True
+        self.assertTrue(self.worker._should_record_env_metrics(0))
+
+        self.worker.cfg.env.train.auto_reset = False
+        self.worker.cfg.env.train.ignore_terminations = True
+        self.assertTrue(self.worker._should_record_env_metrics(0))
+
     def test_interact_records_metrics_only_on_final_chunk_when_not_auto_reset(self):
         """Non-auto-reset training should record episode metrics only once per rollout epoch."""
         self.worker.cfg.env.train.auto_reset = False

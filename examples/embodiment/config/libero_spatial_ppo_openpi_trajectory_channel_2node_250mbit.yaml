@@ -1,0 +1,176 @@
+defaults:
+  - env/libero_spatial@env.train
+  - env/libero_spatial@env.eval
+  - model/pi0@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 2
+  node_groups:
+    - label: benchmark
+      node_ranks: 0-1
+      env_configs:
+        - node_ranks: 0-1
+          python_interpreter_path: /opt/venv/openpi/bin/python
+          env_vars:
+            - RLINF_COMM_NET_DEVICES: eth0
+            - GLOO_SOCKET_IFNAME: eth0
+            - NCCL_SOCKET_IFNAME: eth0
+  component_placement:
+    actor:
+      node_group: benchmark
+      placement: 0-3
+    env:
+      node_group: benchmark
+      placement: 4-7
+    rollout:
+      node_group: benchmark
+      placement: 4-7
+    trajectory_storage:
+      node_group: benchmark
+      placement: 0-3
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: ../results
+    project_name: rlinf
+    experiment_name: libero_spatial_ppo_openpi_trajectory_channel_2node_250mbit
+    logger_backends: ["tensorboard"]
+  max_epochs: 2
+  max_steps: 2
+  only_eval: false
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  normalize_advantages: true
+  kl_penalty: kl
+  group_size: 1
+  reward_coef: 1.0
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: token_level
+  update_epoch: 4
+  adv_type: gae
+  loss_type: actor_critic
+  loss_agg_func: token-mean
+  kl_beta: 0.0
+  entropy_bonus: 0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+  gamma: 0.99
+  gae_lambda: 0.95
+  filter_rewards: false
+  rewards_lower_bound: 0.1
+  rewards_upper_bound: 0.9
+
+env:
+  group_name: EnvGroup
+  train:
+    rollout_epoch: 8
+    total_num_envs: 32
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 500
+    auto_reset: true
+    ignore_terminations: true
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
+    group_size: 1
+    is_eval: true
+    video_cfg:
+      save_video: false
+
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  recompute_logprobs: false
+  unnorm_key: libero_10
+  enable_offload: false
+  pipeline_stage_num: 1
+  model:
+    model_path: /mnt/public/daibo/models/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 128
+  global_batch_size: 2048
+  seed: 42
+  enable_offload: false
+  model:
+    model_path: /mnt/public/daibo/models/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    num_action_chunks: 5
+    add_value_head: true
+    openpi:
+      detach_critic_input: true
+  optim:
+    lr: 5.0e-6
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 1.0
+    critic_warmup_steps: 0
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    gradient_checkpointing: false
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false
+
+trajectory:
+  enabled: true
+  channel_group_name: TrajectoryChannelGroup
+  storage_group_name: TrajectoryStorageGroup
+  live_queue_size: 8
+  ingest_queue_size: 8
+  max_inflight_frames: 8
+  max_resident_bytes: 4294967296
+  backpressure_timeout_s: 30.0
+  reservation_timeout_s: 30.0
+  drain_timeout_s: 30.0
+  live:
+    direct_policy_input: true
+    image_shape: [256, 256, 3]
+    state_shape: [8]
+    extra_view_shape: null
+    max_description_bytes: 256
+    compress_images: true
+    compression_level: 1
+    pin_memory: true
+  compression:
+    enabled: true
+    codec: lz4
+    level: 1
+    min_bytes: 65536
+    block_bytes: 1048576
+    num_threads: 4

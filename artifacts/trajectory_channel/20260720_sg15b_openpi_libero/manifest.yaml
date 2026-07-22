@@ -1,0 +1,26 @@
+run_id: 20260720_sg15b_openpi_libero
+created_on: '2026-07-20'
+commit: c5ca51cc21c007a41d287159f9e1b14e0200000e
+benchmark_sha256: 75d9e2181232909c164a455b1b79e317d8ec86689e41a1e614549456e9bfcdd3
+compression_sha256: 326e34d972cd9e9fc4ad57277fd267de569c6ccb38074585da352ffe8e558d84
+tensor_codec_sha256: 2cf189efeba07906c7982ef97f5f0fde45380fb8d307072e6a715911c418812d
+workload:
+  profile: target
+  slots: 8
+  chunk_steps: 48
+  image_height: 256
+  image_width: 256
+  image_fields: 4
+raw_bytes: 314511360
+warmup: 2
+repeats: 10
+hosts:
+  - bjd_dev
+  - bjd_dev_2
+gates:
+  bitwise_round_trip: passed
+  workspace_reuse: passed
+  storage_actor_e2e: passed
+  four_lane_lz4_faster_than_raw: true
+  eight_lane_regresses: true
+  production_default_changed: false

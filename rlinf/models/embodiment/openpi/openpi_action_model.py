@@ -278,6 +278,30 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
 
         self.torch_compile_enabled = False
+        self._pinned_h2d = False
+        self._h2d_staging: dict[str, torch.Tensor] = {}
+
+    def configure_pinned_h2d(self, enabled: bool) -> None:
+        """Enable reusable pinned staging for asynchronous model-input H2D."""
+        self._pinned_h2d = enabled
+
+    def _move_model_input(
+        self, key: str, value: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        if self._pinned_h2d and value.device.type == "cpu" and device.type == "cuda":
+            if not value.is_pinned():
+                staging = self._h2d_staging.get(key)
+                if (
+                    staging is None
+                    or staging.shape != value.shape
+                    or staging.dtype != value.dtype
+                ):
+                    staging = torch.empty_like(value, pin_memory=True)
+                    self._h2d_staging[key] = staging
+                staging.copy_(value)
+                value = staging
+            return value.to(device=device, non_blocking=True).contiguous()
+        return value.to(device=device).contiguous()
 
     def set_global_step(self, global_step):
         self.global_step = global_step
@@ -814,18 +838,18 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         for key, value in processed_obs.items():
             if isinstance(value, list):
                 processed_obs[key] = [
-                    item.to(device=device).contiguous()
+                    self._move_model_input(f"{key}.{index}", item, device)
                     if torch.is_tensor(item)
                     else item
-                    for item in value
+                    for index, item in enumerate(value)
                 ]
             elif torch.is_tensor(value):
-                processed_obs[key] = value.to(device=device).contiguous()
+                processed_obs[key] = self._move_model_input(key, value, device)
             elif isinstance(value, dict):
                 for sub_key, sub_value in value.items():
-                    processed_obs[key][sub_key] = sub_value.to(
-                        device=device
-                    ).contiguous()
+                    processed_obs[key][sub_key] = self._move_model_input(
+                        f"{key}.{sub_key}", sub_value, device
+                    )
         return processed_obs
 
     def predict_action_batch(

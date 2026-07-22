@@ -968,6 +968,13 @@ class EnvWorker(Worker):
         for key, value in env_info.items():
             env_metrics.setdefault(key, []).append(value)
 
+    def _should_record_env_metrics(self, chunk_step: int) -> bool:
+        return (
+            self.cfg.env.train.auto_reset
+            or self.cfg.env.train.ignore_terminations
+            or chunk_step == self.n_train_chunk_steps - 1
+        )
+
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
         self.last_intervened_info_list = [
@@ -1141,12 +1148,7 @@ class EnvWorker(Worker):
                         )
 
                     env_outputs[stage_id] = env_output
-                    should_record = (
-                        self.cfg.env.train.auto_reset
-                        or self.cfg.env.train.ignore_terminations
-                        or chunk_step_idx == self.n_train_chunk_steps - 1
-                    )
-                    if should_record:
+                    if self._should_record_env_metrics(chunk_step_idx):
                         self.record_env_metrics(env_metrics, env_info)
 
             for stage_id in range(self.stage_num):
@@ -1256,6 +1258,98 @@ class EnvWorker(Worker):
             if self.train_enable_offload:
                 get_env_attr(env, "offload")()
 
+        return env_metrics
+
+    @Worker.timer("interact_trajectory")
+    async def interact_trajectory(self, channel, writer, global_step: int):
+        """Run Env interaction with only actions on the live return path."""
+        if self.stage_num != 1:
+            raise ValueError("trajectory path currently requires pipeline_stage_num=1")
+        if self.use_external_reward_model:
+            raise ValueError("trajectory RewardWorker migration is not enabled yet")
+
+        from rlinf.workers.trajectory.bypass import SubmitStatus
+        from rlinf.workers.trajectory.records import (
+            boundary_request,
+            env_result,
+            policy_input,
+        )
+
+        slot_ids = writer.owned_slots()
+        env_metrics = defaultdict(list)
+        for epoch in range(self.rollout_epoch):
+            env_output = self.bootstrap_step()[0]
+            rollout_observations = env_output.prepare_observations(env_output.obs)
+            request = policy_input(
+                global_step=global_step,
+                rollout_epoch=epoch,
+                chunk_step=0,
+                slot_ids=slot_ids,
+                observations=rollout_observations,
+                rlt_switch_flags=env_output.rlt_switch_flags,
+                intervene_requested=env_output.intervene_flags,
+            )
+            for chunk_step in range(self.n_train_chunk_steps):
+                channel.publish_policy_input(request)
+                policy_output = channel.take_policy_output()
+                env_output, env_info, _ = self.env_interact_step(
+                    policy_output.actions, 0
+                )
+                writer.submit(
+                    env_result(
+                        request,
+                        rewards=env_output.rewards,
+                        dones=env_output.dones,
+                        terminations=env_output.terminations,
+                        truncations=env_output.truncations,
+                    ),
+                    wait_for=SubmitStatus.INGESTED,
+                )
+                # LIBERO may report success and time-limit on the same final
+                # transition. True termination wins, so only pure timeouts
+                # request a bootstrap value.
+                timeout = env_output.truncations.any(
+                    dim=-1
+                ) & ~env_output.terminations.any(dim=-1)
+                timeout_request = boundary_request(
+                    request,
+                    kind="timeout",
+                    observations=(
+                        env_output.prepare_observations(env_output.final_obs)
+                        if env_output.final_obs is not None
+                        else env_output.prepare_observations(env_output.obs)
+                    ),
+                    mask=timeout,
+                )
+                if timeout_request is not None:
+                    channel.publish_value_request(timeout_request)
+                if self._should_record_env_metrics(chunk_step):
+                    self.record_env_metrics(env_metrics, env_info)
+                request = policy_input(
+                    global_step=global_step,
+                    rollout_epoch=epoch,
+                    chunk_step=chunk_step + 1,
+                    slot_ids=slot_ids,
+                    observations=env_output.prepare_observations(env_output.obs),
+                    rlt_switch_flags=env_output.rlt_switch_flags,
+                    intervene_requested=env_output.intervene_flags,
+                )
+
+            alive = ~env_output.dones.any(dim=-1)
+            tail_request = boundary_request(
+                request,
+                kind="tail",
+                observations=env_output.prepare_observations(env_output.obs),
+                mask=alive,
+                chunk_step=self.n_train_chunk_steps,
+            )
+            if tail_request is not None:
+                channel.publish_value_request(tail_request)
+            self.store_last_obs_and_intervened_info([env_output])
+            self.finish_rollout()
+
+        for key, value in env_metrics.items():
+            env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
         return env_metrics
 
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):

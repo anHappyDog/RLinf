@@ -1161,6 +1161,27 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.rollout_batch = convert_trajectories_to_batch(recv_list)
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+        self._transition_aligned_trajectory = False
+
+    @Worker.timer("actor/pull_trajectory")
+    def pull_trajectory(self, reader) -> dict[str, torch.Tensor]:
+        """Pull a ready Storage shard and prepare transition-aligned GAE."""
+        if SupportedModel(self.cfg.actor.model.model_type) is SupportedModel.OPENPI:
+            import rlinf.models.embodiment.openpi.forward_inputs  # noqa: F401
+
+        from rlinf.workers.trajectory.actor import prepare_actor_batch
+
+        trajectory = reader.pull()
+        self.rollout_batch = prepare_actor_batch(
+            trajectory,
+            gamma=self.cfg.algorithm.get("gamma", 1),
+            gae_lambda=self.cfg.algorithm.get("gae_lambda", 1),
+            normalize_advantages=self.cfg.algorithm.get("normalize_advantages", False),
+            env_reward_weight=self.cfg.get("reward", {}).get("env_reward_weight", 1.0),
+            external_reward_weight=self.cfg.get("reward", {}).get("reward_weight", 1.0),
+        )
+        self._transition_aligned_trajectory = True
+        return compute_rollout_metrics(self.rollout_batch)
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
@@ -1364,9 +1385,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         shuffle_id = torch.randperm(rollout_size, generator=g)
 
         with torch.no_grad():
-            self.rollout_batch = process_nested_dict_for_train(
-                self.rollout_batch, shuffle_id
-            )
+            if getattr(self, "_transition_aligned_trajectory", False):
+                from rlinf.workers.trajectory.actor import shuffle_actor_batch
+
+                self.rollout_batch = shuffle_actor_batch(self.rollout_batch, shuffle_id)
+            else:
+                self.rollout_batch = process_nested_dict_for_train(
+                    self.rollout_batch, shuffle_id
+                )
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347

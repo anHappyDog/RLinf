@@ -1,0 +1,103 @@
+workload:
+  profile: target
+  slots: 8
+  chunk_steps: 48
+  image_height: 256
+  image_width: 256
+  image_fields: 4
+  action_chunks: 5
+  action_dim: 7
+  denoise_steps: 4
+  action_horizon: 50
+  openpi_action_dim: 32
+  token_length: 48
+tensor_schema:
+  image_0:
+    shape:
+    - 48
+    - 8
+    - 256
+    - 256
+    - 3
+    dtype: torch.uint8
+    bytes: 75497472
+  image_1:
+    shape:
+    - 48
+    - 8
+    - 256
+    - 256
+    - 3
+    dtype: torch.uint8
+    bytes: 75497472
+  image_2:
+    shape:
+    - 48
+    - 8
+    - 256
+    - 256
+    - 3
+    dtype: torch.uint8
+    bytes: 75497472
+  image_3:
+    shape:
+    - 48
+    - 8
+    - 256
+    - 256
+    - 3
+    dtype: torch.uint8
+    bytes: 75497472
+  chains:
+    shape:
+    - 384
+    - 5
+    - 50
+    - 32
+    dtype: torch.float32
+    bytes: 12288000
+  denoise_inds:
+    shape:
+    - 384
+    - 4
+    dtype: torch.int64
+    bytes: 12288
+  tokenized_prompt:
+    shape:
+    - 384
+    - 48
+    dtype: torch.int64
+    bytes: 147456
+  tokenized_prompt_mask:
+    shape:
+    - 384
+    - 48
+    dtype: torch.bool
+    bytes: 18432
+  actions:
+    shape:
+    - 48
+    - 8
+    - 5
+    - 7
+    dtype: torch.float32
+    bytes: 53760
+  state_values:
+    shape:
+    - 48
+    - 8
+    - 1
+    dtype: torch.float32
+    bytes: 1536
+settings:
+  profile: target
+  seed: 0
+  warmup: 2
+  repeats: 10
+  codecs: raw,lz4,zstd
+  level: 1
+  min_bytes: 65536
+  block_bytes: 1048576
+  isolation_modes: baseline,inline,async,thread,process
+  isolation_seconds: 3.0
+  probe_interval_ms: 2.0

@@ -63,6 +63,7 @@ class EmbodiedRunner:
         env: Union["EnvWorker", "AsyncEnvWorker"],
         reward: Union["EmbodiedRewardWorker"] = None,
         critic=None,
+        trajectory_runtime: dict | None = None,
     ):
         self.cfg = cfg
         self.actor = actor
@@ -70,6 +71,7 @@ class EmbodiedRunner:
         self.env = env
         self.critic = critic
         self.reward = reward
+        self.trajectory_runtime = trajectory_runtime
         self.weight_sync_interval = self.cfg.runner.weight_sync_interval
         self.overlap_env_bootstrap = bool(
             self.cfg.runner.get("overlap_env_bootstrap", False)
@@ -478,6 +480,8 @@ class EmbodiedRunner:
     def run(self):
         if self.cfg.runner.get("use_training_pipeline", False):
             return self.run_pipeline()
+        if self.trajectory_runtime is not None:
+            return self.run_trajectory()
 
         start_step = self.global_step
         start_time = time.time()
@@ -559,6 +563,64 @@ class EmbodiedRunner:
                 eval_metrics=eval_metrics,
             )
 
+        self._finish_run()
+
+    def run_trajectory(self):
+        """Run transition-aligned generations through bounded trajectory storage."""
+        from rlinf.workers.trajectory.runtime import begin_trajectory_generation
+
+        start_step = self.global_step
+        start_time = time.time()
+        for step in range(start_step, self.max_steps):
+            if step != start_step:
+                begin_trajectory_generation(self.trajectory_runtime, self.global_step)
+            self.actor.set_global_step(self.global_step)
+            self.rollout.set_global_step(self.global_step)
+            with self.timer("step"):
+                with self.timer("sync_weights"):
+                    self.update_rollout_weights()
+                with self.timer("generate_rollouts"):
+                    env_handle = self.env.interact_trajectory(
+                        channel=self.trajectory_runtime["channel"],
+                        writer=self.trajectory_runtime["env_writer"],
+                        global_step=self.global_step,
+                    )
+                    rollout_handle = self.rollout.generate_trajectory(
+                        channel=self.trajectory_runtime["channel"],
+                        writer=self.trajectory_runtime["rollout_writer"],
+                    )
+                    env_handle.wait()
+                    rollout_handle.wait()
+                    self.rollout.infer_trajectory_values(
+                        channel=self.trajectory_runtime["channel"],
+                        writer=self.trajectory_runtime["rollout_writer"],
+                    ).wait()
+                    actor_rollout_metrics = self.actor.pull_trajectory(
+                        self.trajectory_runtime["reader"]
+                    ).wait()
+                    storage_metrics = (
+                        self.trajectory_runtime["storage_group"].metrics().wait()
+                    )
+                actor_training_handle = self.actor.run_training()
+                actor_training_metrics = actor_training_handle.wait()
+            self.global_step += 1
+            self._log_step_metrics(
+                step=step,
+                start_time=start_time,
+                start_step=start_step,
+                env_handle=env_handle,
+                rollout_handle=rollout_handle,
+                actor_training_handle=actor_training_handle,
+                reward_handle=None,
+                actor_rollout_metrics=actor_rollout_metrics,
+                actor_training_metrics=actor_training_metrics,
+                eval_metrics={
+                    f"trajectory/{key}": value
+                    for key, value in self._aggregate_numeric_metrics(
+                        storage_metrics
+                    ).items()
+                },
+            )
         self._finish_run()
 
     def run_pipeline(self):

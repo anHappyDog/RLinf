@@ -1,0 +1,284 @@
+{
+  "kind": "cross_host",
+  "host": "is-dc7qg3gpfwjevvh5-devmachine-0",
+  "peer": "bjd_dev_2",
+  "environments": [
+    {
+      "python": "3.11.14 (main, Feb 12 2026, 00:42:50) [Clang 21.1.4 ]",
+      "torch": "2.6.0+cu124",
+      "hostname": "is-dc7qg3gpfwjevvh5-devmachine-0",
+      "platform": "Linux-5.15.0-94-generic-x86_64-with-glibc2.35",
+      "cpu_count": 56,
+      "torch_threads": 42,
+      "torch_interop_threads": 43,
+      "network_interfaces": {
+        "egp-tenan-20270": {
+          "operstate": "unknown",
+          "speed_mbit": "10000"
+        },
+        "bonding_masters": {
+          "operstate": null,
+          "speed_mbit": null
+        },
+        "lo": {
+          "operstate": "unknown",
+          "speed_mbit": null
+        },
+        "eth0": {
+          "operstate": "up",
+          "speed_mbit": "10000"
+        }
+      }
+    },
+    {
+      "python": "3.11.14 (main, Feb 12 2026, 00:42:50) [Clang 21.1.4 ]",
+      "torch": "2.6.0+cu124",
+      "hostname": "is-ddbgtrdzyl6jhnfe-devmachine-0",
+      "platform": "Linux-5.15.0-94-generic-x86_64-with-glibc2.35",
+      "cpu_count": 56,
+      "torch_threads": 42,
+      "torch_interop_threads": 42,
+      "network_interfaces": {
+        "lo": {
+          "operstate": "unknown",
+          "speed_mbit": null
+        },
+        "eth0": {
+          "operstate": "up",
+          "speed_mbit": "10000"
+        },
+        "egp-tenan-20270": {
+          "operstate": "unknown",
+          "speed_mbit": "10000"
+        },
+        "bonding_masters": {
+          "operstate": null,
+          "speed_mbit": null
+        }
+      }
+    }
+  ],
+  "workload": {
+    "profile": "target",
+    "slots": 8,
+    "chunk_steps": 48,
+    "image_height": 256,
+    "image_width": 256,
+    "image_fields": 4,
+    "action_chunks": 5,
+    "action_dim": 7,
+    "denoise_steps": 4,
+    "action_horizon": 50,
+    "openpi_action_dim": 32,
+    "token_length": 48
+  },
+  "tensor_schema": {
+    "image_0": {
+      "shape": [
+        48,
+        8,
+        256,
+        256,
+        3
+      ],
+      "dtype": "torch.uint8",
+      "bytes": 75497472
+    },
+    "image_1": {
+      "shape": [
+        48,
+        8,
+        256,
+        256,
+        3
+      ],
+      "dtype": "torch.uint8",
+      "bytes": 75497472
+    },
+    "image_2": {
+      "shape": [
+        48,
+        8,
+        256,
+        256,
+        3
+      ],
+      "dtype": "torch.uint8",
+      "bytes": 75497472
+    },
+    "image_3": {
+      "shape": [
+        48,
+        8,
+        256,
+        256,
+        3
+      ],
+      "dtype": "torch.uint8",
+      "bytes": 75497472
+    },
+    "chains": {
+      "shape": [
+        384,
+        5,
+        50,
+        32
+      ],
+      "dtype": "torch.float32",
+      "bytes": 12288000
+    },
+    "denoise_inds": {
+      "shape": [
+        384,
+        4
+      ],
+      "dtype": "torch.int64",
+      "bytes": 12288
+    },
+    "tokenized_prompt": {
+      "shape": [
+        384,
+        48
+      ],
+      "dtype": "torch.int64",
+      "bytes": 147456
+    },
+    "tokenized_prompt_mask": {
+      "shape": [
+        384,
+        48
+      ],
+      "dtype": "torch.bool",
+      "bytes": 18432
+    },
+    "actions": {
+      "shape": [
+        48,
+        8,
+        5,
+        7
+      ],
+      "dtype": "torch.float32",
+      "bytes": 53760
+    },
+    "state_values": {
+      "shape": [
+        48,
+        8,
+        1
+      ],
+      "dtype": "torch.float32",
+      "bytes": 1536
+    }
+  },
+  "raw_bytes": 314511360,
+  "settings": {
+    "profile": "target",
+    "seed": 0,
+    "warmup": 2,
+    "repeats": 10,
+    "codecs": "raw,lz4,zstd",
+    "level": 1,
+    "min_bytes": 65536,
+    "block_bytes": 1048576,
+    "compression_threads": 2,
+    "isolation_modes": "baseline,inline,async,thread,process",
+    "isolation_seconds": 2.0,
+    "probe_interval_ms": 2.0
+  },
+  "results": [
+    {
+      "mode": "raw",
+      "latency": {
+        "count": 10,
+        "mean_ms": 169.44202054291964,
+        "p50_ms": 167.7628168836236,
+        "p95_ms": 180.71125661954284,
+        "p99_ms": 186.791363786906,
+        "p999_ms": 188.15938789956272,
+        "max_ms": 188.3113905787468
+      },
+      "cpu_time_rank0": {
+        "count": 10,
+        "mean_ms": 90.86067850000016,
+        "p50_ms": 86.63088149999965,
+        "p95_ms": 110.05449815000011,
+        "p99_ms": 122.7232556299997,
+        "p999_ms": 125.57372606299958,
+        "max_ms": 125.89044499999957
+      },
+      "peak_rss_rank0_bytes": 764891136,
+      "peak_rss_rank0_delta_bytes": 466944,
+      "rank1_cpu_mean_ms": 167.56993010000033,
+      "rank1_cpu_p95_ms": 171.80918824999986,
+      "peak_rss_rank1_bytes": 1107468288,
+      "peak_rss_rank1_delta_bytes": 353177600,
+      "raw_bytes": 314511360,
+      "wire_bytes": 314511360,
+      "compression_ratio": 1.0,
+      "throughput_raw_gib_s": 1.745985999652159
+    },
+    {
+      "mode": "lz4",
+      "latency": {
+        "count": 10,
+        "mean_ms": 134.73185058683157,
+        "p50_ms": 134.40040592104197,
+        "p95_ms": 137.44242638349533,
+        "p99_ms": 139.09918397665024,
+        "p999_ms": 139.4719544351101,
+        "max_ms": 139.51337337493896
+      },
+      "cpu_time_rank0": {
+        "count": 10,
+        "mean_ms": 95.34348399999999,
+        "p50_ms": 95.4446090000003,
+        "p95_ms": 96.88722629999998,
+        "p99_ms": 97.14441965999936,
+        "p999_ms": 97.2022881659992,
+        "max_ms": 97.2087179999992
+      },
+      "peak_rss_rank0_bytes": 790843392,
+      "peak_rss_rank0_delta_bytes": 413696,
+      "rank1_cpu_mean_ms": 161.0698603999996,
+      "rank1_cpu_p95_ms": 164.1894545999996,
+      "peak_rss_rank1_bytes": 1120223232,
+      "peak_rss_rank1_delta_bytes": 351465472,
+      "raw_bytes": 314511360,
+      "wire_bytes": 24873812,
+      "compression_ratio": 12.644276639222007,
+      "throughput_raw_gib_s": 2.1793946791581593
+    },
+    {
+      "mode": "zstd",
+      "latency": {
+        "count": 10,
+        "mean_ms": 190.91820809990168,
+        "p50_ms": 191.8961936607957,
+        "p95_ms": 192.7039903588593,
+        "p99_ms": 192.8865891136229,
+        "p999_ms": 192.92767383344471,
+        "max_ms": 192.9322388023138
+      },
+      "cpu_time_rank0": {
+        "count": 10,
+        "mean_ms": 142.9469060999999,
+        "p50_ms": 142.96406749999946,
+        "p95_ms": 143.35834905000013,
+        "p99_ms": 143.40584421000025,
+        "p999_ms": 143.41653062100028,
+        "max_ms": 143.41771800000026
+      },
+      "peak_rss_rank0_bytes": 784695296,
+      "peak_rss_rank0_delta_bytes": 0,
+      "rank1_cpu_mean_ms": 189.24244169999992,
+      "rank1_cpu_p95_ms": 191.5553488999997,
+      "peak_rss_rank1_bytes": 1182732288,
+      "peak_rss_rank1_delta_bytes": 411930624,
+      "raw_bytes": 314511360,
+      "wire_bytes": 16624024,
+      "compression_ratio": 18.919087219797085,
+      "throughput_raw_gib_s": 1.5264061467460848
+    }
+  ]
+}

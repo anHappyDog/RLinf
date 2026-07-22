@@ -32,11 +32,13 @@ from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
     RolloutResult,
 )
+from rlinf.data.trajectory import ValueRequest, ValueResult
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.workers.trajectory.value import infer_value_request
 
 
 class MultiStepRolloutWorker(Worker):
@@ -143,6 +145,15 @@ class MultiStepRolloutWorker(Worker):
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
+        configure_h2d = getattr(self.hf_model, "configure_pinned_h2d", None)
+        if configure_h2d is not None:
+            configure_h2d(
+                bool(
+                    OmegaConf.select(
+                        self.cfg, "trajectory.live.pin_memory", default=False
+                    )
+                )
+            )
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
@@ -618,6 +629,10 @@ class MultiStepRolloutWorker(Worker):
                 final_values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
         return final_values[:, :1].cpu().contiguous()
 
+    def infer_value_request(self, request: ValueRequest) -> ValueResult:
+        """Evaluate selected boundary observations through the actual value head."""
+        return infer_value_request(self.hf_model, request)
+
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
 
@@ -761,6 +776,53 @@ class MultiStepRolloutWorker(Worker):
 
         if self.enable_offload:
             self.offload_model()
+
+    async def generate_trajectory(self, channel, writer) -> None:
+        """Run policy inference while bypassing Actor-only data to Storage."""
+        if self.num_pipeline_stages != 1:
+            raise ValueError("trajectory path currently requires pipeline_stage_num=1")
+        if self.enable_offload:
+            self.reload_model()
+        from rlinf.models.embodiment.openpi.forward_inputs import (
+            OpenPILiberoForwardInputs,
+        )
+        from rlinf.workers.trajectory.bypass import SubmitStatus
+        from rlinf.workers.trajectory.records import rollout_results
+
+        for _ in range(self.rollout_epoch * self.n_train_chunk_steps):
+            request = channel.take_policy_input()
+            actions, result = self._predict_rollout_actions(request.observations)
+            forward_inputs = OpenPILiberoForwardInputs.from_model_inputs(
+                result["forward_inputs"]
+            )
+            version = torch.full_like(
+                result["prev_logprobs"], float(self.version), dtype=torch.float32
+            )
+            output, stored = rollout_results(
+                request,
+                actions=actions,
+                forward_inputs=forward_inputs,
+                prev_logprobs=result["prev_logprobs"],
+                state_values=result["prev_values"],
+                versions=version,
+                intervene_flags=result.get("intervene_flags"),
+            )
+            writer.submit(stored, wait_for=SubmitStatus.INGESTED)
+            channel.publish_policy_output(output)
+        if self.enable_offload:
+            self.offload_model()
+
+    def infer_trajectory_values(self, channel, writer) -> int:
+        """Drain sparse timeout/tail requests after Env interaction completes."""
+        from rlinf.workers.trajectory.bypass import SubmitStatus
+
+        count = channel.value_request_count()
+        for _ in range(count):
+            writer.submit(
+                self.infer_value_request(channel.take_value_request()),
+                wait_for=SubmitStatus.INGESTED,
+            )
+        return count
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
