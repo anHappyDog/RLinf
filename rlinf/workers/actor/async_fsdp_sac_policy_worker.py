@@ -19,6 +19,8 @@ import threading
 import torch
 
 from rlinf.scheduler import Worker
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
+from rlinf.scheduler.channel.trajectory_channel.storage import TrajectoryBatch
 from rlinf.utils.metric_utils import (
     append_to_dict,
     compute_split_num,
@@ -44,6 +46,12 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
             self._recv_rollout_thread.start()
 
     def _recv_rollout_thread_main(self, input_channel):
+        if isinstance(input_channel, TrajectoryChannel):
+            while not self.should_stop:
+                batch = input_channel.take(TrajectoryBatch)
+                self._recv_queue.put(batch.to_trajectory(self.cfg))
+            return
+
         send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(send_num, recv_num)

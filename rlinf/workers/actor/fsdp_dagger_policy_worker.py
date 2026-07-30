@@ -30,6 +30,11 @@ from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
+from rlinf.scheduler.channel.trajectory_channel.storage import (
+    LeRobotEpisodeBatch,
+    TrajectoryBatch,
+)
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import append_to_dict, compute_split_num
@@ -279,8 +284,24 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             self._resume_lerobot_dataset()
 
     @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
+    async def recv_rollout_trajectories(
+        self, input_channel: Channel | TrajectoryChannel
+    ) -> None:
         clear_memory(sync=False)
+
+        if isinstance(input_channel, TrajectoryChannel):
+            if self.enable_online_lerobot:
+                batch = await input_channel.take(
+                    LeRobotEpisodeBatch, async_op=True
+                ).async_wait()
+                self._record_lerobot_batch(batch)
+                return
+            batch = await input_channel.take(
+                TrajectoryBatch, async_op=True
+            ).async_wait()
+            return self.recv_buffer_rollout_trajectories(
+                [batch.to_trajectory(self.cfg)]
+            )
 
         if not self.enable_online_lerobot:
             send_num = self._component_placement.get_world_size("env") * self.stage_num
@@ -295,6 +316,13 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             return self.recv_buffer_rollout_trajectories(recv_list)
         else:
             return self.recv_lerobot_rollout_trajectories(input_channel)
+
+    def _record_lerobot_batch(self, batch: LeRobotEpisodeBatch) -> None:
+        for episode in batch.to_numpy_episodes():
+            if episode:
+                self._append_lerobot_episode(episode)
+        if self.dataset.is_ready():
+            self._ensure_lerobot_loader()
 
     def recv_buffer_rollout_trajectories(self, recv_list: list[Trajectory]) -> None:
         intervene_traj_list = []

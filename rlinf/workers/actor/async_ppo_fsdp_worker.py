@@ -26,6 +26,8 @@ from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.priority_store import PriorityStore
 from rlinf.scheduler import Worker
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
+from rlinf.scheduler.channel.trajectory_channel.storage import TrajectoryBatch
 from rlinf.utils.distributed import all_reduce_dict, masked_normalization
 from rlinf.utils.metric_utils import (
     CRITIC_EXPLAINED_VARIANCE_KEY,
@@ -98,16 +100,26 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     def _recv_rollout_thread_main(self, input_channel):
         while not self.should_stop:
-            trajectory: Trajectory = input_channel.get()
+            if isinstance(input_channel, TrajectoryChannel):
+                batch = input_channel.take(TrajectoryBatch)
+                trajectory = batch.to_trajectory(self.cfg)
+                channel_size = "storage"
+            else:
+                trajectory = input_channel.get()
+                channel_size = input_channel.qsize()
             self.log_info(
                 f"recv trajectory versions.shape={trajectory.versions.shape} "
-                f"input_channel.qsize={input_channel.qsize()}"
+                f"input_channel.qsize={channel_size}"
             )
             if trajectory.versions.min() < self.version - self.cfg.algorithm.get(
                 "staleness_threshold", None
             ):
                 continue
             self._recv_queue.put(trajectory)
+
+    async def stop(self) -> None:
+        """Stop accepting rollout batches."""
+        self.should_stop = True
 
     @Worker.timer("drain_received_trajectories")
     def _drain_received_trajectories(self):

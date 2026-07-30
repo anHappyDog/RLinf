@@ -20,6 +20,11 @@ import time
 import torch
 
 from rlinf.scheduler import Worker
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
+from rlinf.scheduler.channel.trajectory_channel.storage import (
+    LeRobotEpisodeBatch,
+    TrajectoryBatch,
+)
 from rlinf.utils.metric_utils import append_to_dict, compute_split_num
 from rlinf.workers.actor.fsdp_dagger_policy_worker import EmbodiedDAGGERFSDPPolicy
 
@@ -63,6 +68,10 @@ class AsyncEmbodiedDAGGERFSDPPolicy(EmbodiedDAGGERFSDPPolicy):
         readiness.
         """
         while not self.should_stop:
+            if isinstance(input_channel, TrajectoryChannel):
+                batch = input_channel.take(LeRobotEpisodeBatch)
+                self._record_lerobot_batch(batch)
+                continue
             received_any = self._recv_lerobot_episodes_from_channel(input_channel)
             if self.dataset.is_ready():
                 self._ensure_lerobot_loader()
@@ -70,6 +79,12 @@ class AsyncEmbodiedDAGGERFSDPPolicy(EmbodiedDAGGERFSDPPolicy):
                 time.sleep(0.1)
 
     def _recv_rollout_thread_main(self, input_channel):
+        if isinstance(input_channel, TrajectoryChannel):
+            while not self.should_stop:
+                batch = input_channel.take(TrajectoryBatch)
+                self._recv_queue.put(batch.to_trajectory(self.cfg))
+            return
+
         send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(send_num, recv_num)

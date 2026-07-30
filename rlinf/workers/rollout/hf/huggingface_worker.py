@@ -16,7 +16,7 @@ import asyncio
 import copy
 import gc
 import time
-from typing import Any, Callable, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
 import numpy as np
 import torch
@@ -30,13 +30,22 @@ from rlinf.algorithms.rlt import (
 )
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
+    LegacyRolloutResult,
+    PolicyInput,
+    PolicyOutput,
     RolloutResult,
+    ValueRequest,
+    ValueResult,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.scheduler import Channel, Cluster, CommMapper, Worker, split_channel_message
+from rlinf.utils.nested_dict_process import put_tensor_device, split_dict
 from rlinf.utils.placement import HybridComponentPlacement
+
+if TYPE_CHECKING:
+    from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
 
 
 class MultiStepRolloutWorker(Worker):
@@ -68,6 +77,13 @@ class MultiStepRolloutWorker(Worker):
         train_env_cfg = cfg.env.get("train", None)
         eval_env_cfg = cfg.env.get("eval", None)
         self.enable_train = not self.only_eval and train_env_cfg is not None
+        self.enable_online_lerobot = self.enable_train and bool(
+            OmegaConf.select(
+                cfg,
+                "algorithm.dagger.online_lerobot.enabled",
+                default=False,
+            )
+        )
         self.enable_eval = (
             cfg.runner.get("val_check_interval", -1) > 0 or self.only_eval
         )
@@ -137,6 +153,28 @@ class MultiStepRolloutWorker(Worker):
                 "rollout_results": [],
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
+        self._value_consumer_task: asyncio.Task[None] | None = None
+
+        policy_requests_per_chunk = 0
+        if self.enable_train:
+            actor_world_size = self.placement.get_world_size("actor")
+            env_world_size = self.placement.get_world_size("env")
+            logical_env_world_size = env_world_size * self.num_pipeline_stages
+            policy_requests_per_chunk = sum(
+                len(
+                    CommMapper.get_dst_ranks(
+                        batch_size=self.total_num_train_envs,
+                        src_world_size=logical_env_world_size,
+                        dst_world_size=actor_world_size,
+                        src_rank=logical_env_rank,
+                    )
+                )
+                for logical_env_rank in range(logical_env_world_size)
+            )
+        requests_per_rank, remainder = divmod(
+            policy_requests_per_chunk, rollout_world_size
+        )
+        self._policy_requests_per_chunk = requests_per_rank + (self._rank < remainder)
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
@@ -581,7 +619,7 @@ class MultiStepRolloutWorker(Worker):
         result: dict[str, Any],
         *,
         final_obs: dict[str, Any] | None = None,
-    ) -> RolloutResult:
+    ) -> LegacyRolloutResult:
         intervene_flags = result.get("intervene_flags")
         if intervene_flags is None and result.get("expert_label_flag", False):
             intervene_flags = torch.full(
@@ -590,7 +628,7 @@ class MultiStepRolloutWorker(Worker):
                 dtype=torch.bool,
                 device=actions.device,
             )
-        return RolloutResult(
+        return LegacyRolloutResult(
             actions=actions,
             prev_logprobs=result["prev_logprobs"] if self.collect_prev_infos else None,
             prev_values=result["prev_values"] if self.collect_prev_infos else None,
@@ -732,7 +770,7 @@ class MultiStepRolloutWorker(Worker):
                     final_obs=env_output.get("final_obs", None),
                 )
             else:
-                rollout_result = RolloutResult(
+                rollout_result = LegacyRolloutResult(
                     actions=actions,
                     prev_values=(
                         result["prev_values"] if self.collect_prev_infos else None
@@ -762,9 +800,14 @@ class MultiStepRolloutWorker(Worker):
         self,
         input_channel: Channel,
         output_channel: Channel,
+        trajectory_channel: "TrajectoryChannel | None" = None,
     ):
         if self.enable_offload:
             self.reload_model()
+
+        if trajectory_channel is not None:
+            await self._generate_with_trajectory_channel(trajectory_channel)
+            return
 
         for _ in tqdm(
             range(self.rollout_epoch),
@@ -775,6 +818,205 @@ class MultiStepRolloutWorker(Worker):
 
         if self.enable_offload:
             self.offload_model()
+
+    async def _generate_with_trajectory_channel(
+        self, trajectory_channel: "TrajectoryChannel"
+    ) -> None:
+        self._ensure_value_consumer(trajectory_channel)
+
+        for _ in tqdm(
+            range(self.rollout_epoch),
+            desc="Generating Rollout Epochs",
+            disable=(self._rank != 0),
+        ):
+            self.update_dagger_beta()
+            for _ in range(self.n_train_chunk_steps):
+                for _ in range(self._policy_requests_per_chunk):
+                    policy_input = await trajectory_channel.take(
+                        PolicyInput, async_op=True
+                    ).async_wait()
+                    await self._process_policy_input(trajectory_channel, policy_input)
+
+    def _ensure_value_consumer(self, trajectory_channel: "TrajectoryChannel") -> None:
+        if bool(
+            OmegaConf.select(self.cfg, "actor.model.add_value_head", default=False)
+        ):
+            if self._value_consumer_task is None:
+                self._value_consumer_task = asyncio.create_task(
+                    self._consume_value_requests(trajectory_channel),
+                    name=f"rollout-value-consumer-{self._rank}",
+                )
+            elif self._value_consumer_task.done():
+                self._value_consumer_task.result()
+                raise RuntimeError("Value request consumer stopped unexpectedly.")
+
+    async def _process_policy_input(
+        self,
+        trajectory_channel: "TrajectoryChannel",
+        policy_input: PolicyInput,
+    ) -> None:
+        actions, result = self._predict_rollout_actions(
+            policy_input.observations,
+            mode=policy_input.mode,
+            rlt_switch_flags=policy_input.rlt_switch_flags,
+            intervene_requested=policy_input.intervene_flags,
+        )
+        await self._publish_policy_result(
+            trajectory_channel, policy_input, actions, result
+        )
+
+    async def _process_policy_inputs(
+        self,
+        trajectory_channel: "TrajectoryChannel",
+        policy_inputs: list[PolicyInput],
+    ) -> None:
+        """Run one inference batch and return each request independently."""
+        if len(policy_inputs) == 1:
+            await self._process_policy_input(trajectory_channel, policy_inputs[0])
+            return
+
+        merged = self._merge_obs_batches(
+            [
+                {
+                    "obs": request.observations,
+                    "rlt_switch_flags": request.rlt_switch_flags,
+                    "intervene_flags": request.intervene_flags,
+                }
+                for request in policy_inputs
+            ]
+        )
+        actions, result = self._predict_rollout_actions(
+            merged["obs"],
+            mode=policy_inputs[0].mode,
+            rlt_switch_flags=merged["rlt_switch_flags"],
+            intervene_requested=merged["intervene_flags"],
+        )
+        split_sizes = [request.batch_size for request in policy_inputs]
+        split_actions = torch.split(actions, split_sizes, dim=0)
+        split_results = split_dict(result, split_sizes)
+        await asyncio.gather(
+            *(
+                self._publish_policy_result(
+                    trajectory_channel,
+                    request,
+                    request_actions,
+                    request_result,
+                )
+                for request, request_actions, request_result in zip(
+                    policy_inputs, split_actions, split_results
+                )
+            )
+        )
+
+    async def _publish_policy_result(
+        self,
+        trajectory_channel: "TrajectoryChannel",
+        policy_input: PolicyInput,
+        actions: torch.Tensor,
+        result: dict[str, Any],
+    ) -> None:
+        actions = actions.detach().cpu().contiguous()
+        intervene_flags = result.get("intervene_flags")
+        if intervene_flags is None and result.get("expert_label_flag", False):
+            intervene_flags = torch.full(
+                (actions.shape[0], self.model_cfg.num_action_chunks),
+                True,
+                dtype=torch.bool,
+            )
+
+        prev_logprobs = result.get("prev_logprobs")
+        state_values = result.get("prev_values")
+        versions = (
+            torch.full_like(
+                prev_logprobs,
+                float(self.version),
+                dtype=torch.float32,
+            )
+            if prev_logprobs is not None
+            else None
+        )
+        forward_inputs = put_tensor_device(result.get("forward_inputs"), "cpu")
+        record_fields = {
+            "global_step": policy_input.global_step,
+            "rollout_epoch": policy_input.rollout_epoch,
+            "chunk_step": policy_input.chunk_step,
+            "slot_ids": policy_input.slot_ids,
+            "actor_rank": policy_input.actor_rank,
+            "pipeline_stage": policy_input.pipeline_stage,
+        }
+        policy_output = PolicyOutput(
+            **record_fields,
+            env_rank=policy_input.env_rank,
+            actions=actions,
+            mode=policy_input.mode,
+            expert_actions=(
+                forward_inputs.get("action")
+                if self.enable_online_lerobot and forward_inputs is not None
+                else None
+            ),
+            intervene_flags=(
+                intervene_flags.cpu().contiguous()
+                if intervene_flags is not None
+                else None
+            ),
+        )
+        policy_work = trajectory_channel.publish(policy_output, async_op=True)
+        await policy_work.async_wait()
+        if policy_input.mode == "train" and not self.enable_online_lerobot:
+            await trajectory_channel.publish(
+                RolloutResult(
+                    **record_fields,
+                    actions=actions,
+                    forward_inputs=forward_inputs,
+                    prev_logprobs=(
+                        prev_logprobs.cpu().contiguous()
+                        if self.collect_prev_infos and prev_logprobs is not None
+                        else None
+                    ),
+                    state_values=(
+                        state_values.cpu().contiguous()
+                        if self.collect_prev_infos and state_values is not None
+                        else None
+                    ),
+                    versions=(
+                        versions.cpu().contiguous() if versions is not None else None
+                    ),
+                    intervene_flags=(
+                        intervene_flags.cpu().contiguous()
+                        if intervene_flags is not None
+                        else None
+                    ),
+                ),
+                async_op=True,
+            ).async_wait()
+
+    async def _consume_value_requests(
+        self, trajectory_channel: "TrajectoryChannel"
+    ) -> None:
+        while True:
+            request = await trajectory_channel.take(
+                ValueRequest, async_op=True
+            ).async_wait()
+            actions, result = self._predict_rollout_actions(request.observations)
+            values = result.get("prev_values")
+            if values is None:
+                values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
+            values = values[:, :1].detach().cpu().contiguous()
+            versions = torch.full_like(values, float(self.version), dtype=torch.float32)
+            await trajectory_channel.publish(
+                ValueResult(
+                    global_step=request.global_step,
+                    rollout_epoch=request.rollout_epoch,
+                    chunk_step=request.chunk_step,
+                    slot_ids=request.slot_ids,
+                    actor_rank=request.actor_rank,
+                    pipeline_stage=request.pipeline_stage,
+                    kind=request.value_kind,
+                    values=values,
+                    versions=versions,
+                ),
+                async_op=True,
+            ).async_wait()
 
     @Worker.timer("evaluate")
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
@@ -955,8 +1197,8 @@ class MultiStepRolloutWorker(Worker):
         }
 
     def _split_rollout_result(
-        self, rollout_result: RolloutResult, sizes: list[int]
-    ) -> list[RolloutResult]:
+        self, rollout_result: LegacyRolloutResult, sizes: list[int]
+    ) -> list[LegacyRolloutResult]:
         def _split_optional_tensor(
             tensor: torch.Tensor | None,
         ) -> tuple[torch.Tensor | None, ...]:
@@ -984,7 +1226,7 @@ class MultiStepRolloutWorker(Worker):
         )
 
         return [
-            RolloutResult(
+            LegacyRolloutResult(
                 actions=split_actions[idx],
                 prev_logprobs=split_prev_logprobs[idx],
                 prev_values=split_prev_values[idx],

@@ -14,8 +14,8 @@
 
 import copy
 import uuid
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING, Any, Literal, Optional, Self, TypeAlias
 
 import numpy as np
 import torch
@@ -281,7 +281,7 @@ class EnvOutput:
 
 
 @dataclass(kw_only=True)
-class RolloutResult:
+class LegacyRolloutResult:
     """Rollout result for a single chunk step."""
 
     actions: torch.Tensor = None  # [B, action_dim]
@@ -311,8 +311,8 @@ class RolloutResult:
 
     @staticmethod
     def merge_rollout_results(
-        rollout_results: list["RolloutResult"],
-    ) -> "RolloutResult":
+        rollout_results: list["LegacyRolloutResult"],
+    ) -> "LegacyRolloutResult":
         def _merge_optional_tensor(field_name: str) -> torch.Tensor | None:
             values = [
                 getattr(rollout_result, field_name)
@@ -341,7 +341,7 @@ class RolloutResult:
         else:
             merged_forward_inputs = cat_list_of_dict_tensor(forward_inputs_list)
 
-        return RolloutResult(
+        return LegacyRolloutResult(
             actions=merged_actions,
             prev_logprobs=merged_prev_logprobs,
             prev_values=merged_prev_values,
@@ -1246,7 +1246,7 @@ class EmbodiedLerobotRolloutResult(EmbodiedRolloutResult):
     def append_chunk_episode_data(
         self,
         *,
-        rollout_result: RolloutResult,
+        rollout_result: LegacyRolloutResult,
         chunk_actions,
         obs_list,
         terminations,
@@ -1485,3 +1485,256 @@ def convert_trajectories_to_batch(
             batch[field_name] = torch.cat(field_list, dim=1)
 
     return batch
+
+
+Observations: TypeAlias = dict[str, Any]
+PolicyMode: TypeAlias = Literal["train", "eval"]
+ValueKind: TypeAlias = Literal["truncation", "boundary"]
+RewardMode: TypeAlias = Literal["per_step", "terminal", "history_buffer"]
+TensorPath: TypeAlias = tuple[str | int, ...]
+
+
+@dataclass(kw_only=True)
+class TrajectoryData:
+    def flatten(self) -> tuple[dict[str, Any], dict[TensorPath, torch.Tensor]]:
+        """Flatten the data into a skeleton and a tensor dictionary."""
+        tensors: dict[TensorPath, torch.Tensor] = {}
+        skeleton = {
+            field.name: _flatten_value(
+                getattr(self, field.name), path=(field.name,), tensors=tensors
+            )
+            for field in fields(self)
+            if field.metadata.get("serialize", True)
+        }
+        return skeleton, tensors
+
+    @classmethod
+    def from_flattened(
+        cls,
+        skeleton: dict[str, Any],
+        tensors: dict[TensorPath, torch.Tensor],
+    ) -> Self:
+        restored_paths: set[TensorPath] = set()
+        values = {
+            name: _unflatten_value(
+                skeleton[name],
+                path=(name,),
+                tensors=tensors,
+                restored_paths=restored_paths,
+            )
+            for field in fields(cls)
+            if field.metadata.get("serialize", True)
+            for name in (field.name,)
+        }
+        unused_paths = set(tensors.keys()) - restored_paths
+        if unused_paths:
+            raise ValueError(f"Unused tensor paths in from_flattened: {unused_paths}")
+        return cls(**values)
+
+
+@dataclass(kw_only=True)
+class TrajectoryRecord(TrajectoryData):
+    global_step: int
+    rollout_epoch: int
+    chunk_step: int
+    slot_ids: tuple[int, ...]
+    actor_rank: int = 0
+    pipeline_stage: int = 0
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.slot_ids)
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        for name in (
+            "global_step",
+            "rollout_epoch",
+            "chunk_step",
+            "actor_rank",
+            "pipeline_stage",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(
+                    f"{name} must be a non-negative integer, got {value!r}."
+                )
+
+        if not isinstance(self.slot_ids, tuple) or not self.slot_ids:
+            raise ValueError("slot_ids must be a non-empty tuple.")
+        if any(
+            not isinstance(slot_id, int) or isinstance(slot_id, bool) or slot_id < 0
+            for slot_id in self.slot_ids
+        ):
+            raise ValueError("slot_ids must contain non-negative integers.")
+        if len(set(self.slot_ids)) != len(self.slot_ids):
+            raise ValueError("slot_ids must not contain duplicates.")
+
+
+@dataclass(kw_only=True)
+class PolicyInput(TrajectoryRecord):
+    env_rank: int
+    observations: Observations
+    mode: PolicyMode = "train"
+    rlt_switch_flags: torch.Tensor | None = None
+    intervene_flags: torch.Tensor | None = None
+
+
+@dataclass(kw_only=True)
+class PolicyOutput(TrajectoryRecord):
+    env_rank: int
+    actions: torch.Tensor
+    mode: PolicyMode = "train"
+    expert_actions: torch.Tensor | None = None
+    intervene_flags: torch.Tensor | None = None
+
+    @property
+    def route_key(self) -> tuple[int, PolicyMode]:
+        return self.env_rank, self.mode
+
+
+@dataclass(kw_only=True)
+class ValueRequest(TrajectoryRecord):
+    value_kind: ValueKind
+    observations: Observations
+
+
+@dataclass(kw_only=True)
+class ValueResult(TrajectoryRecord):
+    kind: ValueKind
+    values: torch.Tensor
+    versions: torch.Tensor | None = None
+
+
+@dataclass(kw_only=True)
+class RewardRequest(TrajectoryRecord):
+    mode: RewardMode
+    inputs: dict[str, Any]
+    history_lengths: dict[str, torch.Tensor] | None = None
+
+
+@dataclass(kw_only=True)
+class RewardResult(TrajectoryRecord):
+    rewards: torch.Tensor
+    mode: RewardMode = "per_step"
+    history_lengths: torch.Tensor | None = None
+
+
+@dataclass(kw_only=True)
+class EnvResult(TrajectoryRecord):
+    rewards: torch.Tensor
+    dones: torch.Tensor
+    terminations: torch.Tensor
+    truncations: torch.Tensor
+    observations: Observations | None = None
+    next_observations: Observations | None = None
+    intervene_actions: torch.Tensor | None = None
+    intervene_flags: torch.Tensor | None = None
+    rlt_switch_flags: torch.Tensor | None = None
+
+
+@dataclass(kw_only=True)
+class RolloutResult(TrajectoryRecord):
+    actions: torch.Tensor
+    forward_inputs: dict[str, torch.Tensor] | None = None
+    prev_logprobs: torch.Tensor | None = None
+    state_values: torch.Tensor | None = None
+    versions: torch.Tensor | None = None
+    intervene_flags: torch.Tensor | None = None
+
+
+@dataclass(kw_only=True)
+class LeRobotStepResult(TrajectoryRecord):
+    """Raw environment step data for StorageWorker episode collection."""
+
+    env_rank: int
+    chunk_actions: torch.Tensor
+    observations: list[Observations]
+    terminations: torch.Tensor
+    truncations: torch.Tensor
+    env_infos: list[dict[str, Any]]
+    expert_actions: torch.Tensor | None = None
+    intervene_flags: torch.Tensor | None = None
+
+
+def _flatten_value(
+    value: Any,
+    path: TensorPath,
+    tensors: dict[TensorPath, torch.Tensor],
+) -> Any:
+    if isinstance(value, torch.Tensor):
+        tensors[path] = value
+        return None
+
+    if isinstance(value, dict):
+        return {
+            key: _flatten_value(child, (*path, key), tensors)
+            for key, child in value.items()
+        }
+
+    if isinstance(value, list):
+        return [
+            _flatten_value(child, (*path, index), tensors)
+            for index, child in enumerate(value)
+        ]
+
+    if isinstance(value, tuple):
+        return tuple(
+            _flatten_value(child, (*path, index), tensors)
+            for index, child in enumerate(value)
+        )
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    raise TypeError(
+        f"Unsupported trajectory value at {path!r}: {type(value).__name__}."
+    )
+
+
+def _unflatten_value(
+    value: Any,
+    path: TensorPath,
+    tensors: dict[TensorPath, torch.Tensor],
+    restored_paths: set[TensorPath],
+) -> Any:
+    if path in tensors:
+        restored_paths.add(path)
+        return tensors[path]
+
+    if isinstance(value, dict):
+        return {
+            key: _unflatten_value(
+                child,
+                (*path, key),
+                tensors,
+                restored_paths,
+            )
+            for key, child in value.items()
+        }
+
+    if isinstance(value, list):
+        return [
+            _unflatten_value(
+                child,
+                (*path, index),
+                tensors,
+                restored_paths,
+            )
+            for index, child in enumerate(value)
+        ]
+
+    if isinstance(value, tuple):
+        return tuple(
+            _unflatten_value(
+                child,
+                (*path, index),
+                tensors,
+                restored_paths,
+            )
+            for index, child in enumerate(value)
+        )
+
+    return value

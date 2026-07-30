@@ -22,6 +22,7 @@ from omegaconf.omegaconf import OmegaConf
 from rlinf.config import validate_cfg
 from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Cluster
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.reward import EmbodiedAPIRewardWorker, EmbodiedRewardWorker
@@ -152,12 +153,21 @@ def main(cfg) -> None:
             placement_strategy=reward_placement,
         )
 
+    trajectory_channel = None
+    if cfg.get("trajectory_channel", {}).get("enabled", False):
+        trajectory_channel = TrajectoryChannel.create(
+            cfg=cfg,
+            cluster=cluster,
+            placement=component_placement,
+        )
+
     runner = EmbodiedRunner(
         cfg=cfg,
         actor=actor_group,
         rollout=rollout_group,
         env=env_group,
         reward=reward_group,
+        trajectory_channel=trajectory_channel,
     )
 
     runner.init_workers()

@@ -33,6 +33,8 @@ from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
 from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
+from rlinf.scheduler.channel.trajectory_channel.storage import TrajectoryBatch
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import (
@@ -311,7 +313,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                         target_param.data.copy_(shadow.to(target_param.data.dtype))
 
     @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
+    async def recv_rollout_trajectories(
+        self, input_channel: Channel | TrajectoryChannel
+    ) -> None:
         """
         Receive rollout trajectories from rollout workers.
 
@@ -319,6 +323,13 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             input_channel: The input channel to read from.
         """
         clear_memory(sync=False)
+
+        if isinstance(input_channel, TrajectoryChannel):
+            batch = await input_channel.take(
+                TrajectoryBatch, async_op=True
+            ).async_wait()
+            self.replay_buffer.add_trajectories([batch.to_trajectory(self.cfg)])
+            return
 
         send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")

@@ -34,6 +34,7 @@ from rlinf.utils.timers import Timer
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
         AsyncEmbodiedSACFSDPPolicy,
     )
@@ -63,6 +64,7 @@ class EmbodiedRunner:
         env: Union["EnvWorker", "AsyncEnvWorker"],
         reward: Union["EmbodiedRewardWorker"] = None,
         critic=None,
+        trajectory_channel: "TrajectoryChannel | None" = None,
     ):
         self.cfg = cfg
         self.actor = actor
@@ -70,6 +72,7 @@ class EmbodiedRunner:
         self.env = env
         self.critic = critic
         self.reward = reward
+        self.trajectory_channel = trajectory_channel
         self.weight_sync_interval = self.cfg.runner.weight_sync_interval
         self.overlap_env_bootstrap = bool(
             self.cfg.runner.get("overlap_env_bootstrap", False)
@@ -359,8 +362,8 @@ class EmbodiedRunner:
         time_metrics.update(
             {f"time/actor/{k}": v for k, v in actor_time_metrics.items()}
         )
-        if self.reward is not None:
-            assert reward_handle is not None
+        reward_time_metrics_per_rank = []
+        if reward_handle is not None:
             reward_time_metrics, reward_time_metrics_per_rank = (
                 reward_handle.consume_durations(return_per_rank=True)
             )
@@ -430,7 +433,7 @@ class EmbodiedRunner:
             prefix="env",
             worker_group_name=self.env.worker_group_name,
         )
-        if self.reward is not None:
+        if reward_handle is not None:
             self._log_ranked_metrics(
                 metrics_list=reward_time_metrics_per_rank,
                 step=step,
@@ -481,10 +484,30 @@ class EmbodiedRunner:
 
         start_step = self.global_step
         start_time = time.time()
+        trajectory_env_channel = None
+        trajectory_rollout_channel = None
+        trajectory_actor_channel = None
+        trajectory_reward_handle = None
+        if self.trajectory_channel is not None:
+            trajectory_env_channel = self.trajectory_channel.for_participant("env")
+            trajectory_rollout_channel = self.trajectory_channel.for_participant(
+                "rollout"
+            )
+            trajectory_actor_channel = self.trajectory_channel.for_participant("actor")
+            if self.reward is not None:
+                trajectory_reward_channel = self.trajectory_channel.for_participant(
+                    "reward"
+                )
+                trajectory_reward_handle = self.reward.compute_rewards_async(
+                    input_channel=trajectory_reward_channel,
+                    output_channel=trajectory_reward_channel,
+                )
         for _step in range(start_step, self.max_steps):
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
+            if self.trajectory_channel is not None:
+                self.env.set_global_step(self.global_step)
 
             profiled_step = (
                 self.global_step
@@ -504,22 +527,33 @@ class EmbodiedRunner:
                         rollout_channel=self.rollout_channel,
                         reward_channel=self.reward_channel,
                         actor_channel=self.actor_channel,
+                        trajectory_channel=trajectory_env_channel,
                     )
                     rollout_handle: Handle = self.rollout.generate(
                         input_channel=self.rollout_channel,
                         output_channel=self.env_channel,
+                        trajectory_channel=trajectory_rollout_channel,
                     )
                     reward_handle = None
-                    if self.reward is not None:
+                    if self.reward is not None and self.trajectory_channel is None:
                         reward_handle: Handle = self.reward.compute_rewards(
                             input_channel=self.reward_channel,
                             output_channel=self.env_channel,
                         )
                     self.actor.recv_rollout_trajectories(
-                        input_channel=self.actor_channel
+                        input_channel=(
+                            trajectory_actor_channel
+                            if trajectory_actor_channel is not None
+                            else self.actor_channel
+                        )
                     ).wait()
                     rollout_handle.wait()
-                    if self.reward is not None:
+                    if (
+                        self.trajectory_channel is not None
+                        and self.cfg.rollout.enable_offload
+                    ):
+                        self.rollout.offload_model().wait()
+                    if reward_handle is not None:
                         reward_handle.wait()
 
                 # compute advantages and returns.
@@ -532,7 +566,11 @@ class EmbodiedRunner:
                 with self.timer("actor_training"):
                     actor_training_handle: Handle = self.actor.run_training()
                     env_bootstrap_handle: Handle | None = None
-                    if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
+                    if (
+                        self.trajectory_channel is None
+                        and self.overlap_env_bootstrap
+                        and _step + 1 < self.max_steps
+                    ):
                         env_bootstrap_handle = self.env.prefetch_train_bootstrap(
                             rollout_channel=self.rollout_channel
                         )
@@ -560,9 +598,16 @@ class EmbodiedRunner:
                 eval_metrics=eval_metrics,
             )
 
+        if trajectory_reward_handle is not None:
+            self.reward.stop().wait()
+            trajectory_reward_handle.wait()
         self._finish_run()
 
     def run_pipeline(self):
+        if self.trajectory_channel is not None:
+            raise NotImplementedError(
+                "TrajectoryChannel does not support the training pipeline yet."
+            )
         start_step = self.global_step
         start_time = time.time()
         for _step in range(start_step, self.max_steps):

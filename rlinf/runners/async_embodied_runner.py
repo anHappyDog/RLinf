@@ -25,6 +25,7 @@ from rlinf.utils.metric_utils import compute_evaluate_metrics
 from rlinf.utils.runner_utils import check_progress
 
 if TYPE_CHECKING:
+    from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
     from rlinf.workers.actor.async_fsdp_dagger_policy_worker import (
         AsyncEmbodiedDAGGERFSDPPolicy,
     )
@@ -47,8 +48,17 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         env: "AsyncEnvWorker",
         reward: "EmbodiedRewardWorker",
         critic=None,
+        trajectory_channel: "TrajectoryChannel | None" = None,
     ):
-        super().__init__(cfg, actor, rollout, env, reward, critic)
+        super().__init__(
+            cfg=cfg,
+            actor=actor,
+            rollout=rollout,
+            env=env,
+            reward=reward,
+            critic=critic,
+            trajectory_channel=trajectory_channel,
+        )
 
         # Data channels
         self.env_metric_channel = Channel.create("EnvMetric")
@@ -137,6 +147,13 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         self._pending_rollout_weight_sync = (rollout_handle, actor_handle)
 
     def evaluate(self):
+        if self.trajectory_channel is not None:
+            env_handle = self.env.evaluate_with_trajectory_channel()
+            env_results = env_handle.wait()
+            return compute_evaluate_metrics(
+                [result for result in env_results if result is not None]
+            )
+
         env_handle: Handle = self.env.evaluate(
             input_channel=self.env_channel,
             rollout_channel=self.rollout_channel,
@@ -159,25 +176,43 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         start_time = time.time()
         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
 
+        trajectory_env_channel = None
+        trajectory_rollout_channel = None
+        trajectory_actor_channel = None
+        trajectory_reward_channel = None
+        if self.trajectory_channel is not None:
+            trajectory_env_channel = self.trajectory_channel.for_participant("env")
+            trajectory_rollout_channel = self.trajectory_channel.for_participant(
+                "rollout"
+            )
+            trajectory_actor_channel = self.trajectory_channel.for_participant("actor")
+            if self.reward is not None:
+                trajectory_reward_channel = self.trajectory_channel.for_participant(
+                    "reward"
+                )
+            self.env.set_global_step(self.global_step).wait()
+
         env_handle: Handle = self.env.interact(
             input_channel=self.env_channel,
             rollout_channel=self.rollout_channel,
             reward_channel=self.reward_channel,
             actor_channel=self.actor_channel,
             metric_channel=self.env_metric_channel,
+            trajectory_channel=trajectory_env_channel,
         )
         rollout_handle: Handle = self.rollout.generate(
             input_channel=self.rollout_channel,
             output_channel=self.env_channel,
             metric_channel=self.rollout_metric_channel,
+            trajectory_channel=trajectory_rollout_channel,
         )
         if self.reward is not None:
             reward_handle: Handle = self.reward.compute_rewards_async(
-                input_channel=self.reward_channel,
-                output_channel=self.env_channel,
+                input_channel=trajectory_reward_channel or self.reward_channel,
+                output_channel=trajectory_reward_channel or self.env_channel,
             )
         actor_handle: Handle = self.actor.recv_rollout_trajectories(
-            input_channel=self.actor_channel
+            input_channel=trajectory_actor_channel or self.actor_channel
         )
 
         while self.global_step < self.max_steps:
@@ -236,7 +271,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-            if self.actor_channel is not None:
+            if self.trajectory_channel is None and self.actor_channel is not None:
                 training_metrics["train/replay_channel_qsize"] = (
                     self.actor_channel.qsize()
                 )

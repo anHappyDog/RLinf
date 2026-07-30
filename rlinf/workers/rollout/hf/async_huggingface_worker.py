@@ -13,10 +13,13 @@
 # limitations under the License.
 
 import asyncio
+from collections import deque
 
 from omegaconf.omegaconf import DictConfig
 
+from rlinf.data.embodied_io_struct import PolicyInput
 from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -42,6 +45,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self._weight_sync_apply_total = 0
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
+        self._pending_policy_inputs: deque[PolicyInput] = deque()
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -49,12 +53,18 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         input_channel: Channel,
         output_channel: Channel,
         metric_channel: Channel,
+        trajectory_channel: TrajectoryChannel | None = None,
     ):
         assert self._generate_task is None, (
             "generate task is not None but generate function is called."
         )
         self._generate_task = asyncio.create_task(
-            self._generate(input_channel, output_channel, metric_channel)
+            self._generate(
+                input_channel,
+                output_channel,
+                metric_channel,
+                trajectory_channel,
+            )
         )
         try:
             await self._generate_task
@@ -66,7 +76,26 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         input_channel: Channel,
         output_channel: Channel,
         metric_channel: Channel,
+        trajectory_channel: TrajectoryChannel | None,
     ):
+        if trajectory_channel is not None and self.env_decoupled_mode:
+            await self._decoupled_generate_with_trajectory_channel(
+                trajectory_channel, metric_channel
+            )
+            return
+
+        if trajectory_channel is not None:
+            while True:
+                if self._background_weight_sync_active:
+                    await self._poll_background_weight_sync()
+                await self._generate_with_trajectory_channel(trajectory_channel)
+                if self.finished_episodes is not None:
+                    self.finished_episodes += (
+                        self.total_num_train_envs * self.rollout_epoch
+                    )
+                self._publish_rollout_metrics(metric_channel)
+            return
+
         if self.env_decoupled_mode:
             await self.decoupled_generate_one_epoch(input_channel, output_channel)
         else:
@@ -80,14 +109,90 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     self.finished_episodes += (
                         self.total_num_train_envs * self.rollout_epoch
                     )
-                rollout_metrics = self.pop_execution_times()
-                rollout_metrics = {
-                    f"time/rollout/{k}": v for k, v in rollout_metrics.items()
-                }
-                metric_channel.put(
-                    {"rank": self._rank, "time": rollout_metrics},
-                    async_op=True,
+                self._publish_rollout_metrics(metric_channel)
+
+    def _publish_rollout_metrics(self, metric_channel: Channel) -> None:
+        rollout_metrics = self.pop_execution_times()
+        rollout_metrics = {
+            f"time/rollout/{key}": value for key, value in rollout_metrics.items()
+        }
+        metric_channel.put(
+            {"rank": self._rank, "time": rollout_metrics},
+            async_op=True,
+        )
+
+    async def _decoupled_generate_with_trajectory_channel(
+        self,
+        trajectory_channel: TrajectoryChannel,
+        metric_channel: Channel,
+    ) -> None:
+        self._ensure_value_consumer(trajectory_channel)
+        batch_limit = max(1, self.rollout_queue_size or self._policy_requests_per_chunk)
+        input_queue: asyncio.Queue[PolicyInput] = asyncio.Queue(batch_limit)
+
+        async def consume() -> None:
+            while True:
+                request = await trajectory_channel.take(
+                    PolicyInput, async_op=True
+                ).async_wait()
+                await input_queue.put(request)
+
+        consumers = [asyncio.create_task(consume()) for _ in range(batch_limit)]
+        inference_count = 0
+        self.update_dagger_beta()
+        try:
+            while True:
+                if inference_count % self.sync_rollout_weight_time == 0:
+                    if self._background_weight_sync_active:
+                        await self._poll_background_weight_sync()
+                    await self.wait_if_stale()
+                    if inference_count:
+                        self.update_dagger_beta()
+                        self._publish_rollout_metrics(metric_channel)
+
+                requests = await self._collect_policy_inputs(
+                    input_queue,
+                    batch_limit,
                 )
+                await self._process_policy_inputs(trajectory_channel, requests)
+                if self.finished_episodes is not None:
+                    self.finished_episodes += sum(
+                        request.batch_size
+                        for request in requests
+                        if request.rollout_epoch == self.rollout_epoch - 1
+                        and request.chunk_step == self.n_train_chunk_steps - 1
+                    )
+                inference_count += 1
+        finally:
+            for consumer in consumers:
+                consumer.cancel()
+            await asyncio.gather(*consumers, return_exceptions=True)
+
+    async def _collect_policy_inputs(
+        self,
+        input_queue: asyncio.Queue[PolicyInput],
+        batch_limit: int,
+    ) -> list[PolicyInput]:
+        requests = [
+            self._pending_policy_inputs.popleft()
+            if self._pending_policy_inputs
+            else await input_queue.get()
+        ]
+        mode = requests[0].mode
+        deadline = asyncio.get_running_loop().time() + 0.02
+        while len(requests) < batch_limit:
+            timeout = deadline - asyncio.get_running_loop().time()
+            if timeout <= 0:
+                break
+            try:
+                request = await asyncio.wait_for(input_queue.get(), timeout)
+            except TimeoutError:
+                break
+            if request.mode == mode:
+                requests.append(request)
+            else:
+                self._pending_policy_inputs.append(request)
+        return requests
 
     async def wait_if_stale(self) -> None:
         if self.staleness_threshold is None:

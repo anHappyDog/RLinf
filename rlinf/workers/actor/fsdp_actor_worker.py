@@ -44,6 +44,8 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
+from rlinf.scheduler.channel.trajectory_channel.storage import TrajectoryBatch
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
     get_reverse_idx,
@@ -1196,7 +1198,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.offload_param_and_grad(True)
 
     @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
+    async def recv_rollout_trajectories(
+        self, input_channel: Channel | TrajectoryChannel
+    ) -> None:
         """
         Receive rollout trajectories from rollout workers.
 
@@ -1204,6 +1208,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             input_channel: The input channel to read from.
         """
         clear_memory(sync=False)
+
+        if isinstance(input_channel, TrajectoryChannel):
+            if self.cfg.runner.get("use_training_pipeline", False):
+                raise NotImplementedError(
+                    "TrajectoryChannel actor input is not supported by the training "
+                    "pipeline yet."
+                )
+            batch = await input_channel.take(
+                TrajectoryBatch, async_op=True
+            ).async_wait()
+            self.rollout_batch = self._process_received_rollout_batch(
+                batch.to_training_batch(self.cfg)
+            )
+            return
 
         send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")

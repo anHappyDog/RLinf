@@ -14,7 +14,7 @@
 
 import torch
 
-from rlinf.data.embodied_io_struct import EnvOutput, RolloutResult
+from rlinf.data.embodied_io_struct import EnvOutput, LegacyRolloutResult
 from rlinf.scheduler import (
     build_recv_plan,
     build_route_channel_key,
@@ -184,7 +184,7 @@ def test_split_and_merge_nested_batches():
 
 
 def test_rollout_result_split_merge_invariant():
-    rollout_result = RolloutResult(
+    rollout_result = LegacyRolloutResult(
         actions=torch.arange(12, dtype=torch.float32).view(6, 2),
         prev_logprobs=torch.arange(12, dtype=torch.float32).view(6, 2),
         prev_values=torch.arange(6, dtype=torch.float32).view(6, 1),
@@ -199,7 +199,7 @@ def test_rollout_result_split_merge_invariant():
 
     worker = object.__new__(MultiStepRolloutWorker)
     shards = worker._split_rollout_result(rollout_result, [4, 2])
-    merged = RolloutResult.merge_rollout_results(shards)
+    merged = LegacyRolloutResult.merge_rollout_results(shards)
 
     assert torch.equal(merged.actions, rollout_result.actions)
     assert torch.equal(merged.prev_logprobs, rollout_result.prev_logprobs)

@@ -22,6 +22,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader, DistributedSampler
 
 from rlinf.data.datasets.reward_model import RewardBinaryDataset
+from rlinf.data.embodied_io_struct import RewardRequest, RewardResult
 from rlinf.data.io_struct import RolloutResult
 from rlinf.data.tokenizers import hf_tokenizer
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
@@ -32,6 +33,7 @@ from rlinf.scheduler import (
     NodePlacementStrategy,
     Worker,
 )
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.down_sampling import down_sample_batch
 from rlinf.utils.metric_utils import append_to_dict
@@ -343,7 +345,9 @@ class EmbodiedRewardWorker(Worker):
         return self._format_reward_output(self.model.compute_reward(observations))
 
     async def compute_rewards_async(
-        self, input_channel: Channel, output_channel: Channel
+        self,
+        input_channel: Channel | TrajectoryChannel,
+        output_channel: Channel | TrajectoryChannel,
     ):
         assert self._interact_task is None or self._interact_task.done(), (
             "Previous interact task is still running while a new interact call is made."
@@ -356,12 +360,21 @@ class EmbodiedRewardWorker(Worker):
         except asyncio.CancelledError:
             pass
 
-    async def _compute_rewards(self, input_channel: Channel, output_channel: Channel):
-        """Continuously compute rewards for embodied env batches.
+    async def _compute_rewards(
+        self,
+        input_channel: Channel | TrajectoryChannel,
+        output_channel: Channel | TrajectoryChannel,
+    ):
+        """Continuously compute image rewards for embodied env batches.
 
         Used by ``compute_rewards_async``. Receives observations from Env Workers,
         runs :meth:`compute_reward`, and sends results back until cancelled.
         """
+        if isinstance(input_channel, TrajectoryChannel):
+            assert isinstance(output_channel, TrajectoryChannel)
+            await self._serve_reward_requests(input_channel, output_channel)
+            return
+
         while True:
             merged_data = await self.recv_from(
                 group_name=self.cfg.env.group_name,
@@ -382,6 +395,45 @@ class EmbodiedRewardWorker(Worker):
                 async_op=True,
                 decoupled_mode=self.env_decoupled_mode,
             )
+
+    async def _serve_reward_requests(
+        self,
+        input_channel: TrajectoryChannel,
+        output_channel: TrajectoryChannel,
+    ) -> None:
+        """Serve embodied reward requests carried by a TrajectoryChannel."""
+        if self.enable_offload:
+            self.model.to(self.device)
+
+        try:
+            while True:
+                request = await input_channel.take(
+                    RewardRequest, async_op=True
+                ).async_wait()
+                rewards = self.compute_reward(request.inputs)
+                rewards = torch.as_tensor(rewards).contiguous()
+
+                history_lengths = None
+                if request.history_lengths:
+                    history_lengths = torch.stack(
+                        tuple(request.history_lengths.values())
+                    ).amin(dim=0)
+
+                result = RewardResult(
+                    global_step=request.global_step,
+                    rollout_epoch=request.rollout_epoch,
+                    chunk_step=request.chunk_step,
+                    slot_ids=request.slot_ids,
+                    actor_rank=request.actor_rank,
+                    pipeline_stage=request.pipeline_stage,
+                    rewards=rewards,
+                    mode=request.mode,
+                    history_lengths=history_lengths,
+                )
+                await output_channel.publish(result, async_op=True).async_wait()
+        finally:
+            if self.enable_offload:
+                self.model.to("cpu")
 
     async def stop(self):
         if self._interact_task is not None and not self._interact_task.done():

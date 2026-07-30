@@ -24,6 +24,7 @@ from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.runner_utils import check_progress
 
 if TYPE_CHECKING:
+    from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
     from rlinf.workers.actor.async_ppo_fsdp_worker import (
         AsyncPPOEmbodiedFSDPActor,
     )
@@ -44,8 +45,17 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         env: "AsyncEnvWorker",
         critic=None,
         reward=None,
+        trajectory_channel: "TrajectoryChannel | None" = None,
     ):
-        super().__init__(cfg, actor, rollout, env, critic, reward)
+        super().__init__(
+            cfg=cfg,
+            actor=actor,
+            rollout=rollout,
+            env=env,
+            reward=reward,
+            critic=critic,
+            trajectory_channel=trajectory_channel,
+        )
         self.env_metric_channel = Channel.create("EnvMetric")
         self.rollout_metric_channel = Channel.create("RolloutMetric")
         self.recompute_logprobs = bool(
@@ -114,21 +124,46 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.rollout.set_global_step(self.global_step).wait()
         self.update_rollout_weights()
 
+        trajectory_env_channel = None
+        trajectory_rollout_channel = None
+        trajectory_actor_channel = None
+        trajectory_reward_channel = None
+        if self.trajectory_channel is not None:
+            trajectory_env_channel = self.trajectory_channel.for_participant("env")
+            trajectory_rollout_channel = self.trajectory_channel.for_participant(
+                "rollout"
+            )
+            trajectory_actor_channel = self.trajectory_channel.for_participant("actor")
+            if self.reward is not None:
+                trajectory_reward_channel = self.trajectory_channel.for_participant(
+                    "reward"
+                )
+            self.env.set_global_step(self.global_step).wait()
+
         env_handle: Handle = self.env.interact(
             input_channel=self.env_channel,
             rollout_channel=self.rollout_channel,
             reward_channel=self.reward_channel,
             actor_channel=self.actor_channel,
             metric_channel=self.env_metric_channel,
+            trajectory_channel=trajectory_env_channel,
         )
         rollout_handle: Handle = self.rollout.generate(
             input_channel=self.rollout_channel,
             output_channel=self.env_channel,
             metric_channel=self.rollout_metric_channel,
+            trajectory_channel=trajectory_rollout_channel,
         )
 
+        reward_handle = None
+        if self.reward is not None:
+            reward_handle = self.reward.compute_rewards_async(
+                input_channel=trajectory_reward_channel or self.reward_channel,
+                output_channel=trajectory_reward_channel or self.env_channel,
+            )
+
         actor_handle: Handle = self.actor.recv_rollout_trajectories(
-            input_channel=self.actor_channel
+            input_channel=trajectory_actor_channel or self.actor_channel
         )
 
         while self.global_step < self.max_steps:
@@ -277,6 +312,10 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
 
         self.env.stop().wait()
         self.rollout.stop().wait()
+        self.actor.stop().wait()
+        if self.reward is not None:
+            self.reward.stop().wait()
+            reward_handle.wait()
 
         env_handle.wait()
         rollout_handle.wait()

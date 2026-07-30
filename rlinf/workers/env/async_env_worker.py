@@ -17,6 +17,7 @@ import asyncio
 from omegaconf.omegaconf import DictConfig
 
 from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
 from rlinf.workers.env.env_worker import EnvWorker
 
 
@@ -36,10 +37,12 @@ class AsyncEnvWorker(EnvWorker):
         reward_channel: Channel | None,
         actor_channel: Channel | None,
         metric_channel: Channel,
+        trajectory_channel: TrajectoryChannel | None = None,
     ):
         assert self._interact_task is None or self._interact_task.done(), (
             "Previous interact task is still running while a new interact call is made."
         )
+        self._trajectory_channel = trajectory_channel
         self._interact_task = asyncio.create_task(
             self._interact(
                 input_channel,
@@ -47,6 +50,7 @@ class AsyncEnvWorker(EnvWorker):
                 reward_channel,
                 actor_channel,
                 metric_channel,
+                trajectory_channel,
             )
         )
         try:
@@ -61,15 +65,22 @@ class AsyncEnvWorker(EnvWorker):
         reward_channel: Channel | None,
         actor_channel: Channel | None,
         metric_channel: Channel,
+        trajectory_channel: TrajectoryChannel | None,
     ):
         while True:
-            env_metrics = await self._run_interact_once(
-                input_channel,
-                rollout_channel,
-                reward_channel,
-                actor_channel,
-                cooperative_yield=True,
-            )
+            if trajectory_channel is None:
+                env_metrics = await self._run_interact_once(
+                    input_channel,
+                    rollout_channel,
+                    reward_channel,
+                    actor_channel,
+                    cooperative_yield=True,
+                )
+            else:
+                env_metrics = await self._run_trajectory_interact_once(
+                    trajectory_channel
+                )
+                self.global_step += 1
 
             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
             env_interact_time_metrics = self.pop_execution_times()
