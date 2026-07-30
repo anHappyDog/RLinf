@@ -33,13 +33,22 @@ class BatchKey:
 
 
 @dataclass(frozen=True)
+class PipelineBatchKey:
+    """Identify one actor-local rollout epoch in the training pipeline."""
+
+    global_step: int
+    rollout_epoch: int
+    actor_rank: int
+
+
+@dataclass(frozen=True)
 class LeRobotOwnerKey:
     """Identify the StorageWorker that owns one actor's LeRobot streams."""
 
     actor_rank: int
 
 
-OwnerKey: TypeAlias = BatchKey | LeRobotOwnerKey
+OwnerKey: TypeAlias = BatchKey | PipelineBatchKey | LeRobotOwnerKey
 OwnerKeyBuilder: TypeAlias = Callable[[TrajectoryData, WorkerAddress], OwnerKey]
 
 
@@ -49,6 +58,19 @@ def trajectory_batch_owner_key(data: TrajectoryData, source: WorkerAddress) -> B
     record = cast(TrajectoryRecord, data)
     return BatchKey(
         global_step=record.global_step,
+        actor_rank=record.actor_rank,
+    )
+
+
+def pipeline_batch_owner_key(
+    data: TrajectoryData, source: WorkerAddress
+) -> PipelineBatchKey:
+    """Build the owner key for one actor-local rollout epoch."""
+    del source
+    record = cast(TrajectoryRecord, data)
+    return PipelineBatchKey(
+        global_step=record.global_step,
+        rollout_epoch=record.rollout_epoch,
         actor_rank=record.actor_rank,
     )
 

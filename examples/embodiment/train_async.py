@@ -104,13 +104,11 @@ def main(cfg) -> None:
             cluster, name=cfg.reward.group_name, placement_strategy=reward_placement
         )
 
-    trajectory_channel = None
-    if cfg.get("trajectory_channel", {}).get("enabled", False):
-        trajectory_channel = TrajectoryChannel.create(
-            cfg=cfg,
-            cluster=cluster,
-            placement=component_placement,
-        )
+    trajectory_channel = TrajectoryChannel.create(
+        cfg=cfg,
+        cluster=cluster,
+        placement=component_placement,
+    )
 
     runner = runner_cls(
         cfg=cfg,

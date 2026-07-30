@@ -17,11 +17,13 @@
 import asyncio
 from collections import defaultdict
 from collections.abc import Callable
+from inspect import unwrap
 from typing import Any
 
 import pytest
 import torch
 
+import rlinf.workers.actor.fsdp_rlt_ac_policy_worker as rlt_ac_worker
 from rlinf.data.embodied_io_struct import (
     EnvResult,
     LeRobotStepResult,
@@ -45,6 +47,7 @@ from rlinf.scheduler.channel.trajectory_channel.data_route import get_data_route
 from rlinf.scheduler.channel.trajectory_channel.owner_key import BatchKey
 from rlinf.scheduler.channel.trajectory_channel.storage import (
     LeRobotEpisodeBatch,
+    PipelineMicroBatch,
     TrajectoryBatch,
     TrajectoryBatchContext,
     create_embodied_progress,
@@ -58,7 +61,9 @@ from rlinf.scheduler.channel.trajectory_channel.workers import (
 )
 from rlinf.scheduler.collective.async_work import AsyncWork
 from rlinf.scheduler.manager import WorkerAddress
+from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACFSDPPolicy
 from rlinf.workers.reward.api_reward_worker import EmbodiedAPIRewardWorker
+from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
 class _RemoteMethod:
@@ -80,6 +85,29 @@ class _CompletedWork(AsyncWork):
 
     def done(self) -> bool:
         return True
+
+
+class _TrajectoryTake:
+    """Return one trajectory batch through the asynchronous take surface."""
+
+    def __init__(self, batch: Any) -> None:
+        self._batch = batch
+
+    async def async_wait(self) -> Any:
+        return self._batch
+
+
+class _TrajectoryInputChannel:
+    """Expose the minimal TrajectoryChannel consumer API used by RLT."""
+
+    def __init__(self, batch: Any) -> None:
+        self._batch = batch
+        self.received_type: type | None = None
+
+    def take(self, data_type: type, *, async_op: bool) -> _TrajectoryTake:
+        assert async_op
+        self.received_type = data_type
+        return _TrajectoryTake(self._batch)
 
 
 def _controller() -> TrajectoryControllerWorker:
@@ -108,6 +136,29 @@ def _record_fields(**overrides: Any) -> dict[str, Any]:
     return fields
 
 
+def test_trajectory_records_normalize_tensors() -> None:
+    tensor = torch.randn(3, 4, requires_grad=True).transpose(0, 1)
+    record = RolloutResult(
+        **_record_fields(),
+        actions=tensor,
+        forward_inputs={"states": tensor},
+    )
+    policy_input = PolicyInput(
+        **_record_fields(),
+        env_rank=0,
+        observations={"nested": {"states": tensor}},
+    )
+
+    for value in (
+        record.actions,
+        record.forward_inputs["states"],
+        policy_input.observations["nested"]["states"],
+    ):
+        assert value.device.type == "cpu"
+        assert value.is_contiguous()
+        assert not value.requires_grad
+
+
 @pytest.mark.parametrize(
     ("algorithm", "record_types"),
     (
@@ -126,6 +177,7 @@ def _record_fields(**overrides: Any) -> dict[str, Any]:
         ("grpo", {EnvResult, RolloutResult, RewardRequest, RewardResult}),
         ("dsrl", {EnvResult, RolloutResult}),
         ("dagger", {EnvResult, RolloutResult, LeRobotStepResult}),
+        ("rlt_ac", {EnvResult, RolloutResult}),
     ),
 )
 def test_routes_keep_policy_traffic_separate_from_training_records(
@@ -158,6 +210,81 @@ def test_routes_keep_policy_traffic_separate_from_training_records(
         assert routes[LeRobotEpisodeBatch].dst == "actor"
 
 
+@pytest.mark.parametrize(
+    ("alias", "base"),
+    (
+        ("actor_critic", "ppo"),
+        ("decoupled_actor_critic", "ppo"),
+        ("embodied_nft", "ppo"),
+        ("embodied_sac", "sac"),
+        ("rlt_ac", "sac"),
+        ("embodied_dagger", "dagger"),
+    ),
+)
+def test_loss_type_aliases_use_the_matching_trajectory_protocol(
+    alias: str, base: str
+) -> None:
+    assert get_data_routes(alias) == get_data_routes(base)
+
+
+def test_rlt_ingests_trajectory_channel_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RLT consumes TC batches through its transition-replay ingestion path."""
+    trajectory = object()
+    batch = type("Batch", (), {"to_trajectory": lambda self, cfg: trajectory})()
+    channel = _TrajectoryInputChannel(batch)
+    policy = object.__new__(RLTACFSDPPolicy)
+    policy.cfg = object()
+    ingested: list[list[object]] = []
+    counters: list[tuple[int, int]] = []
+    policy._ingest_rollout_trajectories = lambda trajectories: (
+        ingested.append(trajectories) or (3, 1)
+    )
+    policy._update_rollout_ingest_counters = lambda added, completed: counters.append(
+        (added, completed)
+    )
+    monkeypatch.setattr(rlt_ac_worker, "clear_memory", lambda **_: None)
+
+    asyncio.run(unwrap(RLTACFSDPPolicy.recv_rollout_trajectories)(policy, channel))
+
+    assert channel.received_type is TrajectoryBatch
+    assert ingested == [[trajectory]]
+    assert counters == [(3, 1)]
+
+
+class _Placement:
+    """Minimal component placement used to test request partitioning."""
+
+    def __init__(self, actor_world_size: int, env_world_size: int):
+        self.components = ["actor", "env", "rollout"]
+        self._world_sizes = {
+            "actor": actor_world_size,
+            "env": env_world_size,
+            "rollout": 3,
+        }
+
+    def get_world_size(self, component: str) -> int:
+        return self._world_sizes[component]
+
+
+def test_eval_requests_are_partitioned_across_rollout_ranks() -> None:
+    total_num_envs = 12
+    rollout_world_size = 3
+    env_world_size = 2
+    pipeline_stages = 2
+    counts = []
+    for rank in range(rollout_world_size):
+        worker = object.__new__(MultiStepRolloutWorker)
+        worker.placement = _Placement(actor_world_size=4, env_world_size=env_world_size)
+        worker.num_pipeline_stages = pipeline_stages
+        worker._rank = rank
+        counts.append(worker._policy_request_count(total_num_envs, rollout_world_size))
+
+    assert sum(counts) == env_world_size * pipeline_stages
+    assert max(counts) - min(counts) <= 1
+
+
 def test_policy_output_publish_and_take_use_the_same_env_partition() -> None:
     channel = object.__new__(TrajectoryChannel)
     route = get_data_routes("ppo")[PolicyOutput]
@@ -178,6 +305,25 @@ def test_policy_output_publish_and_take_use_the_same_env_partition() -> None:
     assert published_key == consumed_key
     with pytest.raises(ValueError, match="requires an explicit partition"):
         channel._get_queue_key(route, PolicyOutput)
+
+
+def test_pipeline_routes_use_epoch_scoped_storage_and_actor_partitions() -> None:
+    routes = get_data_routes("ppo", use_training_pipeline=True)
+    record = EnvResult(
+        **_record_fields(rollout_epoch=2),
+        rewards=torch.ones(1, 1),
+        dones=torch.zeros(1, 1, dtype=torch.bool),
+        terminations=torch.zeros(1, 1, dtype=torch.bool),
+        truncations=torch.zeros(1, 1, dtype=torch.bool),
+    )
+
+    assert PipelineMicroBatch in routes
+    assert TrajectoryBatch not in routes
+    assert routes[PipelineMicroBatch].extra_key == "actor_rank"
+    owner_key = routes[EnvResult].owner_key(record, WorkerAddress("env", 0))
+    assert owner_key.global_step == record.global_step
+    assert owner_key.rollout_epoch == 2
+    assert owner_key.actor_rank == record.actor_rank
 
 
 def test_controller_reserves_only_the_matching_partition() -> None:

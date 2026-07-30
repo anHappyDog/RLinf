@@ -30,7 +30,6 @@ from rlinf.algorithms.utils import (
     kl_penalty,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
-from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
@@ -67,7 +66,6 @@ from rlinf.utils.metric_utils import (
     compute_critic_explained_variance_from_stats,
     compute_loss_mask,
     compute_rollout_metrics,
-    compute_split_num,
     pop_critic_explained_variance_stats,
 )
 from rlinf.utils.nested_dict_process import (
@@ -1198,9 +1196,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.offload_param_and_grad(True)
 
     @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(
-        self, input_channel: Channel | TrajectoryChannel
-    ) -> None:
+    async def recv_rollout_trajectories(self, input_channel: TrajectoryChannel) -> None:
         """
         Receive rollout trajectories from rollout workers.
 
@@ -1209,32 +1205,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         clear_memory(sync=False)
 
-        if isinstance(input_channel, TrajectoryChannel):
-            if self.cfg.runner.get("use_training_pipeline", False):
-                raise NotImplementedError(
-                    "TrajectoryChannel actor input is not supported by the training "
-                    "pipeline yet."
-                )
-            batch = await input_channel.take(
-                TrajectoryBatch, async_op=True
-            ).async_wait()
-            self.rollout_batch = self._process_received_rollout_batch(
-                batch.to_training_batch(self.cfg)
-            )
-            return
-
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
-
-        recv_list = []
-        for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            recv_list.append(trajectory)
-
-        self.rollout_batch = convert_trajectories_to_batch(recv_list)
-
-        self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+        batch = await input_channel.take(TrajectoryBatch, async_op=True).async_wait()
+        self.rollout_batch = self._process_received_rollout_batch(
+            batch.to_training_batch(self.cfg)
+        )
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]

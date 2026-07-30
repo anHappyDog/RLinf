@@ -42,9 +42,11 @@ from rlinf.scheduler.channel.trajectory_channel.owner_key import (
     BatchKey,
     LeRobotOwnerKey,
     OwnerKey,
+    PipelineBatchKey,
 )
 from rlinf.scheduler.channel.trajectory_channel.storage import (
     LeRobotEpisodeBatch,
+    PipelineMicroBatch,
     TrajectoryBatch,
     TrajectoryStorage,
     create_trajectory_storage,
@@ -203,6 +205,7 @@ class TrajectoryStorageWorker(Worker):
         algorithm_name: str,
         cfg: DictConfig,
         actor_world_size: int,
+        env_world_size: int,
     ) -> None:
         """Configure storage routes, compressors, and the output publisher."""
         self._routes = {
@@ -219,6 +222,7 @@ class TrajectoryStorageWorker(Worker):
             algorithm_name,
             cfg,
             actor_world_size,
+            env_world_size,
             max_queue_size=self._max_queue_size,
             num_record_threads=self._num_record_threads,
         )
@@ -259,7 +263,7 @@ class TrajectoryStorageWorker(Worker):
                     f"Storage input must be TrajectoryRecord, got {type(record).__name__}."
                 )
             owner_key = queue_key.extra_key
-            if not isinstance(owner_key, (BatchKey, LeRobotOwnerKey)):
+            if not isinstance(owner_key, (BatchKey, PipelineBatchKey, LeRobotOwnerKey)):
                 raise ValueError("Storage record has no valid owner key.")
             await self._storage.record(record, owner_key)
             return
@@ -300,7 +304,9 @@ class TrajectoryStorageWorker(Worker):
         try:
             while True:
                 output = await self._storage.take()
-                if not isinstance(output, (TrajectoryBatch, LeRobotEpisodeBatch)):
+                if not isinstance(
+                    output, (TrajectoryBatch, PipelineMicroBatch, LeRobotEpisodeBatch)
+                ):
                     raise TypeError(
                         f"Unsupported storage output {type(output).__name__}."
                     )
@@ -310,12 +316,23 @@ class TrajectoryStorageWorker(Worker):
                     data_type=type(output),
                     src=route.src,
                     dst=route.dst,
+                    extra_key=(
+                        getattr(output, route.extra_key)
+                        if route.extra_key is not None
+                        else None
+                    ),
                 )
                 queue = self._get_or_create_queue(queue_key)
                 release_owner_key = None
                 if isinstance(output, TrajectoryBatch):
                     release_owner_key = BatchKey(
                         global_step=output.global_step,
+                        actor_rank=output.actor_rank,
+                    )
+                elif isinstance(output, PipelineMicroBatch) and output.is_last:
+                    release_owner_key = PipelineBatchKey(
+                        global_step=output.global_step,
+                        rollout_epoch=output.rollout_epoch,
                         actor_rank=output.actor_rank,
                     )
                 await queue.put(

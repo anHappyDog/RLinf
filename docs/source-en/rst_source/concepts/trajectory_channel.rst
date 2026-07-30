@@ -19,7 +19,7 @@ Overview
    * - ``TrajectoryChannelWorker``
      - Forwards short-lived online requests and responses, such as ``PolicyInput`` from an environment and ``PolicyOutput`` from rollout.
    * - ``TrajectoryStorageWorker``
-     - Receives training records, aggregates them into ``TrajectoryBatch`` or ``LeRobotEpisodeBatch`` in the background, and delivers the result to an actor.
+     - Receives training records, aggregates them into ``TrajectoryBatch``, ``PipelineMicroBatch``, or ``LeRobotEpisodeBatch`` in the background, and delivers the result to an actor.
    * - ``TrajectoryControllerWorker``
      - Tracks which worker has data available and chooses one storage owner for each training batch.
 
@@ -43,7 +43,12 @@ Use it in these situations:
 Use It
 ------
 
-Enable the channel in an embodied configuration and give both ``trajectory_channel`` and ``trajectory_storage`` a placement. The following is the minimal single-node setup. For multiple nodes, replace the node numbers with placements that match your actor, environment, and rollout deployment.
+TrajectoryChannel is the embodied training data plane. By default, its channel and
+storage workers share the actor placement. Add explicit ``trajectory_channel`` and
+``trajectory_storage`` placements only when they should run elsewhere. The following
+is a single-node example. For multiple nodes, replace the node numbers with
+placements that match your actor, environment, and rollout deployment.
+For eval-only runs without an actor group, they share the rollout placement instead.
 
 .. code-block:: yaml
 
@@ -54,7 +59,6 @@ Enable the channel in an embodied configuration and give both ``trajectory_chann
        trajectory_channel,trajectory_storage: 0
 
    trajectory_channel:
-     enabled: true
      max_queue_size: 0
      num_record_threads: 4
 
@@ -64,11 +68,20 @@ Launch the configuration through the existing embodied training entrypoint:
 
    bash examples/embodiment/run_embodiment.sh <config_name>
 
-This command loads ``examples/embodiment/config/<config_name>.yaml``. When ``trajectory_channel.enabled`` is ``true``, ``train_embodied_agent.py`` and ``train_async.py`` create ``TrajectoryChannel`` after creating worker groups and before training begins. The runner then gives env, rollout, actor, and optional reward workers their routed channel views.
+This command loads ``examples/embodiment/config/<config_name>.yaml``.
+``train_embodied_agent.py`` and ``train_async.py`` create ``TrajectoryChannel``
+after creating worker groups and before training begins. The runner then gives env,
+rollout, actor, and optional reward workers their routed channel views. The only
+ordinary channels retained by the embodied runners carry metrics.
 
-.. warning::
+.. note::
 
-   ``runner.use_training_pipeline: true`` is not currently supported with ``TrajectoryChannel``. Keep it set to ``false``. Also, ``env.train.total_num_envs`` must be divisible by the actor world size, or storage cannot construct fixed trajectory shards for each actor.
+   ``TrajectoryChannel`` supports ``runner.use_training_pipeline: true`` for the
+   embodied FSDP pipeline. Pipeline mode currently requires
+   ``algorithm.adv_type: gae`` and does not support ``embodied_sac``,
+   ``embodied_dagger``, ``embodied_nft``, or OPD. ``env.train.total_num_envs``
+   must be divisible by the actor world size, so storage can construct fixed
+   trajectory shards for each actor.
 
 Configuration
 ~~~~~~~~~~~~~
@@ -80,9 +93,6 @@ Configuration
    * - Setting
      - Default
      - Meaning
-   * - ``trajectory_channel.enabled``
-     - ``false``
-     - Creates and uses ``TrajectoryChannel``. When disabled, training uses the existing ``Channel`` data path.
    * - ``trajectory_channel.max_queue_size``
      - ``0``
      - Maximum number of items in each internal queue. ``0`` means an unbounded queue: producers do not block on capacity, but memory can grow when consumers continually fall behind.
@@ -90,11 +100,11 @@ Configuration
      - ``4``
      - Background threads per storage worker for writing and aggregating records. Increasing this can improve record-processing concurrency but also increases CPU contention.
    * - ``trajectory_channel`` in ``cluster.component_placement``
-     - Required
-     - Places online request/response queue workers. Prefer placing them near high-frequency environment or rollout traffic.
+     - actor placement (rollout for eval-only)
+     - Optionally places online request/response queue workers. Prefer placing them near high-frequency environment or rollout traffic.
    * - ``trajectory_storage`` in ``cluster.component_placement``
-     - Required
-     - Places trajectory aggregation workers. Prefer placing them near actors to reduce cross-node transfers of completed training batches.
+     - actor placement (rollout for eval-only)
+     - Optionally places trajectory aggregation workers. Prefer placing them near actors to reduce cross-node transfers of completed training batches.
 
 How It Works
 ------------
@@ -123,12 +133,27 @@ The environment first publishes ``PolicyInput`` with the current observations, t
 
 While stepping the environment, env publishes ``EnvResult`` and rollout publishes ``RolloutResult``. When the value head is enabled, env also publishes ``ValueRequest`` and rollout returns ``ValueResult``. When an external reward model is enabled, env publishes ``RewardRequest`` and the reward worker returns ``RewardResult``. These records do not go directly to the actor. Storage aggregates them and emits one completed batch.
 
+With ``runner.use_training_pipeline: true``, the completion boundary is one
+``rollout_epoch`` rather than the whole training step. Storage reconstructs the
+same actor-local source partitions used by the legacy pipeline, preprocesses the
+trajectory, calculates advantages and returns, normalizes advantages across all
+environment ranks that feed the actor, then shuffles and packs training
+micro-batches. It delivers ``PipelineMicroBatch`` messages directly to the
+actor. The actor starts training as soon as an epoch is ready and reuses each
+micro-batch for its configured update epochs; data is not returned to an
+environment worker.
+
 Batch Ownership and Completion
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Regular training records use ``BatchKey(global_step, actor_rank)`` as their owner key. The controller chooses one ``TrajectoryStorageWorker`` for each key, so the ``EnvResult``, ``RolloutResult``, ``ValueResult``, and ``RewardResult`` for one actor and training step are written in one place. Storage tracks the expected positions for every record type from ``rollout_epoch``, the chunk count, and the actor's environment slots. It emits ``TrajectoryBatch`` only after every enabled record is present.
 
 An actor then consumes the batch, converts it to the training trajectory layout, computes advantages and returns, and trains. After the batch is sent successfully, the controller releases its owner so later steps can be balanced across storage workers again.
+
+Pipeline records instead use ``PipelineBatchKey(global_step, rollout_epoch,
+actor_rank)``. This pins every source shard for one actor and rollout epoch to
+one storage worker. The owner is released only after the last
+``PipelineMicroBatch`` has been delivered.
 
 Online LeRobot DAgger uses a different long-lived owner: ``LeRobotOwnerKey(actor_rank)``. It keeps consecutive environment streams for one actor on the same storage worker so episodes can be assembled across steps. Storage emits ``LeRobotEpisodeBatch`` when every slot reaches a rollout boundary.
 
@@ -145,7 +170,7 @@ The current implementation registers routes for the following ``algorithm.name``
      - Shared by every algorithm
      - Additional records
    * - ``ppo``
-     - ``PolicyInput``, ``PolicyOutput``, ``EnvResult``, ``RolloutResult``, ``TrajectoryBatch``
+     - ``PolicyInput``, ``PolicyOutput``, ``EnvResult``, ``RolloutResult``, and ``TrajectoryBatch`` (or ``PipelineMicroBatch`` in pipeline mode)
      - ``ValueRequest`` / ``ValueResult``; ``RewardRequest`` / ``RewardResult`` when an external reward is used.
    * - ``sac``
      - Same as above
@@ -171,7 +196,7 @@ Communication Protocol and Data Transfer
 
 ``QueueKey`` contains the message type, producer, consumer, and an optional partition. The controller tracks only which worker has a message for a matching key. A consumer first reserves an available worker from the controller, then receives the data from that worker. Producers and consumers therefore do not need to know each other's rank in advance.
 
-For large, high-frequency tensors, ``PolicyInput``, ``ValueRequest``, ``RewardRequest``, ``TrajectoryBatch``, and LeRobot data attempt LZ4 compression before transfer. By default, only contiguous CPU tensors of at least 64 KiB are compressed, in 1 MiB blocks; data stays raw when compression is not beneficial. This needs no extra configuration, but custom participants that directly publish compressed messages must use contiguous CPU tensors.
+For large, high-frequency tensors, ``PolicyInput``, ``ValueRequest``, ``RewardRequest``, ``TrajectoryBatch``, ``PipelineMicroBatch``, and LeRobot data attempt LZ4 compression before transfer. By default, only contiguous CPU tensors of at least 64 KiB are compressed, in 1 MiB blocks; data stays raw when compression is not beneficial. This needs no extra configuration, but custom participants that directly publish compressed messages must use contiguous CPU tensors.
 
 Capacity and Placement
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -206,8 +231,8 @@ Troubleshooting
      - Configure both component names under ``cluster.component_placement``. The names must match exactly.
    * - Storage creation says the environment count is not divisible by actor world size
      - Adjust ``env.train.total_num_envs`` or the actor placement world size so the former is divisible by the latter.
-   * - Enabling the channel immediately reports unsupported training pipeline
-     - Set ``runner.use_training_pipeline`` to ``false``. This combination is not implemented yet.
+   * - Pipeline startup reports an unsupported algorithm
+     - Use ``algorithm.adv_type: gae`` and an embodied FSDP PPO-style actor loss. Pipeline mode does not support ``embodied_sac``, ``embodied_dagger``, ``embodied_nft``, or OPD.
    * - A consumer waits or a training batch does not appear
      - Confirm that the algorithm is in the support table, all required workers are running, and reward/value features have their corresponding service worker. A complete batch needs every enabled record.
    * - Storage writing, deserialization, or compression fails

@@ -21,6 +21,7 @@ from omegaconf.omegaconf import OmegaConf
 from rlinf.config import validate_cfg
 from rlinf.runners.embodied_eval_runner import EmbodiedEvalRunner
 from rlinf.scheduler import Cluster
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -51,11 +52,17 @@ def main(cfg) -> None:
     env_group = EnvWorker.create_group(cfg).launch(
         cluster, name=cfg.env.group_name, placement_strategy=env_placement
     )
+    trajectory_channel = TrajectoryChannel.create(
+        cfg=cfg,
+        cluster=cluster,
+        placement=component_placement,
+    )
 
     runner = EmbodiedEvalRunner(
         cfg=cfg,
         rollout=rollout_group,
         env=env_group,
+        trajectory_channel=trajectory_channel,
     )
 
     runner.init_workers()

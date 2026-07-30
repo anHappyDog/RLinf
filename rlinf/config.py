@@ -964,9 +964,7 @@ def validate_embodied_cfg(cfg):
                     "cluster.component_placement.reward_server."
                 )
 
-    if cfg.runner.get("enable_decoupled_mode", False) and not cfg.get(
-        "trajectory_channel", {}
-    ).get("enabled", False):
+    if cfg.runner.get("enable_decoupled_mode", False):
         assert stage_num == 1, (
             "enable_decoupled_mode requires rollout.pipeline_stage_num to be 1"
         )

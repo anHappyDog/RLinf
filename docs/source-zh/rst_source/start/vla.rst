@@ -98,9 +98,11 @@ ManiSkill3 是一个基于 GPU 加速的机器人研究仿真平台，
 --------------------------
 
 对于具身 FSDP 训练，可以通过 ``runner.use_training_pipeline`` 开启环境交互
-与 actor 训练之间的流水线执行路径。设置为 ``True`` 后，环境 worker 会先处理
-rollout 轨迹，将其转换为打包后的 actor micro-batch，并通过 channel 流式发送给
-actor。actor 可以在 rollout 仍在生成时训练这些已经准备好的 micro-batch。
+与 actor 训练之间的流水线执行路径。设置为 ``True`` 后，每个完成的 rollout
+epoch 都会被转换为打包后的 actor micro-batch 并流式发送给 actor。启用
+``TrajectoryChannel`` 时，这些准备工作由
+``TrajectoryStorageWorker`` 完成；否则由 env worker 完成。actor 可以在 rollout
+仍在生成时训练这些已经准备好的 micro-batch。
 
 当 rollout 数据中包含嵌套 observation 或较大的 tensor 时，该模式通常更有用。
 发送打包后的 micro-batch 可以让 channel payload 更适合 tensor fast path，同时减少
@@ -121,9 +123,10 @@ actor 侧重新组装和处理 batch 的额外开销。尤其当 env worker 和 
 
 说明与限制：
 
-- 该模式支持 ``algorithm.normalize_advantages``。pipeline 路径会在 env worker
-  侧计算 raw advantages，聚合所有会发送到同一 actor rank 的 env worker 的 masked
-  advantage 统计量，并在流式发送 actor micro-batch 之前完成 normalization。
+- 该模式支持 ``algorithm.normalize_advantages``。pipeline 路径会计算 raw
+  advantages，聚合所有会发送到同一 actor rank 的环境 rank 的 masked advantage
+  统计量，并在流式发送 actor micro-batch 之前完成 normalization。启用
+  ``TrajectoryChannel`` 时，这些步骤由 storage 完成。
 - ``algorithm.adv_type`` 在该模式下目前仅支持 ``gae``。
 - 该模式面向具身 FSDP actor 训练中的 PPO/GRPO 类 actor loss；目前不支持
   ``embodied_sac``、``embodied_dagger`` 或 ``embodied_nft``。

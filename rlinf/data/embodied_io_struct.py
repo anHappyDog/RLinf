@@ -1532,6 +1532,18 @@ class TrajectoryData:
         return cls(**values)
 
 
+def _record_data(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().contiguous()
+    if isinstance(value, dict):
+        return {key: _record_data(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_record_data(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_record_data(item) for item in value)
+    return value
+
+
 @dataclass(kw_only=True)
 class TrajectoryRecord(TrajectoryData):
     global_step: int
@@ -1546,6 +1558,8 @@ class TrajectoryRecord(TrajectoryData):
         return len(self.slot_ids)
 
     def __post_init__(self) -> None:
+        for item in fields(self):
+            setattr(self, item.name, _record_data(getattr(self, item.name)))
         self.validate()
 
     def validate(self) -> None:

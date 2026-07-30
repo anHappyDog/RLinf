@@ -21,11 +21,12 @@ from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
+from rlinf.scheduler.channel.trajectory_channel.storage import TrajectoryBatch
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import (
     append_to_dict,
     collect_trajectory_replay_metrics,
-    compute_split_num,
     trajectory_has_bool_tensor,
 )
 from rlinf.utils.utils import clear_memory
@@ -687,17 +688,11 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
             self.buffer_dataset.min_replay_buffer_size = 1
 
     @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(self, input_channel):
+    async def recv_rollout_trajectories(self, input_channel: TrajectoryChannel):
         clear_memory(sync=False)
 
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
-
-        recv_list = []
-        for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            recv_list.append(trajectory)
+        batch = await input_channel.take(TrajectoryBatch, async_op=True).async_wait()
+        recv_list = [batch.to_trajectory(self.cfg)]
 
         added, completed = self._ingest_rollout_trajectories(recv_list)
         self._update_rollout_ingest_counters(added, completed)

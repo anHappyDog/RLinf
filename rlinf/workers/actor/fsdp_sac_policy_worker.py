@@ -28,18 +28,16 @@ from rlinf.data.embodied_buffer_dataset import (
     ReplayBufferDataset,
     replay_buffer_collate_fn,
 )
-from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
-from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler import Worker
 from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
 from rlinf.scheduler.channel.trajectory_channel.storage import TrajectoryBatch
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import (
     append_to_dict,
-    compute_split_num,
 )
 from rlinf.utils.nested_dict_process import (
     put_tensor_device,
@@ -313,9 +311,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                         target_param.data.copy_(shadow.to(target_param.data.dtype))
 
     @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(
-        self, input_channel: Channel | TrajectoryChannel
-    ) -> None:
+    async def recv_rollout_trajectories(self, input_channel: TrajectoryChannel) -> None:
         """
         Receive rollout trajectories from rollout workers.
 
@@ -324,35 +320,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         """
         clear_memory(sync=False)
 
-        if isinstance(input_channel, TrajectoryChannel):
-            batch = await input_channel.take(
-                TrajectoryBatch, async_op=True
-            ).async_wait()
-            self.replay_buffer.add_trajectories([batch.to_trajectory(self.cfg)])
-            return
-
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
-
-        recv_list = []
-
-        for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            recv_list.append(trajectory)
-
-        self.replay_buffer.add_trajectories(recv_list)
-
-        if self.demo_buffer is not None:
-            intervene_traj_list = []
-            for traj in recv_list:
-                assert isinstance(traj, Trajectory)
-                intervene_trajs = traj.extract_intervene_traj()
-                if intervene_trajs is not None:
-                    intervene_traj_list.extend(intervene_trajs)
-
-            if len(intervene_traj_list) > 0:
-                self.demo_buffer.add_trajectories(intervene_traj_list)
+        batch = await input_channel.take(TrajectoryBatch, async_op=True).async_wait()
+        self.replay_buffer.add_trajectories([batch.to_trajectory(self.cfg)])
 
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):

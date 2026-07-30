@@ -31,11 +31,14 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.scheduler.channel.trajectory_channel.owner_key import (
     BatchKey,
     LeRobotOwnerKey,
+    PipelineBatchKey,
 )
 from rlinf.scheduler.channel.trajectory_channel.storage import (
     LeRobotEpisodeBatch,
     LeRobotStorageContext,
     LeRobotTrajectoryStorage,
+    PipelineStorageContext,
+    PipelineTrajectoryStorage,
     RolloutTrajectoryStorage,
     TrajectoryBatchContext,
 )
@@ -134,6 +137,115 @@ def test_storage_aggregates_pipeline_stages() -> None:
         assert batch.slot_ids == (0, 1, 2, 3)
         assert batch.actions is not None
         assert batch.actions.shape[:3] == (1, 1, 4)
+
+    asyncio.run(run())
+
+
+def test_pipeline_storage_emits_normalized_micro_batches_per_epoch() -> None:
+    async def record_epoch(
+        storage: PipelineTrajectoryStorage,
+        rollout_epoch: int,
+    ) -> None:
+        owner_key = PipelineBatchKey(
+            global_step=7,
+            rollout_epoch=rollout_epoch,
+            actor_rank=0,
+        )
+        flags = torch.zeros(2, 1, dtype=torch.bool)
+        for slot_ids, reward, marker in (((0, 1), 1.0, 10.0), ((2, 3), 3.0, 20.0)):
+            args = {
+                **_record_args(actor_rank=0),
+                "rollout_epoch": rollout_epoch,
+                "slot_ids": slot_ids,
+            }
+            await storage.record(
+                EnvResult(
+                    **args,
+                    rewards=torch.full((2, 1), reward),
+                    dones=flags,
+                    terminations=flags,
+                    truncations=flags,
+                ),
+                owner_key,
+            )
+            await storage.record(
+                RolloutResult(
+                    **args,
+                    actions=torch.full((2, 1), marker),
+                    prev_logprobs=torch.zeros(2, 1),
+                    state_values=torch.zeros(2, 1),
+                ),
+                owner_key,
+            )
+            await storage.record(
+                ValueResult(
+                    **{**args, "chunk_step": 1},
+                    kind="boundary",
+                    values=torch.zeros(2, 1),
+                ),
+                owner_key,
+            )
+
+    async def take_epoch(storage: PipelineTrajectoryStorage) -> list:
+        return [await storage.take() for _ in range(4)]
+
+    async def run() -> None:
+        cfg = OmegaConf.create(
+            {
+                "runner": {"task_type": "embodied", "use_training_pipeline": True},
+                "env": {
+                    "train": {
+                        "auto_reset": True,
+                        "ignore_terminations": False,
+                    }
+                },
+                "algorithm": {
+                    "adv_type": "gae",
+                    "reward_type": "action_level",
+                    "group_size": 1,
+                    "normalize_advantages": True,
+                    "shuffle_rollout": False,
+                },
+                "actor": {
+                    "seed": 0,
+                    "micro_batch_size": 1,
+                    "model": {"num_action_chunks": 1},
+                },
+                "reward": {},
+            }
+        )
+        storage = PipelineTrajectoryStorage(
+            "ppo",
+            TrajectoryBatchContext(
+                rollout_epochs=1,
+                chunk_steps=1,
+                slot_ids=(0, 1, 2, 3),
+                collect_values=True,
+            ),
+            PipelineStorageContext(
+                total_num_envs=4,
+                actor_world_size=1,
+                env_world_size=2,
+                stage_num=1,
+            ),
+            cfg,
+        )
+
+        await record_epoch(storage, rollout_epoch=0)
+        first_epoch = await take_epoch(storage)
+        assert {batch.rollout_epoch for batch in first_epoch} == {0}
+        assert [batch.is_last for batch in first_epoch] == [False, False, False, True]
+
+        advantages = {
+            batch.batch["actions"].item(): batch.batch["advantages"].item()
+            for batch in first_epoch
+        }
+        assert advantages[10.0] < 0
+        assert advantages[20.0] > 0
+
+        await record_epoch(storage, rollout_epoch=1)
+        second_epoch = await take_epoch(storage)
+        assert {batch.rollout_epoch for batch in second_epoch} == {1}
 
     asyncio.run(run())
 

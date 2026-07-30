@@ -284,38 +284,17 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             self._resume_lerobot_dataset()
 
     @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(
-        self, input_channel: Channel | TrajectoryChannel
-    ) -> None:
+    async def recv_rollout_trajectories(self, input_channel: TrajectoryChannel) -> None:
         clear_memory(sync=False)
 
-        if isinstance(input_channel, TrajectoryChannel):
-            if self.enable_online_lerobot:
-                batch = await input_channel.take(
-                    LeRobotEpisodeBatch, async_op=True
-                ).async_wait()
-                self._record_lerobot_batch(batch)
-                return
+        if self.enable_online_lerobot:
             batch = await input_channel.take(
-                TrajectoryBatch, async_op=True
+                LeRobotEpisodeBatch, async_op=True
             ).async_wait()
-            return self.recv_buffer_rollout_trajectories(
-                [batch.to_trajectory(self.cfg)]
-            )
-
-        if not self.enable_online_lerobot:
-            send_num = self._component_placement.get_world_size("env") * self.stage_num
-            recv_num = self._component_placement.get_world_size("actor")
-            split_num = compute_split_num(send_num, recv_num)
-            recv_list = []
-            for _ in range(split_num):
-                trajectory: Trajectory = await input_channel.get(
-                    async_op=True
-                ).async_wait()
-                recv_list.append(trajectory)
-            return self.recv_buffer_rollout_trajectories(recv_list)
-        else:
-            return self.recv_lerobot_rollout_trajectories(input_channel)
+            self._record_lerobot_batch(batch)
+            return
+        batch = await input_channel.take(TrajectoryBatch, async_op=True).async_wait()
+        return self.recv_buffer_rollout_trajectories([batch.to_trajectory(self.cfg)])
 
     def _record_lerobot_batch(self, batch: LeRobotEpisodeBatch) -> None:
         for episode in batch.to_numpy_episodes():

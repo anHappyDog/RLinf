@@ -47,8 +47,8 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         rollout: "AsyncMultiStepRolloutWorker",
         env: "AsyncEnvWorker",
         reward: "EmbodiedRewardWorker",
+        trajectory_channel: "TrajectoryChannel",
         critic=None,
-        trajectory_channel: "TrajectoryChannel | None" = None,
     ):
         super().__init__(
             cfg=cfg,
@@ -147,72 +147,42 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         self._pending_rollout_weight_sync = (rollout_handle, actor_handle)
 
     def evaluate(self):
-        if self.trajectory_channel is not None:
-            env_handle = self.env.evaluate_with_trajectory_channel()
-            env_results = env_handle.wait()
-            return compute_evaluate_metrics(
-                [result for result in env_results if result is not None]
-            )
-
-        env_handle: Handle = self.env.evaluate(
-            input_channel=self.env_channel,
-            rollout_channel=self.rollout_channel,
-        )
-        env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
-        if not env_decoupled_mode:
-            rollout_handle: Handle = self.rollout.evaluate(
-                input_channel=self.rollout_channel,
-                output_channel=self.env_channel,
-            )
+        env_handle = self.env.evaluate(self.trajectory_channel.for_participant("env"))
         env_results = env_handle.wait()
-        if not env_decoupled_mode:
-            rollout_handle.wait()
-        eval_metrics_list = [results for results in env_results if results is not None]
-        eval_metrics = compute_evaluate_metrics(eval_metrics_list)
-        return eval_metrics
+        return compute_evaluate_metrics(
+            [result for result in env_results if result is not None]
+        )
 
     def run(self):
         start_step = self.global_step
         start_time = time.time()
         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
 
-        trajectory_env_channel = None
-        trajectory_rollout_channel = None
-        trajectory_actor_channel = None
-        trajectory_reward_channel = None
-        if self.trajectory_channel is not None:
-            trajectory_env_channel = self.trajectory_channel.for_participant("env")
-            trajectory_rollout_channel = self.trajectory_channel.for_participant(
-                "rollout"
-            )
-            trajectory_actor_channel = self.trajectory_channel.for_participant("actor")
-            if self.reward is not None:
-                trajectory_reward_channel = self.trajectory_channel.for_participant(
-                    "reward"
-                )
-            self.env.set_global_step(self.global_step).wait()
+        trajectory_env_channel = self.trajectory_channel.for_participant("env")
+        trajectory_rollout_channel = self.trajectory_channel.for_participant("rollout")
+        trajectory_actor_channel = self.trajectory_channel.for_participant("actor")
+        trajectory_reward_channel = (
+            self.trajectory_channel.for_participant("reward")
+            if self.reward is not None
+            else None
+        )
+        self.env.set_global_step(self.global_step).wait()
 
         env_handle: Handle = self.env.interact(
-            input_channel=self.env_channel,
-            rollout_channel=self.rollout_channel,
-            reward_channel=self.reward_channel,
-            actor_channel=self.actor_channel,
             metric_channel=self.env_metric_channel,
             trajectory_channel=trajectory_env_channel,
         )
         rollout_handle: Handle = self.rollout.generate(
-            input_channel=self.rollout_channel,
-            output_channel=self.env_channel,
             metric_channel=self.rollout_metric_channel,
             trajectory_channel=trajectory_rollout_channel,
         )
         if self.reward is not None:
             reward_handle: Handle = self.reward.compute_rewards_async(
-                input_channel=trajectory_reward_channel or self.reward_channel,
-                output_channel=trajectory_reward_channel or self.env_channel,
+                input_channel=trajectory_reward_channel,
+                output_channel=trajectory_reward_channel,
             )
         actor_handle: Handle = self.actor.recv_rollout_trajectories(
-            input_channel=trajectory_actor_channel or self.actor_channel
+            input_channel=trajectory_actor_channel
         )
 
         while self.global_step < self.max_steps:
@@ -271,10 +241,6 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-            if self.trajectory_channel is None and self.actor_channel is not None:
-                training_metrics["train/replay_channel_qsize"] = (
-                    self.actor_channel.qsize()
-                )
             actor_training_time_metrics, actor_time_metrics_per_rank = (
                 actor_training_handle.consume_durations(return_per_rank=True)
             )

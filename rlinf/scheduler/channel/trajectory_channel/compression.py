@@ -31,6 +31,7 @@ from rlinf.data.embodied_io_struct import (
 )
 from rlinf.scheduler.channel.trajectory_channel.storage import (
     LeRobotEpisodeBatch,
+    PipelineMicroBatch,
     TrajectoryBatch,
 )
 from rlinf.utils.tensor_codec import TensorCodec, create_tensor_codec
@@ -104,6 +105,13 @@ _COMPRESSION_CONFIGS: CompressionConfigDict = {
         num_threads=4,
     ),
     TrajectoryBatch: CompressionConfig(
+        codec="lz4",
+        level=1,
+        min_bytes=1024 * 64,
+        block_bytes=1024 * 1024,
+        num_threads=4,
+    ),
+    PipelineMicroBatch: CompressionConfig(
         codec="lz4",
         level=1,
         min_bytes=1024 * 64,

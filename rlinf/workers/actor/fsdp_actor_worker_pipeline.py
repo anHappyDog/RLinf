@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import asyncio
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
@@ -21,10 +20,11 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from rlinf.scheduler import Channel, CommMapper, Worker
+from rlinf.scheduler import Worker
+from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
+from rlinf.scheduler.channel.trajectory_channel.storage import PipelineMicroBatch
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import compute_rollout_metrics
-from rlinf.utils.utils import unpack_batch
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
@@ -55,23 +55,18 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     def try_recv_micro_batch(
         self,
-        input_channel: Channel,
+        input_channel: TrajectoryChannel,
     ) -> dict[str, torch.Tensor] | None:
-        try:
-            packed_batch = input_channel.get_nowait(
-                key=CommMapper.build_channel_key(
-                    self._rank, self._rank, "pipeline_actor"
-                )
-            )
-            return unpack_batch(packed_batch)
-        except asyncio.QueueEmpty:
-            return None
+        return None
 
-    def recv_micro_batch(self, input_channel: Channel) -> dict[str, torch.Tensor]:
-        packed_batch = input_channel.get(
-            key=CommMapper.build_channel_key(self._rank, self._rank, "pipeline_actor")
+    def recv_micro_batch(
+        self, input_channel: TrajectoryChannel
+    ) -> dict[str, torch.Tensor]:
+        micro_batch = input_channel.take(
+            PipelineMicroBatch,
+            partition=self._rank,
         )
-        return unpack_batch(packed_batch)
+        return micro_batch.batch
 
     def select_global_batch(
         self, global_batches: dict[int, deque[GlobalBatchState]]
@@ -83,7 +78,7 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     @Worker.timer("run_training")
     def run_training(
-        self, input_channel: Channel
+        self, input_channel: TrajectoryChannel
     ) -> dict[str, dict[str, float] | dict]:
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)

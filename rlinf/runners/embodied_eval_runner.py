@@ -15,7 +15,6 @@
 import time
 import typing
 
-from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
@@ -25,6 +24,7 @@ from rlinf.utils.metric_utils import compute_evaluate_metrics, print_metrics_tab
 if typing.TYPE_CHECKING:
     from omegaconf.dictconfig import DictConfig
 
+    from rlinf.scheduler.channel.trajectory_channel.channel import TrajectoryChannel
     from rlinf.workers.env.env_worker import EnvWorker
     from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
@@ -35,15 +35,13 @@ class EmbodiedEvalRunner:
         cfg: "DictConfig",
         rollout: "MultiStepRolloutWorker",
         env: "EnvWorker",
+        trajectory_channel: "TrajectoryChannel",
         run_timer=None,
     ):
         self.cfg = cfg
         self.rollout = rollout
         self.env = env
-
-        # Data channels
-        self.env_channel = Channel.create("Env")
-        self.rollout_channel = Channel.create("Rollout")
+        self.trajectory_channel = trajectory_channel
 
         # this timer checks if we should stop training
         self.run_timer = run_timer
@@ -62,17 +60,13 @@ class EmbodiedEvalRunner:
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
-            input_channel=self.env_channel,
-            rollout_channel=self.rollout_channel,
+            self.trajectory_channel.for_participant("env")
         )
         rollout_handle: Handle = self.rollout.evaluate(
-            input_channel=self.rollout_channel,
-            output_channel=self.env_channel,
+            self.trajectory_channel.for_participant("rollout")
         )
         env_results = env_handle.wait()
-        env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
-        if not env_decoupled_mode:
-            rollout_handle.wait()
+        rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics

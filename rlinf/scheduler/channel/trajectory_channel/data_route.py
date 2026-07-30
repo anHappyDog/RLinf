@@ -30,10 +30,12 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.scheduler.channel.trajectory_channel.owner_key import (
     OwnerKeyBuilder,
     lerobot_actor_owner_key,
+    pipeline_batch_owner_key,
     trajectory_batch_owner_key,
 )
 from rlinf.scheduler.channel.trajectory_channel.storage import (
     LeRobotEpisodeBatch,
+    PipelineMicroBatch,
     TrajectoryBatch,
 )
 
@@ -58,39 +60,43 @@ class DataRoute:
 
 
 DataRouteDict: TypeAlias = dict[type[TrajectoryData], DataRoute]
-_DataRouteProvider: TypeAlias = Callable[[], DataRouteDict]
+_DataRouteProvider: TypeAlias = Callable[[bool], DataRouteDict]
 
 _DATA_ROUTE_PROVIDERS: dict[str, _DataRouteProvider] = {}
 
 
 def register_data_routes(
-    algo: str,
+    *algorithms: str,
 ) -> Callable[[_DataRouteProvider], _DataRouteProvider]:
-    """Register a route provider for an algorithm name."""
-    key = algo.lower()
+    """Register a route provider for one or more algorithm names."""
+    if not algorithms:
+        raise ValueError("At least one algorithm name is required.")
 
     def decorator(provider: _DataRouteProvider) -> _DataRouteProvider:
-        if key in _DATA_ROUTE_PROVIDERS:
-            raise ValueError(
-                f"Data route provider for algorithm '{algo}' is already registered."
-            )
-        _DATA_ROUTE_PROVIDERS[key] = provider
+        for algorithm in algorithms:
+            key = algorithm.lower()
+            if key in _DATA_ROUTE_PROVIDERS:
+                raise ValueError(
+                    "Data route provider for algorithm "
+                    f"'{algorithm}' is already registered."
+                )
+            _DATA_ROUTE_PROVIDERS[key] = provider
         return provider
 
     return decorator
 
 
-def get_data_routes(algo: str) -> DataRouteDict:
+def get_data_routes(algo: str, use_training_pipeline: bool = False) -> DataRouteDict:
     """Build the routes registered for an algorithm."""
     key = algo.lower()
     if key not in _DATA_ROUTE_PROVIDERS:
         raise ValueError(f"No data route provider registered for algorithm '{algo}'")
-    return _DATA_ROUTE_PROVIDERS[key]()
+    return _DATA_ROUTE_PROVIDERS[key](use_training_pipeline)
 
 
-def basic_policy_routes() -> DataRouteDict:
+def basic_policy_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     """Return policy request, response, and training-batch routes."""
-    return {
+    routes = {
         PolicyInput: DataRoute(src="env", dst="rollout", via="channel_worker"),
         PolicyOutput: DataRoute(
             src="rollout",
@@ -98,120 +104,148 @@ def basic_policy_routes() -> DataRouteDict:
             via="channel_worker",
             extra_key="route_key",
         ),
-        TrajectoryBatch: DataRoute(
+    }
+    if use_training_pipeline:
+        routes[PipelineMicroBatch] = DataRoute(
             src=None,
             dst="actor",
             via="storage_worker",
-        ),
-    }
+            extra_key="actor_rank",
+        )
+    else:
+        routes[TrajectoryBatch] = DataRoute(
+            src=None,
+            dst="actor",
+            via="storage_worker",
+        )
+    return routes
 
 
-@register_data_routes("ppo")
-def ppo_data_routes() -> DataRouteDict:
+def rollout_owner_key(use_training_pipeline: bool) -> OwnerKeyBuilder:
+    """Select the storage ownership boundary for a rollout."""
+    return (
+        pipeline_batch_owner_key
+        if use_training_pipeline
+        else trajectory_batch_owner_key
+    )
+
+
+@register_data_routes(
+    "ppo",
+    "actor_critic",
+    "decoupled_actor_critic",
+    "embodied_nft",
+    "opd",
+)
+def ppo_data_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     """Return PPO routes including value and reward records."""
+    owner_key = rollout_owner_key(use_training_pipeline)
     return {
-        **basic_policy_routes(),
+        **basic_policy_routes(use_training_pipeline),
         ValueRequest: DataRoute(src="env", dst="rollout", via="storage_worker"),
         RewardRequest: DataRoute(src="env", dst="reward", via="storage_worker"),
         EnvResult: DataRoute(
             src="env",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
         RolloutResult: DataRoute(
             src="rollout",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
         ValueResult: DataRoute(
             src="rollout",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
         RewardResult: DataRoute(
             src="reward",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
     }
 
 
-@register_data_routes("sac")
-def sac_data_routes() -> DataRouteDict:
+@register_data_routes("sac", "embodied_sac", "rlt_ac")
+def sac_data_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     """Return SAC routes for environment and rollout records."""
+    owner_key = rollout_owner_key(use_training_pipeline)
     return {
-        **basic_policy_routes(),
+        **basic_policy_routes(use_training_pipeline),
         EnvResult: DataRoute(
             src="env",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
         RolloutResult: DataRoute(
             src="rollout",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
     }
 
 
 @register_data_routes("grpo")
-def grpo_data_routes() -> DataRouteDict:
+def grpo_data_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     """Return GRPO routes including reward records."""
+    owner_key = rollout_owner_key(use_training_pipeline)
     return {
-        **basic_policy_routes(),
+        **basic_policy_routes(use_training_pipeline),
         EnvResult: DataRoute(
             src="env",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
         RolloutResult: DataRoute(
             src="rollout",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
         RewardRequest: DataRoute(src="env", dst="reward", via="storage_worker"),
         RewardResult: DataRoute(
             src="reward",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
     }
 
 
 @register_data_routes("dsrl")
-def dsrl_data_routes() -> DataRouteDict:
+def dsrl_data_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     """Return DSRL routes for environment and rollout records."""
+    owner_key = rollout_owner_key(use_training_pipeline)
     return {
-        **basic_policy_routes(),
+        **basic_policy_routes(use_training_pipeline),
         EnvResult: DataRoute(
             src="env",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
         RolloutResult: DataRoute(
             src="rollout",
             dst=None,
             via="storage_worker",
-            owner_key=trajectory_batch_owner_key,
+            owner_key=owner_key,
         ),
     }
 
 
-@register_data_routes("dagger")
-def dagger_data_routes() -> DataRouteDict:
+@register_data_routes("dagger", "embodied_dagger")
+def dagger_data_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     """Return DAgger routes including episode collection records."""
     return {
-        **basic_policy_routes(),
+        **basic_policy_routes(use_training_pipeline),
         LeRobotEpisodeBatch: DataRoute(
             src=None,
             dst="actor",

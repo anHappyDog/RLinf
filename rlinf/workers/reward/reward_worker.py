@@ -346,8 +346,8 @@ class EmbodiedRewardWorker(Worker):
 
     async def compute_rewards_async(
         self,
-        input_channel: Channel | TrajectoryChannel,
-        output_channel: Channel | TrajectoryChannel,
+        input_channel: TrajectoryChannel,
+        output_channel: TrajectoryChannel,
     ):
         assert self._interact_task is None or self._interact_task.done(), (
             "Previous interact task is still running while a new interact call is made."
@@ -362,39 +362,15 @@ class EmbodiedRewardWorker(Worker):
 
     async def _compute_rewards(
         self,
-        input_channel: Channel | TrajectoryChannel,
-        output_channel: Channel | TrajectoryChannel,
+        input_channel: TrajectoryChannel,
+        output_channel: TrajectoryChannel,
     ):
         """Continuously compute image rewards for embodied env batches.
 
         Used by ``compute_rewards_async``. Receives observations from Env Workers,
         runs :meth:`compute_reward`, and sends results back until cancelled.
         """
-        if isinstance(input_channel, TrajectoryChannel):
-            assert isinstance(output_channel, TrajectoryChannel)
-            await self._serve_reward_requests(input_channel, output_channel)
-            return
-
-        while True:
-            merged_data = await self.recv_from(
-                group_name=self.cfg.env.group_name,
-                channel=input_channel,
-                tag="train_reward_obs",
-                async_op=True,
-                batch_size=self.train_batch_size,
-                decoupled_mode=self.env_decoupled_mode,
-            ).async_wait()
-            rewards = self.compute_reward(observations=merged_data)
-            if isinstance(rewards, torch.Tensor):
-                rewards = rewards.contiguous()
-            self.send_to(
-                group_name=self.cfg.env.group_name,
-                channel=output_channel,
-                data=rewards,
-                tag="train_reward_obs",
-                async_op=True,
-                decoupled_mode=self.env_decoupled_mode,
-            )
+        await self._serve_reward_requests(input_channel, output_channel)
 
     async def _serve_reward_requests(
         self,
@@ -411,7 +387,7 @@ class EmbodiedRewardWorker(Worker):
                     RewardRequest, async_op=True
                 ).async_wait()
                 rewards = self.compute_reward(request.inputs)
-                rewards = torch.as_tensor(rewards).contiguous()
+                rewards = torch.as_tensor(rewards)
 
                 history_lengths = None
                 if request.history_lengths:

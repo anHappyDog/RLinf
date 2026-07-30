@@ -358,13 +358,30 @@ class TrajectoryChannel:
         placement: ComponentPlacement,
     ) -> "TrajectoryChannel":
         """Create the worker groups and a channel from the training configuration."""
-        algorithm = str(cfg.algorithm.name)
-        routes = get_data_routes(algorithm)
+        algorithm_cfg = cfg.get("algorithm", {})
+        algorithm = str(
+            algorithm_cfg.get("name", algorithm_cfg.get("loss_type", "ppo"))
+        )
+        routes = get_data_routes(
+            algorithm,
+            use_training_pipeline=cfg.runner.get("use_training_pipeline", False),
+        )
         compressions = get_compression_configs()
 
         channel_cfg = cfg.get("trajectory_channel", {})
         max_queue_size = int(channel_cfg.get("max_queue_size", 0))
         num_record_threads = int(channel_cfg.get("num_record_threads", 4))
+        compute_component = "actor" if "actor" in placement.components else "rollout"
+        channel_placement = placement.get_strategy(
+            "trajectory_channel"
+            if "trajectory_channel" in placement.components
+            else compute_component
+        )
+        storage_placement = placement.get_strategy(
+            "trajectory_storage"
+            if "trajectory_storage" in placement.components
+            else compute_component
+        )
 
         controller_worker_group = TrajectoryControllerWorker.create_group(
             routes
@@ -381,7 +398,7 @@ class TrajectoryChannel:
         ).launch(
             cluster,
             name=_CHANNEL_WORKER_GROUP_NAME,
-            placement_strategy=placement.get_strategy("trajectory_channel"),
+            placement_strategy=channel_placement,
             max_concurrency=_MAX_ACTOR_CONCURRENCY,
             isolate_gpu=False,
             disable_distributed_log=True,
@@ -392,7 +409,7 @@ class TrajectoryChannel:
         ).launch(
             cluster,
             name=_STORAGE_WORKER_GROUP_NAME,
-            placement_strategy=placement.get_strategy("trajectory_storage"),
+            placement_strategy=storage_placement,
             max_concurrency=_MAX_ACTOR_CONCURRENCY,
             isolate_gpu=False,
             disable_distributed_log=True,
@@ -405,7 +422,8 @@ class TrajectoryChannel:
             controller_worker_group,
             algorithm,
             cfg,
-            placement.get_world_size("actor"),
+            placement.get_world_size(compute_component),
+            placement.get_world_size("env"),
         ).wait()
         return cls(
             controller_worker_group=controller_worker_group,

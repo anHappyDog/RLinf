@@ -98,10 +98,11 @@ Training Pipeline Mode
 
 For embodied FSDP training, ``runner.use_training_pipeline`` enables a pipeline
 execution path between environment rollout and actor training. When it is set to
-``True``, rollout trajectories are processed on the environment worker, converted
-into packed actor micro-batches, and streamed to the actor through the channel.
-The actor can then train on ready-to-use micro-batches while rollout generation is
-still progressing.
+``True``, each completed rollout epoch is processed into packed actor
+micro-batches and streamed to the actor. With ``TrajectoryChannel`` enabled,
+``TrajectoryStorageWorker`` performs this preparation; otherwise it is performed
+by the environment worker. The actor can then train on ready-to-use micro-batches
+while rollout generation is still progressing.
 
 This mode is useful when rollout payloads contain nested observations or large
 tensors. Sending packed micro-batches makes the channel payload more friendly to
@@ -124,9 +125,9 @@ Example:
 Notes and limitations:
 
 - ``algorithm.normalize_advantages`` is supported. The pipeline path computes raw
-  advantages on the environment worker, aggregates masked advantage statistics
-  across the environment workers that feed each actor rank, and normalizes before
-  streaming actor micro-batches.
+  advantages, aggregates masked advantage statistics across the environment ranks
+  that feed each actor rank, and normalizes before streaming actor micro-batches.
+  With ``TrajectoryChannel`` enabled, storage performs these steps.
 - ``algorithm.adv_type`` currently supports only ``gae`` in this mode.
 - This mode is intended for embodied FSDP actor training with PPO/GRPO-style
   actor losses. It is not supported for ``embodied_sac``, ``embodied_dagger``,

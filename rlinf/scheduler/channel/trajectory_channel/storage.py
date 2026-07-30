@@ -17,13 +17,15 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Generic, TypeAlias, TypeVar, cast
 
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+import rlinf.algorithms  # noqa: F401
+from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.data.embodied_io_struct import (
     EmbodiedLerobotRolloutResult,
     EnvResult,
@@ -41,6 +43,14 @@ from rlinf.scheduler.channel.trajectory_channel.owner_key import (
     BatchKey,
     LeRobotOwnerKey,
     OwnerKey,
+    PipelineBatchKey,
+)
+from rlinf.utils.distributed import masked_stats, normalize_from_stats
+from rlinf.utils.nested_dict_process import split_dict_to_chunk
+from rlinf.utils.utils import (
+    flatten_embodied_batch,
+    pack_batch,
+    preprocess_embodied_batch,
 )
 
 StorageOutput = TypeVar("StorageOutput", bound=TrajectoryData, covariant=True)
@@ -209,7 +219,20 @@ def get_progress_factory(algorithm_name: str) -> ProgressFactory:
         ) from error
 
 
-@register_progress_factory("ppo", "grpo", "sac", "dagger", "dsrl")
+@register_progress_factory(
+    "ppo",
+    "grpo",
+    "sac",
+    "dagger",
+    "dsrl",
+    "actor_critic",
+    "decoupled_actor_critic",
+    "embodied_nft",
+    "opd",
+    "embodied_sac",
+    "rlt_ac",
+    "embodied_dagger",
+)
 def create_embodied_progress(
     context: TrajectoryBatchContext,
 ) -> dict[type[TrajectoryRecord], RecordProgress]:
@@ -675,6 +698,46 @@ class TrajectoryBatch(TrajectoryData):
         del self._progress
 
 
+@dataclass(kw_only=True)
+class PipelineMicroBatch(TrajectoryData):
+    """One packed training micro-batch produced from a rollout epoch."""
+
+    global_step: int
+    rollout_epoch: int
+    actor_rank: int
+    batch: dict[str, Any]
+    is_last: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class PipelineStorageContext:
+    """Static layout used to rebuild legacy pipeline input partitions."""
+
+    total_num_envs: int
+    actor_world_size: int
+    env_world_size: int
+    stage_num: int
+
+    def source_slices(self, actor_rank: int) -> list[tuple[int, slice]]:
+        """Return actor-local slot ranges in legacy Env/stage iteration order."""
+        actor_slots = self.total_num_envs // self.actor_world_size
+        source_slots = self.total_num_envs // (self.env_world_size * self.stage_num)
+        actor_start = actor_rank * actor_slots
+        actor_end = actor_start + actor_slots
+        slices = []
+        for env_rank in range(self.env_world_size):
+            for stage in range(self.stage_num):
+                source_start = (env_rank * self.stage_num + stage) * source_slots
+                source_end = source_start + source_slots
+                start = max(actor_start, source_start)
+                end = min(actor_end, source_end)
+                if start < end:
+                    slices.append(
+                        (env_rank, slice(start - actor_start, end - actor_start))
+                    )
+        return slices
+
+
 @dataclass(frozen=True)
 class _StorageFailure:
     error: BaseException
@@ -732,7 +795,9 @@ class TrajectoryStorage(ABC, Generic[StorageOutput]):
                         data,
                     )
                     if output is not None:
-                        await self._ready.put(output)
+                        outputs = output if isinstance(output, list) else [output]
+                        for ready_output in outputs:
+                            await self._ready.put(ready_output)
                 finally:
                     queue.task_done()
                 if queue.empty():
@@ -751,7 +816,7 @@ class TrajectoryStorage(ABC, Generic[StorageOutput]):
     @abstractmethod
     def _record_sync(
         self, owner_key: OwnerKey, data: TrajectoryRecord
-    ) -> StorageOutput | None:
+    ) -> StorageOutput | list[StorageOutput] | None:
         """Write one record from a record thread."""
 
     async def take(self) -> StorageOutput:
@@ -807,6 +872,175 @@ class RolloutTrajectoryStorage(TrajectoryStorage[TrajectoryBatch]):
             batch._seal()
             return batch
         return None
+
+
+class PipelineTrajectoryStorage(TrajectoryStorage[PipelineMicroBatch]):
+    """Prepare actor micro-batches as each rollout epoch becomes complete."""
+
+    def __init__(
+        self,
+        algorithm_name: str,
+        batch_context: TrajectoryBatchContext,
+        pipeline_context: PipelineStorageContext,
+        cfg: DictConfig,
+        max_queue_size: int = 0,
+        num_record_threads: int = 4,
+    ) -> None:
+        """Initialize epoch-scoped storage and pipeline batch preparation."""
+        super().__init__(max_queue_size, num_record_threads)
+        self._batch_context = batch_context
+        self._pipeline_context = pipeline_context
+        self._cfg = cfg
+        self._progress_factory = get_progress_factory(algorithm_name)
+        self._batches: dict[PipelineBatchKey, TrajectoryBatch] = {}
+        self._batches_lock = threading.Lock()
+        self._shuffle_generators: dict[tuple[int, int], torch.Generator] = {}
+        self._shuffle_lock = threading.Lock()
+
+    async def record(self, data: TrajectoryRecord, owner_key: OwnerKey) -> None:
+        """Enqueue one record from an actor-local rollout epoch."""
+        if not isinstance(owner_key, PipelineBatchKey):
+            raise TypeError("Pipeline storage requires a PipelineBatchKey.")
+        await self._submit(owner_key, data)
+
+    def _record_sync(
+        self, owner_key: OwnerKey, data: TrajectoryRecord
+    ) -> list[PipelineMicroBatch] | None:
+        if not isinstance(owner_key, PipelineBatchKey):
+            raise TypeError("Pipeline storage requires a PipelineBatchKey.")
+        with self._batches_lock:
+            batch = self._batches.get(owner_key)
+            if batch is None:
+                batch = TrajectoryBatch.create(
+                    data.global_step,
+                    data.actor_rank,
+                    self._batch_context,
+                    self._progress_factory,
+                )
+                self._batches[owner_key] = batch
+        batch.record(replace(data, rollout_epoch=0))
+        if not batch.complete:
+            return None
+        with self._batches_lock:
+            del self._batches[owner_key]
+        batch._seal()
+        return self._build_micro_batches(owner_key, batch)
+
+    def _build_micro_batches(
+        self,
+        owner_key: PipelineBatchKey,
+        trajectory_batch: TrajectoryBatch,
+    ) -> list[PipelineMicroBatch]:
+        training_batch = trajectory_batch.to_training_batch(self._cfg)
+        sources = self._pipeline_context.source_slices(owner_key.actor_rank)
+        batches = [
+            self._prepare_batch(
+                self._slice_batch(training_batch, slot_slice),
+            )
+            for _, slot_slice in sources
+        ]
+        if self._cfg.algorithm.get("normalize_advantages", True):
+            stats = sum(
+                masked_stats(batch["advantages"], batch.get("loss_mask"))
+                for batch in batches
+            )
+            for batch in batches:
+                batch["advantages"] = normalize_from_stats(batch["advantages"], stats)
+
+        micro_batches = []
+        for (env_rank, _), batch in zip(sources, batches):
+            micro_batches.extend(
+                self._pack_micro_batches(batch, owner_key.actor_rank, env_rank)
+            )
+        if not micro_batches:
+            raise RuntimeError("Pipeline storage produced no micro-batches.")
+        return [
+            PipelineMicroBatch(
+                global_step=owner_key.global_step,
+                rollout_epoch=owner_key.rollout_epoch,
+                actor_rank=owner_key.actor_rank,
+                batch=batch,
+                is_last=index == len(micro_batches) - 1,
+            )
+            for index, batch in enumerate(micro_batches)
+        ]
+
+    def _prepare_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        batch = preprocess_embodied_batch(
+            batch,
+            rollout_epoch=1,
+            auto_reset=self._cfg.env.train.auto_reset,
+            ignore_terminations=self._cfg.env.train.ignore_terminations,
+            reward_type=self._cfg.algorithm.reward_type,
+            filter_rewards=self._cfg.algorithm.get("filter_rewards", False),
+            group_size=self._cfg.algorithm.group_size,
+            rewards_lower_bound=self._cfg.algorithm.get("rewards_lower_bound", None),
+            rewards_upper_bound=self._cfg.algorithm.get("rewards_upper_bound", None),
+        )
+        kwargs = {
+            "task_type": self._cfg.runner.task_type,
+            "adv_type": self._cfg.algorithm.adv_type,
+            "rewards": batch["rewards"],
+            "dones": batch["dones"],
+            "values": batch.get("prev_values"),
+            "prev_logprobs": batch.get("prev_logprobs"),
+            "num_action_chunks": self._cfg.actor.model.num_action_chunks,
+            "gamma": self._cfg.algorithm.get("gamma", 1),
+            "gae_lambda": self._cfg.algorithm.get("gae_lambda", 1),
+            "group_size": self._cfg.algorithm.get("group_size", 8),
+            "reward_type": self._cfg.algorithm.reward_type,
+            "loss_mask": batch.get("loss_mask"),
+            "loss_mask_sum": batch.get("loss_mask_sum"),
+            "normalize_advantages": False,
+        }
+        batch.update(calculate_adv_and_returns(**kwargs))
+        return batch
+
+    @staticmethod
+    def _slice_batch(batch: dict[str, Any], slots: slice) -> dict[str, Any]:
+        sliced = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                sliced[key] = value[:, slots].contiguous()
+            elif isinstance(value, dict):
+                sliced[key] = PipelineTrajectoryStorage._slice_batch(value, slots)
+            else:
+                sliced[key] = value
+        return sliced
+
+    def _pack_micro_batches(
+        self,
+        batch: dict[str, Any],
+        actor_rank: int,
+        env_rank: int,
+    ) -> list[dict[str, Any]]:
+        batch_size = batch["prev_logprobs"].shape[0] * batch["prev_logprobs"].shape[1]
+        if self._cfg.algorithm.get("shuffle_rollout", True):
+            with self._shuffle_lock:
+                generator = self._shuffle_generators.setdefault(
+                    (env_rank, actor_rank),
+                    torch.Generator().manual_seed(
+                        self._cfg.actor.seed
+                        + actor_rank
+                        + env_rank * self._pipeline_context.actor_world_size
+                    ),
+                )
+                shuffle_ids = torch.randperm(batch_size, generator=generator)
+        else:
+            shuffle_ids = torch.arange(batch_size)
+        micro_batch_size = self._cfg.actor.micro_batch_size
+        if batch_size % micro_batch_size:
+            raise ValueError(
+                f"Batch size {batch_size} is not divisible by micro_batch_size "
+                f"{micro_batch_size}."
+            )
+        flattened = flatten_embodied_batch(batch, shuffle_ids)
+        return [
+            pack_batch(micro_batch)
+            for micro_batch in split_dict_to_chunk(
+                flattened, batch_size // micro_batch_size, dim=0
+            )
+        ]
 
 
 class LeRobotTrajectoryStorage(TrajectoryStorage[LeRobotEpisodeBatch]):
@@ -906,6 +1140,7 @@ def create_trajectory_storage(
     algorithm_name: str,
     cfg: DictConfig,
     actor_world_size: int,
+    env_world_size: int = 1,
     max_queue_size: int = 0,
     num_record_threads: int = 4,
 ) -> TrajectoryStorage[TrajectoryData]:
@@ -958,22 +1193,41 @@ def create_trajectory_storage(
         if reward_mode in ("per_step", "history_buffer")
         else ()
     )
+    context = TrajectoryBatchContext(
+        rollout_epochs=1
+        if cfg.runner.get("use_training_pipeline", False)
+        else int(cfg.env.train.rollout_epoch),
+        chunk_steps=chunk_steps,
+        slot_ids=tuple(range(total_num_envs // actor_world_size)),
+        reward_mode=reward_mode,
+        reward_steps=reward_steps,
+        collect_values=bool(
+            OmegaConf.select(cfg, "actor.model.add_value_head", default=False)
+        ),
+        bootstrap_on_termination=(
+            OmegaConf.select(cfg, "algorithm.bootstrap_type", default="standard")
+            != "standard"
+        ),
+    )
+    if cfg.runner.get("use_training_pipeline", False):
+        if cfg.algorithm.adv_type == "opd":
+            raise ValueError("OPD does not support runner.use_training_pipeline=True.")
+        return PipelineTrajectoryStorage(
+            algorithm_name,
+            context,
+            PipelineStorageContext(
+                total_num_envs=total_num_envs,
+                actor_world_size=actor_world_size,
+                env_world_size=env_world_size,
+                stage_num=int(cfg.rollout.pipeline_stage_num),
+            ),
+            cfg,
+            max_queue_size=max_queue_size,
+            num_record_threads=num_record_threads,
+        )
     return RolloutTrajectoryStorage(
         algorithm_name,
-        TrajectoryBatchContext(
-            rollout_epochs=int(cfg.env.train.rollout_epoch),
-            chunk_steps=chunk_steps,
-            slot_ids=tuple(range(total_num_envs // actor_world_size)),
-            reward_mode=reward_mode,
-            reward_steps=reward_steps,
-            collect_values=bool(
-                OmegaConf.select(cfg, "actor.model.add_value_head", default=False)
-            ),
-            bootstrap_on_termination=(
-                OmegaConf.select(cfg, "algorithm.bootstrap_type", default="standard")
-                != "standard"
-            ),
-        ),
+        context,
         max_queue_size=max_queue_size,
         num_record_threads=num_record_threads,
     )
