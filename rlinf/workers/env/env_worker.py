@@ -923,6 +923,7 @@ class EnvWorker(Worker):
         else:
             selected = env_output.dones[local_slice, -1]
 
+        bootstrap_observations = env_output.prepare_observations(bootstrap_obs)
         requests = []
         if selected.any():
             requests.append(
@@ -941,7 +942,7 @@ class EnvWorker(Worker):
                     ),
                     value_kind="truncation",
                     observations=_slice_data(
-                        _slice_data(bootstrap_obs, local_slice),
+                        _slice_data(bootstrap_observations, local_slice),
                         selected,
                     ),
                 )
@@ -969,7 +970,9 @@ class EnvWorker(Worker):
                     ),
                     value_kind="boundary",
                     observations=_slice_data(
-                        _slice_data(env_output.obs, local_slice),
+                        _slice_data(
+                            env_output.prepare_observations(env_output.obs), local_slice
+                        ),
                         selected,
                     ),
                 )

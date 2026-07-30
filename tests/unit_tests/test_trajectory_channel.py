@@ -18,13 +18,16 @@ import asyncio
 from collections import defaultdict
 from collections.abc import Callable
 from inspect import unwrap
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 import rlinf.workers.actor.fsdp_rlt_ac_policy_worker as rlt_ac_worker
 from rlinf.data.embodied_io_struct import (
+    EnvOutput,
     EnvResult,
     LeRobotStepResult,
     PolicyInput,
@@ -62,6 +65,7 @@ from rlinf.scheduler.channel.trajectory_channel.workers import (
 from rlinf.scheduler.collective.async_work import AsyncWork
 from rlinf.scheduler.manager import WorkerAddress
 from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACFSDPPolicy
+from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.reward.api_reward_worker import EmbodiedAPIRewardWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
@@ -157,6 +161,67 @@ def test_trajectory_records_normalize_tensors() -> None:
         assert value.device.type == "cpu"
         assert value.is_contiguous()
         assert not value.requires_grad
+
+
+def test_value_requests_use_policy_observation_layout() -> None:
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "actor": {"model": {"add_value_head": True}},
+            "algorithm": {"bootstrap_type": "standard"},
+        }
+    )
+    worker.n_train_chunk_steps = 1
+    output = EnvOutput(
+        obs={"main_images": torch.ones(2, 1)},
+        dones=torch.zeros(2, 1, dtype=torch.bool),
+        terminations=torch.zeros(2, 1, dtype=torch.bool),
+        truncations=torch.zeros(2, 1, dtype=torch.bool),
+    )
+
+    requests = worker._value_requests(
+        _record_fields(slot_ids=(0, 1)),
+        output,
+        slice(None),
+        output.obs,
+        chunk_step=0,
+    )
+
+    assert len(requests) == 1
+    assert set(requests[0].observations) == {
+        "main_images",
+        "wrist_images",
+        "extra_view_images",
+        "states",
+        "task_descriptions",
+    }
+
+
+def test_value_consumer_reports_background_failures() -> None:
+    class _FailingChannel:
+        def __init__(self) -> None:
+            self.error: BaseException | None = None
+
+        def take(self, data_type: type, *, async_op: bool) -> _TrajectoryTake:
+            assert data_type is ValueRequest
+            assert async_op
+            return _TrajectoryTake(SimpleNamespace(observations={}))
+
+        async def report_failure(self, error: BaseException) -> None:
+            self.error = error
+
+    worker = object.__new__(MultiStepRolloutWorker)
+    worker._predict_rollout_actions = lambda observations: (_ for _ in ()).throw(
+        KeyError("missing input")
+    )
+    channel = _FailingChannel()
+
+    with pytest.raises(KeyError, match="missing input"):
+        asyncio.run(
+            unwrap(MultiStepRolloutWorker._consume_value_requests)(worker, channel)
+        )
+
+    assert isinstance(channel.error, KeyError)
 
 
 @pytest.mark.parametrize(

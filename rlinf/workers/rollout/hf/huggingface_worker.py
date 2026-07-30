@@ -634,30 +634,36 @@ class MultiStepRolloutWorker(Worker):
     async def _consume_value_requests(
         self, trajectory_channel: "TrajectoryChannel"
     ) -> None:
-        while True:
-            request = await trajectory_channel.take(
-                ValueRequest, async_op=True
-            ).async_wait()
-            actions, result = self._predict_rollout_actions(request.observations)
-            values = result.get("prev_values")
-            if values is None:
-                values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
-            values = values[:, :1]
-            versions = torch.full_like(values, float(self.version), dtype=torch.float32)
-            await trajectory_channel.publish(
-                ValueResult(
-                    global_step=request.global_step,
-                    rollout_epoch=request.rollout_epoch,
-                    chunk_step=request.chunk_step,
-                    slot_ids=request.slot_ids,
-                    actor_rank=request.actor_rank,
-                    pipeline_stage=request.pipeline_stage,
-                    kind=request.value_kind,
-                    values=values,
-                    versions=versions,
-                ),
-                async_op=True,
-            ).async_wait()
+        try:
+            while True:
+                request = await trajectory_channel.take(
+                    ValueRequest, async_op=True
+                ).async_wait()
+                actions, result = self._predict_rollout_actions(request.observations)
+                values = result.get("prev_values")
+                if values is None:
+                    values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
+                values = values[:, :1]
+                versions = torch.full_like(
+                    values, float(self.version), dtype=torch.float32
+                )
+                await trajectory_channel.publish(
+                    ValueResult(
+                        global_step=request.global_step,
+                        rollout_epoch=request.rollout_epoch,
+                        chunk_step=request.chunk_step,
+                        slot_ids=request.slot_ids,
+                        actor_rank=request.actor_rank,
+                        pipeline_stage=request.pipeline_stage,
+                        kind=request.value_kind,
+                        values=values,
+                        versions=versions,
+                    ),
+                    async_op=True,
+                ).async_wait()
+        except Exception as error:
+            await trajectory_channel.report_failure(error)
+            raise
 
     def offload_model(self):
         if self.enable_cuda_graph:

@@ -512,6 +512,11 @@ class TrajectoryChannel:
         )
         return work if async_op else work.wait()
 
+    async def report_failure(self, error: BaseException) -> None:
+        """Make an asynchronous participant failure visible to channel consumers."""
+        controller_worker = self._controller_worker_group.worker_info_list[0].worker
+        await controller_worker.report_failure.remote(error)
+
     def _encode(
         self, data: TrajectoryData
     ) -> tuple[PackedTrajectoryData, CompressionLease | None]:
