@@ -41,6 +41,8 @@ from rlinf.scheduler.channel.trajectory_channel.storage import (
     PipelineTrajectoryStorage,
     RolloutTrajectoryStorage,
     TrajectoryBatchContext,
+    create_embodied_progress,
+    get_progress_factory,
 )
 from rlinf.scheduler.channel.trajectory_channel.workers import (
     TrajectoryControllerWorker,
@@ -58,6 +60,14 @@ def _record_args(actor_rank: int) -> dict:
         "chunk_step": 0,
         "slot_ids": (0, 1),
     }
+
+
+@pytest.mark.parametrize(
+    "algorithm",
+    ("ppo", "grpo", "sac", "dsrl", "dagger", "nft", "rlt_ac", "opd"),
+)
+def test_algorithm_types_share_the_embodied_progress_factory(algorithm: str) -> None:
+    assert get_progress_factory(algorithm) is create_embodied_progress
 
 
 def test_storage_keeps_actor_batches_separate() -> None:
@@ -317,6 +327,161 @@ def test_trajectory_batch_converts_to_training_layout() -> None:
         assert trajectory.max_episode_length == 2
         assert trajectory.model_weights_id
         torch.testing.assert_close(trajectory.actions, batch["actions"])
+
+    asyncio.run(run())
+
+
+def test_storage_does_not_wait_for_truncation_values_without_auto_reset() -> None:
+    async def run() -> None:
+        storage = RolloutTrajectoryStorage(
+            "ppo",
+            TrajectoryBatchContext(
+                rollout_epochs=1,
+                chunk_steps=1,
+                slot_ids=(0,),
+                collect_values=True,
+            ),
+        )
+        args = _record_args(actor_rank=0) | {"slot_ids": (0,)}
+        owner_key = BatchKey(global_step=7, actor_rank=0)
+        await storage.record(
+            EnvResult(
+                **args,
+                rewards=torch.ones(1, 1),
+                dones=torch.ones(1, 1, dtype=torch.bool),
+                terminations=torch.zeros(1, 1, dtype=torch.bool),
+                truncations=torch.ones(1, 1, dtype=torch.bool),
+            ),
+            owner_key,
+        )
+        await storage.record(RolloutResult(**args, actions=torch.ones(1, 1)), owner_key)
+
+        batch = await storage.take()
+        assert batch.truncation_values is None
+
+    asyncio.run(run())
+
+
+def test_storage_records_executed_intervention_actions() -> None:
+    async def run() -> None:
+        storage = RolloutTrajectoryStorage(
+            "rlt_ac",
+            TrajectoryBatchContext(
+                rollout_epochs=1,
+                chunk_steps=1,
+                slot_ids=(0,),
+            ),
+        )
+        args = _record_args(actor_rank=0) | {"slot_ids": (0,)}
+        owner_key = BatchKey(global_step=7, actor_rank=0)
+        await storage.record(
+            RolloutResult(
+                **args,
+                actions=torch.ones(1, 4),
+                forward_inputs={"action": torch.ones(1, 4)},
+                intervene_flags=torch.zeros(1, 2, dtype=torch.bool),
+            ),
+            owner_key,
+        )
+        await storage.record(
+            EnvResult(
+                **args,
+                rewards=torch.ones(1, 1),
+                dones=torch.zeros(1, 1, dtype=torch.bool),
+                terminations=torch.zeros(1, 1, dtype=torch.bool),
+                truncations=torch.zeros(1, 1, dtype=torch.bool),
+                intervene_actions=torch.full((1, 4), 3.0),
+                intervene_flags=torch.tensor([[False, True]]),
+            ),
+            owner_key,
+        )
+
+        batch = await storage.take()
+        training_batch = batch.to_training_batch(
+            OmegaConf.create({"algorithm": {"gamma": 0.99}, "reward": {}})
+        )
+        torch.testing.assert_close(
+            training_batch["actions"], torch.tensor([[[1.0, 1.0, 3.0, 3.0]]])
+        )
+        torch.testing.assert_close(
+            training_batch["forward_inputs"]["action"],
+            training_batch["actions"],
+        )
+        assert training_batch["intervene_flags"].tolist() == [
+            [[False, False, True, True]]
+        ]
+
+    asyncio.run(run())
+
+
+def test_storage_preserves_epoch_reward_and_value_boundaries() -> None:
+    async def run() -> None:
+        storage = RolloutTrajectoryStorage(
+            "ppo",
+            TrajectoryBatchContext(
+                rollout_epochs=2,
+                chunk_steps=2,
+                slot_ids=(0,),
+                collect_values=True,
+            ),
+        )
+        owner_key = BatchKey(global_step=7, actor_rank=0)
+        flags = torch.zeros(1, 1, dtype=torch.bool)
+        for rollout_epoch in range(2):
+            for chunk_step in range(2):
+                marker = 10 * rollout_epoch + chunk_step
+                args = {
+                    **_record_args(actor_rank=0),
+                    "rollout_epoch": rollout_epoch,
+                    "chunk_step": chunk_step,
+                    "slot_ids": (0,),
+                }
+                await storage.record(
+                    EnvResult(
+                        **args,
+                        rewards=torch.full((1, 1), marker),
+                        dones=flags,
+                        terminations=flags,
+                        truncations=flags,
+                    ),
+                    owner_key,
+                )
+                await storage.record(
+                    RolloutResult(
+                        **args,
+                        actions=torch.full((1, 1), marker),
+                        prev_logprobs=torch.full((1, 1), marker),
+                        state_values=torch.full((1, 1), marker),
+                    ),
+                    owner_key,
+                )
+            await storage.record(
+                ValueResult(
+                    **{
+                        **_record_args(actor_rank=0),
+                        "rollout_epoch": rollout_epoch,
+                        "chunk_step": 2,
+                        "slot_ids": (0,),
+                    },
+                    kind="boundary",
+                    values=torch.full((1, 1), 100 + rollout_epoch),
+                ),
+                owner_key,
+            )
+
+        batch = (await storage.take()).to_training_batch(
+            OmegaConf.create({"algorithm": {"gamma": 0.99}, "reward": {}})
+        )
+        batch = process_nested_dict_for_adv(batch, rollout_epoch=2)
+
+        torch.testing.assert_close(
+            batch["rewards"].squeeze(-1), torch.tensor([[0, 10], [1, 11]])
+        )
+        torch.testing.assert_close(
+            batch["prev_values"].squeeze(-1),
+            torch.tensor([[0, 10], [1, 11], [100, 101]]),
+        )
+        assert not batch["dones"].any()
 
     asyncio.run(run())
 

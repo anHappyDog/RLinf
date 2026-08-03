@@ -44,6 +44,7 @@ runner:
   weight_sync_interval: 1
 
 algorithm:
+  type: ppo
   update_epoch: 4
   normalize_advantages: True
   kl_penalty: kl

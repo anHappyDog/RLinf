@@ -78,8 +78,8 @@ ordinary channels retained by the embodied runners carry metrics.
 
    ``TrajectoryChannel`` supports ``runner.use_training_pipeline: true`` for the
    embodied FSDP pipeline. Pipeline mode currently requires
-   ``algorithm.adv_type: gae`` and does not support ``embodied_sac``,
-   ``embodied_dagger``, ``embodied_nft``, or OPD. ``env.train.total_num_envs``
+   ``algorithm.adv_type: gae`` and does not support ``algorithm.type: sac``,
+   ``dsrl``, ``rlt_ac``, ``dagger``, ``nft``, or ``opd``. ``env.train.total_num_envs``
    must be divisible by the actor world size, so storage can construct fixed
    trajectory shards for each actor.
 
@@ -160,7 +160,11 @@ Online LeRobot DAgger uses a different long-lived owner: ``LeRobotOwnerKey(actor
 Supported Algorithms and Records
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The current implementation registers routes for the following ``algorithm.name`` values. Algorithm configuration still determines the loss, reward, and model behavior. This table only describes the additional records carried by the channel.
+``algorithm.type`` is required for embodied runs and selects the
+``TrajectoryChannel`` protocol. It is independent of ``algorithm.loss_type``
+and ``algorithm.adv_type``: those fields still select the policy loss and
+advantage estimator, while the channel never infers its protocol from either
+field. The supported values and their records are listed below.
 
 .. list-table::
    :header-rows: 1
@@ -172,6 +176,9 @@ The current implementation registers routes for the following ``algorithm.name``
    * - ``ppo``
      - ``PolicyInput``, ``PolicyOutput``, ``EnvResult``, ``RolloutResult``, and ``TrajectoryBatch`` (or ``PipelineMicroBatch`` in pipeline mode)
      - ``ValueRequest`` / ``ValueResult``; ``RewardRequest`` / ``RewardResult`` when an external reward is used.
+   * - ``nft`` / ``opd``
+     - Same as PPO.
+     - Same as PPO.
    * - ``sac``
      - Same as above
      - No additional channel records.
@@ -184,6 +191,9 @@ The current implementation registers routes for the following ``algorithm.name``
    * - ``dagger``
      - Same as above
      - ``LeRobotStepResult`` / ``LeRobotEpisodeBatch`` in online LeRobot mode.
+   * - ``rlt_ac``
+     - ``PolicyInput``, ``PolicyOutput``, ``EnvResult``, ``RolloutResult``, and ``TrajectoryBatch``.
+     - No additional channel records.
 
 Communication Protocol and Data Transfer
 ----------------------------------------
@@ -232,7 +242,7 @@ Troubleshooting
    * - Storage creation says the environment count is not divisible by actor world size
      - Adjust ``env.train.total_num_envs`` or the actor placement world size so the former is divisible by the latter.
    * - Pipeline startup reports an unsupported algorithm
-     - Use ``algorithm.adv_type: gae`` and an embodied FSDP PPO-style actor loss. Pipeline mode does not support ``embodied_sac``, ``embodied_dagger``, ``embodied_nft``, or OPD.
+     - Use ``algorithm.adv_type: gae`` and an embodied FSDP PPO-style actor loss. Pipeline mode does not support ``algorithm.type: sac``, ``dsrl``, ``rlt_ac``, ``dagger``, ``nft``, or ``opd``.
    * - A consumer waits or a training batch does not appear
      - Confirm that the algorithm is in the support table, all required workers are running, and reward/value features have their corresponding service worker. A complete batch needs every enabled record.
    * - Storage writing, deserialization, or compression fails

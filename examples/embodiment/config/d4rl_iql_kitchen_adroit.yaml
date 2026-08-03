@@ -40,6 +40,7 @@ runner:
   resume_dir: null
 
 algorithm:
+  type: iql
   loss_type: "offline_iql"
   adv_type: null
   hidden_dims: [256, 256]

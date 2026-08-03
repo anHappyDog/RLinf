@@ -34,6 +34,7 @@ runner:
   save_interval: -1
 
 algorithm:
+  type: nft
   group_size: 1
   reward_coef: 1.0
 

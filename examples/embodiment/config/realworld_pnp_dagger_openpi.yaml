@@ -55,6 +55,7 @@ runner:
   ckpt_path: "/path/to/ckpt"
 
 algorithm:
+  type: dagger
   dagger:
     init_beta: 1.0
     beta_schedule: "exponential"

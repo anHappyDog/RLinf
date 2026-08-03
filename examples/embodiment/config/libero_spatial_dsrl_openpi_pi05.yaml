@@ -37,6 +37,7 @@ runner:
   ckpt_path: null
 
 algorithm:
+  type: dsrl
   normalize_advantages: False
   kl_penalty: kl
   group_size: 1

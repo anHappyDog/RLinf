@@ -58,6 +58,7 @@ runner:
   ckpt_path: null
 
 algorithm:
+  type: sac
   update_epoch: 8
   group_size: 1
   agg_q: min

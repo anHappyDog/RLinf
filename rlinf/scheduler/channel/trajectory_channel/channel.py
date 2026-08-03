@@ -358,14 +358,17 @@ class TrajectoryChannel:
         placement: ComponentPlacement,
     ) -> "TrajectoryChannel":
         """Create the worker groups and a channel from the training configuration."""
-        algorithm_cfg = cfg.get("algorithm", {})
-        algorithm = str(
-            algorithm_cfg.get("name", algorithm_cfg.get("loss_type", "ppo"))
-        )
+        algorithm_type = cfg.algorithm.type
         routes = get_data_routes(
-            algorithm,
+            algorithm_type,
             use_training_pipeline=cfg.runner.get("use_training_pipeline", False),
         )
+        if cfg.runner.get("only_eval", False):
+            routes = {
+                data_type: route
+                for data_type, route in routes.items()
+                if route.src is not None and route.dst is not None
+            }
         compressions = get_compression_configs()
 
         channel_cfg = cfg.get("trajectory_channel", {})
@@ -420,7 +423,7 @@ class TrajectoryChannel:
             routes,
             compressions,
             controller_worker_group,
-            algorithm,
+            algorithm_type,
             cfg,
             placement.get_world_size(compute_component),
             placement.get_world_size("env"),

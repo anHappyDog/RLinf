@@ -40,6 +40,7 @@ runner:
   expert_ckpt_path: "/path/to/ckpt" # fill expert ckpt path here
 
 algorithm:
+  type: dagger
   # dagger specific args
   dagger:
     # beta scheduling args. Expert acts with the probability of beta, while student acts with 1 - beta

@@ -66,19 +66,19 @@ _DATA_ROUTE_PROVIDERS: dict[str, _DataRouteProvider] = {}
 
 
 def register_data_routes(
-    *algorithms: str,
+    *algorithm_types: str,
 ) -> Callable[[_DataRouteProvider], _DataRouteProvider]:
-    """Register a route provider for one or more algorithm names."""
-    if not algorithms:
-        raise ValueError("At least one algorithm name is required.")
+    """Register a route provider for one or more algorithm types."""
+    if not algorithm_types:
+        raise ValueError("At least one algorithm type is required.")
 
     def decorator(provider: _DataRouteProvider) -> _DataRouteProvider:
-        for algorithm in algorithms:
-            key = algorithm.lower()
+        for algorithm_type in algorithm_types:
+            key = algorithm_type.lower()
             if key in _DATA_ROUTE_PROVIDERS:
                 raise ValueError(
-                    "Data route provider for algorithm "
-                    f"'{algorithm}' is already registered."
+                    "Data route provider for algorithm type "
+                    f"'{algorithm_type}' is already registered."
                 )
             _DATA_ROUTE_PROVIDERS[key] = provider
         return provider
@@ -86,11 +86,15 @@ def register_data_routes(
     return decorator
 
 
-def get_data_routes(algo: str, use_training_pipeline: bool = False) -> DataRouteDict:
-    """Build the routes registered for an algorithm."""
-    key = algo.lower()
+def get_data_routes(
+    algorithm_type: str, use_training_pipeline: bool = False
+) -> DataRouteDict:
+    """Build the routes registered for an algorithm type."""
+    key = algorithm_type.lower()
     if key not in _DATA_ROUTE_PROVIDERS:
-        raise ValueError(f"No data route provider registered for algorithm '{algo}'")
+        raise ValueError(
+            f"No data route provider registered for algorithm type '{algorithm_type}'"
+        )
     return _DATA_ROUTE_PROVIDERS[key](use_training_pipeline)
 
 
@@ -130,13 +134,7 @@ def rollout_owner_key(use_training_pipeline: bool) -> OwnerKeyBuilder:
     )
 
 
-@register_data_routes(
-    "ppo",
-    "actor_critic",
-    "decoupled_actor_critic",
-    "embodied_nft",
-    "opd",
-)
+@register_data_routes("ppo", "nft", "opd")
 def ppo_data_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     """Return PPO routes including value and reward records."""
     owner_key = rollout_owner_key(use_training_pipeline)
@@ -171,7 +169,7 @@ def ppo_data_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     }
 
 
-@register_data_routes("sac", "embodied_sac", "rlt_ac")
+@register_data_routes("sac", "rlt_ac")
 def sac_data_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     """Return SAC routes for environment and rollout records."""
     owner_key = rollout_owner_key(use_training_pipeline)
@@ -241,7 +239,7 @@ def dsrl_data_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     }
 
 
-@register_data_routes("dagger", "embodied_dagger")
+@register_data_routes("dagger")
 def dagger_data_routes(use_training_pipeline: bool = False) -> DataRouteDict:
     """Return DAgger routes including episode collection records."""
     return {

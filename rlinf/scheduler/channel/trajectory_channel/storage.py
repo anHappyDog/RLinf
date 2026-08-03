@@ -149,6 +149,7 @@ class TrajectoryBatchContext:
     reward_mode: RewardMode | None = None
     reward_steps: tuple[int, ...] = ()
     collect_values: bool = False
+    bootstrap_truncations: bool = False
     bootstrap_on_termination: bool = False
 
     def __post_init__(self) -> None:
@@ -194,13 +195,13 @@ _PROGRESS_FACTORIES: dict[str, ProgressFactory] = {}
 
 
 def register_progress_factory(
-    *algorithm_names: str,
+    *algorithm_types: str,
 ) -> Callable[[ProgressFactory], ProgressFactory]:
-    """Register one progress definition for one or more algorithms."""
+    """Register one progress definition for one or more algorithm types."""
 
     def register(factory: ProgressFactory) -> ProgressFactory:
-        for algorithm_name in algorithm_names:
-            key = algorithm_name.lower()
+        for algorithm_type in algorithm_types:
+            key = algorithm_type.lower()
             if key in _PROGRESS_FACTORIES:
                 raise ValueError(f"Progress factory {key!r} is already registered.")
             _PROGRESS_FACTORIES[key] = factory
@@ -209,13 +210,13 @@ def register_progress_factory(
     return register
 
 
-def get_progress_factory(algorithm_name: str) -> ProgressFactory:
-    """Return the progress factory registered for an algorithm."""
+def get_progress_factory(algorithm_type: str) -> ProgressFactory:
+    """Return the progress factory registered for an algorithm type."""
     try:
-        return _PROGRESS_FACTORIES[algorithm_name.lower()]
+        return _PROGRESS_FACTORIES[algorithm_type.lower()]
     except KeyError as error:
         raise ValueError(
-            f"No trajectory progress factory registered for {algorithm_name!r}."
+            f"No trajectory progress factory registered for {algorithm_type!r}."
         ) from error
 
 
@@ -225,13 +226,9 @@ def get_progress_factory(algorithm_name: str) -> ProgressFactory:
     "sac",
     "dagger",
     "dsrl",
-    "actor_critic",
-    "decoupled_actor_critic",
-    "embodied_nft",
+    "nft",
     "opd",
-    "embodied_sac",
     "rlt_ac",
-    "embodied_dagger",
 )
 def create_embodied_progress(
     context: TrajectoryBatchContext,
@@ -367,6 +364,7 @@ class TrajectoryBatch(TrajectoryData):
         self.rlt_switch_flags = self._write(
             self.rlt_switch_flags, record.rlt_switch_flags, index
         )
+        self._apply_interventions(index)
 
     def record_rollout_result(self, record: RolloutResult) -> None:
         """Write rollout outputs."""
@@ -386,8 +384,50 @@ class TrajectoryBatch(TrajectoryData):
         self.state_values = self._write(self.state_values, record.state_values, index)
         self.versions = self._write(self.versions, record.versions, index)
         self.rollout_intervene_flags = self._write(
-            self.rollout_intervene_flags, record.intervene_flags, index
+            self.rollout_intervene_flags,
+            self._expand_intervene_flags(record.intervene_flags, training_actions),
+            index,
         )
+        self._apply_interventions(index)
+
+    @staticmethod
+    def _expand_intervene_flags(
+        flags: torch.Tensor | None, actions: torch.Tensor
+    ) -> torch.Tensor | None:
+        if flags is None or flags.shape == actions.shape:
+            return flags
+        if actions.ndim == 2 and flags.ndim == 2:
+            if actions.shape[1] % flags.shape[1]:
+                raise ValueError("Intervention flags do not match action chunks.")
+            return (
+                flags[..., None]
+                .expand(-1, -1, actions.shape[1] // flags.shape[1])
+                .reshape_as(actions)
+            )
+        if actions.ndim == flags.ndim + 1 and actions.shape[:-1] == flags.shape:
+            return flags[..., None].expand_as(actions)
+        raise ValueError("Intervention flags do not match action layout.")
+
+    def _apply_interventions(self, index: tuple[int, int, torch.Tensor]) -> None:
+        if (
+            self.actions is None
+            or self.intervene_actions is None
+            or self.env_intervene_flags is None
+        ):
+            return
+        actions = self.actions[index]
+        intervene_actions = self.intervene_actions[index]
+        flags = self._expand_intervene_flags(self.env_intervene_flags[index], actions)
+        if flags is None:
+            return
+        if intervene_actions.shape != actions.shape:
+            raise ValueError("Intervention actions do not match rollout actions.")
+        actions = torch.where(flags, intervene_actions, actions)
+        self.actions[index] = actions
+        if self.forward_inputs is not None and "action" in self.forward_inputs:
+            self.forward_inputs["action"][index] = actions
+        if self.rollout_intervene_flags is not None:
+            self.rollout_intervene_flags[index] = flags
 
     def record_reward_result(self, record: RewardResult) -> None:
         """Write externally computed rewards."""
@@ -422,6 +462,8 @@ class TrajectoryBatch(TrajectoryData):
     def record_value_result(self, record: ValueResult) -> None:
         """Write sparse truncation or rollout-boundary values."""
         if record.kind == "truncation":
+            if not self._context.bootstrap_truncations:
+                raise ValueError("Truncation values require auto-reset rollouts.")
             index = self._step_index(record)
             self.truncation_values = self._write(
                 self.truncation_values, record.values, index
@@ -604,14 +646,15 @@ class TrajectoryBatch(TrajectoryData):
         progress = self._progress.get(ValueResult)
         if progress is None:
             return
-        truncated = (
-            record.dones[..., -1]
-            if self._context.bootstrap_on_termination
-            else record.truncations[..., -1] & ~record.terminations[..., -1]
-        )
-        progress.expected += int(
-            truncated.reshape(record.batch_size, -1).any(dim=1).sum().item()
-        )
+        if self._context.bootstrap_truncations:
+            truncated = (
+                record.dones[..., -1]
+                if self._context.bootstrap_on_termination
+                else record.truncations[..., -1] & ~record.terminations[..., -1]
+            )
+            progress.expected += int(
+                truncated.reshape(record.batch_size, -1).any(dim=1).sum().item()
+            )
         if record.chunk_step == self._context.chunk_steps - 1:
             done_slots = int(
                 record.dones[..., -1]
@@ -832,7 +875,7 @@ class RolloutTrajectoryStorage(TrajectoryStorage[TrajectoryBatch]):
 
     def __init__(
         self,
-        algorithm_name: str,
+        algorithm_type: str,
         context: TrajectoryBatchContext,
         max_queue_size: int = 0,
         num_record_threads: int = 4,
@@ -840,7 +883,7 @@ class RolloutTrajectoryStorage(TrajectoryStorage[TrajectoryBatch]):
         """Initialize rollout storage."""
         super().__init__(max_queue_size, num_record_threads)
         self._context = context
-        self._progress_factory = get_progress_factory(algorithm_name)
+        self._progress_factory = get_progress_factory(algorithm_type)
         self._batches: dict[BatchKey, TrajectoryBatch] = {}
         self._batches_lock = threading.Lock()
 
@@ -879,7 +922,7 @@ class PipelineTrajectoryStorage(TrajectoryStorage[PipelineMicroBatch]):
 
     def __init__(
         self,
-        algorithm_name: str,
+        algorithm_type: str,
         batch_context: TrajectoryBatchContext,
         pipeline_context: PipelineStorageContext,
         cfg: DictConfig,
@@ -891,7 +934,7 @@ class PipelineTrajectoryStorage(TrajectoryStorage[PipelineMicroBatch]):
         self._batch_context = batch_context
         self._pipeline_context = pipeline_context
         self._cfg = cfg
-        self._progress_factory = get_progress_factory(algorithm_name)
+        self._progress_factory = get_progress_factory(algorithm_type)
         self._batches: dict[PipelineBatchKey, TrajectoryBatch] = {}
         self._batches_lock = threading.Lock()
         self._shuffle_generators: dict[tuple[int, int], torch.Generator] = {}
@@ -1137,7 +1180,7 @@ class LeRobotTrajectoryStorage(TrajectoryStorage[LeRobotEpisodeBatch]):
 
 
 def create_trajectory_storage(
-    algorithm_name: str,
+    algorithm_type: str,
     cfg: DictConfig,
     actor_world_size: int,
     env_world_size: int = 1,
@@ -1204,6 +1247,7 @@ def create_trajectory_storage(
         collect_values=bool(
             OmegaConf.select(cfg, "actor.model.add_value_head", default=False)
         ),
+        bootstrap_truncations=bool(cfg.env.train.auto_reset),
         bootstrap_on_termination=(
             OmegaConf.select(cfg, "algorithm.bootstrap_type", default="standard")
             != "standard"
@@ -1213,7 +1257,7 @@ def create_trajectory_storage(
         if cfg.algorithm.adv_type == "opd":
             raise ValueError("OPD does not support runner.use_training_pipeline=True.")
         return PipelineTrajectoryStorage(
-            algorithm_name,
+            algorithm_type,
             context,
             PipelineStorageContext(
                 total_num_envs=total_num_envs,
@@ -1226,7 +1270,7 @@ def create_trajectory_storage(
             num_record_threads=num_record_threads,
         )
     return RolloutTrajectoryStorage(
-        algorithm_name,
+        algorithm_type,
         context,
         max_queue_size=max_queue_size,
         num_record_threads=num_record_threads,

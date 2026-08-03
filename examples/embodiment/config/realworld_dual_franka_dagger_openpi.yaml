@@ -72,6 +72,7 @@ runner:
   ckpt_path: null
 
 algorithm:
+  type: dagger
   dagger:
     # With no rollout.expert_model configured, beta is not used for model-vs-model
     # expert mixing. Human PICO intervention is collected through info["intervene_action"].

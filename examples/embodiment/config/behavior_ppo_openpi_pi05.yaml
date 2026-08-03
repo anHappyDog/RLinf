@@ -42,6 +42,7 @@ runner:
   ckpt_path: null
 
 algorithm:
+  type: ppo
   normalize_advantages: True
   kl_penalty: kl
   group_size: 1

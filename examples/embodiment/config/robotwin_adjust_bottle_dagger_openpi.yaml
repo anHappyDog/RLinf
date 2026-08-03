@@ -39,6 +39,7 @@ runner:
   ckpt_path: null
 
 algorithm:
+  type: dagger
   reward_coef: 1.0
 
   dagger:

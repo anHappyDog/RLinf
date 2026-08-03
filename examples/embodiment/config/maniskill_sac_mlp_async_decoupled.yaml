@@ -44,6 +44,7 @@ runner:
   enable_decoupled_mode: True
 
 algorithm:
+  type: sac
   update_epoch: 32
   group_size: 1
   agg_q: min

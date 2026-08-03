@@ -70,6 +70,7 @@ algorithm
 .. code:: yaml
 
   algorithm:
+    type: ppo
     normalize_advantages: True
     kl_penalty: kl
 
@@ -110,6 +111,10 @@ algorithm
      - 对数概率计算粒度（例如 ``token_level``）。
    * - ``algorithm.entropy_type``
      - 熵计算粒度（例如 ``token_level``）。
+   * - ``algorithm.type``
+     - ``TrajectoryChannel`` 路由所需的 embodied 算法类型（例如 ``ppo``、
+       ``grpo``、``sac``、``dsrl``、``dagger``、``nft``、``rlt_ac`` 或
+       ``opd``）。该字段不会由 loss 或 advantage 设置推断。
    * - ``algorithm.adv_type``
      - 优势估计器（例如 PPO 使用 ``gae``）。
    * - ``algorithm.loss_type``

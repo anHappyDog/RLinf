@@ -829,6 +829,9 @@ def validate_embodied_cfg(cfg):
     )
     model_cfg = cfg.rollout.model if only_eval else cfg.actor.model
     algorithm_cfg = cfg.get("algorithm", {}) or {}
+    assert algorithm_cfg.get("type", None) is not None, (
+        "algorithm.type is required for embodied runs."
+    )
     model_type = SupportedModel(model_cfg.model_type)
     assert model_type in EMBODIED_MODEL, (
         f"Model type: '{model_cfg.model_type}' is not an embodied model. "

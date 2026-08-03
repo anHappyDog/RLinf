@@ -34,6 +34,7 @@ runner:
   save_interval: -1
 
 algorithm:
+  type: grpo
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 4

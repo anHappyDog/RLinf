@@ -39,6 +39,7 @@ runner:
   ckpt_path: null
 
 algorithm:
+  type: dagger
   # dagger specific args
   dagger:
     # beta scheduling args. Expert acts with the probability of beta, while student acts with 1 - beta

@@ -52,6 +52,7 @@ runner:
   save_interval: -1
 
 algorithm:
+  type: sac
   update_epoch: 30  # 32 -> 30 for real world
   group_size: 1
   normalize_advantages: False  # SAC doesn't use advantages

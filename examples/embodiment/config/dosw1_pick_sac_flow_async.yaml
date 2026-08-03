@@ -61,6 +61,7 @@ runner:
   weight_sync_interval: 30
 
 algorithm:
+  type: sac
   update_epoch: 30
   group_size: 1
   normalize_advantages: False

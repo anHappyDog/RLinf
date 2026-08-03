@@ -35,6 +35,7 @@ runner:
   save_interval: -1
 
 algorithm:
+  type: grpo
   normalize_advantages: True
   kl_penalty: kl
   group_size: 4

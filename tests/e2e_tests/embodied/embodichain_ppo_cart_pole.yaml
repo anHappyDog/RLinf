@@ -38,6 +38,7 @@ runner:
   ckpt_path: null
 
 algorithm:
+  type: ppo
   update_epoch: 2
   normalize_advantages: true
   kl_penalty: kl

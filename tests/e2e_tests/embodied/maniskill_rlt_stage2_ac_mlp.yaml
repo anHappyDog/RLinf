@@ -35,6 +35,7 @@ runner:
   ckpt_path: null
 
 algorithm:
+  type: rlt_ac
   update_epoch: 1
   rlt_schedule:
     enable: True

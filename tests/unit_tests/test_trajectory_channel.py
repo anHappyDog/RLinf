@@ -169,6 +169,7 @@ def test_value_requests_use_policy_observation_layout() -> None:
         {
             "actor": {"model": {"add_value_head": True}},
             "algorithm": {"bootstrap_type": "standard"},
+            "env": {"train": {"auto_reset": True}},
         }
     )
     worker.n_train_chunk_steps = 1
@@ -195,6 +196,24 @@ def test_value_requests_use_policy_observation_layout() -> None:
         "states",
         "task_descriptions",
     }
+
+
+def test_evaluation_shards_follow_rollout_mapping() -> None:
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create({"env": {"eval": {"total_num_envs": 16}}})
+    worker._rank = 0
+    worker._world_size = 2
+    worker.stage_num = 1
+    worker._component_placement = SimpleNamespace(
+        get_world_size=lambda component: 4 if component == "rollout" else None
+    )
+
+    shards = worker._evaluation_shards(stage_id=0)
+
+    assert [(shard.actor_rank, shard.slot_ids) for shard in shards] == [
+        (0, (0, 1, 2, 3)),
+        (1, (4, 5, 6, 7)),
+    ]
 
 
 def test_value_consumer_reports_background_failures() -> None:
@@ -229,6 +248,28 @@ def test_value_consumer_reports_background_failures() -> None:
     (
         (
             "ppo",
+            {
+                EnvResult,
+                RolloutResult,
+                ValueRequest,
+                ValueResult,
+                RewardRequest,
+                RewardResult,
+            },
+        ),
+        (
+            "nft",
+            {
+                EnvResult,
+                RolloutResult,
+                ValueRequest,
+                ValueResult,
+                RewardRequest,
+                RewardResult,
+            },
+        ),
+        (
+            "opd",
             {
                 EnvResult,
                 RolloutResult,
@@ -276,20 +317,18 @@ def test_routes_keep_policy_traffic_separate_from_training_records(
 
 
 @pytest.mark.parametrize(
-    ("alias", "base"),
+    "loss_type",
     (
-        ("actor_critic", "ppo"),
-        ("decoupled_actor_critic", "ppo"),
-        ("embodied_nft", "ppo"),
-        ("embodied_sac", "sac"),
-        ("rlt_ac", "sac"),
-        ("embodied_dagger", "dagger"),
+        "actor_critic",
+        "decoupled_actor_critic",
+        "embodied_sac",
+        "embodied_dagger",
+        "embodied_nft",
     ),
 )
-def test_loss_type_aliases_use_the_matching_trajectory_protocol(
-    alias: str, base: str
-) -> None:
-    assert get_data_routes(alias) == get_data_routes(base)
+def test_loss_types_do_not_select_trajectory_protocols(loss_type: str) -> None:
+    with pytest.raises(ValueError, match="algorithm type"):
+        get_data_routes(loss_type)
 
 
 def test_rlt_ingests_trajectory_channel_batches(

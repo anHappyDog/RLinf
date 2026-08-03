@@ -76,6 +76,7 @@ algorithm
 .. code:: yaml
 
   algorithm:
+    type: ppo
     normalize_advantages: True
     kl_penalty: kl
 
@@ -116,6 +117,11 @@ algorithm
      - Log-probability computation level (e.g., ``token_level``).
    * - ``algorithm.entropy_type``
      - Entropy computation level (e.g., ``token_level``).
+   * - ``algorithm.type``
+     - Required embodied algorithm type for ``TrajectoryChannel`` routing (for
+       example, ``ppo``, ``grpo``, ``sac``, ``dsrl``, ``dagger``, ``nft``,
+       ``rlt_ac``, or ``opd``). This is not inferred from loss or advantage
+       settings.
    * - ``algorithm.adv_type``
      - Advantage estimator (e.g., ``gae`` for PPO).
    * - ``algorithm.loss_type``

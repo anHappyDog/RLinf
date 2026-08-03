@@ -40,6 +40,7 @@ runner:
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
+  type: ppo
   update_epoch: 8
   normalize_advantages: True
   kl_penalty: kl

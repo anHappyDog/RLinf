@@ -72,8 +72,8 @@ storage worker 与 actor 使用相同 placement。只有需要将它们部署到
 
    ``TrajectoryChannel`` 支持具身 FSDP 的
    ``runner.use_training_pipeline: true``。pipeline 模式目前要求
-   ``algorithm.adv_type: gae``，且不支持 ``embodied_sac``、
-   ``embodied_dagger``、``embodied_nft`` 和 OPD。``env.train.total_num_envs``
+   ``algorithm.adv_type: gae``，且不支持 ``algorithm.type: sac``、
+   ``dsrl``、``rlt_ac``、``dagger``、``nft`` 和 ``opd``。``env.train.total_num_envs``
    必须能被 actor world size 整除，storage 才能为每个 actor 构造固定的轨迹分片。
 
 配置项
@@ -149,7 +149,10 @@ online LeRobot DAgger 使用不同的长期 owner：``LeRobotOwnerKey(actor_rank
 支持的算法和记录
 ~~~~~~~~~~~~~~~~~~
 
-当前实现为下列 ``algorithm.name`` 注册了路由。算法配置仍决定具体的损失、奖励和模型行为；下表只描述 channel 会传输哪些额外记录。
+embodied 运行必须配置 ``algorithm.type``，它用于选择
+``TrajectoryChannel`` 协议。它与 ``algorithm.loss_type``、
+``algorithm.adv_type`` 相互独立：后两者仍分别选择策略损失和优势估计器，
+channel 不会从其中任一字段推断协议。支持的取值及其记录如下。
 
 .. list-table::
    :header-rows: 1
@@ -161,6 +164,9 @@ online LeRobot DAgger 使用不同的长期 owner：``LeRobotOwnerKey(actor_rank
    * - ``ppo``
      - ``PolicyInput``、``PolicyOutput``、``EnvResult``、``RolloutResult``、``TrajectoryBatch``（pipeline 模式下为 ``PipelineMicroBatch``）
      - ``ValueRequest`` / ``ValueResult``；使用外部奖励时还有 ``RewardRequest`` / ``RewardResult``。
+   * - ``nft`` / ``opd``
+     - 与 PPO 相同。
+     - 与 PPO 相同。
    * - ``sac``
      - 同上
      - 无额外的 channel 记录。
@@ -173,6 +179,9 @@ online LeRobot DAgger 使用不同的长期 owner：``LeRobotOwnerKey(actor_rank
    * - ``dagger``
      - 同上
      - online LeRobot 模式还使用 ``LeRobotStepResult`` / ``LeRobotEpisodeBatch``。
+   * - ``rlt_ac``
+     - ``PolicyInput``、``PolicyOutput``、``EnvResult``、``RolloutResult`` 和 ``TrajectoryBatch``。
+     - 无额外的 channel 记录。
 
 通信协议和数据传输
 ------------------
@@ -221,7 +230,7 @@ online LeRobot DAgger 使用不同的长期 owner：``LeRobotOwnerKey(actor_rank
    * - 创建 storage 时提示环境数不能整除 actor world size
      - 调整 ``env.train.total_num_envs`` 或 actor placement 的 world size，使前者能被后者整除。
    * - pipeline 启动时报算法不支持
-     - 使用 ``algorithm.adv_type: gae`` 和具身 FSDP 的 PPO 风格 actor loss。pipeline 模式不支持 ``embodied_sac``、``embodied_dagger``、``embodied_nft`` 和 OPD。
+     - 使用 ``algorithm.adv_type: gae`` 和具身 FSDP 的 PPO 风格 actor loss。pipeline 模式不支持 ``algorithm.type: sac``、``dsrl``、``rlt_ac``、``dagger``、``nft`` 和 ``opd``。
    * - 消费者等待或训练批次迟迟不出现
      - 确认算法在支持表中，确认每个必要 worker 已启动，并检查 reward/value 功能是否有对应的服务 worker。完整批次需要全部已启用的记录。
    * - storage 写入、反序列化或压缩失败

@@ -66,6 +66,7 @@ runner:
   val_check_interval: -1
 
 algorithm:
+  type: ppo
   update_epoch: 1
   group_size: 1
   eval_rollout_epoch: 100

@@ -106,6 +106,7 @@ class EnvWorker(Worker):
         self.last_obs_list = []
         self.last_intervened_info_list = []
         self._stage_shards = ()
+        self._eval_stage_shards = ()
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
@@ -251,6 +252,11 @@ class EnvWorker(Worker):
                 ]
             self._stage_shards = tuple(
                 tuple(self._trajectory_shards(stage_id))
+                for stage_id in range(self.stage_num)
+            )
+        if self.enable_eval:
+            self._eval_stage_shards = tuple(
+                tuple(self._evaluation_shards(stage_id))
                 for stage_id in range(self.stage_num)
             )
 
@@ -765,6 +771,27 @@ class EnvWorker(Worker):
             )
         return shards
 
+    def _evaluation_shards(self, stage_id: int) -> list[_Shard]:
+        logical_env_rank = self._rank * self.stage_num + stage_id
+        rollout_world_size = self._component_placement.get_world_size("rollout")
+        shards = []
+        offset = 0
+        for rollout_rank, size in CommMapper.get_dst_ranks(
+            batch_size=self.cfg.env.eval.total_num_envs,
+            src_world_size=self._world_size * self.stage_num,
+            dst_world_size=rollout_world_size,
+            src_rank=logical_env_rank,
+        ):
+            shards.append(
+                _Shard(
+                    actor_rank=rollout_rank,
+                    slot_ids=tuple(range(offset, offset + size)),
+                    index=slice(offset, offset + size),
+                )
+            )
+            offset += size
+        return shards
+
     async def _publish_trajectory_records(
         self, trajectory_channel: TrajectoryChannel, records: list
     ) -> None:
@@ -915,7 +942,9 @@ class EnvWorker(Worker):
             return []
 
         slot_ids = record_kwargs["slot_ids"]
-        if self.cfg.algorithm.get("bootstrap_type", "standard") == "standard":
+        if not self.cfg.env.train.auto_reset:
+            selected = torch.zeros_like(env_output.dones[local_slice, -1])
+        elif self.cfg.algorithm.get("bootstrap_type", "standard") == "standard":
             selected = (
                 env_output.truncations[local_slice, -1]
                 & ~env_output.terminations[local_slice, -1]
@@ -1200,21 +1229,29 @@ class EnvWorker(Worker):
                     )
 
             for eval_step in range(self.n_eval_chunk_steps):
-                requests = [
-                    PolicyInput(
-                        global_step=self.global_step,
-                        rollout_epoch=eval_rollout_epoch,
-                        chunk_step=eval_step,
-                        slot_ids=tuple(range(self.eval_num_envs_per_stage)),
-                        pipeline_stage=stage_id,
-                        env_rank=self._rank,
-                        observations=env_output.prepare_observations(env_output.obs),
-                        mode="eval",
-                        rlt_switch_flags=env_output.rlt_switch_flags,
-                        intervene_flags=env_output.intervene_flags,
-                    )
-                    for stage_id, env_output in enumerate(env_outputs)
-                ]
+                requests = []
+                for stage_id, env_output in enumerate(env_outputs):
+                    observations = env_output.prepare_observations(env_output.obs)
+                    for shard in self._eval_stage_shards[stage_id]:
+                        requests.append(
+                            PolicyInput(
+                                global_step=self.global_step,
+                                rollout_epoch=eval_rollout_epoch,
+                                chunk_step=eval_step,
+                                slot_ids=shard.slot_ids,
+                                actor_rank=shard.actor_rank,
+                                pipeline_stage=stage_id,
+                                env_rank=self._rank,
+                                observations=_slice_data(observations, shard.index),
+                                mode="eval",
+                                rlt_switch_flags=_slice_data(
+                                    env_output.rlt_switch_flags, shard.index
+                                ),
+                                intervene_flags=_slice_data(
+                                    env_output.intervene_flags, shard.index
+                                ),
+                            )
+                        )
                 await self._publish_trajectory_records(trajectory_channel, requests)
                 output_works = [
                     trajectory_channel.take(
@@ -1225,14 +1262,27 @@ class EnvWorker(Worker):
                     for _ in requests
                 ]
                 outputs = {
-                    output.pipeline_stage: output
+                    (output.pipeline_stage, output.actor_rank, output.slot_ids): output
                     for output in await asyncio.gather(
                         *(work.async_wait() for work in output_works)
                     )
                 }
 
                 for stage_id in range(self.stage_num):
-                    actions = outputs[stage_id].actions.detach().cpu().numpy()
+                    actions = (
+                        torch.cat(
+                            [
+                                outputs[
+                                    (stage_id, shard.actor_rank, shard.slot_ids)
+                                ].actions
+                                for shard in self._eval_stage_shards[stage_id]
+                            ],
+                            dim=0,
+                        )
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
                     env_output, env_info = self.env_evaluate_step(actions, stage_id)
                     env_outputs[stage_id] = env_output
                     for key, value in env_info.items():

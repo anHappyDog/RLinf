@@ -36,6 +36,7 @@ runner:
   save_interval: -1
 
 algorithm:
+  type: ppo
   normalize_advantages: True
   group_size: 1
   staleness_threshold: 2

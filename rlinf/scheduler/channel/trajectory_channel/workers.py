@@ -202,7 +202,7 @@ class TrajectoryStorageWorker(Worker):
         routes: DataRouteDict,
         compression_configs: CompressionConfigDict,
         controller_worker_group: WorkerGroup[TrajectoryControllerWorker],
-        algorithm_name: str,
+        algorithm_type: str,
         cfg: DictConfig,
         actor_world_size: int,
         env_world_size: int,
@@ -218,18 +218,20 @@ class TrajectoryStorageWorker(Worker):
             for data_type, config in compression_configs.items()
             if data_type in self._routes
         }
+        self._queues = {}
+        for data_type, route in self._routes.items():
+            key = QueueKey(data_type=data_type, src=route.src, dst=route.dst)
+            self._queues[key] = Queue(maxsize=self._max_queue_size)
+        if not self._routes:
+            return
         self._storage = create_trajectory_storage(
-            algorithm_name,
+            algorithm_type,
             cfg,
             actor_world_size,
             env_world_size,
             max_queue_size=self._max_queue_size,
             num_record_threads=self._num_record_threads,
         )
-        self._queues = {}
-        for data_type, route in self._routes.items():
-            key = QueueKey(data_type=data_type, src=route.src, dst=route.dst)
-            self._queues[key] = Queue(maxsize=self._max_queue_size)
         self._controller_worker = controller_worker_group.worker_info_list[0].worker
         self._output_task = asyncio.create_task(self._publish_completed_outputs())
 

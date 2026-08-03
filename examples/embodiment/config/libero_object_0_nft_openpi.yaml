@@ -37,6 +37,7 @@ runner:
   ckpt_path: null
 
 algorithm:
+  type: nft
   group_size: 8
   reward_coef: 1.0
 
