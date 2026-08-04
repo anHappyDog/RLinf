@@ -259,6 +259,48 @@ def test_async_channel_work_stops_a_source_chain_after_failure() -> None:
         work.wait()
 
 
+def test_trajectory_event_send_stays_in_the_calling_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Register the storage receive before sending from the EnvWorker thread."""
+    channel = object.__new__(TrajectoryChannel)
+    worker = Mock()
+    worker.worker_address = Mock()
+    storage = Mock()
+    channel._current_worker = worker
+    channel._trajectory_group_name = "trajectory"
+    channel._trajectory_workers_by_rank = {0: storage}
+    channel._source_routes = {0: [(0, 1)]}
+    channel._source_storage_ranks = {0: 0}
+    channel._next_sequences = {}
+    channel._open_sources = set()
+
+    class Work:
+        def __init__(self, **kwargs) -> None:
+            assert not worker.send.called
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(
+        "rlinf.scheduler.channel.trajectory_channel.AsyncChannelWork", Work
+    )
+
+    work = channel._send_event(
+        0,
+        TrajectoryEventType.OPEN,
+        {"routes": [(0, 1)]},
+        async_op=True,
+    )
+
+    assert isinstance(work, Work)
+    assert "on_execute" not in work.kwargs
+    worker.send.assert_called_once_with(
+        TrajectoryEvent(0, 0, TrajectoryEventType.OPEN, {"routes": [(0, 1)]}),
+        "trajectory",
+        0,
+        async_op=True,
+    )
+
+
 def test_trajectory_worker_is_separate_from_channel_worker() -> None:
     """Trajectory placement does not alter ordinary ChannelWorker placement."""
     assert not issubclass(TrajectoryWorker, ChannelWorker)

@@ -496,10 +496,8 @@ class TrajectoryChannel(Channel):
             channel_actor=storage,
             method="consume_event",
             src_addr=worker.worker_address,
-            on_execute=lambda: worker.send(
-                event, self._trajectory_group_name, storage_rank, async_op=True
-            ),
         )
+        worker.send(event, self._trajectory_group_name, storage_rank, async_op=True)
         if kind is TrajectoryEventType.FLUSH and payload["close"]:
             self._next_sequences.pop(source_id, None)
             self._open_sources.discard(source_id)
