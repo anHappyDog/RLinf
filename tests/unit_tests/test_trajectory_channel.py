@@ -229,6 +229,61 @@ def test_worker_failure_is_queued_for_each_assigned_actor() -> None:
         assert worker._ready[actor_rank].get_nowait() == 0
 
 
+def test_remote_storage_reservation_returns_the_right_worker() -> None:
+    """A coordinator forwards a remote storage rank to the actor worker."""
+    coordinator = _worker()
+    coordinator._rank = 0
+    coordinator._group_name = "trajectory"
+    coordinator.recv = Mock(return_value=3)
+    coordinator.send = Mock()
+    src_addr = SimpleNamespace(root_group_name="trajectory", rank_path=1, rank=1)
+    dst_addr = SimpleNamespace(root_group_name="actor", rank_path=0)
+
+    async def reserve() -> None:
+        await coordinator.announce_ready(src_addr)
+        await coordinator.reserve(dst_addr, query_id=7, actor_rank=3)
+
+    asyncio.run(reserve())
+    coordinator.send.assert_called_once_with(
+        1, "actor", 0, async_op=True, piggyback_payload=7
+    )
+
+    storage = _worker()
+    storage._rank = 1
+    storage._group_name = "trajectory"
+    storage.send = Mock()
+    storage._completed_queue(3).put_nowait("remote-trajectory")
+
+    asyncio.run(storage.take(dst_addr, query_id=8, actor_rank=3))
+
+    storage.send.assert_called_once_with(
+        "remote-trajectory",
+        "actor",
+        0,
+        async_op=True,
+        piggyback_payload=8,
+    )
+
+
+def test_transition_event_omits_task_descriptions() -> None:
+    """Transition storage never sends rollout-only task descriptions."""
+    channel = object.__new__(TrajectoryChannel)
+    channel._send_event = Mock(return_value=Mock())
+    curr_obs = {"states": torch.ones(1, 2), "task_descriptions": ["pick"]}
+    next_obs = {"states": torch.zeros(1, 2), "task_descriptions": ["place"]}
+
+    channel.append_transitions(2, curr_obs, next_obs)
+
+    _, kind, payload = channel._send_event.call_args.args
+    assert kind is TrajectoryEventType.APPEND_TRANSITIONS
+    assert payload["curr_obs"].keys() == {"states"}
+    assert payload["next_obs"].keys() == {"states"}
+    assert payload["curr_obs"]["states"] is curr_obs["states"]
+    assert payload["next_obs"]["states"] is next_obs["states"]
+    assert curr_obs["task_descriptions"] == ["pick"]
+    assert next_obs["task_descriptions"] == ["place"]
+
+
 def test_async_channel_work_propagates_rpc_failure() -> None:
     """A failed RPC completes its work and prevents a silent wait forever."""
     work = object.__new__(AsyncChannelWork)

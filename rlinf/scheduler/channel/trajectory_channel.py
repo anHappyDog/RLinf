@@ -561,7 +561,18 @@ class TrajectoryChannel(Channel):
         return self._send_event(
             source_id,
             TrajectoryEventType.APPEND_TRANSITIONS,
-            {"curr_obs": curr_obs, "next_obs": next_obs},
+            {
+                "curr_obs": {
+                    key: value
+                    for key, value in curr_obs.items()
+                    if key != "task_descriptions"
+                },
+                "next_obs": {
+                    key: value
+                    for key, value in next_obs.items()
+                    if key != "task_descriptions"
+                },
+            },
             async_op=async_op,
         )
 
@@ -654,8 +665,8 @@ class TrajectoryChannel(Channel):
             raise RuntimeError(
                 "TrajectoryChannel.try_take() requires a Worker context."
             )
-        query_id = uuid.uuid4().int
         coordinator = self._trajectory_workers_by_rank[0]
+        query_id = uuid.uuid4().int
         coordinator.reserve.remote(
             dst_addr=self._current_worker.worker_address,
             query_id=query_id,
