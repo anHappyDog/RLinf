@@ -16,6 +16,7 @@
 
 import asyncio
 from concurrent.futures import Future as ConcurrentFuture
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -132,21 +133,28 @@ def test_history_reward_helper_preserves_existing_assignment_semantics() -> None
     assert rewards[2].tolist() == [[0.0], [0.0]]
 
 
-def test_storage_routing_is_source_rank_modulo_worker_count() -> None:
-    """Storage routing is deterministic and balanced without source hashing."""
-    channel = object.__new__(TrajectoryChannel)
-    channel._trajectory_workers_by_rank = {0: object(), 1: object(), 2: object()}
+def test_storage_routing_prefers_the_source_node() -> None:
+    """A storage worker on the source node keeps every shard within one hop."""
+    storage_ranks = TrajectoryChannel.plan_storage_ranks(
+        source_nodes={0: 0, 1: 1, 2: 0},
+        source_routes={0: [(0, 2)], 1: [(1, 2)], 2: [(1, 2)]},
+        actor_nodes={0: 1, 1: 0},
+        storage_nodes={0: 0, 1: 1},
+    )
 
-    assert [channel._storage_rank(source) for source in range(8)] == [
-        0,
-        1,
-        2,
-        0,
-        1,
-        2,
-        0,
-        1,
-    ]
+    assert storage_ranks == {0: 0, 1: 1, 2: 0}
+
+
+def test_storage_routing_avoids_a_second_cross_node_hop() -> None:
+    """Without source-local storage, actor-local storage is the next best path."""
+    storage_ranks = TrajectoryChannel.plan_storage_ranks(
+        source_nodes={0: 0},
+        source_routes={0: [(0, 4)]},
+        actor_nodes={0: 1},
+        storage_nodes={0: 1, 1: 2},
+    )
+
+    assert storage_ranks == {0: 0}
 
 
 def test_actor_item_count_matches_comm_mapper_routes() -> None:
@@ -273,12 +281,17 @@ def test_runner_registers_all_source_routes(monkeypatch: pytest.MonkeyPatch) -> 
             "rollout": {"pipeline_stage_num": 2},
             "actor": {"model": {"num_action_chunks": 1, "action_dim": 7}},
             "env": {"train": {"total_num_envs": 16, "max_episode_steps": 8}},
-            "cluster": {"component_placement": {}},
+            "cluster": {"component_placement": {"trajectory": "all"}},
         }
     )
 
     placement = Mock()
     placement.get_world_size.side_effect = lambda name: {"env": 2, "actor": 4}[name]
+    strategy = Mock()
+    strategy.get_placement.side_effect = lambda _: [
+        SimpleNamespace(rank=rank, cluster_node_rank=rank // 2) for rank in range(4)
+    ]
+    placement.get_strategy.return_value = strategy
     monkeypatch.setattr(
         "rlinf.runners.embodied_runner.ComponentPlacement", Mock(return_value=placement)
     )
@@ -296,6 +309,12 @@ def test_runner_registers_all_source_routes(monkeypatch: pytest.MonkeyPatch) -> 
         1: [(1, 4)],
         2: [(2, 4)],
         3: [(3, 4)],
+    }
+    assert trajectory_create.call_args.kwargs["source_storage_ranks"] == {
+        0: 0,
+        1: 1,
+        2: 0,
+        3: 1,
     }
     assert trajectory_create.call_args.kwargs["collector_config"]["type"] == "raw"
     assert not channel_create.called

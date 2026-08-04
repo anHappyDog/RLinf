@@ -27,6 +27,7 @@ from rlinf.scheduler import (
     Cluster,
     CommMapper,
     ComponentPlacement,
+    NodePlacementStrategy,
     TrajectoryChannel,
 )
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
@@ -136,7 +137,8 @@ class EmbodiedRunner:
         ):
             return Channel.create("Actor")
 
-        component_placement = ComponentPlacement(self.cfg, Cluster())
+        cluster = Cluster()
+        component_placement = ComponentPlacement(self.cfg, cluster)
         env_world_size = component_placement.get_world_size("env")
         actor_world_size = component_placement.get_world_size("actor")
         stage_num = self.cfg.rollout.pipeline_stage_num
@@ -149,6 +151,10 @@ class EmbodiedRunner:
                 src_rank=source_rank,
             )
             for source_rank in range(source_world_size)
+        }
+        env_placements = component_placement.get_strategy("env").get_placement(cluster)
+        env_nodes = {
+            placement.rank: placement.cluster_node_rank for placement in env_placements
         }
         online_lerobot_cfg = self.cfg.algorithm.get("dagger", {}).get(
             "online_lerobot", {}
@@ -163,12 +169,34 @@ class EmbodiedRunner:
             "action_dim": self.cfg.actor.model.action_dim,
             "reward_weight": self.cfg.get("reward", {}).get("reward_weight", 1.0),
         }
-        trajectory_placement = None
         if "trajectory" in self.cfg.cluster.component_placement:
             trajectory_placement = component_placement.get_strategy("trajectory")
+        else:
+            trajectory_placement = NodePlacementStrategy(
+                sorted(set(env_nodes.values()))
+            )
+        trajectory_placements = trajectory_placement.get_placement(cluster)
+        source_nodes = {
+            source_rank: env_nodes[source_rank // stage_num]
+            for source_rank in range(source_world_size)
+        }
+        storage_nodes = {
+            placement.rank: placement.cluster_node_rank
+            for placement in trajectory_placements
+        }
+        actor_nodes = {
+            placement.rank: placement.cluster_node_rank
+            for placement in component_placement.get_strategy("actor").get_placement(
+                cluster
+            )
+        }
+        source_storage_ranks = TrajectoryChannel.plan_storage_ranks(
+            source_nodes, source_routes, actor_nodes, storage_nodes
+        )
         return TrajectoryChannel.create(
             "Actor",
             source_routes=source_routes,
+            source_storage_ranks=source_storage_ranks,
             collector_config=collector_config,
             placement_strategy=trajectory_placement,
         )

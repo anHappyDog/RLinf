@@ -329,6 +329,7 @@ class TrajectoryChannel(Channel):
         name: str,
         *,
         source_routes: dict[int, list[tuple[int, int]]],
+        source_storage_ranks: dict[int, int],
         collector_config: dict[str, Any],
         maxsize: int = 0,
         placement_strategy: PlacementStrategy | None = None,
@@ -355,12 +356,18 @@ class TrajectoryChannel(Channel):
                 name,
                 Worker.current_worker,
                 source_routes=source_routes,
+                source_storage_ranks=source_storage_ranks,
                 collector_config=collector_config,
             )
 
         channel = cls()
         channel.__dict__.update(normal_channel.__dict__)
-        channel._initialize_trajectory(trajectory_name, worker_group, source_routes)
+        channel._initialize_trajectory(
+            trajectory_name,
+            worker_group,
+            source_routes,
+            source_storage_ranks,
+        )
         return channel
 
     @classmethod
@@ -370,6 +377,7 @@ class TrajectoryChannel(Channel):
         current_worker: Worker,
         *,
         source_routes: dict[int, list[tuple[int, int]]],
+        source_storage_ranks: dict[int, int],
         collector_config: dict[str, Any],
     ) -> "TrajectoryChannel":
         """Connect to existing ordinary and trajectory worker groups."""
@@ -379,7 +387,12 @@ class TrajectoryChannel(Channel):
         worker_group = WorkerGroup.from_group_name(TrajectoryWorker, trajectory_name)
         channel = cls()
         channel.__dict__.update(normal_channel.__dict__)
-        channel._initialize_trajectory(trajectory_name, worker_group, source_routes)
+        channel._initialize_trajectory(
+            trajectory_name,
+            worker_group,
+            source_routes,
+            source_storage_ranks,
+        )
         return channel
 
     def _initialize_trajectory(
@@ -387,6 +400,7 @@ class TrajectoryChannel(Channel):
         trajectory_name: str,
         worker_group: WorkerGroup[TrajectoryWorker],
         source_routes: dict[int, list[tuple[int, int]]],
+        source_storage_ranks: dict[int, int],
     ) -> None:
         self._trajectory_group_name = trajectory_name
         self._trajectory_worker_group = worker_group
@@ -394,6 +408,7 @@ class TrajectoryChannel(Channel):
             worker.rank: worker.worker for worker in worker_group.worker_info_list
         }
         self._source_routes = source_routes
+        self._source_storage_ranks = source_storage_ranks
         self._next_sequences: dict[int, int] = {}
         self._open_sources: set[int] = set()
         self._actor_item_counts = self._count_actor_items(source_routes)
@@ -409,8 +424,49 @@ class TrajectoryChannel(Channel):
                 counts[actor_rank] = counts.get(actor_rank, 0) + 1
         return counts
 
+    @staticmethod
+    def plan_storage_ranks(
+        source_nodes: dict[int, int],
+        source_routes: dict[int, list[tuple[int, int]]],
+        actor_nodes: dict[int, int],
+        storage_nodes: dict[int, int],
+    ) -> dict[int, int]:
+        """Assign each source to storage with the shortest distributed path.
+
+        The primary objective is to minimize the largest number of node hops for
+        any shard. Ties keep high-frequency Env-to-storage traffic local, then
+        minimize total weighted hops and balance stored batch size.
+        """
+        if not storage_nodes:
+            raise ValueError("At least one TrajectoryWorker is required.")
+
+        loads = dict.fromkeys(storage_nodes, 0)
+        assignments = {}
+        for source_id, routes in source_routes.items():
+            source_node = source_nodes[source_id]
+
+            def cost(storage_rank: int) -> tuple[int, int, int, int, int]:
+                storage_node = storage_nodes[storage_rank]
+                hops = [
+                    int(source_node != storage_node)
+                    + int(storage_node != actor_nodes[actor_rank])
+                    for actor_rank, _ in routes
+                ]
+                return (
+                    max(hops),
+                    int(source_node != storage_node),
+                    sum(size * hop for (_, size), hop in zip(routes, hops)),
+                    loads[storage_rank],
+                    storage_rank,
+                )
+
+            storage_rank = min(storage_nodes, key=cost)
+            assignments[source_id] = storage_rank
+            loads[storage_rank] += sum(size for _, size in routes)
+        return assignments
+
     def _storage_rank(self, source_id: int) -> int:
-        return source_id % len(self._trajectory_workers_by_rank)
+        return self._source_storage_ranks[source_id]
 
     def _current_source(self, source_id: int) -> Worker:
         if self._current_worker is None:
