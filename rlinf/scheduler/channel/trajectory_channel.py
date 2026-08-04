@@ -207,12 +207,18 @@ class TrajectoryWorker(Worker):
                 self._collector_config["reward_weight"],
             )
         elif event.kind is TrajectoryEventType.APPEND_EPISODE_DATA:
-            assert isinstance(collector, EmbodiedLerobotRolloutResult)
+            if not isinstance(collector, EmbodiedLerobotRolloutResult):
+                raise TypeError(
+                    "append_episode_data requires an Online LeRobot collector."
+                )
             collector.append_chunk_episode_data(**event.payload)
         elif event.kind is TrajectoryEventType.CLEAR_REWARDS:
             collector.rewards.clear()
         elif event.kind is TrajectoryEventType.RESET_EPISODE_BUFFERS:
-            assert isinstance(collector, EmbodiedLerobotRolloutResult)
+            if not isinstance(collector, EmbodiedLerobotRolloutResult):
+                raise TypeError(
+                    "reset_episode_buffers requires an Online LeRobot collector."
+                )
             collector.reset_episode_buffers()
         elif event.kind is TrajectoryEventType.FLUSH:
             close = event.payload["close"]
@@ -434,8 +440,10 @@ class TrajectoryChannel(Channel):
             channel_actor=storage,
             method="consume_event",
             src_addr=worker.worker_address,
+            on_execute=lambda: worker.send(
+                event, self._trajectory_group_name, storage_rank, async_op=True
+            ),
         )
-        worker.send(event, self._trajectory_group_name, storage_rank, async_op=True)
         if kind is TrajectoryEventType.FLUSH and payload["close"]:
             self._next_sequences.pop(source_id, None)
             self._open_sources.discard(source_id)

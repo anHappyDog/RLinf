@@ -239,12 +239,14 @@ def test_async_channel_work_stops_a_source_chain_after_failure() -> None:
     work = object.__new__(AsyncChannelWork)
     work._future = Future()
     work._execute = Mock()
+    work._on_execute = Mock()
     previous = Future()
     previous.set_exception(ValueError("bad event"))
 
     work._execute_after(previous)
 
     work._execute.assert_not_called()
+    work._on_execute.assert_not_called()
     with pytest.raises(ValueError, match="bad event"):
         work.wait()
 

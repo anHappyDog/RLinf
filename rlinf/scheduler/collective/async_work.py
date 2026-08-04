@@ -268,6 +268,7 @@ class AsyncChannelWork(AsyncWork):
         channel_actor: ray.actor.ActorHandle,
         method: str,
         *args,
+        on_execute: Callable[[], None] | None = None,
         **kwargs,
     ):
         """Initialize the AsyncChannelWork.
@@ -278,6 +279,7 @@ class AsyncChannelWork(AsyncWork):
             channel_actor (ray.actor.ActorHandle): The actor handle for the channel.
             method (str): The method to call on the channel actor.
             *args: Positional arguments to pass to the method.
+            on_execute: Optional local callback run immediately before the RPC.
             **kwargs: Keyword arguments to pass to the method.
         """
         self._channel_key = f"{channel_name}:{channel_key}"
@@ -285,6 +287,7 @@ class AsyncChannelWork(AsyncWork):
         self._method = method
         self._args = args
         self._kwargs = kwargs
+        self._on_execute = on_execute
         self._future = Future()
 
         # Enqueue the operation
@@ -306,6 +309,8 @@ class AsyncChannelWork(AsyncWork):
         self._execute()
 
     def _execute(self) -> None:
+        if self._on_execute is not None:
+            self._on_execute()
         method = getattr(self._channel_actor, self._method)
         future: ConcurrentFuture = method.remote(*self._args, **self._kwargs).future()
         future.add_done_callback(self._complete)
