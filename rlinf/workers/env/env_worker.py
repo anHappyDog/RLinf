@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import gc
 from collections import defaultdict
 from typing import Any
 
@@ -30,16 +29,15 @@ from rlinf.data.embodied_io_struct import (
     EnvOutput,
     RolloutResult,
     Trajectory,
+    assign_history_reward,
     convert_trajectories_to_batch,
 )
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import RecordVideo
-from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
-from rlinf.utils.data_iter_utils import split_list
+from rlinf.scheduler import Channel, Cluster, CommMapper, TrajectoryChannel, Worker
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
-from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
@@ -155,9 +153,6 @@ class EnvWorker(Worker):
                 self.cfg.env.eval.max_steps_per_rollout_epoch
                 // self.model_cfg.num_action_chunks
             )
-        self.actor_split_num = (
-            1 if not self.enable_train else self.get_actor_split_num()
-        )
         if self.use_training_pipeline and self.enable_train:
             self._init_pipeline_params()
 
@@ -842,30 +837,18 @@ class EnvWorker(Worker):
         return sparse_rewards
 
     def assign_history_reward(self, stage_id: int, reward_model_output: torch.Tensor):
-        reward_assign_lengths = [
-            min(
-                history_buffer_length[env_id]
-                for history_buffer_length in self.history_lengths[stage_id].values()
-            )
-            for env_id in range(self.train_num_envs_per_stage)
-        ]
-        rollout_rewards = self.rollout_results[stage_id].rewards
-        rollout_rewards_length = len(rollout_rewards)
-        reward_assign_lengths = [
-            min(reward_assign_length, rollout_rewards_length)
-            for reward_assign_length in reward_assign_lengths
-        ]
-        if not any(reward_assign_lengths):
-            return
-        reward = (self.reward_weight * reward_model_output).to(
-            rollout_rewards[-1].dtype
+        """Apply the reward-model output to this stage's local collector."""
+        assign_history_reward(
+            self.rollout_results[stage_id].rewards,
+            reward_model_output,
+            self._history_reward_assign_lengths(stage_id),
+            self.reward_weight,
         )
-        for env_id, reward_assign_length in enumerate(reward_assign_lengths):
-            for reward_assign_step in range(2, reward_assign_length + 1):
-                rollout_rewards[-reward_assign_step][env_id] += reward[env_id]
 
     @Worker.timer("env/bootstrap_step")
-    def bootstrap_step(self) -> list[EnvOutput]:
+    def bootstrap_step(
+        self, trajectory_channel: TrajectoryChannel | None = None
+    ) -> list[EnvOutput]:
         def get_zero_dones() -> torch.Tensor:
             return (
                 torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
@@ -880,7 +863,11 @@ class EnvWorker(Worker):
                 extracted_obs, infos = self.env_list[stage_id].reset()
                 if self.enable_online_lerobot:
                     rollout_results = getattr(self, "rollout_results", None)
-                    if rollout_results is not None:
+                    if trajectory_channel is not None:
+                        trajectory_channel.reset_episode_buffers(
+                            self._trajectory_source(stage_id)
+                        )
+                    elif rollout_results is not None:
                         rollout_results[stage_id].reset_episode_buffers()
                 dones = get_zero_dones()
                 terminations = dones.clone()
@@ -946,12 +933,18 @@ class EnvWorker(Worker):
                 decoupled_mode=self.env_decoupled_mode,
             )
 
-    def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
-        env_outputs = self.bootstrap_step()
+    def _bootstrap_and_send_train(
+        self,
+        rollout_channel: Channel,
+        trajectory_channel: TrajectoryChannel | None = None,
+    ) -> list[EnvOutput]:
+        env_outputs = self.bootstrap_step(trajectory_channel)
         self._send_train_bootstrap(rollout_channel, env_outputs)
         return env_outputs
 
-    def prefetch_train_bootstrap(self, rollout_channel: Channel) -> None:
+    def prefetch_train_bootstrap(
+        self, rollout_channel: Channel, actor_channel: Channel | None = None
+    ) -> None:
         """Prepare and send the first env batch for the next training rollout."""
         if self._prefetched_train_bootstrap is not None:
             raise RuntimeError(
@@ -959,7 +952,8 @@ class EnvWorker(Worker):
                 "Call interact() to consume it before prefetching again."
             )
         self._prefetched_train_bootstrap = self._bootstrap_and_send_train(
-            rollout_channel
+            rollout_channel,
+            actor_channel if isinstance(actor_channel, TrajectoryChannel) else None,
         )
 
     def record_env_metrics(
@@ -977,37 +971,76 @@ class EnvWorker(Worker):
             for env_output in env_output_list
         ]
 
-    @Worker.timer("env/send_rollout_trajectories")
-    async def send_rollout_trajectories(
-        self, rollout_result: EmbodiedRolloutResult, channel: Channel
-    ):
-        trajectories: list[Trajectory] = rollout_result.to_splited_trajectories(
-            self.actor_split_num
-        )
-        rollout_result.clear()
-        for trajectory in trajectories:
-            channel.put(trajectory, async_op=True)
-        del trajectories
-        gc.collect()
+    def _trajectory_source(self, stage_id: int) -> int:
+        """Return the logical source rank for one local environment stage."""
+        return self._rank * self.stage_num + stage_id
 
-    @Worker.timer("env/send_lerobot_episodes")
-    async def send_lerobot_episodes(
-        self, episodes: list[list[dict]], channel: Channel
+    def _append_step(
+        self,
+        stage_id: int,
+        step: ChunkStepResult,
+        channel: TrajectoryChannel | None,
     ) -> None:
-        if not episodes:
+        if channel is None:
+            self.rollout_results[stage_id].append_step_result(step)
             return
-        if self.actor_split_num <= 1:
-            chunks = [episodes]
-        else:
-            chunks = split_list(
-                episodes,
-                self.actor_split_num,
-                enforce_divisible_batch=False,
+        channel.append_step(self._trajectory_source(stage_id), step)
+
+    def _update_last_actions(
+        self,
+        stage_id: int,
+        actions: torch.Tensor,
+        flags: torch.Tensor,
+        channel: TrajectoryChannel | None,
+    ) -> None:
+        if channel is None:
+            self.rollout_results[stage_id].update_last_actions(actions, flags)
+            return
+        channel.update_last_actions(self._trajectory_source(stage_id), actions, flags)
+
+    def _append_transitions(
+        self,
+        stage_id: int,
+        curr_obs: dict[str, Any],
+        next_obs: dict[str, Any],
+        channel: TrajectoryChannel | None,
+    ) -> None:
+        if channel is None:
+            self.rollout_results[stage_id].append_transitions(curr_obs, next_obs)
+            return
+        channel.append_transitions(
+            self._trajectory_source(stage_id), curr_obs, next_obs
+        )
+
+    def _update_rlt_transitions(
+        self,
+        stage_id: int,
+        pending_obs: list[dict[str, Any] | None],
+        rollout_result: RolloutResult,
+        *,
+        cache_current: bool,
+        channel: TrajectoryChannel | None,
+    ) -> None:
+        """Route one RLT transition to the local or remote collector."""
+        update_rlt_transitions(
+            stage_id,
+            pending_obs,
+            rollout_result,
+            cache_current=cache_current,
+            append_transition=lambda curr_obs, next_obs: self._append_transitions(
+                stage_id, curr_obs, next_obs, channel
+            ),
+        )
+
+    def _history_reward_assign_lengths(self, stage_id: int) -> list[int]:
+        """Return the history lengths that should receive the latest reward."""
+        return [
+            min(
+                history_buffer_length[env_id]
+                for history_buffer_length in self.history_lengths[stage_id].values()
             )
-        for chunk in chunks:
-            if not chunk:
-                continue
-            channel.put(chunk, async_op=True)
+            for env_id in range(self.train_num_envs_per_stage)
+        ]
 
     @Worker.timer("run_interact_once")
     async def _run_interact_once(
@@ -1019,9 +1052,16 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
-        self.rollout_results = self._prepare_rollout_results(
-            getattr(self, "rollout_results", None)
+        trajectory_channel = (
+            actor_channel if isinstance(actor_channel, TrajectoryChannel) else None
         )
+        if trajectory_channel is None:
+            self.rollout_results = self._prepare_rollout_results(
+                getattr(self, "rollout_results", None)
+            )
+        else:
+            for stage_id in range(self.stage_num):
+                trajectory_channel.open_trajectory(self._trajectory_source(stage_id))
         env_metrics = defaultdict(list)
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
 
@@ -1030,7 +1070,9 @@ class EnvWorker(Worker):
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
             else:
-                env_outputs = self._bootstrap_and_send_train(rollout_channel)
+                env_outputs = self._bootstrap_and_send_train(
+                    rollout_channel, trajectory_channel
+                )
 
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
@@ -1040,9 +1082,11 @@ class EnvWorker(Worker):
                     env_output = env_outputs[stage_id]
                     curr_obs = env_output.obs
                     if env_output.intervene_actions is not None:
-                        self.rollout_results[stage_id].update_last_actions(
+                        self._update_last_actions(
+                            stage_id,
                             env_output.intervene_actions,
                             env_output.intervene_flags,
+                            trajectory_channel,
                         )
 
                     reward_model_output = None
@@ -1091,37 +1135,56 @@ class EnvWorker(Worker):
                         rewards=rewards,
                     )
 
-                    self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                    self._append_step(stage_id, chunk_step_result, trajectory_channel)
                     if (
                         self.reward_mode == "history_buffer"
                         and self.history_reward_assign
                         and reward_model_output is not None
                     ):
-                        self.assign_history_reward(stage_id, reward_model_output)
+                        if trajectory_channel is None:
+                            self.assign_history_reward(stage_id, reward_model_output)
+                        else:
+                            trajectory_channel.assign_history_reward(
+                                self._trajectory_source(stage_id),
+                                reward_model_output,
+                                self._history_reward_assign_lengths(stage_id),
+                            )
                     if rollout_result.intervene_flags is not None:
-                        self.rollout_results[
-                            stage_id
-                        ].mark_last_step_with_intervene_flags(
-                            rollout_result.intervene_flags
-                        )
+                        if trajectory_channel is None:
+                            self.rollout_results[
+                                stage_id
+                            ].mark_last_step_with_intervene_flags(
+                                rollout_result.intervene_flags
+                            )
+                        else:
+                            trajectory_channel.mark_last_step_with_intervene_flags(
+                                self._trajectory_source(stage_id),
+                                rollout_result.intervene_flags,
+                            )
                     if self.enable_rlt and self.collect_transitions:
-                        update_rlt_transitions(
+                        self._update_rlt_transitions(
                             stage_id,
                             rlt_pending_obs,
-                            self.rollout_results,
                             rollout_result,
                             cache_current=True,
+                            channel=trajectory_channel,
                         )
 
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )
-                    stage_rollout = self.rollout_results[stage_id]
-                    if isinstance(stage_rollout, EmbodiedLerobotRolloutResult):
-                        stage_rollout.append_chunk_episode_data(
-                            rollout_result=rollout_result,
-                            **chunk_step_payload,
-                        )
+                    if self.enable_online_lerobot:
+                        if trajectory_channel is None:
+                            self.rollout_results[stage_id].append_chunk_episode_data(
+                                rollout_result=rollout_result,
+                                **chunk_step_payload,
+                            )
+                        else:
+                            trajectory_channel.append_episode_data(
+                                self._trajectory_source(stage_id),
+                                rollout_result=rollout_result,
+                                **chunk_step_payload,
+                            )
                     env_batch = env_output.to_dict()
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
@@ -1138,8 +1201,8 @@ class EnvWorker(Worker):
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
                             else env_output.obs
                         )
-                        self.rollout_results[stage_id].append_transitions(
-                            curr_obs, next_obs
+                        self._append_transitions(
+                            stage_id, curr_obs, next_obs, trajectory_channel
                         )
 
                     env_outputs[stage_id] = env_output
@@ -1154,9 +1217,11 @@ class EnvWorker(Worker):
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
                 if env_output.intervene_actions is not None:
-                    self.rollout_results[stage_id].update_last_actions(
+                    self._update_last_actions(
+                        stage_id,
                         env_output.intervene_actions,
                         env_output.intervene_flags,
+                        trajectory_channel,
                     )
 
                 reward_model_output = None
@@ -1212,20 +1277,27 @@ class EnvWorker(Worker):
                     terminations=env_output.terminations,
                     rewards=rewards,
                 )
-                self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                self._append_step(stage_id, chunk_step_result, trajectory_channel)
                 if (
                     self.reward_mode == "history_buffer"
                     and self.history_reward_assign
                     and reward_model_output is not None
                 ):
-                    self.assign_history_reward(stage_id, reward_model_output)
+                    if trajectory_channel is None:
+                        self.assign_history_reward(stage_id, reward_model_output)
+                    else:
+                        trajectory_channel.assign_history_reward(
+                            self._trajectory_source(stage_id),
+                            reward_model_output,
+                            self._history_reward_assign_lengths(stage_id),
+                        )
                 if self.enable_rlt and self.collect_transitions:
-                    update_rlt_transitions(
+                    self._update_rlt_transitions(
                         stage_id,
                         rlt_pending_obs,
-                        self.rollout_results,
                         rollout_result,
                         cache_current=False,
+                        channel=trajectory_channel,
                     )
 
             if self.use_training_pipeline and actor_channel is not None:
@@ -1235,20 +1307,22 @@ class EnvWorker(Worker):
                 self.rollout_results = self._prepare_rollout_results(
                     getattr(self, "rollout_results", None)
                 )
+            elif trajectory_channel is not None:
+                for stage_id in range(self.stage_num):
+                    trajectory_channel.flush_trajectory(
+                        self._trajectory_source(stage_id),
+                        close=(
+                            not self.enable_online_lerobot
+                            and epoch == self.rollout_epoch - 1
+                        ),
+                    )
+            elif actor_channel is not None:
+                raise TypeError(
+                    "Embodied trajectory collection requires TrajectoryChannel."
+                )
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
-
-        if not self.use_training_pipeline and actor_channel is not None:
-            if self.enable_online_lerobot:
-                for stage_id in range(self.stage_num):
-                    episodes = self.rollout_results[stage_id].drain_episodes()
-                    await self.send_lerobot_episodes(episodes, actor_channel)
-            else:
-                for stage_id in range(self.stage_num):
-                    await self.send_rollout_trajectories(
-                        self.rollout_results[stage_id], actor_channel
-                    )
 
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
@@ -1366,12 +1440,6 @@ class EnvWorker(Worker):
             eval_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
         return eval_metrics
-
-    def get_actor_split_num(self):
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(recv_num, send_num)
-        return split_num
 
     def compute_advantages_and_returns(
         self, rollout_batch: dict[str, torch.Tensor]

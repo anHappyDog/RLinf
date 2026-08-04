@@ -293,13 +293,29 @@ class AsyncChannelWork(AsyncWork):
             if last_fut is None:
                 self._execute()
             else:
-                last_fut.then(lambda _: self._execute())
+                last_fut.then(self._execute_after)
             AsyncChannelWork.last_future_per_key[self._channel_key] = self._future
 
-    def _execute(self):
+    def _execute_after(self, previous: Future) -> None:
+        """Run only when the preceding operation for this key succeeded."""
+        try:
+            previous.wait()
+        except BaseException as error:
+            self._future.set_exception(error)
+            return
+        self._execute()
+
+    def _execute(self) -> None:
         method = getattr(self._channel_actor, self._method)
         future: ConcurrentFuture = method.remote(*self._args, **self._kwargs).future()
-        future.add_done_callback(lambda f: self._future.set_result(f.result()))
+        future.add_done_callback(self._complete)
+
+    def _complete(self, future: ConcurrentFuture) -> None:
+        """Complete this work with either the RPC result or its exception."""
+        try:
+            self._future.set_result(future.result())
+        except BaseException as error:
+            self._future.set_exception(error)
 
     async def async_wait(self):
         """Async wait for the work to complete.

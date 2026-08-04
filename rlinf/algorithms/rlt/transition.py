@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Callable
 
 from rlinf.envs import SupportedEnvType
 from rlinf.utils.nested_dict_process import copy_dict_tensor
@@ -60,20 +60,18 @@ def extract_rlt_obs_from_forward_inputs(
 def update_rlt_transitions(
     stage_id: int,
     pending_obs: list[dict[str, Any] | None],
-    rollout_results: list[Any],
     rollout_result: Any,
     *,
     cache_current: bool,
+    append_transition: Callable[[dict[str, Any], dict[str, Any]], None],
 ) -> None:
+    """Append a completed RLT transition and optionally cache its next source."""
     if pending_obs[stage_id] is not None:
         next_obs = extract_rlt_obs_from_forward_inputs(
             rollout_result.forward_inputs,
             transition=True,
         )
-        rollout_results[stage_id].append_transitions(
-            pending_obs[stage_id],
-            next_obs,
-        )
+        append_transition(pending_obs[stage_id], next_obs)
         pending_obs[stage_id] = None
 
     if cache_current:

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import os
 import threading
 from pathlib import Path
@@ -29,7 +28,7 @@ from rlinf.data.datasets.dagger import (
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
-from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler import Channel, TrajectoryChannel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import append_to_dict, compute_split_num
@@ -283,14 +282,19 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         clear_memory(sync=False)
 
         if not self.enable_online_lerobot:
-            send_num = self._component_placement.get_world_size("env") * self.stage_num
-            recv_num = self._component_placement.get_world_size("actor")
-            split_num = compute_split_num(send_num, recv_num)
+            if isinstance(input_channel, TrajectoryChannel):
+                split_num = input_channel.actor_item_count()
+                receive = input_channel.take
+            else:
+                send_num = (
+                    self._component_placement.get_world_size("env") * self.stage_num
+                )
+                recv_num = self._component_placement.get_world_size("actor")
+                split_num = compute_split_num(send_num, recv_num)
+                receive = input_channel.get
             recv_list = []
             for _ in range(split_num):
-                trajectory: Trajectory = await input_channel.get(
-                    async_op=True
-                ).async_wait()
+                trajectory: Trajectory = await receive(async_op=True).async_wait()
                 recv_list.append(trajectory)
             return self.recv_buffer_rollout_trajectories(recv_list)
         else:
@@ -306,21 +310,20 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         if intervene_traj_list:
             self.replay_buffer.add_trajectories(intervene_traj_list)
 
-    def _recv_lerobot_episodes_from_channel(self, input_channel: Channel) -> bool:
-        """Receive up to one actor-side split from the shared Actor channel.
+    def _recv_lerobot_episodes_from_channel(
+        self, input_channel: TrajectoryChannel
+    ) -> bool:
+        """Receive up to one actor-side split from trajectory storage.
 
         Each rank pulls at most ``split_num`` messages per call so multi-actor
-        recv stays balanced like the buffer trajectory path. ``get_nowait`` is
+        recv stays balanced like the buffer trajectory path. ``try_take`` is
         used because env ranks with no completed episodes send nothing.
         """
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
+        split_num = input_channel.actor_item_count()
         received_any = False
         for _ in range(split_num):
-            try:
-                episodes: list[list[dict]] = input_channel.get_nowait()
-            except asyncio.QueueEmpty:
+            episodes: list[list[dict]] | None = input_channel.try_take()
+            if episodes is None:
                 break
             received_any = True
             for ep_frames in episodes:
@@ -328,12 +331,14 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
                     self._append_lerobot_episode(ep_frames)
         return received_any
 
-    def recv_lerobot_rollout_trajectories(self, input_channel: Channel) -> None:
+    def recv_lerobot_rollout_trajectories(
+        self, input_channel: TrajectoryChannel
+    ) -> None:
         """Receive episodes from EnvWorker and append them to the memory dataset.
 
-        EnvWorkers collect completed episodes via ``EmbodiedLerobotRolloutResult``
-        and send them here each interact round. Empty batches are not sent by env;
-        if the dataset is still below ``min_frames``, training is skipped later.
+        TrajectoryWorker owns ``EmbodiedLerobotRolloutResult`` and sends completed
+        episode batches here. If the dataset is below ``min_frames``, training is
+        skipped later.
         """
         self._recv_lerobot_episodes_from_channel(input_channel)
         if self.dataset.is_ready():

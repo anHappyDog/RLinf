@@ -25,7 +25,7 @@ from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.priority_store import PriorityStore
-from rlinf.scheduler import Worker
+from rlinf.scheduler import TrajectoryChannel, Worker
 from rlinf.utils.distributed import all_reduce_dict, masked_normalization
 from rlinf.utils.metric_utils import (
     CRITIC_EXPLAINED_VARIANCE_KEY,
@@ -82,6 +82,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.rollout_store = PriorityStore(maxsize=self.rollout_store_size)
 
     async def recv_rollout_trajectories(self, input_channel):
+        self._raise_recv_error()
         # drain channel
         if getattr(self, "_recv_queue", None) is None:
             self._recv_queue = queue.Queue()
@@ -97,20 +98,31 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             self._recv_rollout_thread.start()
 
     def _recv_rollout_thread_main(self, input_channel):
-        while not self.should_stop:
-            trajectory: Trajectory = input_channel.get()
-            self.log_info(
-                f"recv trajectory versions.shape={trajectory.versions.shape} "
-                f"input_channel.qsize={input_channel.qsize()}"
-            )
-            if trajectory.versions.min() < self.version - self.cfg.algorithm.get(
-                "staleness_threshold", None
-            ):
-                continue
-            self._recv_queue.put(trajectory)
+        try:
+            while not self.should_stop:
+                if isinstance(input_channel, TrajectoryChannel):
+                    trajectory: Trajectory = input_channel.take()
+                else:
+                    trajectory = input_channel.get()
+                self.log_info(
+                    f"recv trajectory versions.shape={trajectory.versions.shape}"
+                )
+                if trajectory.versions.min() < self.version - self.cfg.algorithm.get(
+                    "staleness_threshold", None
+                ):
+                    continue
+                self._recv_queue.put(trajectory)
+        except Exception as error:
+            self._recv_error = error
+
+    def _raise_recv_error(self) -> None:
+        """Raise a terminal trajectory-receive error from the background thread."""
+        if (error := getattr(self, "_recv_error", None)) is not None:
+            raise error
 
     @Worker.timer("drain_received_trajectories")
     def _drain_received_trajectories(self):
+        self._raise_recv_error()
         while True:
             try:
                 traj: Trajectory = self._recv_queue.get_nowait()

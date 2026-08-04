@@ -19,7 +19,7 @@ import time
 
 import torch
 
-from rlinf.scheduler import Worker
+from rlinf.scheduler import TrajectoryChannel, Worker
 from rlinf.utils.metric_utils import append_to_dict, compute_split_num
 from rlinf.workers.actor.fsdp_dagger_policy_worker import EmbodiedDAGGERFSDPPolicy
 
@@ -28,6 +28,7 @@ class AsyncEmbodiedDAGGERFSDPPolicy(EmbodiedDAGGERFSDPPolicy):
     should_stop = False
 
     async def recv_rollout_trajectories(self, input_channel):
+        self._raise_recv_error()
         if self.enable_online_lerobot:
             if (
                 getattr(self, "_recv_lerobot_thread", None) is None
@@ -62,23 +63,40 @@ class AsyncEmbodiedDAGGERFSDPPolicy(EmbodiedDAGGERFSDPPolicy):
         ``algorithm.dagger.online_lerobot.finalize_interval`` and are not part of training
         readiness.
         """
-        while not self.should_stop:
-            received_any = self._recv_lerobot_episodes_from_channel(input_channel)
-            if self.dataset.is_ready():
-                self._ensure_lerobot_loader()
-            if not received_any:
-                time.sleep(0.1)
+        try:
+            while not self.should_stop:
+                received_any = self._recv_lerobot_episodes_from_channel(input_channel)
+                if self.dataset.is_ready():
+                    self._ensure_lerobot_loader()
+                if not received_any:
+                    time.sleep(0.1)
+        except Exception as error:
+            self._recv_error = error
 
     def _recv_rollout_thread_main(self, input_channel):
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
-        while not self.should_stop:
-            for _ in range(split_num):
-                trajectory = input_channel.get()
-                self._recv_queue.put(trajectory)
+        if isinstance(input_channel, TrajectoryChannel):
+            split_num = input_channel.actor_item_count()
+            receive = input_channel.take
+        else:
+            send_num = self._component_placement.get_world_size("env") * self.stage_num
+            recv_num = self._component_placement.get_world_size("actor")
+            split_num = compute_split_num(send_num, recv_num)
+            receive = input_channel.get
+        try:
+            while not self.should_stop:
+                for _ in range(split_num):
+                    trajectory = receive()
+                    self._recv_queue.put(trajectory)
+        except Exception as error:
+            self._recv_error = error
+
+    def _raise_recv_error(self) -> None:
+        """Raise a terminal trajectory-receive error from the background thread."""
+        if (error := getattr(self, "_recv_error", None)) is not None:
+            raise error
 
     def _drain_received_trajectories(self, max_trajectories: int | None = None):
+        self._raise_recv_error()
         if getattr(self, "_recv_queue", None) is None:
             return
 
@@ -115,6 +133,7 @@ class AsyncEmbodiedDAGGERFSDPPolicy(EmbodiedDAGGERFSDPPolicy):
     @Worker.timer("run_training")
     async def run_training(self):
         """Run async DAgger updates with replay-buffer samples."""
+        self._raise_recv_error()
         if self.cfg.actor.get("enable_offload", False):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)

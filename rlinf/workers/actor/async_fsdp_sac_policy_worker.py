@@ -18,7 +18,7 @@ import threading
 
 import torch
 
-from rlinf.scheduler import Worker
+from rlinf.scheduler import TrajectoryChannel, Worker
 from rlinf.utils.metric_utils import (
     append_to_dict,
     compute_split_num,
@@ -30,6 +30,7 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
     should_stop = False
 
     async def recv_rollout_trajectories(self, input_channel):
+        self._raise_recv_error()
         if getattr(self, "_recv_queue", None) is None:
             self._recv_queue = queue.Queue()
         if (
@@ -44,15 +45,29 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
             self._recv_rollout_thread.start()
 
     def _recv_rollout_thread_main(self, input_channel):
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
-        while not self.should_stop:
-            for _ in range(split_num):
-                trajectory = input_channel.get()
-                self._recv_queue.put(trajectory)
+        if isinstance(input_channel, TrajectoryChannel):
+            split_num = input_channel.actor_item_count()
+            receive = input_channel.take
+        else:
+            send_num = self._component_placement.get_world_size("env") * self.stage_num
+            recv_num = self._component_placement.get_world_size("actor")
+            split_num = compute_split_num(send_num, recv_num)
+            receive = input_channel.get
+        try:
+            while not self.should_stop:
+                for _ in range(split_num):
+                    trajectory = receive()
+                    self._recv_queue.put(trajectory)
+        except Exception as error:
+            self._recv_error = error
+
+    def _raise_recv_error(self) -> None:
+        """Raise a terminal trajectory-receive error from the background thread."""
+        if (error := getattr(self, "_recv_error", None)) is not None:
+            raise error
 
     def _drain_received_trajectories(self, max_trajectories: int | None = None):
+        self._raise_recv_error()
         if getattr(self, "_recv_queue", None) is None:
             return
         recv_list = []

@@ -43,7 +43,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
-from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.scheduler import Channel, Cluster, TrajectoryChannel, Worker
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
     get_reverse_idx,
@@ -1205,13 +1205,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         clear_memory(sync=False)
 
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
+        if isinstance(input_channel, TrajectoryChannel):
+            split_num = input_channel.actor_item_count()
+            receive = input_channel.take
+        else:
+            send_num = self._component_placement.get_world_size("env") * self.stage_num
+            recv_num = self._component_placement.get_world_size("actor")
+            split_num = compute_split_num(send_num, recv_num)
+            receive = input_channel.get
 
         recv_list = []
         for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
+            trajectory: Trajectory = await receive(async_op=True).async_wait()
             recv_list.append(trajectory)
 
         self.rollout_batch = convert_trajectories_to_batch(recv_list)

@@ -555,6 +555,21 @@ class Trajectory:
         return filtered_trajectories if filtered_trajectories else None
 
 
+def assign_history_reward(
+    rewards: list[torch.Tensor],
+    reward_output: torch.Tensor,
+    assign_lengths: list[int],
+    reward_weight: float,
+) -> None:
+    """Apply a history-buffer reward to earlier chunk-step rewards in place."""
+    if not rewards:
+        return
+    reward = (reward_weight * reward_output).to(rewards[-1].dtype)
+    for env_id, assign_length in enumerate(assign_lengths):
+        for step in range(2, min(assign_length, len(rewards)) + 1):
+            rewards[-step][env_id] += reward[env_id]
+
+
 @dataclass(kw_only=True)
 class EmbodiedRolloutResult:
     """

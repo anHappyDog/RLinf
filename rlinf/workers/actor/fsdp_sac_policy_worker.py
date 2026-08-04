@@ -32,7 +32,7 @@ from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
-from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler import Channel, TrajectoryChannel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import (
@@ -320,14 +320,19 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         """
         clear_memory(sync=False)
 
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
+        if isinstance(input_channel, TrajectoryChannel):
+            split_num = input_channel.actor_item_count()
+            receive = input_channel.take
+        else:
+            send_num = self._component_placement.get_world_size("env") * self.stage_num
+            recv_num = self._component_placement.get_world_size("actor")
+            split_num = compute_split_num(send_num, recv_num)
+            receive = input_channel.get
 
         recv_list = []
 
         for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
+            trajectory: Trajectory = await receive(async_op=True).async_wait()
             recv_list.append(trajectory)
 
         self.replay_buffer.add_trajectories(recv_list)

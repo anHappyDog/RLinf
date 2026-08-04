@@ -22,7 +22,13 @@ from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
-from rlinf.scheduler import Channel
+from rlinf.scheduler import (
+    Channel,
+    Cluster,
+    CommMapper,
+    ComponentPlacement,
+    TrajectoryChannel,
+)
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
@@ -93,7 +99,7 @@ class EmbodiedRunner:
         # Data channels
         self.env_channel = Channel.create("Env")
         self.rollout_channel = Channel.create("Rollout")
-        self.actor_channel = Channel.create("Actor")
+        self.actor_channel = self._create_actor_channel()
         if self.reward is not None:
             self.reward_channel = Channel.create("Reward")
         else:
@@ -122,6 +128,50 @@ class EmbodiedRunner:
         self.log_queue = queue.Queue()
         self.log_thread = threading.Thread(target=self._log_worker, daemon=True)
         self.log_thread.start()
+
+    def _create_actor_channel(self) -> Channel:
+        """Create the actor channel required by the configured data flow."""
+        if self.cfg.runner.get("use_training_pipeline", False) or self.cfg.runner.get(
+            "only_eval", False
+        ):
+            return Channel.create("Actor")
+
+        component_placement = ComponentPlacement(self.cfg, Cluster())
+        env_world_size = component_placement.get_world_size("env")
+        actor_world_size = component_placement.get_world_size("actor")
+        stage_num = self.cfg.rollout.pipeline_stage_num
+        source_world_size = env_world_size * stage_num
+        source_routes = {
+            source_rank: CommMapper.get_dst_ranks(
+                batch_size=self.cfg.env.train.total_num_envs,
+                src_world_size=source_world_size,
+                dst_world_size=actor_world_size,
+                src_rank=source_rank,
+            )
+            for source_rank in range(source_world_size)
+        }
+        online_lerobot_cfg = self.cfg.algorithm.get("dagger", {}).get(
+            "online_lerobot", {}
+        )
+        online_lerobot = online_lerobot_cfg.get("enabled", False)
+        collector_config = {
+            "type": "lerobot" if online_lerobot else "raw",
+            "max_episode_length": self.cfg.env.train.max_episode_steps,
+            "num_envs": self.cfg.env.train.total_num_envs // source_world_size,
+            "only_success": online_lerobot_cfg.get("only_success", False),
+            "num_action_chunks": self.cfg.actor.model.num_action_chunks,
+            "action_dim": self.cfg.actor.model.action_dim,
+            "reward_weight": self.cfg.get("reward", {}).get("reward_weight", 1.0),
+        }
+        trajectory_placement = None
+        if "trajectory" in self.cfg.cluster.component_placement:
+            trajectory_placement = component_placement.get_strategy("trajectory")
+        return TrajectoryChannel.create(
+            "Actor",
+            source_routes=source_routes,
+            collector_config=collector_config,
+            placement_strategy=trajectory_placement,
+        )
 
     def _log_worker(self):
         """Background thread for processing log messages."""
@@ -534,7 +584,8 @@ class EmbodiedRunner:
                     env_bootstrap_handle: Handle | None = None
                     if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
                         env_bootstrap_handle = self.env.prefetch_train_bootstrap(
-                            rollout_channel=self.rollout_channel
+                            rollout_channel=self.rollout_channel,
+                            actor_channel=self.actor_channel,
                         )
 
                     actor_training_metrics = actor_training_handle.wait()
@@ -610,7 +661,8 @@ class EmbodiedRunner:
                 env_bootstrap_handle: Handle | None = None
                 if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
                     env_bootstrap_handle = self.env.prefetch_train_bootstrap(
-                        rollout_channel=self.rollout_channel
+                        rollout_channel=self.rollout_channel,
+                        actor_channel=self.actor_channel,
                     )
 
                 actor_results = actor_training_handle.wait()
