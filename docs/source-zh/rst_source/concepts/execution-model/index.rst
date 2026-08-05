@@ -19,6 +19,8 @@
      - 集群抽象与资源模型。
    * - :doc:`Channel <../channel>`
      - 用于 worker 间数据交换的异步通道。
+   * - :doc:`TrajectoryChannel <../trajectory_channel>`
+     - 为具身训练拼接完整轨迹，并将其交给 actor。
    * - :doc:`集合通信 <../collective>`
      - 集合通信操作与异步工作句柄。
 
@@ -30,4 +32,5 @@
    Worker 与 WorkerGroup <../worker>
    Cluster <../cluster>
    Channel <../channel>
+   TrajectoryChannel <../trajectory_channel>
    集合通信 <../collective>

@@ -85,6 +85,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             while True:
                 if self._background_weight_sync_active:
                     await self._poll_background_weight_sync()
+                await self.wait_if_stale()
 
                 step_id = self.global_step
                 for epoch_id in range(self.rollout_epoch):
