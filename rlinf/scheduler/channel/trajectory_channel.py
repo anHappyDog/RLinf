@@ -49,7 +49,10 @@ class TrajectoryWorker(Worker):
         self.cfg = cfg
         self.channel_name = channel_name
         self.collectors: dict[tuple[int, int], EmbodiedRolloutResult] = {}
-        self.finished_sources: set[tuple[int, int]] = set()
+        self.step_collectors: dict[
+            int, dict[tuple[int, int], EmbodiedRolloutResult]
+        ] = {}
+        self.finished_sources: dict[int, set[tuple[int, int]]] = {}
         self.pipeline_collectors: dict[
             tuple[int, int], dict[tuple[int, int], EmbodiedRolloutResult]
         ] = {}
@@ -282,13 +285,15 @@ class TrajectoryWorker(Worker):
             event.final_prev_values, [size for _, _, size in event.sources]
         )
         for (rank, stage, _), value in zip(event.sources, values):
-            collectors = self.collectors
+            collectors = self.step_collectors.setdefault(event.step_id, {})
             if self.use_training_pipeline:
                 collectors = self.pipeline_collectors[(event.step_id, event.epoch_id)]
             self._collector(collectors, (rank, stage)).append_final_value(value)
 
     def _append(self, segment: TrajectorySegment) -> None:
         collectors = self.collectors
+        if not self.enable_online_lerobot:
+            collectors = self.step_collectors.setdefault(segment.step_id, {})
         if self.use_training_pipeline:
             key = (segment.step_id, segment.epoch_id)
             collectors = self.pipeline_collectors.setdefault(key, {})
@@ -400,10 +405,14 @@ class TrajectoryWorker(Worker):
             for micro_batch in micro_batches:
                 self.output.put(pack_batch(micro_batch), key=key, async_op=True)
 
-    def _flush(self) -> None:
-        if len(self.finished_sources) != self.producer_count:
+    def _flush(self, step_id: int) -> None:
+        finished_sources = self.finished_sources[step_id]
+        if len(finished_sources) != self.producer_count:
             return
-        if len(self.collectors) != self.source_count:
+        collectors = self.collectors
+        if not self.enable_online_lerobot:
+            collectors = self.step_collectors.pop(step_id)
+        if len(collectors) != self.source_count:
             raise ValueError(
                 "Trajectory storage did not receive every logical env source before "
                 "the rollout workers finished."
@@ -411,7 +420,7 @@ class TrajectoryWorker(Worker):
         if self.enable_online_lerobot:
             from rlinf.utils.data_iter_utils import split_list
 
-            for collector in self.collectors.values():
+            for collector in collectors.values():
                 assert isinstance(collector, EmbodiedLerobotRolloutResult)
                 episodes = collector.drain_episodes()
                 for episode_chunk in split_list(
@@ -422,14 +431,12 @@ class TrajectoryWorker(Worker):
                     if episode_chunk:
                         self.output.put(episode_chunk, async_op=True)
         else:
-            for collector in self.collectors.values():
+            for collector in collectors.values():
                 for trajectory in collector.to_splited_trajectories(
                     self.shards_per_source
                 ):
                     self.output.put(trajectory, async_op=True)
-        if not self.enable_online_lerobot:
-            self.collectors.clear()
-        self.finished_sources.clear()
+        del self.finished_sources[step_id]
 
     def _flush_pipeline_epoch(self, key: tuple[int, int]) -> None:
         if len(self.finished_epoch_sources[key]) != self.producer_count:
@@ -456,8 +463,10 @@ class TrajectoryWorker(Worker):
                     self._flush_pipeline_epoch(key)
             elif isinstance(item, TrajectoryEnd):
                 if not self.use_training_pipeline:
-                    self.finished_sources.add(item.source)
-                    self._flush()
+                    self.finished_sources.setdefault(item.step_id, set()).add(
+                        item.source
+                    )
+                    self._flush(item.step_id)
             else:
                 raise TypeError(f"Unexpected trajectory item: {type(item)!r}")
 

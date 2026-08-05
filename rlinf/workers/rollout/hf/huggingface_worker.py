@@ -861,7 +861,12 @@ class MultiStepRolloutWorker(Worker):
             )
 
         for stage_id in range(self.num_pipeline_stages):
-            trajectory_channel.publish(TrajectoryEnd(source=(self._rank, stage_id)))
+            trajectory_channel.publish(
+                TrajectoryEnd(
+                    step_id=self.global_step,
+                    source=(self._rank, stage_id),
+                )
+            )
 
         if self.enable_offload:
             self.offload_model()

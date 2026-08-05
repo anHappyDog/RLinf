@@ -328,6 +328,7 @@ def test_trajectory_events_make_p2p_tensors_contiguous():
 def test_trajectory_worker_collects_rollout_owned_segment():
     worker = TrajectoryWorker.__new__(TrajectoryWorker)
     worker.collectors = {}
+    worker.step_collectors = {}
     worker.use_training_pipeline = False
     worker.collect_prev_infos = True
     worker.collect_transitions = True
@@ -390,7 +391,7 @@ def test_trajectory_worker_collects_rollout_owned_segment():
         )
     )
 
-    trajectory = worker.collectors[(0, 0)].to_trajectory()
+    trajectory = worker.step_collectors[0][(0, 0)].to_trajectory()
 
     assert torch.equal(trajectory.actions, torch.tensor([[[3.0]]]))
     assert torch.equal(trajectory.rewards, torch.tensor([[[2.8]]]))

@@ -48,6 +48,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self._weight_sync_apply_total = 0
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
+        self._trajectory_step = 0
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -87,7 +88,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     await self._poll_background_weight_sync()
                 await self.wait_if_stale()
 
-                step_id = self.global_step
+                step_id = self._trajectory_step
+                self._trajectory_step += 1
                 for epoch_id in range(self.rollout_epoch):
                     await self.generate_one_epoch(
                         input_channel,
@@ -98,7 +100,10 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     )
                 for stage_id in range(self.num_pipeline_stages):
                     trajectory_channel.publish(
-                        TrajectoryEnd(source=(self._rank, stage_id))
+                        TrajectoryEnd(
+                            step_id=step_id,
+                            source=(self._rank, stage_id),
+                        )
                     )
                 if self.finished_episodes is not None:
                     self.finished_episodes += (
@@ -217,7 +222,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                             raise ValueError(
                                 "Final policy input has no pending result."
                             )
-                        obs, result, sources = pending
+                        obs, result, sources, step_id = pending
                         _, final_result = self._predict_rollout_actions(
                             policy_input.obs,
                             final_obs=policy_input.env_result.final_obs,
@@ -226,7 +231,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                         )
                         self._publish_segment(
                             trajectory_channel,
-                            self.global_step,
+                            step_id,
                             0,
                             sources,
                             obs,
@@ -235,7 +240,10 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                             final_result["forward_inputs"],
                         )
                         trajectory_channel.publish(
-                            TrajectoryEnd(source=(self._rank, 0))
+                            TrajectoryEnd(
+                                step_id=step_id,
+                                source=(self._rank, 0),
+                            )
                         )
                         pending = None
                         self.batch_router[tag].clear()
@@ -260,10 +268,10 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     )
                     rollout_result = self._build_rollout_result(actions, result)
                     if pending is not None:
-                        obs, previous_result, sources = pending
+                        obs, previous_result, sources, step_id = pending
                         self._publish_segment(
                             trajectory_channel,
-                            self.global_step,
+                            step_id,
                             0,
                             sources,
                             obs,
@@ -283,7 +291,9 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                         policy_input.obs,
                         rollout_result,
                         policy_input.sources,
+                        self._trajectory_step,
                     )
+                    self._trajectory_step += 1
         finally:
             for task in receive_tasks:
                 task.cancel()
