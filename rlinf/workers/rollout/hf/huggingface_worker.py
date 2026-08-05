@@ -29,11 +29,26 @@ from rlinf.algorithms.rlt import (
     predict_rlt_actions,
 )
 from rlinf.config import SupportedModel
-from rlinf.data.schema.embodied_types import PolicyOutput
+from rlinf.data.embodied_io_struct import (
+    EnvResult,
+    PolicyInput,
+    PolicyOutput,
+    RolloutResult,
+    TrajectoryEnd,
+    TrajectoryEpochEnd,
+    TrajectorySegment,
+    merge_policy_inputs,
+)
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.scheduler import (
+    Channel,
+    Cluster,
+    TrajectoryChannel,
+    Worker,
+    split_channel_message,
+)
 from rlinf.utils.placement import HybridComponentPlacement
 
 
@@ -72,6 +87,7 @@ class MultiStepRolloutWorker(Worker):
         self.rollout_epoch = (
             train_env_cfg.rollout_epoch if train_env_cfg is not None else 1
         )
+        self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.eval_rollout_epoch = eval_env_cfg.rollout_epoch if self.enable_eval else 1
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.enable_dagger = self.algorithm_cfg.get("loss_type") == "embodied_dagger"
@@ -112,8 +128,8 @@ class MultiStepRolloutWorker(Worker):
                 cfg.env.eval.max_steps_per_rollout_epoch
                 // self.model_cfg.num_action_chunks
             )
-        self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
+        self.global_step = 0
         self.finished_episodes = None
 
         self.weight_syncer = None
@@ -133,6 +149,8 @@ class MultiStepRolloutWorker(Worker):
             # The batch_router is a dictionary that maps the tag to the list of batch_index.
             self.batch_router = {
                 "rollout_results": [],
+                "policy": [],
+                "policy_final": [],
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
 
@@ -574,55 +592,79 @@ class MultiStepRolloutWorker(Worker):
             )
         return self.predict(env_obs, mode=mode)
 
-    def _build_policy_output(
-        self,
-        actions: torch.Tensor,
-        result: dict[str, Any],
-        *,
-        final_obs: dict[str, Any] | None = None,
-    ) -> PolicyOutput:
+    def _build_rollout_result(
+        self, actions: torch.Tensor, result: dict[str, Any]
+    ) -> RolloutResult:
+        """Keep inference metadata locally until its environment result arrives."""
         intervene_flags = result.get("intervene_flags")
-        if (
-            intervene_flags is None
-            and self.enable_dagger
-            and result.get("expert_label_flag", False)
-        ):
-            intervene_flags = torch.full(
+        if intervene_flags is None and result.get("expert_label_flag", False):
+            intervene_flags = torch.ones(
                 (actions.shape[0], self.model_cfg.num_action_chunks),
-                True,
                 dtype=torch.bool,
                 device=actions.device,
             )
-        return PolicyOutput(
+        return RolloutResult(
             actions=actions,
             prev_logprobs=result["prev_logprobs"] if self.collect_prev_infos else None,
             prev_values=result["prev_values"] if self.collect_prev_infos else None,
-            bootstrap_values=self.get_bootstrap_values(final_obs),
             intervene_flags=intervene_flags,
             forward_inputs=result["forward_inputs"],
             versions=torch.full_like(
-                result["prev_logprobs"],
-                float(self.version),
-                dtype=torch.float32,
+                result["prev_logprobs"], float(self.version), dtype=torch.float32
             ),
         )
 
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
     ) -> torch.Tensor | None:
-        if final_obs is None:
-            return None
-        if not (
+        """Evaluate terminal observations for truncated-episode bootstrapping."""
+        if final_obs is None or not (
             hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head")
         ):
             return None
         with torch.no_grad():
             actions, result = self._predict_rollout_actions(final_obs)
-            if "prev_values" in result and result["prev_values"] is not None:
-                final_values = result["prev_values"]
-            else:
-                final_values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
-        return final_values[:, :1].cpu().contiguous()
+        values = result.get("prev_values")
+        if values is None:
+            values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
+        return values[:, :1].cpu().contiguous()
+
+    def _publish_segment(
+        self,
+        channel: TrajectoryChannel,
+        step_id: int,
+        epoch_id: int,
+        sources: list[tuple[int, int, int]],
+        obs: dict[str, Any],
+        result: RolloutResult,
+        policy_input: PolicyInput,
+        next_forward_inputs: dict[str, Any] | None = None,
+        initial_env_result: EnvResult | None = None,
+    ) -> None:
+        result.bootstrap_values = self.get_bootstrap_values(
+            policy_input.env_result.final_obs
+        )
+        next_obs = policy_input.obs
+        if (
+            policy_input.env_result.dones is not None
+            and policy_input.env_result.dones.any()
+            and self.cfg.env.train.auto_reset
+            and policy_input.env_result.final_obs is not None
+        ):
+            next_obs = policy_input.env_result.final_obs
+        channel.publish(
+            TrajectorySegment(
+                step_id=step_id,
+                epoch_id=epoch_id,
+                sources=sources,
+                obs=obs,
+                next_obs=next_obs,
+                rollout_result=result,
+                env_result=policy_input.env_result,
+                initial_env_result=initial_env_result,
+                next_forward_inputs=next_forward_inputs,
+            )
+        )
 
     @Worker.timer("sync_model_from_actor")
     async def sync_model_from_actor(self):
@@ -673,91 +715,126 @@ class MultiStepRolloutWorker(Worker):
         self.torch_platform.empty_cache()
 
     @Worker.timer("generate_one_epoch")
-    async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
+    async def generate_one_epoch(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
+        step_id: int,
+        epoch_id: int,
+    ):
         self.update_dagger_beta()
+        pending: dict[
+            int,
+            tuple[
+                dict[str, Any],
+                RolloutResult,
+                list[tuple[int, int, int]],
+                EnvResult | None,
+            ],
+        ] = {}
+        initial_states: set[int] = set()
         for _ in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
-                env_output = await self.recv_from(
+                policy_input: PolicyInput = await self.recv_from(
                     group_name=self.cfg.env.group_name,
                     channel=input_channel,
-                    tag="train_rollout_results",
+                    tag="train_policy",
                     route_key=stage_id,
                     async_op=True,
                     batch_size=self.train_batch_size,
-                    merge_fn=self._merge_obs_batches,
-                    infer_batch_size_fn=self._infer_env_batch_size,
+                    merge_fn=merge_policy_inputs,
+                    infer_batch_size_fn=self._infer_policy_input_batch_size,
                 ).async_wait()
+                if policy_input.is_last:
+                    raise ValueError(
+                        "Received a final policy input before rollout ended."
+                    )
                 actions, result = self._predict_rollout_actions(
-                    env_output["obs"],
-                    final_obs=env_output.get("final_obs", None),
-                    rlt_switch_flags=env_output.get("rlt_switch_flags", None),
-                    intervene_requested=env_output.get("intervene_flags", None),
+                    policy_input.obs,
+                    final_obs=policy_input.env_result.final_obs,
+                    rlt_switch_flags=policy_input.env_result.rlt_switch_flags,
+                    intervene_requested=policy_input.env_result.intervene_flags,
                 )
-
-                policy_output = self._build_policy_output(
-                    actions,
-                    result,
-                    final_obs=env_output.get("final_obs", None),
-                )
+                rollout_result = self._build_rollout_result(actions, result)
+                if stage_id in pending:
+                    obs, previous_result, sources, initial_env_result = pending.pop(
+                        stage_id
+                    )
+                    self._publish_segment(
+                        trajectory_channel,
+                        step_id,
+                        epoch_id,
+                        sources,
+                        obs,
+                        previous_result,
+                        policy_input,
+                        rollout_result.forward_inputs,
+                        initial_env_result,
+                    )
                 self.send_to(
                     group_name=self.cfg.env.group_name,
                     channel=output_channel,
-                    data=policy_output,
-                    tag="train_rollout_results",
+                    data=PolicyOutput(actions=actions.contiguous()),
+                    tag="policy",
                     route_key=stage_id,
                     async_op=True,
                     batch_size=self.train_batch_size,
                     split_fn=self._split_policy_output,
                 )
+                pending[stage_id] = (
+                    policy_input.obs,
+                    rollout_result,
+                    policy_input.sources,
+                    (
+                        policy_input.env_result
+                        if stage_id not in initial_states
+                        else None
+                    ),
+                )
+                initial_states.add(stage_id)
+
         for stage_id in range(self.num_pipeline_stages):
-            env_output = await self.recv_from(
+            policy_input: PolicyInput = await self.recv_from(
                 group_name=self.cfg.env.group_name,
                 channel=input_channel,
-                tag="train_rollout_results",
+                tag="train_policy_final",
                 route_key=stage_id,
                 async_op=True,
                 batch_size=self.train_batch_size,
-                merge_fn=self._merge_obs_batches,
-                infer_batch_size_fn=self._infer_env_batch_size,
+                merge_fn=merge_policy_inputs,
+                infer_batch_size_fn=self._infer_policy_input_batch_size,
             ).async_wait()
-            actions, result = self._predict_rollout_actions(
-                env_output["obs"],
-                final_obs=env_output.get("final_obs", None),
-                rlt_switch_flags=env_output.get("rlt_switch_flags", None),
-                intervene_requested=env_output.get("intervene_flags", None),
+            if not policy_input.is_last:
+                raise ValueError("Expected a final policy input after rollout ended.")
+            if stage_id not in pending:
+                raise ValueError("Final policy input has no pending rollout result.")
+            obs, result, sources, initial_env_result = pending.pop(stage_id)
+            _, final_result = self._predict_rollout_actions(
+                policy_input.obs,
+                final_obs=policy_input.env_result.final_obs,
+                rlt_switch_flags=policy_input.env_result.rlt_switch_flags,
+                intervene_requested=policy_input.env_result.intervene_flags,
             )
-
-            if self.enable_opd:
-                # OPD keeps this path separate to retain student action tokens for post-rollout teacher logprobs.
-                policy_output = self._build_policy_output(
-                    actions,
-                    result,
-                    final_obs=env_output.get("final_obs", None),
+            self._publish_segment(
+                trajectory_channel,
+                step_id,
+                epoch_id,
+                sources,
+                obs,
+                result,
+                policy_input,
+                final_result["forward_inputs"],
+                initial_env_result,
+            )
+            trajectory_channel.publish(
+                TrajectoryEpochEnd(
+                    step_id=step_id,
+                    epoch_id=epoch_id,
+                    source=(self._rank, stage_id),
+                    sources=sources,
+                    final_prev_values=final_result.get("prev_values"),
                 )
-            else:
-                policy_output = PolicyOutput(
-                    actions=actions,
-                    prev_values=(
-                        result["prev_values"] if self.collect_prev_infos else None
-                    ),
-                    bootstrap_values=self.get_bootstrap_values(
-                        env_output.get("final_obs", None)
-                    ),
-                    forward_inputs=(
-                        result["forward_inputs"]
-                        if self.rlt_feature_model is not None
-                        else {}
-                    ),
-                )
-            self.send_to(
-                group_name=self.cfg.env.group_name,
-                channel=output_channel,
-                data=policy_output,
-                tag="train_rollout_results",
-                route_key=stage_id,
-                async_op=True,
-                batch_size=self.train_batch_size,
-                split_fn=self._split_policy_output,
             )
 
     @Worker.timer("rollout/generate")
@@ -765,16 +842,26 @@ class MultiStepRolloutWorker(Worker):
         self,
         input_channel: Channel,
         output_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
     ):
         if self.enable_offload:
             self.reload_model()
 
-        for _ in tqdm(
+        for epoch_id in tqdm(
             range(self.rollout_epoch),
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            await self.generate_one_epoch(input_channel, output_channel)
+            await self.generate_one_epoch(
+                input_channel,
+                output_channel,
+                trajectory_channel,
+                self.global_step,
+                epoch_id,
+            )
+
+        for stage_id in range(self.num_pipeline_stages):
+            trajectory_channel.publish(TrajectoryEnd(source=(self._rank, stage_id)))
 
         if self.enable_offload:
             self.offload_model()
@@ -887,6 +974,11 @@ class MultiStepRolloutWorker(Worker):
                 return len(value)
         raise ValueError("Cannot infer batch size from env obs.")
 
+    @classmethod
+    def _infer_policy_input_batch_size(cls, policy_input: PolicyInput) -> int:
+        """Infer the batch size of a routed policy input."""
+        return cls._infer_env_batch_size(policy_input.obs)
+
     def _merge_optional_flag_tensors(
         self,
         obs_dicts: list[dict[str, Any]],
@@ -957,48 +1049,17 @@ class MultiStepRolloutWorker(Worker):
             ),
         }
 
+    @staticmethod
     def _split_policy_output(
-        self, policy_output: PolicyOutput, sizes: list[int]
+        policy_output: PolicyOutput, sizes: list[int]
     ) -> list[PolicyOutput]:
-        def _split_optional_tensor(
-            tensor: torch.Tensor | None,
-        ) -> tuple[torch.Tensor | None, ...]:
-            if tensor is None:
-                return tuple(None for _ in sizes)
-            return tuple(torch.split(tensor, sizes, dim=0))
-
-        split_actions = _split_optional_tensor(policy_output.actions)
-        split_prev_logprobs = _split_optional_tensor(policy_output.prev_logprobs)
-        split_prev_values = _split_optional_tensor(policy_output.prev_values)
-        split_bootstrap_values = _split_optional_tensor(policy_output.bootstrap_values)
-        split_intervene_flags = _split_optional_tensor(policy_output.intervene_flags)
-        split_versions = _split_optional_tensor(policy_output.versions)
-        split_forward_inputs = (
-            [{} for _ in sizes]
-            if not policy_output.forward_inputs
-            else [
-                {
-                    key: torch.split(value, sizes, dim=0)[idx]
-                    for key, value in policy_output.forward_inputs.items()
-                    if value is not None
-                }
-                for idx in range(len(sizes))
-            ]
-        )
-
+        """Split policy actions for the environment workers that requested them."""
         return [
-            PolicyOutput(
-                actions=split_actions[idx],
-                prev_logprobs=split_prev_logprobs[idx],
-                prev_values=split_prev_values[idx],
-                bootstrap_values=split_bootstrap_values[idx],
-                intervene_flags=split_intervene_flags[idx],
-                forward_inputs=split_forward_inputs[idx],
-                versions=split_versions[idx],
-            )
-            for idx in range(len(sizes))
+            PolicyOutput(actions=actions.contiguous())
+            for actions in torch.split(policy_output.actions, sizes, dim=0)
         ]
 
     def set_global_step(self, global_step: int):
+        self.global_step = global_step
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)

@@ -98,7 +98,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     def _recv_rollout_thread_main(self, input_channel):
         while not self.should_stop:
-            trajectory: Trajectory = input_channel.get()
+            trajectory: Trajectory = input_channel.take().wait()
             self.log_info(
                 f"recv trajectory versions.shape={trajectory.versions.shape} "
                 f"input_channel.qsize={input_channel.qsize()}"

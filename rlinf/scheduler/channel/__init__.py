@@ -14,5 +14,12 @@
 
 from .channel import Channel
 from .channel_worker import ChannelWorker, WeightedItem
+from .trajectory_channel import TrajectoryChannel, TrajectoryWorker
 
-__all__ = ["Channel", "ChannelWorker", "WeightedItem"]
+__all__ = [
+    "Channel",
+    "ChannelWorker",
+    "TrajectoryChannel",
+    "TrajectoryWorker",
+    "WeightedItem",
+]

@@ -163,13 +163,13 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             input_channel=self.env_channel,
             rollout_channel=self.rollout_channel,
             reward_channel=self.reward_channel,
-            actor_channel=self.actor_channel,
             metric_channel=self.env_metric_channel,
         )
         rollout_handle: Handle = self.rollout.generate(
             input_channel=self.rollout_channel,
             output_channel=self.env_channel,
             metric_channel=self.rollout_metric_channel,
+            trajectory_channel=self.actor_channel,
         )
         if self.reward is not None:
             reward_handle: Handle = self.reward.compute_rewards_async(

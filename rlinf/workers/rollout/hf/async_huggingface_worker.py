@@ -16,7 +16,13 @@ import asyncio
 
 from omegaconf.omegaconf import DictConfig
 
-from rlinf.scheduler import Channel, Worker
+from rlinf.data.embodied_io_struct import (
+    PolicyInput,
+    PolicyOutput,
+    TrajectoryEnd,
+    merge_policy_inputs,
+)
+from rlinf.scheduler import Channel, TrajectoryChannel, Worker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -49,12 +55,15 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         input_channel: Channel,
         output_channel: Channel,
         metric_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
     ):
         assert self._generate_task is None, (
             "generate task is not None but generate function is called."
         )
         self._generate_task = asyncio.create_task(
-            self._generate(input_channel, output_channel, metric_channel)
+            self._generate(
+                input_channel, output_channel, metric_channel, trajectory_channel
+            )
         )
         try:
             await self._generate_task
@@ -66,16 +75,30 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         input_channel: Channel,
         output_channel: Channel,
         metric_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
     ):
         if self.env_decoupled_mode:
-            await self.decoupled_generate_one_epoch(input_channel, output_channel)
+            await self.decoupled_generate_one_epoch(
+                input_channel, output_channel, trajectory_channel
+            )
         else:
             while True:
                 if self._background_weight_sync_active:
                     await self._poll_background_weight_sync()
 
-                for _ in range(self.rollout_epoch):
-                    await self.generate_one_epoch(input_channel, output_channel)
+                step_id = self.global_step
+                for epoch_id in range(self.rollout_epoch):
+                    await self.generate_one_epoch(
+                        input_channel,
+                        output_channel,
+                        trajectory_channel,
+                        step_id,
+                        epoch_id,
+                    )
+                for stage_id in range(self.num_pipeline_stages):
+                    trajectory_channel.publish(
+                        TrajectoryEnd(source=(self._rank, stage_id))
+                    )
                 if self.finished_episodes is not None:
                     self.finished_episodes += (
                         self.total_num_train_envs * self.rollout_epoch
@@ -151,46 +174,116 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self._start_background_weight_sync_if_needed()
 
     async def decoupled_generate_one_epoch(
-        self, input_channel: Channel, output_channel: Channel
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
     ):
         self.update_dagger_beta()
         decoupled_generate_time = 1
-        while True:
-            if decoupled_generate_time % self.sync_rollout_weight_time == 0:
-                self.update_dagger_beta()
-                if self._background_weight_sync_active:
-                    await self._poll_background_weight_sync()
-                await self.wait_if_stale()
-            decoupled_generate_time = decoupled_generate_time + 1
-            (
-                env_output,
-                split_sizes,
-            ) = await self.recv_from_and_record_batch_routes_with_timeout(
+        pending = None
+
+        async def receive_policy_input(tag: str) -> tuple[PolicyInput, list[int]]:
+            return await self.recv_from_and_record_batch_routes_with_timeout(
                 group_name=self.cfg.env.group_name,
                 channel=input_channel,
-                tag="rollout_results",
+                tag=tag,
                 batch_size=self.train_batch_size,
-                merge_fn=self._merge_obs_batches,
-                infer_batch_size_fn=self._infer_env_batch_size,
+                merge_fn=merge_policy_inputs,
+                infer_batch_size_fn=self._infer_policy_input_batch_size,
                 timeout_time=0.02,
                 recv_queue_size=self.rollout_queue_size,
             )
-            actions, result = self._predict_rollout_actions(
-                env_output["obs"],
-                final_obs=env_output.get("final_obs", None),
-                rlt_switch_flags=env_output.get("rlt_switch_flags", None),
-                intervene_requested=env_output.get("intervene_flags", None),
-            )
-            policy_output = self._build_policy_output(
-                actions,
-                result,
-                final_obs=env_output.get("final_obs", None),
-            )
-            self.send_to_recorded_batch_routes(
-                group_name=self.cfg.env.group_name,
-                channel=output_channel,
-                data=policy_output,
-                tag="rollout_results",
-                split_fn=self._split_policy_output,
-                split_sizes=split_sizes,
-            )
+
+        receive_tasks = {
+            asyncio.create_task(receive_policy_input(tag)): tag
+            for tag in ("policy", "policy_final")
+        }
+        try:
+            while True:
+                completed_tasks, _ = await asyncio.wait(
+                    receive_tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in completed_tasks:
+                    tag = receive_tasks.pop(task)
+                    policy_input, split_sizes = task.result()
+                    receive_tasks[asyncio.create_task(receive_policy_input(tag))] = tag
+
+                    if tag == "policy_final":
+                        if not policy_input.is_last:
+                            raise ValueError("Expected a final policy input.")
+                        if pending is None:
+                            raise ValueError(
+                                "Final policy input has no pending result."
+                            )
+                        obs, result, sources = pending
+                        _, final_result = self._predict_rollout_actions(
+                            policy_input.obs,
+                            final_obs=policy_input.env_result.final_obs,
+                            rlt_switch_flags=policy_input.env_result.rlt_switch_flags,
+                            intervene_requested=policy_input.env_result.intervene_flags,
+                        )
+                        self._publish_segment(
+                            trajectory_channel,
+                            self.global_step,
+                            0,
+                            sources,
+                            obs,
+                            result,
+                            policy_input,
+                            final_result["forward_inputs"],
+                        )
+                        trajectory_channel.publish(
+                            TrajectoryEnd(source=(self._rank, 0))
+                        )
+                        pending = None
+                        self.batch_router[tag].clear()
+                        continue
+                    if policy_input.is_last:
+                        raise ValueError(
+                            "Received a final policy input on policy route."
+                        )
+
+                    if decoupled_generate_time % self.sync_rollout_weight_time == 0:
+                        self.update_dagger_beta()
+                        if self._background_weight_sync_active:
+                            await self._poll_background_weight_sync()
+                        await self.wait_if_stale()
+                    decoupled_generate_time += 1
+
+                    actions, result = self._predict_rollout_actions(
+                        policy_input.obs,
+                        final_obs=policy_input.env_result.final_obs,
+                        rlt_switch_flags=policy_input.env_result.rlt_switch_flags,
+                        intervene_requested=policy_input.env_result.intervene_flags,
+                    )
+                    rollout_result = self._build_rollout_result(actions, result)
+                    if pending is not None:
+                        obs, previous_result, sources = pending
+                        self._publish_segment(
+                            trajectory_channel,
+                            self.global_step,
+                            0,
+                            sources,
+                            obs,
+                            previous_result,
+                            policy_input,
+                            rollout_result.forward_inputs,
+                        )
+                    self.send_to_recorded_batch_routes(
+                        group_name=self.cfg.env.group_name,
+                        channel=output_channel,
+                        data=PolicyOutput(actions=actions.contiguous()),
+                        tag=tag,
+                        split_fn=self._split_policy_output,
+                        split_sizes=split_sizes,
+                    )
+                    pending = (
+                        policy_input.obs,
+                        rollout_result,
+                        policy_input.sources,
+                    )
+        finally:
+            for task in receive_tasks:
+                task.cancel()
+            await asyncio.gather(*receive_tasks, return_exceptions=True)

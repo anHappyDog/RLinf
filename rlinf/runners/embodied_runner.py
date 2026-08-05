@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
-from rlinf.scheduler import Channel
+from rlinf.scheduler import Channel, TrajectoryChannel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
@@ -91,9 +91,13 @@ class EmbodiedRunner:
         )
 
         # Data channels
-        self.env_channel = Channel.create("Env")
-        self.rollout_channel = Channel.create("Rollout")
-        self.actor_channel = Channel.create("Actor")
+        self.env_channel = TrajectoryChannel.create("Env")
+        self.rollout_channel = TrajectoryChannel.create("Rollout")
+        self.actor_channel = TrajectoryChannel.create(
+            "Actor",
+            trajectory_cfg=cfg,
+            trajectory_node_rank=cfg.runner.get("trajectory_worker_node_rank", 0),
+        )
         if self.reward is not None:
             self.reward_channel = Channel.create("Reward")
         else:
@@ -503,11 +507,11 @@ class EmbodiedRunner:
                         input_channel=self.env_channel,
                         rollout_channel=self.rollout_channel,
                         reward_channel=self.reward_channel,
-                        actor_channel=self.actor_channel,
                     )
                     rollout_handle: Handle = self.rollout.generate(
                         input_channel=self.rollout_channel,
                         output_channel=self.env_channel,
+                        trajectory_channel=self.actor_channel,
                     )
                     reward_handle = None
                     if self.reward is not None:
@@ -586,11 +590,11 @@ class EmbodiedRunner:
                     input_channel=self.env_channel,
                     rollout_channel=self.rollout_channel,
                     reward_channel=self.reward_channel,
-                    actor_channel=self.actor_channel,
                 )
                 rollout_handle: Handle = self.rollout.generate(
                     input_channel=self.rollout_channel,
                     output_channel=self.env_channel,
+                    trajectory_channel=self.actor_channel,
                 )
                 reward_handle = None
                 if self.reward is not None:

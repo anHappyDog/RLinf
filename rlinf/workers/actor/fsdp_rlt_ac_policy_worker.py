@@ -696,7 +696,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
 
         recv_list = []
         for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
+            trajectory: Trajectory = await input_channel.take().async_wait()
             recv_list.append(trajectory)
 
         added, completed = self._ingest_rollout_trajectories(recv_list)

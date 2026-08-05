@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .channel import Channel, ChannelWorker, WeightedItem
+from .channel import (
+    Channel,
+    ChannelWorker,
+    TrajectoryChannel,
+    TrajectoryWorker,
+    WeightedItem,
+)
 from .cluster import Cluster, ClusterConfig
 from .collective import CollectiveGroupOptions
 from .hardware import (
@@ -84,6 +90,8 @@ __all__ = [
     "WorkerInfo",
     "Channel",
     "ChannelWorker",
+    "TrajectoryChannel",
+    "TrajectoryWorker",
     "WeightedItem",
     "Tracer",
 ]

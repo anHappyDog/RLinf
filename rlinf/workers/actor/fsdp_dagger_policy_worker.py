@@ -288,9 +288,7 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             split_num = compute_split_num(send_num, recv_num)
             recv_list = []
             for _ in range(split_num):
-                trajectory: Trajectory = await input_channel.get(
-                    async_op=True
-                ).async_wait()
+                trajectory: Trajectory = await input_channel.take().async_wait()
                 recv_list.append(trajectory)
             return self.recv_buffer_rollout_trajectories(recv_list)
         else:
