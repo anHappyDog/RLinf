@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Data package public entrypoints."""
+"""Data package namespace.
 
-from rlinf.data import schema, storage
+The schema and storage packages are intentionally not imported eagerly.  Some
+schema helpers use scheduler types at runtime, while the scheduler exposes
+trajectory data types; eager imports would make importing either package
+depend on the order in which the two packages are initialized.
+"""
 
 __all__ = ["schema", "storage"]

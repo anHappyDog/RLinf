@@ -15,13 +15,10 @@
 import copy
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
-
-if TYPE_CHECKING:
-    pass
 
 from rlinf.utils.nested_dict_process import (
     cat_list_of_dict_tensor,
