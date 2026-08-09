@@ -29,19 +29,21 @@ from rlinf.algorithms.rlt import (
     predict_rlt_actions,
 )
 from rlinf.config import SupportedModel
+from rlinf.data.schema.embodied_types import (
+    EmbodiedRolloutResult,
+    EnvResult,
+    PolicyInput,
+    PolicyOutput,
+    merge_policy_inputs,
+)
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.scheduler.channel.trajectory_channel.data import (
-    EnvResult,
-    PolicyInput,
-    PolicyOutput,
-    RolloutResult,
     TrajectoryEnd,
     TrajectoryEpochEnd,
     TrajectorySegment,
-    merge_policy_inputs,
 )
 from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
     TrajectoryChannel,
@@ -590,7 +592,7 @@ class MultiStepRolloutWorker(Worker):
 
     def _build_rollout_result(
         self, actions: torch.Tensor, result: dict[str, Any]
-    ) -> RolloutResult:
+    ) -> EmbodiedRolloutResult:
         """Keep inference metadata locally until its environment result arrives."""
         intervene_flags = result.get("intervene_flags")
         if intervene_flags is None and result.get("expert_label_flag", False):
@@ -599,7 +601,7 @@ class MultiStepRolloutWorker(Worker):
                 dtype=torch.bool,
                 device=actions.device,
             )
-        return RolloutResult(
+        return EmbodiedRolloutResult(
             actions=actions,
             prev_logprobs=result["prev_logprobs"] if self.collect_prev_infos else None,
             prev_values=result["prev_values"] if self.collect_prev_infos else None,
@@ -607,39 +609,6 @@ class MultiStepRolloutWorker(Worker):
             forward_inputs=result["forward_inputs"],
             versions=torch.full_like(
                 result["prev_logprobs"], float(self.version), dtype=torch.float32
-            ),
-        )
-
-    def _build_policy_output(
-        self,
-        actions: torch.Tensor,
-        result: dict[str, Any],
-        *,
-        final_obs: dict[str, Any] | None = None,
-    ) -> PolicyOutput:
-        intervene_flags = result.get("intervene_flags")
-        if (
-            intervene_flags is None
-            and self.enable_dagger
-            and result.get("expert_label_flag", False)
-        ):
-            intervene_flags = torch.full(
-                (actions.shape[0], self.model_cfg.num_action_chunks),
-                True,
-                dtype=torch.bool,
-                device=actions.device,
-            )
-        return PolicyOutput(
-            actions=actions,
-            prev_logprobs=result["prev_logprobs"] if self.collect_prev_infos else None,
-            prev_values=result["prev_values"] if self.collect_prev_infos else None,
-            bootstrap_values=self.get_bootstrap_values(final_obs),
-            intervene_flags=intervene_flags,
-            forward_inputs=result["forward_inputs"],
-            versions=torch.full_like(
-                result["prev_logprobs"],
-                float(self.version),
-                dtype=torch.float32,
             ),
         )
 
@@ -667,7 +636,7 @@ class MultiStepRolloutWorker(Worker):
         epoch_id: int,
         sources: list[tuple[int, int, int]],
         obs: dict[str, Any],
-        result: RolloutResult,
+        result: EmbodiedRolloutResult,
         policy_input: PolicyInput,
         forward_inputs: dict[str, Any] | None = None,
         initial_env_result: EnvResult | None = None,
@@ -825,7 +794,7 @@ class MultiStepRolloutWorker(Worker):
             int,
             tuple[
                 dict[str, Any],
-                RolloutResult,
+                EmbodiedRolloutResult,
                 list[tuple[int, int, int]],
                 EnvResult | None,
             ],

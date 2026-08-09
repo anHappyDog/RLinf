@@ -21,9 +21,11 @@ from omegaconf import OmegaConf
 from rlinf.data.schema.embodied_trajectory_builder import (
     EmbodiedLerobotTrajectoryBuilder,
 )
-from rlinf.scheduler.channel.trajectory_channel.data import (
+from rlinf.data.schema.embodied_types import (
+    EmbodiedRolloutResult,
     EnvResult,
-    RolloutResult,
+)
+from rlinf.scheduler.channel.trajectory_channel.data import (
     TrajectorySegment,
 )
 from rlinf.scheduler.channel.trajectory_channel.trajectory_worker import (
@@ -44,7 +46,7 @@ def test_bootstrap_reward_uses_worker_config():
         sources=[(0, 0, 1)],
         obs={"states": torch.zeros(1, 1)},
         next_obs={"states": torch.zeros(1, 1)},
-        rollout_result=RolloutResult(
+        rollout_result=EmbodiedRolloutResult(
             actions=torch.zeros(1, 1),
             forward_inputs={"action": torch.zeros(1, 1)},
             bootstrap_values=torch.tensor([[4.0]]),

@@ -71,8 +71,8 @@ Rollout worker 为每个 pipeline stage 保留一个待完成的推理结果。�
    * - 事件
      - 含义
    * - ``TrajectorySegment``
-     - 一次 append 操作，包含 observation、next observation、环境结果、rollout
-       结果和逻辑 source 元数据。
+     - 一次 append 操作，包含 observation、next observation、环境结果、
+       ``EmbodiedRolloutResult`` 和逻辑 source 元数据。
    * - ``TrajectoryEpochEnd``
      - 一个 producer 已完成一个 epoch；同时携带基于 value 计算 advantage 所需的
        final value。

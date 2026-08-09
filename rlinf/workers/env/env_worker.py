@@ -22,18 +22,16 @@ from omegaconf import DictConfig, OmegaConf
 
 from rlinf.data.schema.embodied_types import (
     EnvOutput,
+    EnvResult,
+    PolicyInput,
+    PolicyOutput,
+    split_policy_input,
 )
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import InsertDelay, RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
-from rlinf.scheduler.channel.trajectory_channel.data import (
-    EnvResult,
-    PolicyInput,
-    PolicyOutput,
-    split_policy_input,
-)
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,

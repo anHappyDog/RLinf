@@ -16,6 +16,7 @@ import asyncio
 
 from omegaconf.omegaconf import DictConfig
 
+from rlinf.data.schema.embodied_types import PolicyOutput
 from rlinf.scheduler import Channel, Worker
 from rlinf.scheduler.channel.trajectory_channel.data import TrajectoryEnd
 from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
@@ -190,17 +191,13 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 timeout_time=0.02,
                 recv_queue_size=self.rollout_queue_size,
             )
-            actions, result = self._predict_rollout_actions(
+            actions, _ = self._predict_rollout_actions(
                 env_output["obs"],
                 final_obs=env_output.get("final_obs", None),
                 rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                 intervene_requested=env_output.get("intervene_flags", None),
             )
-            policy_output = self._build_policy_output(
-                actions,
-                result,
-                final_obs=env_output.get("final_obs", None),
-            )
+            policy_output = PolicyOutput(actions=actions)
             self.send_to_recorded_batch_routes(
                 group_name=self.cfg.env.group_name,
                 channel=output_channel,

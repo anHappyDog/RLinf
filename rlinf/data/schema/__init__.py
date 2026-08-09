@@ -20,13 +20,18 @@ from rlinf.data.schema.embodied_trajectory_builder import (
 )
 from rlinf.data.schema.embodied_types import (
     ChunkStepResult,
+    EmbodiedRolloutResult,
     EnvOutput,
+    EnvResult,
+    PolicyInput,
     PolicyOutput,
     RTCActionResponse,
     RTCRequest,
     Trajectory,
     convert_trajectories_to_batch,
     get_model_weights_id,
+    merge_policy_inputs,
+    split_policy_input,
 )
 from rlinf.data.schema.reasoning_requests import (
     FinishReasonEnum,
@@ -45,6 +50,9 @@ __all__ = [
     "convert_trajectories_to_batch",
     "DynamicRolloutResult",
     "EmbodiedLerobotTrajectoryBuilder",
+    "EmbodiedRolloutResult",
+    "EnvResult",
+    "PolicyInput",
     "PolicyOutput",
     "EmbodiedTrajectoryBuilder",
     "EnvOutput",
@@ -58,4 +66,6 @@ __all__ = [
     "get_batch_size",
     "get_model_weights_id",
     "get_seq_length",
+    "merge_policy_inputs",
+    "split_policy_input",
 ]

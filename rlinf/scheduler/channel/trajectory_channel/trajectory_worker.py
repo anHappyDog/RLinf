@@ -27,16 +27,16 @@ from rlinf.data.schema.embodied_trajectory_builder import (
 )
 from rlinf.data.schema.embodied_types import (
     ChunkStepResult,
+    EmbodiedRolloutResult,
+    EnvResult,
     convert_trajectories_to_batch,
+    split_batch_value,
+    split_episode_data,
 )
 from rlinf.scheduler.channel.trajectory_channel.data import (
-    EnvResult,
-    RolloutResult,
     TrajectoryEnd,
     TrajectoryEpochEnd,
     TrajectorySegment,
-    split_batch_value,
-    split_episode_data,
 )
 from rlinf.scheduler.worker.routing import CommMapper
 from rlinf.scheduler.worker.worker import Worker, WorkerAddress
@@ -353,7 +353,7 @@ class TrajectoryWorker(Worker):
                     sources=[(rank, stage, sizes[index])],
                     obs=split_batch_value(segment.obs, sizes)[index],
                     next_obs=split_batch_value(segment.next_obs, sizes)[index],
-                    rollout_result=RolloutResult(
+                    rollout_result=EmbodiedRolloutResult(
                         **{
                             name: values[index]
                             for name, values in result_fields.items()

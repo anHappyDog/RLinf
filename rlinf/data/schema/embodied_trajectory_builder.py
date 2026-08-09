@@ -23,7 +23,7 @@ import torch
 
 from rlinf.data.schema.embodied_types import (
     ChunkStepResult,
-    PolicyOutput,
+    EmbodiedRolloutResult,
     Trajectory,
     get_model_weights_id,
 )
@@ -389,7 +389,7 @@ class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
 
     1. Auto-reset envs: ``final_observation`` is attributed to the finished
        episode; post-reset observations are carried via ``_pending_obs``.
-    2. DAgger intervention: ``PolicyOutput.intervene_flags`` and expert actions
+    2. DAgger intervention: ``EmbodiedRolloutResult.intervene_flags`` and expert actions
        override recorded actions and set ``intervene_flag``.
     3. Real-world hooks: ``record_reset``, ``pre_record``, and
        ``segment_advance`` info flags are honored.
@@ -767,7 +767,7 @@ class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
     def append_chunk_episode_data(
         self,
         *,
-        policy_output: PolicyOutput,
+        policy_output: EmbodiedRolloutResult,
         chunk_actions,
         obs_list,
         terminations,

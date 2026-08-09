@@ -12,23 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
+
 import numpy as np
 import torch
 
-from rlinf.scheduler.channel.trajectory_channel.data import (
+from rlinf.data.schema.embodied_types import (
+    EmbodiedRolloutResult,
     EnvResult,
     PolicyInput,
-    RolloutResult,
+    PolicyOutput,
     merge_policy_inputs,
     split_policy_input,
 )
+
+
+def test_policy_output_supports_tensor_transport_skeleton():
+    output = PolicyOutput(actions=torch.ones(2, 3))
+
+    skeleton = replace(output, actions=None)
+    restored = replace(skeleton, actions=output.actions)
+
+    assert skeleton.actions is None
+    assert torch.equal(restored.actions, output.actions)
 
 
 def test_transport_results_store_contiguous_cpu_tensors():
     non_contiguous = torch.arange(12).reshape(3, 4).T
 
     env_result = EnvResult(rewards=non_contiguous)
-    rollout_result = RolloutResult(
+    rollout_result = EmbodiedRolloutResult(
         actions=non_contiguous,
         forward_inputs={"states": non_contiguous},
     )

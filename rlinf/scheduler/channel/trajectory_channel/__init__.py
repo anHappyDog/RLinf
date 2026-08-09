@@ -13,10 +13,6 @@
 # limitations under the License.
 
 from .data import (
-    EnvResult,
-    PolicyInput,
-    PolicyOutput,
-    RolloutResult,
     TrajectoryEnd,
     TrajectoryEpochEnd,
     TrajectorySegment,
@@ -24,10 +20,6 @@ from .data import (
 from .trajectory_channel import TrajectoryChannel
 
 __all__ = [
-    "EnvResult",
-    "PolicyInput",
-    "PolicyOutput",
-    "RolloutResult",
     "TrajectoryChannel",
     "TrajectoryEnd",
     "TrajectoryEpochEnd",

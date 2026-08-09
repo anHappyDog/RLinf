@@ -77,7 +77,8 @@ Events and Results
      - Meaning
    * - ``TrajectorySegment``
      - One append operation containing observations, the next observation,
-       environment results, rollout results, and logical source metadata.
+       environment results, ``EmbodiedRolloutResult``, and logical source
+       metadata.
    * - ``TrajectoryEpochEnd``
      - One producer finished an epoch. It also carries final values needed by
        value-based advantage calculation.
