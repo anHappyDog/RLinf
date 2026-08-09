@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import os
 import threading
 from pathlib import Path
@@ -29,7 +28,7 @@ from rlinf.data.datasets.dagger import (
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
-from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler import Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import append_to_dict, compute_split_num
@@ -279,7 +278,7 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             self._resume_lerobot_dataset()
 
     @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
+    async def recv_rollout_trajectories(self, input_channel) -> None:
         clear_memory(sync=False)
 
         if not self.enable_online_lerobot:
@@ -288,13 +287,13 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             split_num = compute_split_num(send_num, recv_num)
             recv_list = []
             for _ in range(split_num):
-                trajectory: Trajectory = await input_channel.get(
+                trajectory: Trajectory = await input_channel.subscribe(
                     async_op=True
                 ).async_wait()
                 recv_list.append(trajectory)
             return self.recv_buffer_rollout_trajectories(recv_list)
         else:
-            return self.recv_lerobot_rollout_trajectories(input_channel)
+            return await self.recv_lerobot_rollout_trajectories(input_channel)
 
     def recv_buffer_rollout_trajectories(self, recv_list: list[Trajectory]) -> None:
         intervene_traj_list = []
@@ -306,7 +305,7 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         if intervene_traj_list:
             self.replay_buffer.add_trajectories(intervene_traj_list)
 
-    def _recv_lerobot_episodes_from_channel(self, input_channel: Channel) -> bool:
+    async def _recv_lerobot_episodes_from_channel(self, input_channel) -> bool:
         """Receive up to one actor-side split from the shared Actor channel.
 
         Each rank pulls at most ``split_num`` messages per call so multi-actor
@@ -318,24 +317,23 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         split_num = compute_split_num(send_num, recv_num)
         received_any = False
         for _ in range(split_num):
-            try:
-                episodes: list[list[dict]] = input_channel.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+            episodes: list[list[dict]] = await input_channel.subscribe(
+                async_op=True
+            ).async_wait()
             received_any = True
             for ep_frames in episodes:
                 if ep_frames:
                     self._append_lerobot_episode(ep_frames)
         return received_any
 
-    def recv_lerobot_rollout_trajectories(self, input_channel: Channel) -> None:
+    async def recv_lerobot_rollout_trajectories(self, input_channel) -> None:
         """Receive episodes from EnvWorker and append them to the memory dataset.
 
         EnvWorkers collect completed episodes via ``EmbodiedLerobotTrajectoryBuilder``
         and send them here each interact round. Empty batches are not sent by env;
         if the dataset is still below ``min_frames``, training is skipped later.
         """
-        self._recv_lerobot_episodes_from_channel(input_channel)
+        await self._recv_lerobot_episodes_from_channel(input_channel)
         if self.dataset.is_ready():
             self._ensure_lerobot_loader()
 

@@ -17,6 +17,10 @@ import asyncio
 from omegaconf.omegaconf import DictConfig
 
 from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler.channel.trajectory_channel.data import TrajectoryEnd
+from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
+    TrajectoryChannel,
+)
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -42,19 +46,23 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self._weight_sync_apply_total = 0
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
+        self._trajectory_step = 0
 
     @Worker.timer("rollout/generate")
     async def generate(
         self,
         input_channel: Channel,
         output_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
         metric_channel: Channel,
     ):
         assert self._generate_task is None, (
             "generate task is not None but generate function is called."
         )
         self._generate_task = asyncio.create_task(
-            self._generate(input_channel, output_channel, metric_channel)
+            self._generate(
+                input_channel, output_channel, trajectory_channel, metric_channel
+            )
         )
         try:
             await self._generate_task
@@ -65,29 +73,36 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self,
         input_channel: Channel,
         output_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
         metric_channel: Channel,
     ):
-        if self.env_decoupled_mode:
-            await self.decoupled_generate_one_epoch(input_channel, output_channel)
-        else:
-            while True:
-                if self._background_weight_sync_active:
-                    await self._poll_background_weight_sync()
+        while True:
+            if self._background_weight_sync_active:
+                await self._poll_background_weight_sync()
 
-                for _ in range(self.rollout_epoch):
-                    await self.generate_one_epoch(input_channel, output_channel)
-                if self.finished_episodes is not None:
-                    self.finished_episodes += (
-                        self.total_num_train_envs * self.rollout_epoch
-                    )
-                rollout_metrics = self.pop_execution_times()
-                rollout_metrics = {
-                    f"time/rollout/{k}": v for k, v in rollout_metrics.items()
-                }
-                metric_channel.put(
-                    {"rank": self._rank, "time": rollout_metrics},
-                    async_op=True,
+            step_id = self._trajectory_step
+            for epoch_id in range(self.rollout_epoch):
+                await self.generate_one_epoch(
+                    input_channel,
+                    output_channel,
+                    trajectory_channel,
+                    step_id,
+                    epoch_id,
                 )
+            for stage_id in range(self.num_pipeline_stages):
+                trajectory_channel.publish(
+                    TrajectoryEnd(step_id=step_id, source=(self._rank, stage_id))
+                )
+            self._trajectory_step += 1
+            if self.finished_episodes is not None:
+                self.finished_episodes += self.total_num_train_envs * self.rollout_epoch
+            rollout_metrics = {
+                f"time/rollout/{key}": value
+                for key, value in self.pop_execution_times().items()
+            }
+            metric_channel.put(
+                {"rank": self._rank, "time": rollout_metrics}, async_op=True
+            )
 
     async def wait_if_stale(self) -> None:
         if self.staleness_threshold is None:

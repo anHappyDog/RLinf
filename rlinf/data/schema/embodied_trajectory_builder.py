@@ -92,6 +92,26 @@ class EmbodiedTrajectoryBuilder:
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
 
+    def append_final_value(self, value: torch.Tensor | None) -> None:
+        """Append the bootstrap value for the state after a rollout epoch."""
+        if value is not None:
+            self.prev_values.append(value.cpu().contiguous())
+
+    def append_initial_state(
+        self,
+        *,
+        dones: torch.Tensor | None,
+        truncations: torch.Tensor | None,
+        terminations: torch.Tensor | None,
+    ) -> None:
+        """Append the state boundary immediately before a rollout epoch."""
+        if dones is not None:
+            self.dones.append(dones.cpu().contiguous())
+        if truncations is not None:
+            self.truncations.append(truncations.cpu().contiguous())
+        if terminations is not None:
+            self.terminations.append(terminations.cpu().contiguous())
+
     def mark_last_step_with_intervene_flags(self, intervene_flags: torch.Tensor):
         if not self.intervene_flags:
             return

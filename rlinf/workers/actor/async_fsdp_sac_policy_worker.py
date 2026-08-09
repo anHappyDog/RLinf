@@ -49,7 +49,7 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         split_num = compute_split_num(send_num, recv_num)
         while not self.should_stop:
             for _ in range(split_num):
-                trajectory = input_channel.get()
+                trajectory = input_channel.subscribe()
                 self._recv_queue.put(trajectory)
 
     def _drain_received_trajectories(self, max_trajectories: int | None = None):

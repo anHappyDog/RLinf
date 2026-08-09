@@ -24,6 +24,9 @@ from omegaconf.dictconfig import DictConfig
 
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
+from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
+    TrajectoryChannel,
+)
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
@@ -93,7 +96,7 @@ class EmbodiedRunner:
         # Data channels
         self.env_channel = Channel.create("Env")
         self.rollout_channel = Channel.create("Rollout")
-        self.actor_channel = Channel.create("Actor")
+        self.actor_channel = TrajectoryChannel.create(name="Actor", cfg=self.cfg)
         if self.reward is not None:
             self.reward_channel = Channel.create("Reward")
         else:
@@ -503,11 +506,11 @@ class EmbodiedRunner:
                         input_channel=self.env_channel,
                         rollout_channel=self.rollout_channel,
                         reward_channel=self.reward_channel,
-                        actor_channel=self.actor_channel,
                     )
                     rollout_handle: Handle = self.rollout.generate(
                         input_channel=self.rollout_channel,
                         output_channel=self.env_channel,
+                        trajectory_channel=self.actor_channel,
                     )
                     reward_handle = None
                     if self.reward is not None:
@@ -586,11 +589,11 @@ class EmbodiedRunner:
                     input_channel=self.env_channel,
                     rollout_channel=self.rollout_channel,
                     reward_channel=self.reward_channel,
-                    actor_channel=self.actor_channel,
                 )
                 rollout_handle: Handle = self.rollout.generate(
                     input_channel=self.rollout_channel,
                     output_channel=self.env_channel,
+                    trajectory_channel=self.actor_channel,
                 )
                 reward_handle = None
                 if self.reward is not None:

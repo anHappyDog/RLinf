@@ -183,7 +183,7 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
             self.worker.send_rollout_trajectories.return_value.set_result(None)
 
             loop.run_until_complete(
-                self.worker.interact(input_channel, rollout_channel, None, None)
+                self.worker.interact(input_channel, rollout_channel, None)
             )
         finally:
             asyncio.set_event_loop(None)
@@ -280,7 +280,7 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(
-                self.worker.interact(input_channel, rollout_channel, None, None)
+                self.worker.interact(input_channel, rollout_channel, None)
             )
         finally:
             asyncio.set_event_loop(None)
