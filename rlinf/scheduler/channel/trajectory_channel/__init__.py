@@ -12,14 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .data import (
-    TrajectoryEnd,
-    TrajectoryEpochEnd,
-)
 from .trajectory_channel import TrajectoryChannel
 
 __all__ = [
     "TrajectoryChannel",
-    "TrajectoryEnd",
-    "TrajectoryEpochEnd",
 ]

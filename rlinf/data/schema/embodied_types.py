@@ -251,13 +251,29 @@ class EnvResult:
 
 
 @dataclass(kw_only=True)
+class PolicyCompletion:
+    """Environment outcome completed by a subsequent policy request."""
+
+    sources: list[TrajectorySource]
+    env_result: EnvResult
+    next_obs: dict[str, Any]
+    requires_inference: bool
+
+    def __post_init__(self) -> None:
+        self.next_obs = put_tensor_device(self.next_obs, "cpu")
+
+
+@dataclass(kw_only=True)
 class PolicyInput:
-    """Observation and control metadata required for policy inference."""
+    """Policy inference input and optional preceding environment outcome."""
 
     obs: dict[str, Any]
     rlt_switch_flags: torch.Tensor | None = None
     intervene_flags: torch.Tensor | None = None
     sources: list[TrajectorySource] = field(default_factory=list)
+    completions: list[PolicyCompletion | None] = field(default_factory=list)
+    request_sizes: list[int] = field(default_factory=list)
+    is_last: bool = False
 
     def __post_init__(self) -> None:
         self.obs = put_tensor_device(self.obs, "cpu")
@@ -265,17 +281,6 @@ class PolicyInput:
             value = getattr(self, name)
             if value is not None:
                 setattr(self, name, value.cpu().contiguous())
-
-
-@dataclass(kw_only=True)
-class TerminalRequest:
-    """Terminal observations that require policy-side model processing."""
-
-    obs: dict[str, Any]
-    sources: list[TrajectorySource]
-
-    def __post_init__(self) -> None:
-        self.obs = put_tensor_device(self.obs, "cpu")
 
 
 @dataclass(kw_only=True)
@@ -439,44 +444,60 @@ def split_trajectory_sources(
     return result
 
 
+def split_env_result(env_result: EnvResult, split_sizes: list[int]) -> list[EnvResult]:
+    """Split an environment result on its batch dimension."""
+    fields = {
+        name: split_batch_value(getattr(env_result, name), split_sizes)
+        for name in env_result.__dataclass_fields__
+        if name != "episode_data"
+    }
+    episodes = split_episode_data(env_result.episode_data, split_sizes)
+    return [
+        EnvResult(
+            **{name: values[index] for name, values in fields.items()},
+            episode_data=episodes[index],
+        )
+        for index in range(len(split_sizes))
+    ]
+
+
 def split_policy_input(
     policy_input: PolicyInput, split_sizes: list[int]
 ) -> list[PolicyInput]:
     """Split a policy input on its batch dimension."""
-
+    if len(policy_input.completions) > 1:
+        raise ValueError("A producer policy input cannot contain merged completions.")
     source_splits = split_trajectory_sources(policy_input.sources, split_sizes)
     rlt_splits = split_batch_value(policy_input.rlt_switch_flags, split_sizes)
     intervene_splits = split_batch_value(policy_input.intervene_flags, split_sizes)
+    completion = policy_input.completions[0] if policy_input.completions else None
+    if completion is None:
+        completion_splits = [None] * len(split_sizes)
+    else:
+        completion_sources = split_trajectory_sources(completion.sources, split_sizes)
+        env_results = split_env_result(completion.env_result, split_sizes)
+        next_observations = split_batch_value(completion.next_obs, split_sizes)
+        completion_splits = [
+            PolicyCompletion(
+                sources=completion_sources[index],
+                env_result=env_results[index],
+                next_obs=next_observations[index],
+                requires_inference=completion.requires_inference,
+            )
+            for index in range(len(split_sizes))
+        ]
     return [
         PolicyInput(
             obs=obs,
             rlt_switch_flags=rlt_splits[index],
             intervene_flags=intervene_splits[index],
             sources=source_splits[index],
+            completions=[completion_splits[index]],
+            request_sizes=[split_sizes[index]],
+            is_last=policy_input.is_last,
         )
         for index, obs in enumerate(split_batch_value(policy_input.obs, split_sizes))
     ]
-
-
-def split_terminal_request(
-    request: TerminalRequest, split_sizes: list[int]
-) -> list[TerminalRequest]:
-    """Split a terminal request on its batch dimension."""
-    sources = split_trajectory_sources(request.sources, split_sizes)
-    return [
-        TerminalRequest(obs=obs, sources=sources[index])
-        for index, obs in enumerate(split_batch_value(request.obs, split_sizes))
-    ]
-
-
-def merge_terminal_requests(requests: list[TerminalRequest]) -> TerminalRequest:
-    """Merge independently routed terminal requests."""
-    if not requests:
-        raise ValueError("Cannot merge an empty list of terminal requests.")
-    return TerminalRequest(
-        obs=merge_batch_values([request.obs for request in requests]),
-        sources=[source for request in requests for source in request.sources],
-    )
 
 
 def merge_policy_inputs(policy_inputs: list[PolicyInput]) -> PolicyInput:
@@ -534,6 +555,17 @@ def merge_policy_inputs(policy_inputs: list[PolicyInput]) -> PolicyInput:
         rlt_switch_flags=merge_optional_tensor("rlt_switch_flags"),
         intervene_flags=merge_optional_tensor("intervene_flags"),
         sources=sources,
+        completions=[
+            completion
+            for policy_input in policy_inputs
+            for completion in policy_input.completions
+        ],
+        request_sizes=[
+            size
+            for policy_input in policy_inputs
+            for size in policy_input.request_sizes
+        ],
+        is_last=policy_inputs[0].is_last,
     )
 
 
@@ -760,9 +792,9 @@ __all__ = [
     "EmbodiedRolloutResult",
     "EnvOutput",
     "EnvResult",
+    "PolicyCompletion",
     "PolicyInput",
     "PolicyOutput",
-    "TerminalRequest",
     "TrajectoryKey",
     "TrajectorySource",
     "RTCActionResponse",
@@ -773,10 +805,8 @@ __all__ = [
     "merge_batch_values",
     "merge_episode_data",
     "merge_policy_inputs",
-    "merge_terminal_requests",
     "split_batch_value",
     "split_episode_data",
     "split_policy_input",
-    "split_terminal_request",
     "split_trajectory_sources",
 ]

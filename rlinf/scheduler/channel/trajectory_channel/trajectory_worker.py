@@ -41,9 +41,6 @@ from rlinf.data.schema.embodied_types import (
 from rlinf.scheduler.channel.trajectory_channel.data import (
     EnvStepResult,
     PolicyStep,
-    TerminalResult,
-    TrajectoryEnd,
-    TrajectoryEpochEnd,
     TrajectoryStart,
 )
 from rlinf.scheduler.worker.routing import CommMapper
@@ -89,12 +86,9 @@ class TrajectoryWorker(Worker):
         self._pipeline_collectors: dict[
             SourceID, dict[SourceID, TrajectoryCollector]
         ] = {}
-        self._finished_sources: dict[int, set[SourceID]] = {}
-        self._finished_epoch_sources: dict[SourceID, set[SourceID]] = {}
         self._pipeline_generators: dict[SourceID, torch.Generator] = {}
         self._policy_steps: dict[TrajectoryKey, PolicyStep] = {}
         self._env_results: dict[TrajectoryKey, EnvStepResult] = {}
-        self._terminal_results: dict[TrajectoryKey, TerminalResult] = {}
         self._initial_results: dict[tuple[int, int, int, int], EnvResult] = {}
         self._completed_keys: set[TrajectoryKey] = set()
         self._fragments: dict[tuple[type, TrajectoryKey], list[object]] = defaultdict(
@@ -206,9 +200,6 @@ class TrajectoryWorker(Worker):
         return rewards
 
     async def _flush(self, step_id: int) -> None:
-        finished_sources = self._finished_sources[step_id]
-        if len(finished_sources) != self.source_count:
-            return
         expected = (
             self.source_count * self._cfg.env.train.rollout_epoch * self.chunk_count
         )
@@ -238,14 +229,11 @@ class TrajectoryWorker(Worker):
                     self.shards_per_source
                 ):
                     await self._output_queues["default"].put(trajectory)
-        del self._finished_sources[step_id]
         self._completed_keys = {
             key for key in self._completed_keys if key.step_id != step_id
         }
 
     async def _flush_pipeline(self, key: SourceID) -> None:
-        if len(self._finished_epoch_sources[key]) != self.source_count:
-            return
         expected = self.source_count * self.chunk_count
         if (
             sum(
@@ -295,7 +283,6 @@ class TrajectoryWorker(Worker):
                 for micro_batch in self._pipeline_micro_batches(batch, actor_rank):
                     await self._output_queues[f"actor:{actor_rank}"].put(micro_batch)
         del self._pipeline_collectors[key]
-        del self._finished_epoch_sources[key]
         self._completed_keys = {
             item
             for item in self._completed_keys
@@ -395,19 +382,13 @@ class TrajectoryWorker(Worker):
                         **{name: values[index] for name, values in fields.items()},
                         episode_data=episodes[index],
                     ),
-                    needs_terminal=event.needs_terminal,
-                )
-            return
-        if isinstance(event, TerminalResult):
-            values = split_batch_value(event.bootstrap_values, sizes)
-            inputs = split_batch_value(event.forward_inputs, sizes)
-            observations = split_batch_value(event.obs, sizes)
-            for index, source in enumerate(event.sources):
-                yield TerminalResult(
-                    sources=[source],
-                    obs=observations[index],
-                    bootstrap_values=values[index],
-                    forward_inputs=inputs[index],
+                    next_obs=split_batch_value(event.next_obs, sizes)[index],
+                    forward_inputs=split_batch_value(event.forward_inputs, sizes)[
+                        index
+                    ],
+                    bootstrap_values=split_batch_value(event.bootstrap_values, sizes)[
+                        index
+                    ],
                 )
 
     def _merge_fragments(self, event):
@@ -461,18 +442,15 @@ class TrajectoryWorker(Worker):
                         else None
                     ),
                 ),
-                needs_terminal=event.needs_terminal,
+                next_obs=merge_batch_values([item.next_obs for item in fragments]),
+                forward_inputs=merge_batch_values(
+                    [item.forward_inputs for item in fragments]
+                ),
+                bootstrap_values=merge_batch_values(
+                    [item.bootstrap_values for item in fragments]
+                ),
             )
-        return TerminalResult(
-            sources=[full_source],
-            obs=merge_batch_values([item.obs for item in fragments]),
-            bootstrap_values=merge_batch_values(
-                [item.bootstrap_values for item in fragments]
-            ),
-            forward_inputs=merge_batch_values(
-                [item.forward_inputs for item in fragments]
-            ),
-        )
+        raise TypeError(f"Unexpected trajectory event: {type(event)}")
 
     def _store_event(self, event) -> None:
         for fragment in self._split_event(event):
@@ -484,20 +462,8 @@ class TrajectoryWorker(Worker):
                 raise ValueError(f"Received duplicate trajectory event for {key}.")
             if isinstance(complete, PolicyStep):
                 self._policy_steps[key] = complete
-                if key.chunk_id:
-                    self._try_complete(
-                        TrajectoryKey(
-                            key.step_id,
-                            key.epoch_id,
-                            key.env_rank,
-                            key.stage_id,
-                            key.chunk_id - 1,
-                        )
-                    )
-            elif isinstance(complete, EnvStepResult):
-                self._env_results[key] = complete
             else:
-                self._terminal_results[key] = complete
+                self._env_results[key] = complete
             self._try_complete(key)
 
     def _try_complete(self, key: TrajectoryKey) -> None:
@@ -508,30 +474,13 @@ class TrajectoryWorker(Worker):
         initial_key = (key.step_id, key.epoch_id, key.env_rank, key.stage_id)
         if key.chunk_id == 0 and initial_key not in self._initial_results:
             return
-        terminal = self._terminal_results.get(key)
-        next_policy = self._policy_steps.get(
-            TrajectoryKey(
-                key.step_id,
-                key.epoch_id,
-                key.env_rank,
-                key.stage_id,
-                key.chunk_id + 1,
-            )
-        )
         if self.enable_online_lerobot:
             next_obs = {}
             next_inputs = None
-        elif env.needs_terminal:
-            if terminal is None:
-                return
-            next_obs = terminal.obs
-            next_inputs = terminal.forward_inputs
-            policy.rollout_result.bootstrap_values = terminal.bootstrap_values
         else:
-            if next_policy is None:
-                return
-            next_obs = next_policy.obs
-            next_inputs = next_policy.rollout_result.forward_inputs
+            next_obs = env.next_obs
+            next_inputs = env.forward_inputs
+            policy.rollout_result.bootstrap_values = env.bootstrap_values
 
         segment = _TrajectoryStep(
             step_id=key.step_id,
@@ -555,11 +504,10 @@ class TrajectoryWorker(Worker):
         ):
             self._collector(
                 collectors, (key.env_rank, key.stage_id)
-            ).append_final_value(terminal.bootstrap_values)
+            ).append_final_value(env.bootstrap_values)
         self._completed_keys.add(key)
         del self._policy_steps[key]
         del self._env_results[key]
-        self._terminal_results.pop(key, None)
 
     def _collectors_for(
         self, segment: _TrajectoryStep
@@ -657,16 +605,17 @@ class TrajectoryWorker(Worker):
 
     async def _apply_event(self, data) -> None:
         """Apply one received event while holding the assembly lock."""
-        if isinstance(data, (PolicyStep, EnvStepResult, TerminalResult)):
+        if isinstance(data, (PolicyStep, EnvStepResult)):
             self._store_event(data)
-            step_ids = {source.key.step_id for source in data.sources}
-            for step_id in step_ids:
-                if step_id in self._finished_sources:
-                    await self._flush(step_id)
-            for source in data.sources:
-                epoch_key = (source.key.step_id, source.key.epoch_id)
-                if epoch_key in self._finished_epoch_sources:
+            if self.use_training_pipeline:
+                epoch_keys = {
+                    (source.key.step_id, source.key.epoch_id) for source in data.sources
+                }
+                for epoch_key in epoch_keys:
                     await self._flush_pipeline(epoch_key)
+            else:
+                for step_id in {source.key.step_id for source in data.sources}:
+                    await self._flush(step_id)
         elif isinstance(data, TrajectoryStart):
             key = data.source.key
             self._initial_results[
@@ -678,15 +627,11 @@ class TrajectoryWorker(Worker):
                 )
             ] = data.result
             self._try_complete(key)
-        elif isinstance(data, TrajectoryEnd):
-            if not self.use_training_pipeline:
-                self._finished_sources.setdefault(data.step_id, set()).add(data.source)
-                await self._flush(data.step_id)
-        elif isinstance(data, TrajectoryEpochEnd):
+            # TrajectoryStart can arrive after both halves of chunk zero.
             if self.use_training_pipeline:
-                key: SourceID = (data.step_id, data.epoch_id)
-                self._finished_epoch_sources.setdefault(key, set()).add(data.source)
-                await self._flush_pipeline(key)
+                await self._flush_pipeline((key.step_id, key.epoch_id))
+            else:
+                await self._flush(key.step_id)
         else:
             raise ValueError(f"Unexpected data type: {type(data)}")
 

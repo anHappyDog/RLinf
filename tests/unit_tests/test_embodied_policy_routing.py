@@ -20,11 +20,16 @@ import torch
 
 from rlinf.data.schema import (
     EnvOutput,
+    EnvResult,
+    PolicyCompletion,
     PolicyInput,
     PolicyOutput,
-    TerminalRequest,
+    TrajectoryKey,
+    TrajectorySource,
     merge_policy_inputs,
 )
+from rlinf.data.schema.embodied_types import EmbodiedRolloutResult
+from rlinf.scheduler.channel.trajectory_channel.data import EnvStepResult, PolicyStep
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
@@ -41,13 +46,15 @@ def test_decoupled_policy_route_round_trip():
     rollout.cfg = SimpleNamespace(env=SimpleNamespace(group_name="EnvGroup"))
     rollout.train_batch_size = 32
     rollout.rollout_queue_size = 0
-    rollout.batch_router = {"policy": ["stale"], "terminal": []}
+    rollout.batch_router = {"policy": ["stale"]}
     rollout.recv_from_and_record_batch_routes_with_timeout = AsyncMock(
         return_value=(_policy_input(), [8, 8])
     )
     rollout.send_to_recorded_batch_routes = Mock()
 
-    policy_input, split_sizes = asyncio.run(rollout._receive_policy_input(None, 0))
+    policy_input, split_sizes = asyncio.run(
+        rollout._receive_policy_input(None, "policy", 0)
+    )
     output = PolicyOutput(actions=torch.zeros(16, 4))
     rollout._send_policy_output(None, output, 0, split_sizes)
 
@@ -72,25 +79,6 @@ def test_decoupled_policy_route_round_trip():
     )
 
 
-def test_decoupled_terminal_request_does_not_record_return_route():
-    rollout = object.__new__(MultiStepRolloutWorker)
-    rollout.env_decoupled_mode = True
-    rollout.cfg = SimpleNamespace(env=SimpleNamespace(group_name="EnvGroup"))
-    rollout.train_batch_size = 32
-    rollout.rollout_queue_size = 0
-    rollout.batch_router = {"terminal": ["old"]}
-
-    async def receive(**_):
-        rollout.batch_router["terminal"].extend(["route-0", "route-1"])
-        return TerminalRequest(obs={"states": torch.zeros(16, 4)}, sources=[]), [8, 8]
-
-    rollout.recv_from_and_record_batch_routes_with_timeout = receive
-
-    asyncio.run(rollout._receive_terminal_request(None, 0))
-
-    assert rollout.batch_router["terminal"] == []
-
-
 def test_env_uses_mode_qualified_decoupled_response_tag():
     env = object.__new__(EnvWorker)
     env.cfg = SimpleNamespace(rollout=SimpleNamespace(group_name="RolloutGroup"))
@@ -111,6 +99,145 @@ def test_env_uses_mode_qualified_decoupled_response_tag():
     )
 
 
+def test_rollout_completes_each_epoch_through_policy_inputs():
+    rollout = object.__new__(MultiStepRolloutWorker)
+    rollout.n_train_chunk_steps = 2
+    rollout.num_pipeline_stages = 1
+    rollout.env_decoupled_mode = False
+    rollout.update_dagger_beta = Mock()
+    rollout._send_policy_output = Mock()
+    rollout._build_rollout_result = Mock(
+        side_effect=[
+            EmbodiedRolloutResult(
+                actions=torch.zeros(1, 1),
+                forward_inputs={"states": torch.tensor([[1]])},
+            ),
+            EmbodiedRolloutResult(
+                actions=torch.zeros(1, 1),
+                forward_inputs={"states": torch.tensor([[2]])},
+            ),
+        ]
+    )
+    key0 = TrajectoryKey(0, 0, 0, 0, 0)
+    key1 = TrajectoryKey(0, 0, 0, 0, 1)
+    completion0 = PolicyCompletion(
+        sources=[TrajectorySource(key0, 1)],
+        env_result=EnvResult(),
+        next_obs={"states": torch.tensor([[2]])},
+        requires_inference=False,
+    )
+    completion1 = PolicyCompletion(
+        sources=[TrajectorySource(key1, 1)],
+        env_result=EnvResult(),
+        next_obs={"states": torch.tensor([[3]])},
+        requires_inference=True,
+    )
+    rollout._receive_policy_input = AsyncMock(
+        side_effect=[
+            (
+                PolicyInput(
+                    obs={"states": torch.tensor([[1]])},
+                    sources=[TrajectorySource(key0, 1)],
+                    completions=[None],
+                    request_sizes=[1],
+                ),
+                None,
+            ),
+            (
+                PolicyInput(
+                    obs={"states": torch.tensor([[2]])},
+                    sources=[TrajectorySource(key1, 1)],
+                    completions=[completion0],
+                    request_sizes=[1],
+                ),
+                None,
+            ),
+            (
+                PolicyInput(
+                    obs={"states": torch.tensor([[3]])},
+                    completions=[completion1],
+                    request_sizes=[1],
+                    is_last=True,
+                ),
+                None,
+            ),
+        ]
+    )
+    rollout._predict_rollout_actions = Mock(
+        side_effect=[
+            (torch.zeros(1, 1), {"forward_inputs": {"states": torch.tensor([[1]])}}),
+            (torch.zeros(1, 1), {"forward_inputs": {"states": torch.tensor([[2]])}}),
+            (
+                torch.zeros(1, 1),
+                {
+                    "forward_inputs": {"states": torch.tensor([[3]])},
+                    "prev_values": torch.tensor([[4.0]]),
+                },
+            ),
+        ]
+    )
+    trajectory_channel = Mock()
+    generate_one_epoch = MultiStepRolloutWorker.generate_one_epoch
+    while hasattr(generate_one_epoch, "__wrapped__"):
+        generate_one_epoch = generate_one_epoch.__wrapped__
+
+    asyncio.run(
+        generate_one_epoch(
+            rollout,
+            input_channel=Mock(),
+            output_channel=Mock(),
+            trajectory_channel=trajectory_channel,
+        )
+    )
+
+    events = [call.args[0] for call in trajectory_channel.publish.call_args_list]
+    assert sum(isinstance(event, PolicyStep) for event in events) == 2
+    env_events = [event for event in events if isinstance(event, EnvStepResult)]
+    assert len(env_events) == 2
+    assert torch.equal(env_events[0].forward_inputs["states"], torch.tensor([[2]]))
+    assert torch.equal(env_events[1].bootstrap_values, torch.tensor([[4.0]]))
+    assert rollout._predict_rollout_actions.call_count == 3
+
+
+def test_decoupled_final_completion_uses_next_bootstrap():
+    env = object.__new__(EnvWorker)
+    env._trajectory_step = 0
+    env._rank = 0
+    env.stage_num = 1
+    env.train_num_envs_per_stage = 1
+    env.n_train_chunk_steps = 1
+    env.enable_online_lerobot = False
+    env.env_decoupled_mode = True
+    env._build_env_result = Mock(return_value=EnvResult())
+    env._send_policy_input = Mock()
+    env_output = EnvOutput(obs={"states": torch.zeros(1, 4)})
+
+    completion = env._publish_step(
+        rollout_channel=Mock(),
+        env_output=env_output,
+        reward_model_output=None,
+        chunk_step_data=None,
+        epoch_id=0,
+        chunk_id=0,
+        stage_id=0,
+    )
+
+    assert completion is not None
+    env._send_policy_input.assert_not_called()
+
+    env._send_train_bootstrap(
+        rollout_channel=Mock(),
+        trajectory_channel=Mock(),
+        env_outputs=[env_output],
+        step_id=1,
+        epoch_id=0,
+        completions={0: completion},
+    )
+
+    policy_input = env._send_policy_input.call_args.args[1]
+    assert policy_input.completions == [completion]
+
+
 def test_env_closes_reward_stream_with_final_chunk():
     env = object.__new__(EnvWorker)
     env.rollout_epoch = 2
@@ -121,6 +248,7 @@ def test_env_closes_reward_stream_with_final_chunk():
     env._rank = 0
     env.env_list = [SimpleNamespace()]
     env.use_training_pipeline = False
+    env.env_decoupled_mode = False
     env.cfg = SimpleNamespace(
         env=SimpleNamespace(
             train=SimpleNamespace(auto_reset=True, ignore_terminations=False)
@@ -163,18 +291,3 @@ def test_env_closes_reward_stream_with_final_chunk():
     assert [
         call.kwargs["last_run"] for call in env.get_reward_model_output.call_args_list
     ] == [False, False, False, True]
-
-
-def test_rollout_finishes_terminal_task_before_offload():
-    rollout = object.__new__(MultiStepRolloutWorker)
-    rollout.enable_offload = True
-    rollout.offload_model = Mock()
-
-    async def finish_generation():
-        rollout._terminal_task = asyncio.create_task(asyncio.Event().wait())
-        await rollout.finish_generation()
-
-    asyncio.run(finish_generation())
-
-    assert rollout._terminal_task is None
-    rollout.offload_model.assert_called_once_with()

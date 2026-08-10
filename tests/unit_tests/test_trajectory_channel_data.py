@@ -20,17 +20,15 @@ import torch
 from rlinf.data.schema.embodied_types import (
     EmbodiedRolloutResult,
     EnvResult,
+    PolicyCompletion,
     PolicyInput,
     PolicyOutput,
-    TerminalRequest,
     TrajectoryKey,
     TrajectorySource,
     merge_episode_data,
     merge_policy_inputs,
-    merge_terminal_requests,
     split_episode_data,
     split_policy_input,
-    split_terminal_request,
 )
 
 
@@ -114,15 +112,31 @@ def test_online_lerobot_payload_survives_source_routing():
     )
 
 
-def test_terminal_request_split_merge_preserves_offsets():
-    key = TrajectoryKey(1, 2, 3, 0, 4)
-    request = TerminalRequest(
+def test_policy_completion_split_merge_preserves_offsets():
+    current_key = TrajectoryKey(1, 2, 3, 0, 4)
+    previous_key = TrajectoryKey(1, 2, 3, 0, 3)
+    policy_input = PolicyInput(
         obs={"states": torch.arange(12).reshape(4, 3)},
-        sources=[TrajectorySource(key, 4)],
+        sources=[TrajectorySource(current_key, 4)],
+        completions=[
+            PolicyCompletion(
+                sources=[TrajectorySource(previous_key, 4)],
+                env_result=EnvResult(rewards=torch.arange(4).reshape(4, 1)),
+                next_obs={"states": torch.arange(12).reshape(4, 3)},
+                requires_inference=False,
+            )
+        ],
     )
 
-    shards = split_terminal_request(request, [1, 3])
-    merged = merge_terminal_requests(shards)
+    shards = split_policy_input(policy_input, [1, 3])
+    merged = merge_policy_inputs(shards)
 
-    assert shards[1].sources == [TrajectorySource(key, 3, offset=1)]
-    assert torch.equal(merged.obs["states"], request.obs["states"])
+    assert shards[1].sources == [TrajectorySource(current_key, 3, offset=1)]
+    assert shards[1].completions[0].sources == [
+        TrajectorySource(previous_key, 3, offset=1)
+    ]
+    assert merged.request_sizes == [1, 3]
+    assert torch.equal(
+        merged.completions[1].next_obs["states"],
+        torch.arange(12).reshape(4, 3)[1:],
+    )

@@ -31,19 +31,19 @@ from rlinf.algorithms.rlt import (
 from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import (
     EmbodiedRolloutResult,
+    PolicyCompletion,
     PolicyInput,
     PolicyOutput,
-    TerminalRequest,
     merge_policy_inputs,
-    merge_terminal_requests,
+    split_batch_value,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.scheduler.channel.trajectory_channel.data import (
+    EnvStepResult,
     PolicyStep,
-    TerminalResult,
 )
 from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
     TrajectoryChannel,
@@ -148,11 +148,9 @@ class MultiStepRolloutWorker(Worker):
             # The batch_router is a dictionary that maps the tag to the list of batch_index.
             self.batch_router = {
                 "policy": [],
-                "terminal": [],
                 "rollout_results": [],
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
-        self._terminal_task: asyncio.Task | None = None
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
@@ -668,14 +666,10 @@ class MultiStepRolloutWorker(Worker):
         """Infer the batch size of a routed policy input."""
         return cls._infer_env_batch_size(policy_input.obs)
 
-    @classmethod
-    def _infer_terminal_batch_size(cls, request: TerminalRequest) -> int:
-        """Infer the batch size of a terminal request."""
-        return cls._infer_env_batch_size(request.obs)
-
     async def _receive_policy_input(
         self,
         channel: Channel,
+        tag: str,
         stage_id: int,
     ) -> tuple[PolicyInput, list[int] | None]:
         if self.env_decoupled_mode:
@@ -685,7 +679,7 @@ class MultiStepRolloutWorker(Worker):
             ) = await self.recv_from_and_record_batch_routes_with_timeout(
                 group_name=self.cfg.env.group_name,
                 channel=channel,
-                tag="policy",
+                tag=tag,
                 batch_size=self.train_batch_size,
                 merge_fn=merge_policy_inputs,
                 infer_batch_size_fn=self._infer_policy_input_batch_size,
@@ -696,7 +690,7 @@ class MultiStepRolloutWorker(Worker):
         policy_input = await self.recv_from(
             group_name=self.cfg.env.group_name,
             channel=channel,
-            tag="train_policy",
+            tag=f"train_{tag}",
             route_key=stage_id,
             async_op=True,
             batch_size=self.train_batch_size,
@@ -705,52 +699,30 @@ class MultiStepRolloutWorker(Worker):
         ).async_wait()
         return policy_input, None
 
-    async def _receive_terminal_request(
-        self, channel: Channel, stage_id: int
-    ) -> TerminalRequest:
-        if self.env_decoupled_mode:
-            request, _ = await self.recv_from_and_record_batch_routes_with_timeout(
-                group_name=self.cfg.env.group_name,
-                channel=channel,
-                tag="terminal",
-                batch_size=self.train_batch_size,
-                merge_fn=merge_terminal_requests,
-                infer_batch_size_fn=self._infer_terminal_batch_size,
-                timeout_time=0.02,
-                recv_queue_size=self.rollout_queue_size,
-            )
-            self.batch_router["terminal"].clear()
-            return request
-        return await self.recv_from(
-            group_name=self.cfg.env.group_name,
-            channel=channel,
-            tag="train_terminal",
-            route_key=stage_id,
-            async_op=True,
-            batch_size=self.train_batch_size,
-            merge_fn=merge_terminal_requests,
-            infer_batch_size_fn=self._infer_terminal_batch_size,
-        ).async_wait()
-
-    async def _process_terminal_requests(
-        self, input_channel: Channel, trajectory_channel: TrajectoryChannel
+    def _publish_completion(
+        self,
+        completion: PolicyCompletion,
+        forward_inputs: dict[str, Any] | None,
+        trajectory_channel: TrajectoryChannel,
     ) -> None:
-        stage_id = 0
-        while True:
-            request = await self._receive_terminal_request(input_channel, stage_id)
-            _, result = self._predict_rollout_actions(request.obs)
+        bootstrap_values = None
+        if completion.requires_inference:
+            _, result = self._predict_rollout_actions(completion.next_obs)
             values = result.get("prev_values")
-            trajectory_channel.publish(
-                TerminalResult(
-                    sources=request.sources,
-                    obs=request.obs,
-                    bootstrap_values=(
-                        values[:, :1].cpu().contiguous() if values is not None else None
-                    ),
-                    forward_inputs=result.get("forward_inputs"),
-                )
+            bootstrap_values = (
+                values[:, :1].cpu().contiguous() if values is not None else None
             )
-            stage_id = (stage_id + 1) % self.num_pipeline_stages
+            forward_inputs = result.get("forward_inputs")
+        trajectory_channel.publish(
+            EnvStepResult(
+                sources=completion.sources,
+                result=completion.env_result,
+                next_obs=completion.next_obs,
+                forward_inputs=forward_inputs,
+                bootstrap_values=bootstrap_values,
+            ),
+            async_op=True,
+        )
 
     def _send_policy_output(
         self,
@@ -793,19 +765,14 @@ class MultiStepRolloutWorker(Worker):
         for _ in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
                 policy_input, split_sizes = await self._receive_policy_input(
-                    input_channel, stage_id
+                    input_channel, "policy", stage_id
                 )
+                if policy_input.is_last:
+                    raise ValueError("Received a final input in the policy stream.")
                 actions, result = self._predict_rollout_actions(
                     policy_input.obs,
                     rlt_switch_flags=policy_input.rlt_switch_flags,
                     intervene_requested=policy_input.intervene_flags,
-                )
-                trajectory_channel.publish(
-                    PolicyStep(
-                        sources=policy_input.sources,
-                        obs=policy_input.obs,
-                        rollout_result=self._build_rollout_result(actions, result),
-                    )
                 )
                 self._send_policy_output(
                     output_channel,
@@ -813,6 +780,37 @@ class MultiStepRolloutWorker(Worker):
                     stage_id,
                     split_sizes,
                 )
+                trajectory_channel.publish(
+                    PolicyStep(
+                        sources=policy_input.sources,
+                        obs=policy_input.obs,
+                        rollout_result=self._build_rollout_result(actions, result),
+                    ),
+                    async_op=True,
+                )
+                forward_inputs = split_batch_value(
+                    result.get("forward_inputs"), policy_input.request_sizes
+                )
+                for completion, next_inputs in zip(
+                    policy_input.completions, forward_inputs
+                ):
+                    if completion is not None:
+                        self._publish_completion(
+                            completion, next_inputs, trajectory_channel
+                        )
+
+        if self.env_decoupled_mode:
+            return
+
+        for stage_id in range(self.num_pipeline_stages):
+            policy_input, _ = await self._receive_policy_input(
+                input_channel, "policy_final", stage_id
+            )
+            if not policy_input.is_last:
+                raise ValueError("Expected a final policy input at epoch end.")
+            for completion in policy_input.completions:
+                if completion is not None:
+                    self._publish_completion(completion, None, trajectory_channel)
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -824,11 +822,6 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.reload_model()
 
-        if self._terminal_task is None or self._terminal_task.done():
-            self._terminal_task = asyncio.create_task(
-                self._process_terminal_requests(input_channel, trajectory_channel)
-            )
-
         for _ in tqdm(
             range(self.rollout_epoch),
             desc="Generating Rollout Epochs",
@@ -839,16 +832,6 @@ class MultiStepRolloutWorker(Worker):
                 output_channel,
                 trajectory_channel,
             )
-
-    async def finish_generation(self) -> None:
-        """Finish terminal processing and release the rollout model."""
-        if self._terminal_task is not None:
-            self._terminal_task.cancel()
-            try:
-                await self._terminal_task
-            except asyncio.CancelledError:
-                pass
-            self._terminal_task = None
         if self.enable_offload:
             self.offload_model()
 

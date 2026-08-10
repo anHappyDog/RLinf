@@ -40,11 +40,21 @@ class PolicyStep:
 
 @dataclass(kw_only=True)
 class EnvStepResult:
-    """Environment outcome for policy actions identified by ``sources``."""
+    """Completed environment outcome for policy actions."""
 
     sources: list[TrajectorySource]
     result: EnvResult
-    needs_terminal: bool = False
+    next_obs: dict[str, Any]
+    forward_inputs: dict[str, Any] | None
+    bootstrap_values: torch.Tensor | None
+
+    def __post_init__(self) -> None:
+        """Move model-derived completion data to CPU for transport."""
+        self.next_obs = put_tensor_device(self.next_obs, "cpu")
+        if self.forward_inputs is not None:
+            self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
+        if self.bootstrap_values is not None:
+            self.bootstrap_values = self.bootstrap_values.cpu().contiguous()
 
 
 @dataclass(kw_only=True)
@@ -55,46 +65,4 @@ class TrajectoryStart:
     result: EnvResult
 
 
-@dataclass(kw_only=True)
-class TerminalResult:
-    """Policy-side processing result for terminal or final observations."""
-
-    sources: list[TrajectorySource]
-    obs: dict[str, Any]
-    bootstrap_values: torch.Tensor | None
-    forward_inputs: dict[str, Any] | None
-
-    def __post_init__(self) -> None:
-        """Move terminal payloads to CPU for transport."""
-        self.obs = put_tensor_device(self.obs, "cpu")
-        if self.bootstrap_values is not None:
-            self.bootstrap_values = self.bootstrap_values.cpu().contiguous()
-        if self.forward_inputs is not None:
-            self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
-
-
-@dataclass(kw_only=True, frozen=True)
-class TrajectoryEnd:
-    """Signal that one producer has finished a training step."""
-
-    step_id: int
-    source: tuple[int, int]
-
-
-@dataclass(kw_only=True, frozen=True)
-class TrajectoryEpochEnd:
-    """Signal that one environment source has finished a pipeline epoch."""
-
-    step_id: int
-    epoch_id: int
-    source: tuple[int, int]
-
-
-TrajectoryData: TypeAlias = (
-    PolicyStep
-    | TrajectoryStart
-    | EnvStepResult
-    | TerminalResult
-    | TrajectoryEnd
-    | TrajectoryEpochEnd
-)
+TrajectoryData: TypeAlias = PolicyStep | TrajectoryStart | EnvStepResult

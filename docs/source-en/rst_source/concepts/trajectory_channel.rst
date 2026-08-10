@@ -51,21 +51,25 @@ payloads to the policy-response path.
        |     PolicyOutput       |                       |                    |
        |<-----------------------|                       |                    |
        | simulate action        |                       |                    |
-       | EnvStepResult          |                       |                    |
-       |----------------------------------------------->| join by key        |
-       | TerminalRequest*       |                       |                    |
-       |----------------------->| TerminalResult*       |                    |
+       | PolicyInput + completion                      |                    |
+       |----------------------->| EnvStepResult         |                    |
        |                        |---------------------->| append when ready  |
        |          ... repeat for each action chunk ... |                    |
-       | TrajectoryEnd          |                       |                    |
-       |----------------------------------------------->| flush completed    |
+       | PolicyInput + final completion                |                    |
+       |----------------------->| EnvStepResult         |                    |
+       |                        |---------------------->| append final chunk |
+       |                        |                       | infer completion   |
+       |                        |                       | from received keys |
        |                        |                       | trajectory / batch |
        |                        |                       |------------------->|
 
-``*`` marks terminal processing, which runs only for a terminal state or the
-last action chunk. The rollout worker may receive either request from any
-environment rank in decoupled mode. It does not keep cross-request trajectory
-state.
+Each policy input may carry a ``PolicyCompletion`` for the preceding action.
+The rollout worker uses the current inference inputs for an ordinary transition
+or performs terminal inference when required, then publishes one complete
+``EnvStepResult``. With static routing, a final policy input completes the last
+action without generating another action. In decoupled mode, that completion is
+carried by the next trajectory's bootstrap policy input. The rollout worker keeps
+no cross-request trajectory state.
 
 Events and Results
 ------------------
@@ -84,16 +88,16 @@ Events and Results
      - Observation, action, log-probability, value, version, and model forward
        inputs produced by rollout inference.
    * - ``EnvStepResult``
-     - Reward, done flags, interventions, reward-model output, and optional
-       online LeRobot episode data produced by the environment.
-   * - ``TerminalResult``
-     - Terminal observation, bootstrap value, and terminal model inputs produced
-       from a ``TerminalRequest``.
-   * - ``TrajectoryEpochEnd``
-     - One logical environment source finished an epoch.
-   * - ``TrajectoryEnd``
-     - One logical environment source finished a training step. The worker
-       flushes only after every expected action key is complete.
+     - Environment outcome carried by ``PolicyCompletion``, together with the
+       next observation, bootstrap value, and next model inputs completed by the
+       rollout worker.
+
+The trajectory worker derives completion from ``TrajectoryKey`` values instead
+of receiving separate epoch-end or trajectory-end events. In pipeline mode it
+flushes an epoch after receiving ``source_count * chunk_count`` completed keys
+for one ``(step_id, epoch_id)``. Otherwise, it flushes a training step after
+receiving ``source_count * rollout_epoch * chunk_count`` completed keys for one
+``step_id``.
 
 For ordinary training, ``subscribe()`` returns a complete ``Trajectory``. For
 online LeRobot DAgger it returns completed episode dictionaries. With training
@@ -110,11 +114,13 @@ batch across several rollout workers or merge unrelated sources. The trajectory
 worker restores the original batch by offset before joining events with the same
 key.
 
-In decoupled mode, ``PolicyInput`` and ``TerminalRequest`` use separate ordinary
-Channel tags. Either request may reach any available rollout worker. Only policy
-requests record a return route because only actions return to the environment.
-The trajectory worker, rather than rollout-worker affinity or a terminal
-barrier, determines when an action chunk is complete.
+In decoupled mode, policy inputs may reach any available rollout worker. The
+completion for the preceding action travels in the same request, so rollout
+workers do not rely on affinity or local pending state. Ordinary policy requests
+record a return route for actions. At a trajectory boundary, the last completion
+is attached to the next bootstrap request, which both completes the previous key
+and requests the first action for the next key. The trajectory worker joins
+``PolicyStep`` and the completed ``EnvStepResult`` by key.
 
 Completed data is split according to the actor world size. This has two useful
 properties:
@@ -205,8 +211,8 @@ or placement settings:
      - Inspect the ordinary Env-to-Rollout ``Channel`` path; no trajectory event
        has been produced yet.
    * - Actor waits after rollout completes
-     - Confirm Env published ``EnvStepResult`` for every key and Rollout published
-       the matching ``PolicyStep`` and required ``TerminalResult``.
+     - Confirm Env sent a ``PolicyCompletion`` for every key and Rollout published
+       the matching ``PolicyStep`` and completed ``EnvStepResult``.
    * - Pipeline actor waits
      - Confirm the actor subscribes with ``actor:<rank>`` and that the configured
        batch size is divisible by ``actor.micro_batch_size``.

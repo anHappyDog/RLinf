@@ -47,20 +47,24 @@ Environment 和 Rollout 通过普通 :doc:`Channel <channel>` 交换推理请求
        |     PolicyOutput       |                       |                    |
        |<-----------------------|                       |                    |
        | simulate action        |                       |                    |
-       | EnvStepResult          |                       |                    |
-       |----------------------------------------------->| join by key        |
-       | TerminalRequest*       |                       |                    |
-       |----------------------->| TerminalResult*       |                    |
+       | PolicyInput + completion                      |                    |
+       |----------------------->| EnvStepResult         |                    |
        |                        |---------------------->| append when ready  |
        |          ... repeat for each action chunk ... |                    |
-       | TrajectoryEnd          |                       |                    |
-       |----------------------------------------------->| flush completed    |
+       | PolicyInput + final completion                |                    |
+       |----------------------->| EnvStepResult         |                    |
+       |                        |---------------------->| append final chunk |
+       |                        |                       | infer completion   |
+       |                        |                       | from received keys |
        |                        |                       | trajectory / batch |
        |                        |                       |------------------->|
 
-``*`` 表示 terminal 处理，仅在出现 terminal state 或最后一个 action chunk 时执行。
-Decoupled mode 下，RolloutWorker 可以从任意 environment rank 接收这两种请求，且不保存
-跨请求的 trajectory 状态。
+每个 policy input 都可以携带上一个 action 的 ``PolicyCompletion``。普通 transition
+直接复用当前推理的 model input；需要 terminal 处理时，RolloutWorker 会额外执行一次
+terminal inference，然后发布完整的 ``EnvStepResult``。静态路由使用 final policy
+input 完成最后一个 action，且不再生成新 action；decoupled mode 则由下一条 trajectory
+的 bootstrap policy input 携带该 completion。RolloutWorker 不保存跨请求的
+trajectory 状态。
 
 事件与结果
 ----------
@@ -79,16 +83,14 @@ Decoupled mode 下，RolloutWorker 可以从任意 environment rank 接收这两
      - Rollout 推理产生的 observation、action、log-probability、value、version 和
        model forward input。
    * - ``EnvStepResult``
-     - Environment 产生的 reward、done flag、intervention、reward-model output，
-       以及可选的 online LeRobot episode data。
-   * - ``TerminalResult``
-     - 根据 ``TerminalRequest`` 产生的 terminal observation、bootstrap value 和
-       terminal model input。
-   * - ``TrajectoryEpochEnd``
-     - 一个逻辑 environment source 已完成一个 epoch。
-   * - ``TrajectoryEnd``
-     - 一个逻辑 environment source 已完成一个训练 step。只有全部预期 action key
-       都完整后，worker 才会 flush 数据。
+     - ``PolicyCompletion`` 携带的 environment outcome，以及 RolloutWorker 补齐的
+       next observation、bootstrap value 和 next model input。
+
+TrajectoryWorker 根据 ``TrajectoryKey`` 自行推导完成状态，不再接收单独的 epoch-end
+或 trajectory-end 事件。Pipeline 模式下，同一 ``(step_id, epoch_id)`` 收齐
+``source_count * chunk_count`` 个完整 key 后 flush 一个 epoch；其他模式下，同一
+``step_id`` 收齐 ``source_count * rollout_epoch * chunk_count`` 个完整 key 后 flush
+一个训练 step。
 
 普通训练中，``subscribe()`` 返回完整 ``Trajectory``。Online LeRobot DAgger
 中，它返回已完成的 episode 字典。启用 training pipeline 后，Actor 从
@@ -103,10 +105,12 @@ size 与 offset。Channel 路由可以将一个 environment batch 拆给多个 R
 也可以合并无关 source。TrajectoryWorker 先按 offset 恢复原始 batch，再合并具有相同
 key 的事件。
 
-Decoupled mode 下，``PolicyInput`` 和 ``TerminalRequest`` 使用不同的普通 Channel
-tag。任一请求都可以交给任意空闲 RolloutWorker。只有 policy request 需要记录返回
-路由，因为只有 action 需要返回 Environment。action chunk 是否完整由
-TrajectoryWorker 判断，不依赖 RolloutWorker affinity 或 terminal barrier。
+Decoupled mode 下，policy input 可以交给任意空闲 RolloutWorker。上一个 action 的
+completion 与下一个请求一起传递，因此不依赖 RolloutWorker affinity 或本地 pending
+状态。普通 policy request 会记录 action 的返回路由。在 trajectory 边界，最后一个
+completion 会挂到下一条 bootstrap request：它既补全上一个 key，也请求下一个 key
+的第一个 action。TrajectoryWorker 按 key 合并 ``PolicyStep`` 和完整的
+``EnvStepResult``。
 
 完成的数据按照 actor world size 分片。这带来两个性质：
 
@@ -190,8 +194,8 @@ Training pipeline 当前不支持 online LeRobot 数据或 decoupled environment
      - 检查普通 Env 到 Rollout 的 ``Channel`` 通路；此时还没有产生 trajectory
        事件。
    * - Rollout 完成后 Actor 仍等待
-     - 确认 Env 为每个 key 发布了 ``EnvStepResult``，Rollout 发布了匹配的
-       ``PolicyStep`` 和所需的 ``TerminalResult``。
+     - 确认 Env 为每个 key 发送了 ``PolicyCompletion``，Rollout 发布了匹配的
+       ``PolicyStep`` 和完整的 ``EnvStepResult``。
    * - Pipeline Actor 等待
      - 确认 Actor 使用 ``actor:<rank>`` 订阅，并且配置的 batch size 可以被
        ``actor.micro_batch_size`` 整除。

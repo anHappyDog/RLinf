@@ -14,6 +14,7 @@
 
 import asyncio
 from collections import defaultdict
+from unittest.mock import AsyncMock, Mock
 
 import torch
 from omegaconf import OmegaConf
@@ -30,7 +31,7 @@ from rlinf.data.schema.embodied_types import (
 from rlinf.scheduler.channel.trajectory_channel.data import (
     EnvStepResult,
     PolicyStep,
-    TerminalResult,
+    TrajectoryStart,
 )
 from rlinf.scheduler.channel.trajectory_channel.trajectory_worker import (
     TrajectoryWorker,
@@ -65,9 +66,8 @@ def test_bootstrap_reward_uses_worker_config():
     assert torch.equal(worker._rewards(segment), torch.tensor([[3.0]]))
 
 
-def test_flush_waits_for_every_producer():
+def test_flush_waits_for_expected_key_count():
     worker = object.__new__(TrajectoryWorker)
-    worker._finished_sources = {3: {(0, 0)}}
     worker._completed_keys = set()
     worker.source_count = 2
     worker.chunk_count = 1
@@ -75,7 +75,7 @@ def test_flush_waits_for_every_producer():
 
     asyncio.run(worker._flush(3))
 
-    assert worker._finished_sources == {3: {(0, 0)}}
+    assert worker._completed_keys == set()
 
 
 def test_online_lerobot_flush_emits_one_item_per_shard():
@@ -88,7 +88,6 @@ def test_online_lerobot_flush_emits_one_item_per_shard():
             action_dim=1,
         )
     }
-    worker._finished_sources = {3: {(0, 0)}}
     worker._output_queues = defaultdict(asyncio.Queue)
     worker.enable_online_lerobot = True
     worker.source_count = 1
@@ -100,7 +99,7 @@ def test_online_lerobot_flush_emits_one_item_per_shard():
     asyncio.run(worker._flush(3))
 
     assert worker._output_queues["default"].qsize() == 2
-    assert 3 not in worker._finished_sources
+    assert worker._completed_keys == set()
 
 
 def test_pipeline_flush_routes_micro_batches_and_cleans_epoch_state():
@@ -124,7 +123,6 @@ def test_pipeline_flush_routes_micro_batches_and_cleans_epoch_state():
     )
     worker._placement = _Placement()
     worker._pipeline_collectors = {key: {(0, 0): _Collector()}}
-    worker._finished_epoch_sources = {key: {(0, 0)}}
     worker._output_queues = defaultdict(asyncio.Queue)
     worker.source_count = 1
     worker.chunk_count = 1
@@ -136,7 +134,28 @@ def test_pipeline_flush_routes_micro_batches_and_cleans_epoch_state():
 
     assert worker._output_queues["actor:0"].qsize() == 1
     assert key not in worker._pipeline_collectors
-    assert key not in worker._finished_epoch_sources
+    assert worker._completed_keys == set()
+
+
+def test_late_trajectory_start_rechecks_flush():
+    worker = object.__new__(TrajectoryWorker)
+    worker.use_training_pipeline = False
+    worker._initial_results = {}
+    worker._try_complete = Mock()
+    worker._flush = AsyncMock()
+    key = TrajectoryKey(2, 1, 0, 0, 0)
+
+    asyncio.run(
+        worker._apply_event(
+            TrajectoryStart(
+                source=TrajectorySource(key, 1),
+                result=EnvResult(),
+            )
+        )
+    )
+
+    worker._try_complete.assert_called_once_with(key)
+    worker._flush.assert_awaited_once_with(2)
 
 
 def test_source_fragments_join_across_rollout_workers():
@@ -149,7 +168,6 @@ def test_source_fragments_join_across_rollout_workers():
     worker._fragments = defaultdict(list)
     worker._policy_steps = {}
     worker._env_results = {}
-    worker._terminal_results = {}
     worker._completed_keys = set()
     worker._initial_results = {}
     worker.enable_online_lerobot = False
@@ -182,6 +200,9 @@ def test_source_fragments_join_across_rollout_workers():
         EnvStepResult(
             sources=[TrajectorySource(key0, 2)],
             result=EnvResult(rewards=torch.ones(2, 1)),
+            next_obs={"states": torch.tensor([[20], [21]])},
+            forward_inputs={"states": torch.tensor([[20], [21]])},
+            bootstrap_values=None,
         )
     )
     worker._store_event(policy_fragment(key1, 0, 20))
@@ -192,7 +213,7 @@ def test_source_fragments_join_across_rollout_workers():
     assert torch.equal(captured[0][1].next_obs["states"], torch.tensor([[20], [21]]))
 
 
-def test_terminal_result_completes_final_transition():
+def test_env_result_completes_final_transition():
     worker = object.__new__(TrajectoryWorker)
     worker._cfg = OmegaConf.create(
         {"env": {"train": {"total_num_envs": 1, "auto_reset": True}}}
@@ -202,7 +223,6 @@ def test_terminal_result_completes_final_transition():
     worker._fragments = defaultdict(list)
     worker._policy_steps = {}
     worker._env_results = {}
-    worker._terminal_results = {}
     worker._completed_keys = set()
     worker._initial_results = {(0, 0, 0, 0): EnvResult()}
     worker.enable_online_lerobot = False
@@ -226,12 +246,10 @@ def test_terminal_result_completes_final_transition():
         )
     )
     worker._store_event(
-        EnvStepResult(sources=[source], result=EnvResult(), needs_terminal=True)
-    )
-    worker._store_event(
-        TerminalResult(
+        EnvStepResult(
             sources=[source],
-            obs={"states": torch.tensor([[3]])},
+            result=EnvResult(),
+            next_obs={"states": torch.tensor([[3]])},
             bootstrap_values=torch.tensor([[4.0]]),
             forward_inputs={"states": torch.tensor([[3]])},
         )
@@ -244,7 +262,7 @@ def test_terminal_result_completes_final_transition():
     )
 
 
-def test_online_lerobot_step_does_not_wait_for_terminal_result():
+def test_online_lerobot_step_uses_completed_env_result():
     worker = object.__new__(TrajectoryWorker)
     worker._cfg = OmegaConf.create(
         {"env": {"train": {"total_num_envs": 1, "auto_reset": True}}}
@@ -254,7 +272,6 @@ def test_online_lerobot_step_does_not_wait_for_terminal_result():
     worker._fragments = defaultdict(list)
     worker._policy_steps = {}
     worker._env_results = {}
-    worker._terminal_results = {}
     worker._completed_keys = set()
     worker._initial_results = {(0, 0, 0, 0): EnvResult()}
     worker.enable_online_lerobot = True
@@ -289,6 +306,9 @@ def test_online_lerobot_step_does_not_wait_for_terminal_result():
                     "infos_list": [{}],
                 }
             ),
+            next_obs={},
+            forward_inputs=None,
+            bootstrap_values=None,
         )
     )
 

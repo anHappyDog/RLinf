@@ -69,10 +69,6 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         trajectory_channel: TrajectoryChannel,
         metric_channel: Channel,
     ):
-        if self._terminal_task is None or self._terminal_task.done():
-            self._terminal_task = asyncio.create_task(
-                self._process_terminal_requests(input_channel, trajectory_channel)
-            )
         while True:
             if self._background_weight_sync_active:
                 await self._poll_background_weight_sync()

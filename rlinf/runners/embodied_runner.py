@@ -121,24 +121,23 @@ class EmbodiedRunner:
         )
 
         # Async logging setup
-        self.stop_logging = False
         self.log_queue = queue.Queue()
         self.log_thread = threading.Thread(target=self._log_worker, daemon=True)
         self.log_thread.start()
 
     def _log_worker(self):
         """Background thread for processing log messages."""
-        while not self.stop_logging:
+        while True:
+            task = self.log_queue.get()
             try:
-                # Wait for log message with timeout
-                log_func, args = self.log_queue.get(timeout=0.1)
+                if task is None:
+                    return
+                log_func, args = task
                 log_func(*args)
+            except Exception:
+                self.logger.exception("Logging callback failed.")
+            finally:
                 self.log_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"Logging error: {e}")
-                continue
 
     def print_metrics_table_async(
         self,
@@ -454,9 +453,8 @@ class EmbodiedRunner:
     def _finish_run(self) -> None:
         self.metric_logger.finish()
 
-        # Stop logging thread
-        self.stop_logging = True
-        self.log_queue.join()  # Wait for all queued logs to be processed
+        self.log_queue.put(None)
+        self.log_queue.join()
         self.log_thread.join(timeout=1.0)
 
     def _should_profile_step(self, step_idx: int) -> bool:
@@ -524,7 +522,6 @@ class EmbodiedRunner:
                         input_channel=self.actor_channel
                     ).wait()
                     rollout_handle.wait()
-                    self.rollout.finish_generation().wait()
                     if self.reward is not None:
                         reward_handle.wait()
 
@@ -624,7 +621,6 @@ class EmbodiedRunner:
                     )
 
                 actor_results = actor_training_handle.wait()
-                self.rollout.finish_generation().wait()
                 actor_rollout_metrics, actor_training_metrics = (
                     self._split_pipeline_actor_results(actor_results)
                 )
