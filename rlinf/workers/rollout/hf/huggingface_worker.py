@@ -840,6 +840,18 @@ class MultiStepRolloutWorker(Worker):
                 trajectory_channel,
             )
 
+    async def finish_generation(self) -> None:
+        """Finish terminal processing and release the rollout model."""
+        if self._terminal_task is not None:
+            self._terminal_task.cancel()
+            try:
+                await self._terminal_task
+            except asyncio.CancelledError:
+                pass
+            self._terminal_task = None
+        if self.enable_offload:
+            self.offload_model()
+
     @Worker.timer("evaluate")
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:

@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, Mock
 import torch
 
 from rlinf.data.schema import (
+    EnvOutput,
     PolicyInput,
     PolicyOutput,
     TerminalRequest,
@@ -108,3 +109,72 @@ def test_env_uses_mode_qualified_decoupled_response_tag():
         infer_batch_size_fn=env._infer_policy_output_batch_size,
         decoupled_mode=True,
     )
+
+
+def test_env_closes_reward_stream_with_final_chunk():
+    env = object.__new__(EnvWorker)
+    env.rollout_epoch = 2
+    env.stage_num = 1
+    env.n_train_chunk_steps = 2
+    env._prefetched_train_bootstrap = None
+    env._trajectory_step = 0
+    env._rank = 0
+    env.env_list = [SimpleNamespace()]
+    env.use_training_pipeline = False
+    env.cfg = SimpleNamespace(
+        env=SimpleNamespace(
+            train=SimpleNamespace(auto_reset=True, ignore_terminations=False)
+        )
+    )
+    env._bootstrap_and_send_train = Mock(
+        return_value=[EnvOutput(obs={"states": torch.zeros(1, 4)})]
+    )
+    env._maybe_wait_env_delay = AsyncMock()
+    env._recv_policy_output = Mock(return_value=PolicyOutput(actions=torch.zeros(1, 4)))
+    env.env_interact_step = Mock(
+        return_value=(
+            EnvOutput(
+                obs={"states": torch.zeros(1, 4)},
+                rewards=torch.zeros(1, 1),
+            ),
+            {},
+            {},
+        )
+    )
+    env.get_reward_model_output = Mock(return_value=torch.zeros(1, 1))
+    env._publish_step = Mock()
+    env.record_env_metrics = Mock()
+    env.store_last_obs_and_intervened_info = Mock()
+    env.finish_rollout = Mock()
+    trajectory_channel = Mock()
+
+    asyncio.run(
+        EnvWorker._run_interact_once.__wrapped__(
+            env,
+            input_channel=Mock(),
+            rollout_channel=Mock(),
+            reward_channel=Mock(),
+            trajectory_channel=trajectory_channel,
+            cooperative_yield=False,
+        )
+    )
+
+    assert env.get_reward_model_output.call_count == 4
+    assert [
+        call.kwargs["last_run"] for call in env.get_reward_model_output.call_args_list
+    ] == [False, False, False, True]
+
+
+def test_rollout_finishes_terminal_task_before_offload():
+    rollout = object.__new__(MultiStepRolloutWorker)
+    rollout.enable_offload = True
+    rollout.offload_model = Mock()
+
+    async def finish_generation():
+        rollout._terminal_task = asyncio.create_task(asyncio.Event().wait())
+        await rollout.finish_generation()
+
+    asyncio.run(finish_generation())
+
+    assert rollout._terminal_task is None
+    rollout.offload_model.assert_called_once_with()

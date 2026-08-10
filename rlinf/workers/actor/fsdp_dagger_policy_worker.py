@@ -29,6 +29,9 @@ from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
+from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
+    TrajectoryChannel,
+)
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import append_to_dict, compute_split_num
@@ -305,33 +308,37 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         if intervene_traj_list:
             self.replay_buffer.add_trajectories(intervene_traj_list)
 
-    async def _recv_lerobot_episodes_from_channel(self, input_channel) -> bool:
+    async def _recv_lerobot_episodes_from_channel(
+        self, input_channel: TrajectoryChannel
+    ) -> None:
         """Receive up to one actor-side split from the shared Actor channel.
 
-        Each rank pulls at most ``split_num`` messages per call so multi-actor
-        recv stays balanced like the buffer trajectory path. ``get_nowait`` is
-        used because env ranks with no completed episodes send nothing.
+        Each rank pulls exactly ``split_num`` messages per call so multi-actor
+        receive counts stay balanced like the buffer trajectory path. The
+        trajectory worker emits empty episode shards when a source has no
+        completed episodes, so these receives preserve the fixed quota without
+        adding empty episodes to the dataset.
         """
         send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(send_num, recv_num)
-        received_any = False
         for _ in range(split_num):
             episodes: list[list[dict]] = await input_channel.subscribe(
                 async_op=True
             ).async_wait()
-            received_any = True
             for ep_frames in episodes:
                 if ep_frames:
                     self._append_lerobot_episode(ep_frames)
-        return received_any
 
-    async def recv_lerobot_rollout_trajectories(self, input_channel) -> None:
+    async def recv_lerobot_rollout_trajectories(
+        self, input_channel: TrajectoryChannel
+    ) -> None:
         """Receive episodes from EnvWorker and append them to the memory dataset.
 
         EnvWorkers collect completed episodes via ``EmbodiedLerobotTrajectoryBuilder``
-        and send them here each interact round. Empty batches are not sent by env;
-        if the dataset is still below ``min_frames``, training is skipped later.
+        and the trajectory worker sends one shard per expected actor receive each
+        interact round. A shard may be empty when no episode completes; if the
+        dataset is still below ``min_frames``, training is skipped later.
         """
         await self._recv_lerobot_episodes_from_channel(input_channel)
         if self.dataset.is_ready():

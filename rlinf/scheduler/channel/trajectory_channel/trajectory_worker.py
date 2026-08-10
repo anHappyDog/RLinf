@@ -626,11 +626,18 @@ class TrajectoryWorker(Worker):
             collector.mark_last_step_with_intervene_flags(result.intervene_flags)
         if self.enable_rlt:
             from rlinf.algorithms.rlt.transition import (
+                apply_rlt_interventions,
                 extract_rlt_obs_from_forward_inputs,
             )
 
+            current_obs = extract_rlt_obs_from_forward_inputs(result.forward_inputs)
+            apply_rlt_interventions(
+                current_obs,
+                env_result.intervene_actions,
+                env_result.intervene_flags,
+            )
             collector.append_transitions(
-                extract_rlt_obs_from_forward_inputs(result.forward_inputs),
+                current_obs,
                 extract_rlt_obs_from_forward_inputs(
                     segment.forward_inputs, transition=True
                 ),

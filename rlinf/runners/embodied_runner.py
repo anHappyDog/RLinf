@@ -524,6 +524,7 @@ class EmbodiedRunner:
                         input_channel=self.actor_channel
                     ).wait()
                     rollout_handle.wait()
+                    self.rollout.finish_generation().wait()
                     if self.reward is not None:
                         reward_handle.wait()
 
@@ -623,6 +624,7 @@ class EmbodiedRunner:
                     )
 
                 actor_results = actor_training_handle.wait()
+                self.rollout.finish_generation().wait()
                 actor_rollout_metrics, actor_training_metrics = (
                     self._split_pipeline_actor_results(actor_results)
                 )

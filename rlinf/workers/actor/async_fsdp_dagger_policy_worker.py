@@ -15,7 +15,6 @@
 import asyncio
 import queue
 import threading
-import time
 
 import torch
 
@@ -62,12 +61,14 @@ class AsyncEmbodiedDAGGERFSDPPolicy(EmbodiedDAGGERFSDPPolicy):
         ``algorithm.dagger.online_lerobot.finalize_interval`` and are not part of training
         readiness.
         """
+        asyncio.run(self._recv_lerobot_episodes(input_channel))
+
+    async def _recv_lerobot_episodes(self, input_channel) -> None:
+        """Receive online LeRobot episode shards until the worker stops."""
         while not self.should_stop:
-            received_any = self._recv_lerobot_episodes_from_channel(input_channel)
+            await self._recv_lerobot_episodes_from_channel(input_channel)
             if self.dataset.is_ready():
                 self._ensure_lerobot_loader()
-            if not received_any:
-                time.sleep(0.1)
 
     def _recv_rollout_thread_main(self, input_channel):
         send_num = self._component_placement.get_world_size("env") * self.stage_num

@@ -1116,12 +1116,16 @@ class EnvWorker(Worker):
                     await self._maybe_wait_env_delay(stage_id)
 
                     reward_model_output = None
-                    if reward_channel is not None and chunk_step_idx != 0:
+                    if reward_channel is not None:
                         reward_model_output = self.get_reward_model_output(
                             env_output,
                             send_channel=reward_channel,
                             recv_channel=input_channel,
                             stage_id=stage_id,
+                            last_run=(
+                                epoch == self.rollout_epoch - 1
+                                and chunk_step_idx == self.n_train_chunk_steps - 1
+                            ),
                         )
                         if reward_model_output is not None:
                             env_metrics["reward_model_output"].append(
