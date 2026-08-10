@@ -488,6 +488,7 @@ class EmbodiedRunner:
             # set global step
             self.actor.set_global_step(self.global_step).wait()
             self.rollout.set_global_step(self.global_step).wait()
+            self.env.set_global_step(self.global_step).wait()
 
             profiled_step = (
                 self.global_step
@@ -506,6 +507,7 @@ class EmbodiedRunner:
                         input_channel=self.env_channel,
                         rollout_channel=self.rollout_channel,
                         reward_channel=self.reward_channel,
+                        trajectory_channel=self.actor_channel,
                     )
                     rollout_handle: Handle = self.rollout.generate(
                         input_channel=self.rollout_channel,
@@ -537,7 +539,8 @@ class EmbodiedRunner:
                     env_bootstrap_handle: Handle | None = None
                     if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
                         env_bootstrap_handle = self.env.prefetch_train_bootstrap(
-                            rollout_channel=self.rollout_channel
+                            rollout_channel=self.rollout_channel,
+                            trajectory_channel=self.actor_channel,
                         )
 
                     actor_training_metrics = actor_training_handle.wait()
@@ -572,6 +575,7 @@ class EmbodiedRunner:
             # set global step
             self.actor.set_global_step(self.global_step).wait()
             self.rollout.set_global_step(self.global_step).wait()
+            self.env.set_global_step(self.global_step).wait()
 
             profiled_step = (
                 self.global_step
@@ -589,6 +593,7 @@ class EmbodiedRunner:
                     input_channel=self.env_channel,
                     rollout_channel=self.rollout_channel,
                     reward_channel=self.reward_channel,
+                    trajectory_channel=self.actor_channel,
                 )
                 rollout_handle: Handle = self.rollout.generate(
                     input_channel=self.rollout_channel,
@@ -613,7 +618,8 @@ class EmbodiedRunner:
                 env_bootstrap_handle: Handle | None = None
                 if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
                     env_bootstrap_handle = self.env.prefetch_train_bootstrap(
-                        rollout_channel=self.rollout_channel
+                        rollout_channel=self.rollout_channel,
+                        trajectory_channel=self.actor_channel,
                     )
 
                 actor_results = actor_training_handle.wait()

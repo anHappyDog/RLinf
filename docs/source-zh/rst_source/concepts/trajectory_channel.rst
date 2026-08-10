@@ -8,9 +8,9 @@ worker，而不在 environment worker 中组装完整 trajectory。它由一个�
 RLinf 何时使用它
 -----------------
 
-具身 runner 为 Rollout 到 Actor 的数据流创建 ``TrajectoryChannel``。Environment
-和 Rollout 仍通过普通 :doc:`Channel <channel>` 交换策略请求与动作。Rollout
-worker 在每个 action chunk 后发布训练所需的数据，Actor 则订阅组装完成的训练项。
+具身 runner 为 Env/Rollout 到 Actor 的数据流创建 ``TrajectoryChannel``。
+Environment 和 Rollout 通过普通 :doc:`Channel <channel>` 交换推理请求。两者将
+各自产生的训练数据直接发布给 TrajectoryWorker，后者按 action chunk 合并两条数据流。
 
 各组件的职责如下：
 
@@ -21,14 +21,13 @@ worker 在每个 action chunk 后发布训练所需的数据，Actor 则订阅�
    * - 组件
      - 职责
    * - ``EnvWorker``
-     - 执行环境，并发送包含 observation 与前一个 ``EnvResult`` 的
-       ``PolicyInput``。
+     - 发送 ``PolicyInput``、执行 action，并发布 reward、done flag 和算法相关的
+       环境数据。
    * - ``RolloutWorker``
-     - 执行策略推理、返回 ``PolicyOutput`` action，并发布
-       ``TrajectorySegment`` 事件。
+     - 执行策略推理、返回 ``PolicyOutput`` action、发布模型输出，并在环境仿真期间
+       处理 terminal observation。
    * - ``TrajectoryWorker``
-     - 保持 source 顺序、追加 segment、应用滞后更新，并输出可供 Actor 使用的
-       trajectory 或 pipeline micro-batch。
+     - 重组路由分片、合并环境与模型结果、应用滞后更新，并输出 Actor 可消费的数据。
    * - ``ActorWorker``
      - 订阅完成的数据并执行算法对应的更新。
 
@@ -43,26 +42,30 @@ worker 在每个 action chunk 后发布训练所需的数据，Actor 则订阅�
    EnvWorker              RolloutWorker         TrajectoryWorker       ActorWorker
        | PolicyInput            |                       |                    |
        |----------------------->|                       |                    |
+       |                        | PolicyStep            |                    |
+       |                        |---------------------->|                    |
        |     PolicyOutput       |                       |                    |
        |<-----------------------|                       |                    |
-       |                        | TrajectorySegment     |                    |
-       |                        |---------------------->| append by source   |
+       | simulate action        |                       |                    |
+       | EnvStepResult          |                       |                    |
+       |----------------------------------------------->| join by key        |
+       | TerminalRequest*       |                       |                    |
+       |----------------------->| TerminalResult*       |                    |
+       |                        |---------------------->| append when ready  |
        |          ... repeat for each action chunk ... |                    |
-       |                        | TrajectoryEpochEnd    |                    |
-       |                        |---------------------->| finalize epoch     |
-       |                        | TrajectoryEnd         |                    |
-       |                        |---------------------->| flush completed    |
+       | TrajectoryEnd          |                       |                    |
+       |----------------------------------------------->| flush completed    |
        |                        |                       | trajectory / batch |
        |                        |                       |------------------->|
 
-Rollout worker 为每个 pipeline stage 保留一个待完成的推理结果。收到下一个
-``PolicyInput`` 时，它同时拥有前一个 action 的结果和下一个环境状态，因此可以发布
-一个完整 segment。最后一个 policy input 用于关闭最后一个待完成 segment。
+``*`` 表示 terminal 处理，仅在出现 terminal state 或最后一个 action chunk 时执行。
+Decoupled mode 下，RolloutWorker 可以从任意 environment rank 接收这两种请求，且不保存
+跨请求的 trajectory 状态。
 
 事件与结果
 ----------
 
-``TrajectoryChannel.publish()`` 接受三种内部事件：
+``TrajectoryChannel.publish()`` 接受以下内部事件：
 
 .. list-table::
    :header-rows: 1
@@ -70,15 +73,22 @@ Rollout worker 为每个 pipeline stage 保留一个待完成的推理结果。�
 
    * - 事件
      - 含义
-   * - ``TrajectorySegment``
-     - 一次 append 操作，包含 observation、next observation、环境结果、
-       ``EmbodiedRolloutResult`` 和逻辑 source 元数据。
+   * - ``TrajectoryStart``
+     - 一个逻辑 environment source 的初始 done 和 termination 状态。
+   * - ``PolicyStep``
+     - Rollout 推理产生的 observation、action、log-probability、value、version 和
+       model forward input。
+   * - ``EnvStepResult``
+     - Environment 产生的 reward、done flag、intervention、reward-model output，
+       以及可选的 online LeRobot episode data。
+   * - ``TerminalResult``
+     - 根据 ``TerminalRequest`` 产生的 terminal observation、bootstrap value 和
+       terminal model input。
    * - ``TrajectoryEpochEnd``
-     - 一个 producer 已完成一个 epoch；同时携带基于 value 计算 advantage 所需的
-       final value。
+     - 一个逻辑 environment source 已完成一个 epoch。
    * - ``TrajectoryEnd``
-     - 一个 producer 已完成一个训练 step。只有全部预期 producer 都完成后，worker
-       才会 flush 数据。
+     - 一个逻辑 environment source 已完成一个训练 step。只有全部预期 action key
+       都完整后，worker 才会 flush 数据。
 
 普通训练中，``subscribe()`` 返回完整 ``Trajectory``。Online LeRobot DAgger
 中，它返回已完成的 episode 字典。启用 training pipeline 后，Actor 从
@@ -87,10 +97,16 @@ Rollout worker 为每个 pipeline stage 保留一个待完成的推理结果。�
 路由与顺序
 ----------
 
-每个 policy input 使用 ``(env_rank, stage_id, batch_size)`` 记录逻辑 source。
-Channel 路由可以拆分或合并策略 batch，但 source 记录会随数据一起传递。
-Trajectory worker 使用这些记录恢复每个 environment rank、每个 stage 的数据流，
-再按顺序追加 segment。
+``TrajectoryKey`` 使用 ``step_id``、``epoch_id``、``env_rank``、``stage_id`` 和
+``chunk_id`` 标识一个 action。``TrajectorySource`` 额外记录 source shard 的 batch
+size 与 offset。Channel 路由可以将一个 environment batch 拆给多个 RolloutWorker，
+也可以合并无关 source。TrajectoryWorker 先按 offset 恢复原始 batch，再合并具有相同
+key 的事件。
+
+Decoupled mode 下，``PolicyInput`` 和 ``TerminalRequest`` 使用不同的普通 Channel
+tag。任一请求都可以交给任意空闲 RolloutWorker。只有 policy request 需要记录返回
+路由，因为只有 action 需要返回 Environment。action chunk 是否完整由
+TrajectoryWorker 判断，不依赖 RolloutWorker affinity 或 terminal barrier。
 
 完成的数据按照 actor world size 分片。这带来两个性质：
 
@@ -174,8 +190,8 @@ Training pipeline 当前不支持 online LeRobot 数据或 decoupled environment
      - 检查普通 Env 到 Rollout 的 ``Channel`` 通路；此时还没有产生 trajectory
        事件。
    * - Rollout 完成后 Actor 仍等待
-     - 确认每个 rollout rank 和 pipeline stage 都为相同 ``step_id`` 发布了对应的
-       end 事件。
+     - 确认 Env 为每个 key 发布了 ``EnvStepResult``，Rollout 发布了匹配的
+       ``PolicyStep`` 和所需的 ``TerminalResult``。
    * - Pipeline Actor 等待
      - 确认 Actor 使用 ``actor:<rank>`` 订阅，并且配置的 batch size 可以被
        ``actor.micro_batch_size`` 整除。

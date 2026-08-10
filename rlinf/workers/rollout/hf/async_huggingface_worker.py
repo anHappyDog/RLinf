@@ -16,9 +16,7 @@ import asyncio
 
 from omegaconf.omegaconf import DictConfig
 
-from rlinf.data.schema.embodied_types import PolicyOutput
 from rlinf.scheduler import Channel, Worker
-from rlinf.scheduler.channel.trajectory_channel.data import TrajectoryEnd
 from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
     TrajectoryChannel,
 )
@@ -30,11 +28,6 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         super().__init__(cfg)
         self._generate_task: asyncio.Task = None
         self.staleness_threshold = cfg.algorithm.get("staleness_threshold", None)
-        # set the decoupled rollout worker sync weight time
-        self.sync_rollout_weight_time = (
-            self.num_pipeline_stages * self.n_train_chunk_steps * self.rollout_epoch
-        )
-
         assert not self.enable_offload, (
             "Offload not supported in AsyncMultiStepRolloutWorker"
         )
@@ -47,7 +40,6 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self._weight_sync_apply_total = 0
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
-        self._trajectory_step = 0
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -77,24 +69,21 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         trajectory_channel: TrajectoryChannel,
         metric_channel: Channel,
     ):
+        if self._terminal_task is None or self._terminal_task.done():
+            self._terminal_task = asyncio.create_task(
+                self._process_terminal_requests(input_channel, trajectory_channel)
+            )
         while True:
             if self._background_weight_sync_active:
                 await self._poll_background_weight_sync()
+            await self.wait_if_stale()
 
-            step_id = self._trajectory_step
-            for epoch_id in range(self.rollout_epoch):
+            for _ in range(self.rollout_epoch):
                 await self.generate_one_epoch(
                     input_channel,
                     output_channel,
                     trajectory_channel,
-                    step_id,
-                    epoch_id,
                 )
-            for stage_id in range(self.num_pipeline_stages):
-                trajectory_channel.publish(
-                    TrajectoryEnd(step_id=step_id, source=(self._rank, stage_id))
-                )
-            self._trajectory_step += 1
             if self.finished_episodes is not None:
                 self.finished_episodes += self.total_num_train_envs * self.rollout_epoch
             rollout_metrics = {
@@ -165,44 +154,3 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             self._weight_sync_coalesced_total += 1
         self._weight_sync_requested = True
         self._start_background_weight_sync_if_needed()
-
-    async def decoupled_generate_one_epoch(
-        self, input_channel: Channel, output_channel: Channel
-    ):
-        self.update_dagger_beta()
-        decoupled_generate_time = 1
-        while True:
-            if decoupled_generate_time % self.sync_rollout_weight_time == 0:
-                self.update_dagger_beta()
-                if self._background_weight_sync_active:
-                    await self._poll_background_weight_sync()
-                await self.wait_if_stale()
-            decoupled_generate_time = decoupled_generate_time + 1
-            (
-                env_output,
-                split_sizes,
-            ) = await self.recv_from_and_record_batch_routes_with_timeout(
-                group_name=self.cfg.env.group_name,
-                channel=input_channel,
-                tag="rollout_results",
-                batch_size=self.train_batch_size,
-                merge_fn=self._merge_obs_batches,
-                infer_batch_size_fn=self._infer_env_batch_size,
-                timeout_time=0.02,
-                recv_queue_size=self.rollout_queue_size,
-            )
-            actions, _ = self._predict_rollout_actions(
-                env_output["obs"],
-                final_obs=env_output.get("final_obs", None),
-                rlt_switch_flags=env_output.get("rlt_switch_flags", None),
-                intervene_requested=env_output.get("intervene_flags", None),
-            )
-            policy_output = PolicyOutput(actions=actions)
-            self.send_to_recorded_batch_routes(
-                group_name=self.cfg.env.group_name,
-                channel=output_channel,
-                data=policy_output,
-                tag="rollout_results",
-                split_fn=self._split_policy_output,
-                split_sizes=split_sizes,
-            )

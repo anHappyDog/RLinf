@@ -25,13 +25,26 @@ from rlinf.data.schema.embodied_types import (
     EnvResult,
     PolicyInput,
     PolicyOutput,
+    TerminalRequest,
+    TrajectoryKey,
+    TrajectorySource,
     split_policy_input,
+    split_terminal_request,
 )
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import InsertDelay, RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.scheduler.channel.trajectory_channel.data import (
+    EnvStepResult,
+    TrajectoryEnd,
+    TrajectoryEpochEnd,
+    TrajectoryStart,
+)
+from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
+    TrajectoryChannel,
+)
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
@@ -56,6 +69,7 @@ class EnvWorker(Worker):
         self.last_obs_list = []
         self.last_intervened_info_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
+        self._trajectory_step = 0
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
@@ -64,6 +78,7 @@ class EnvWorker(Worker):
         self.enable_rlt = (
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="") == "rlt_ac"
         )
+        self.use_training_pipeline = self.cfg.runner.get("use_training_pipeline", False)
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -161,6 +176,10 @@ class EnvWorker(Worker):
             ) >= self._component_placement.get_world_size("rollout"), (
                 "the world size of env must be greater than the world size of rollout in env_decoupled_mode"
             )
+
+    def set_global_step(self, global_step: int) -> None:
+        """Set the trajectory step used to correlate distributed events."""
+        self._trajectory_step = global_step
 
     def init_worker(self):
         # This is a barrier to ensure all envs' initial setup upon import is done
@@ -830,7 +849,7 @@ class EnvWorker(Worker):
         reward_model_output: torch.Tensor | None = None,
         chunk_step_data: dict[str, Any] | None = None,
     ) -> EnvResult:
-        """Convert one environment step into the result sent to rollout."""
+        """Convert one environment step into its trajectory result."""
         env_result = EnvResult.from_env_output(env_output, reward_model_output)
         if (
             stage_id is not None
@@ -852,22 +871,12 @@ class EnvWorker(Worker):
     def _build_policy_input(
         self,
         env_output: EnvOutput,
-        *,
-        stage_id: int | None = None,
-        reward_model_output: torch.Tensor | None = None,
-        chunk_step_data: dict[str, Any] | None = None,
-        is_last: bool = False,
     ) -> PolicyInput:
-        """Build the next policy request without trajectory-owned model data."""
+        """Build the model input without trajectory-owned environment data."""
         return PolicyInput(
             obs=env_output.prepare_observations(env_output.obs),
-            env_result=self._build_env_result(
-                env_output,
-                stage_id=stage_id,
-                reward_model_output=reward_model_output,
-                chunk_step_data=chunk_step_data,
-            ),
-            is_last=is_last,
+            rlt_switch_flags=env_output.rlt_switch_flags,
+            intervene_flags=env_output.intervene_flags,
         )
 
     def _send_policy_input(
@@ -875,36 +884,150 @@ class EnvWorker(Worker):
         rollout_channel: Channel,
         policy_input: PolicyInput,
         stage_id: int,
+        key: TrajectoryKey,
     ) -> None:
-        policy_input.sources = [(self._rank, stage_id, self.train_num_envs_per_stage)]
+        policy_input.sources = [
+            TrajectorySource(key=key, size=self.train_num_envs_per_stage)
+        ]
         self.send_to(
             group_name=self.cfg.rollout.group_name,
             channel=rollout_channel,
             data=policy_input,
             mode="train",
-            tag="policy_final" if policy_input.is_last else "policy",
+            tag="policy",
             route_key=stage_id if not self.env_decoupled_mode else None,
             batch_size=self.train_batch_size,
             split_fn=split_policy_input,
             decoupled_mode=self.env_decoupled_mode,
         )
 
+    def _send_terminal_request(
+        self,
+        rollout_channel: Channel,
+        request: TerminalRequest,
+        stage_id: int,
+    ) -> None:
+        self.send_to(
+            group_name=self.cfg.rollout.group_name,
+            channel=rollout_channel,
+            data=request,
+            mode="train",
+            tag="terminal",
+            route_key=stage_id if not self.env_decoupled_mode else None,
+            batch_size=self.train_batch_size,
+            split_fn=split_terminal_request,
+            decoupled_mode=self.env_decoupled_mode,
+        )
+
+    def _publish_step(
+        self,
+        rollout_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
+        env_output: EnvOutput,
+        reward_model_output: torch.Tensor | None,
+        chunk_step_data: dict[str, Any] | None,
+        epoch_id: int,
+        chunk_id: int,
+        stage_id: int,
+    ) -> None:
+        """Publish one environment outcome and schedule its next model input."""
+        key = TrajectoryKey(
+            self._trajectory_step, epoch_id, self._rank, stage_id, chunk_id
+        )
+        source = TrajectorySource(key=key, size=self.train_num_envs_per_stage)
+        is_last = chunk_id == self.n_train_chunk_steps - 1
+        has_terminal_state = env_output.dones is not None and bool(
+            env_output.dones.any()
+        )
+        needs_terminal = not self.enable_online_lerobot and (
+            is_last or has_terminal_state
+        )
+
+        trajectory_channel.publish(
+            EnvStepResult(
+                sources=[source],
+                result=self._build_env_result(
+                    env_output,
+                    stage_id=stage_id,
+                    reward_model_output=reward_model_output,
+                    chunk_step_data=chunk_step_data,
+                ),
+                needs_terminal=needs_terminal,
+            ),
+            async_op=True,
+        )
+        if needs_terminal:
+            terminal_obs = (
+                env_output.final_obs
+                if has_terminal_state and env_output.final_obs is not None
+                else env_output.obs
+            )
+            self._send_terminal_request(
+                rollout_channel,
+                TerminalRequest(
+                    obs=env_output.prepare_observations(terminal_obs),
+                    sources=[source],
+                ),
+                stage_id,
+            )
+        if not is_last:
+            next_key = TrajectoryKey(
+                self._trajectory_step,
+                epoch_id,
+                self._rank,
+                stage_id,
+                chunk_id + 1,
+            )
+            self._send_policy_input(
+                rollout_channel,
+                self._build_policy_input(env_output),
+                stage_id,
+                next_key,
+            )
+
     def _send_train_bootstrap(
-        self, rollout_channel: Channel, env_outputs: list[EnvOutput]
+        self,
+        rollout_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
+        env_outputs: list[EnvOutput],
+        step_id: int,
+        epoch_id: int,
     ) -> None:
         for stage_id in range(self.stage_num):
+            key = TrajectoryKey(step_id, epoch_id, self._rank, stage_id, 0)
+            source = TrajectorySource(key=key, size=self.train_num_envs_per_stage)
+            trajectory_channel.publish(
+                TrajectoryStart(
+                    source=source,
+                    result=self._build_env_result(env_outputs[stage_id]),
+                ),
+                async_op=True,
+            )
             self._send_policy_input(
                 rollout_channel,
                 self._build_policy_input(env_outputs[stage_id]),
                 stage_id,
+                key,
             )
 
-    def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
+    def _bootstrap_and_send_train(
+        self,
+        rollout_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
+        step_id: int,
+        epoch_id: int,
+    ) -> list[EnvOutput]:
         env_outputs = self.bootstrap_step()
-        self._send_train_bootstrap(rollout_channel, env_outputs)
+        self._send_train_bootstrap(
+            rollout_channel, trajectory_channel, env_outputs, step_id, epoch_id
+        )
         return env_outputs
 
-    def prefetch_train_bootstrap(self, rollout_channel: Channel) -> None:
+    def prefetch_train_bootstrap(
+        self,
+        rollout_channel: Channel,
+        trajectory_channel: TrajectoryChannel,
+    ) -> None:
         """Prepare and send the first env batch for the next training rollout."""
         if self._prefetched_train_bootstrap is not None:
             raise RuntimeError(
@@ -912,7 +1035,10 @@ class EnvWorker(Worker):
                 "Call interact() to consume it before prefetching again."
             )
         self._prefetched_train_bootstrap = self._bootstrap_and_send_train(
-            rollout_channel
+            rollout_channel,
+            trajectory_channel,
+            self._trajectory_step,
+            0,
         )
 
     def record_env_metrics(
@@ -935,12 +1061,27 @@ class EnvWorker(Worker):
         """Infer the batch dimension of a policy response."""
         return int(policy_output.actions.shape[0])
 
+    def _recv_policy_output(
+        self, input_channel: Channel, stage_id: int
+    ) -> PolicyOutput:
+        """Receive actions using the route paired with the policy request."""
+        return self.recv_from(
+            group_name=self.cfg.rollout.group_name,
+            channel=input_channel,
+            tag="train_policy" if self.env_decoupled_mode else "policy",
+            route_key=stage_id if not self.env_decoupled_mode else None,
+            batch_size=self.train_batch_size,
+            infer_batch_size_fn=self._infer_policy_output_batch_size,
+            decoupled_mode=self.env_decoupled_mode,
+        )
+
     @Worker.timer("run_interact_once")
     async def _run_interact_once(
         self,
         input_channel: Channel,
         rollout_channel: Channel,
         reward_channel: Channel | None,
+        trajectory_channel: TrajectoryChannel,
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
@@ -951,7 +1092,12 @@ class EnvWorker(Worker):
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
             else:
-                env_outputs = self._bootstrap_and_send_train(rollout_channel)
+                env_outputs = self._bootstrap_and_send_train(
+                    rollout_channel,
+                    trajectory_channel,
+                    self._trajectory_step,
+                    epoch,
+                )
 
             for stage_id in range(self.stage_num):
                 await self._maybe_wait_env_delay(stage_id)
@@ -961,15 +1107,7 @@ class EnvWorker(Worker):
                     if cooperative_yield:
                         await asyncio.sleep(0)
 
-                    policy_output: PolicyOutput = self.recv_from(
-                        group_name=self.cfg.rollout.group_name,
-                        channel=input_channel,
-                        tag="policy",
-                        route_key=stage_id if not self.env_decoupled_mode else None,
-                        batch_size=self.train_batch_size,
-                        infer_batch_size_fn=self._infer_policy_output_batch_size,
-                        decoupled_mode=self.env_decoupled_mode,
-                    )
+                    policy_output = self._recv_policy_output(input_channel, stage_id)
 
                     env_output, env_info, chunk_step_data = self.env_interact_step(
                         policy_output.actions, stage_id
@@ -990,15 +1128,14 @@ class EnvWorker(Worker):
                                 reward_model_output.detach().float().reshape(-1).cpu()
                             )
 
-                    self._send_policy_input(
+                    self._publish_step(
                         rollout_channel,
-                        self._build_policy_input(
-                            env_output,
-                            stage_id=stage_id,
-                            reward_model_output=reward_model_output,
-                            chunk_step_data=chunk_step_data,
-                            is_last=chunk_step_idx == self.n_train_chunk_steps - 1,
-                        ),
+                        trajectory_channel,
+                        env_output,
+                        reward_model_output,
+                        chunk_step_data,
+                        epoch,
+                        chunk_step_idx,
                         stage_id,
                     )
                     if (
@@ -1018,7 +1155,27 @@ class EnvWorker(Worker):
                         self.record_env_metrics(env_metrics, env_info)
 
             self.store_last_obs_and_intervened_info(env_outputs)
+            if self.use_training_pipeline:
+                for stage_id in range(self.stage_num):
+                    trajectory_channel.publish(
+                        TrajectoryEpochEnd(
+                            step_id=self._trajectory_step,
+                            epoch_id=epoch,
+                            source=(self._rank, stage_id),
+                        ),
+                        async_op=True,
+                    )
             self.finish_rollout()
+
+        if not self.use_training_pipeline:
+            for stage_id in range(self.stage_num):
+                trajectory_channel.publish(
+                    TrajectoryEnd(
+                        step_id=self._trajectory_step, source=(self._rank, stage_id)
+                    ),
+                    async_op=True,
+                )
+        self._trajectory_step += 1
 
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
@@ -1031,11 +1188,13 @@ class EnvWorker(Worker):
         input_channel: Channel,
         rollout_channel: Channel,
         reward_channel: Channel | None,
+        trajectory_channel: TrajectoryChannel,
     ):
         env_metrics = await self._run_interact_once(
             input_channel,
             rollout_channel,
             reward_channel,
+            trajectory_channel,
             cooperative_yield=False,
         )
 

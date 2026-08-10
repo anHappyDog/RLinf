@@ -15,7 +15,8 @@
 
 import asyncio
 from collections import defaultdict
-from typing import TypeAlias
+from dataclasses import dataclass
+from typing import Any, TypeAlias
 
 import torch
 from omegaconf import DictConfig
@@ -29,14 +30,21 @@ from rlinf.data.schema.embodied_types import (
     ChunkStepResult,
     EmbodiedRolloutResult,
     EnvResult,
+    TrajectoryKey,
+    TrajectorySource,
     convert_trajectories_to_batch,
+    merge_batch_values,
+    merge_episode_data,
     split_batch_value,
     split_episode_data,
 )
 from rlinf.scheduler.channel.trajectory_channel.data import (
+    EnvStepResult,
+    PolicyStep,
+    TerminalResult,
     TrajectoryEnd,
     TrajectoryEpochEnd,
-    TrajectorySegment,
+    TrajectoryStart,
 )
 from rlinf.scheduler.worker.routing import CommMapper
 from rlinf.scheduler.worker.worker import Worker, WorkerAddress
@@ -52,6 +60,20 @@ TrajectoryCollector: TypeAlias = (
     EmbodiedTrajectoryBuilder | EmbodiedLerobotTrajectoryBuilder
 )
 SourceID: TypeAlias = tuple[int, int]
+
+
+@dataclass(kw_only=True)
+class _TrajectoryStep:
+    """Fully joined model and environment data for one action chunk."""
+
+    step_id: int
+    epoch_id: int
+    obs: dict[str, Any]
+    next_obs: dict[str, Any]
+    env_result: EnvResult
+    rollout_result: EmbodiedRolloutResult
+    initial_env_result: EnvResult | None = None
+    forward_inputs: dict[str, Any] | None = None
 
 
 class TrajectoryWorker(Worker):
@@ -70,6 +92,15 @@ class TrajectoryWorker(Worker):
         self._finished_sources: dict[int, set[SourceID]] = {}
         self._finished_epoch_sources: dict[SourceID, set[SourceID]] = {}
         self._pipeline_generators: dict[SourceID, torch.Generator] = {}
+        self._policy_steps: dict[TrajectoryKey, PolicyStep] = {}
+        self._env_results: dict[TrajectoryKey, EnvStepResult] = {}
+        self._terminal_results: dict[TrajectoryKey, TerminalResult] = {}
+        self._initial_results: dict[tuple[int, int, int, int], EnvResult] = {}
+        self._completed_keys: set[TrajectoryKey] = set()
+        self._fragments: dict[tuple[type, TrajectoryKey], list[object]] = defaultdict(
+            list
+        )
+        self._event_lock = asyncio.Lock()
 
         self._output_queues: dict[str, asyncio.Queue] = defaultdict(
             lambda: asyncio.Queue(maxsize=max_size)
@@ -80,11 +111,13 @@ class TrajectoryWorker(Worker):
 
         self._placement = HybridComponentPlacement(self._cfg, Cluster())
 
-        rollout_ws = self._placement.get_world_size("rollout")
         env_ws = self._placement.get_world_size("env")
         actor_ws = self._placement.get_world_size("actor")
-        self.producer_count = rollout_ws * self._cfg.rollout.pipeline_stage_num
         self.source_count = env_ws * self._cfg.rollout.pipeline_stage_num
+        self.chunk_count = (
+            self._cfg.env.train.max_steps_per_rollout_epoch
+            // self._cfg.actor.model.num_action_chunks
+        )
         from rlinf.utils.metric_utils import compute_split_num
 
         self.output_count = (
@@ -143,7 +176,7 @@ class TrajectoryWorker(Worker):
                 )
         return collectors[source]
 
-    def _rewards(self, segment: TrajectorySegment) -> torch.Tensor | None:
+    def _rewards(self, segment: _TrajectoryStep) -> torch.Tensor | None:
         rewards = segment.env_result.rewards
         if rewards is None:
             return None
@@ -172,22 +205,14 @@ class TrajectoryWorker(Worker):
         ].reshape(-1).to(rewards.dtype)
         return rewards
 
-    def _append_final_values(self, event: TrajectoryEpochEnd) -> None:
-        if self.enable_online_lerobot or not self.collect_prev_infos:
-            return
-        values = split_batch_value(
-            event.final_prev_values, [size for _, _, size in event.sources]
-        )
-        for (rank, stage, _), value in zip(event.sources, values):
-            if self.use_training_pipeline:
-                collectors = self._pipeline_collectors[(event.step_id, event.epoch_id)]
-            else:
-                collectors = self._step_collectors.setdefault(event.step_id, {})
-            self._collector(collectors, (rank, stage)).append_final_value(value)
-
     async def _flush(self, step_id: int) -> None:
         finished_sources = self._finished_sources[step_id]
-        if len(finished_sources) != self.producer_count:
+        if len(finished_sources) != self.source_count:
+            return
+        expected = (
+            self.source_count * self._cfg.env.train.rollout_epoch * self.chunk_count
+        )
+        if sum(key.step_id == step_id for key in self._completed_keys) != expected:
             return
 
         collectors = self._collectors
@@ -214,9 +239,21 @@ class TrajectoryWorker(Worker):
                 ):
                     await self._output_queues["default"].put(trajectory)
         del self._finished_sources[step_id]
+        self._completed_keys = {
+            key for key in self._completed_keys if key.step_id != step_id
+        }
 
     async def _flush_pipeline(self, key: SourceID) -> None:
-        if len(self._finished_epoch_sources[key]) != self.producer_count:
+        if len(self._finished_epoch_sources[key]) != self.source_count:
+            return
+        expected = self.source_count * self.chunk_count
+        if (
+            sum(
+                item.step_id == key[0] and item.epoch_id == key[1]
+                for item in self._completed_keys
+            )
+            != expected
+        ):
             return
         collectors = self._pipeline_collectors[key]
         if len(collectors) != self.source_count:
@@ -259,6 +296,11 @@ class TrajectoryWorker(Worker):
                     await self._output_queues[f"actor:{actor_rank}"].put(micro_batch)
         del self._pipeline_collectors[key]
         del self._finished_epoch_sources[key]
+        self._completed_keys = {
+            item
+            for item in self._completed_keys
+            if not (item.step_id == key[0] and item.epoch_id == key[1])
+        }
 
     def _prepare_pipeline_batch(self, trajectory) -> dict[str, torch.Tensor]:
         batch = preprocess_embodied_batch(
@@ -319,81 +361,222 @@ class TrajectoryWorker(Worker):
             )
         ]
 
-    def _split_segments(self, segment: TrajectorySegment):
-        sizes = [size for _, _, size in segment.sources]
-        if not sizes:
-            raise ValueError("Trajectory segment has no logical source metadata.")
-        result_fields = {
-            name: split_batch_value(getattr(segment.rollout_result, name), sizes)
-            for name in segment.rollout_result.__dataclass_fields__
-        }
-        env_fields = {
-            name: split_batch_value(getattr(segment.env_result, name), sizes)
-            for name in segment.env_result.__dataclass_fields__
-            if name != "episode_data"
-        }
-        initial_env_fields = (
-            {
-                name: split_batch_value(
-                    getattr(segment.initial_env_result, name), sizes
+    @property
+    def _source_batch_size(self) -> int:
+        return self._cfg.env.train.total_num_envs // self.source_count
+
+    def _split_event(self, event):
+        sizes = [source.size for source in event.sources]
+        if isinstance(event, PolicyStep):
+            fields = {
+                name: split_batch_value(getattr(event.rollout_result, name), sizes)
+                for name in event.rollout_result.__dataclass_fields__
+            }
+            for index, source in enumerate(event.sources):
+                yield PolicyStep(
+                    sources=[source],
+                    obs=split_batch_value(event.obs, sizes)[index],
+                    rollout_result=EmbodiedRolloutResult(
+                        **{name: values[index] for name, values in fields.items()}
+                    ),
                 )
-                for name in segment.initial_env_result.__dataclass_fields__
+            return
+        if isinstance(event, EnvStepResult):
+            fields = {
+                name: split_batch_value(getattr(event.result, name), sizes)
+                for name in event.result.__dataclass_fields__
                 if name != "episode_data"
             }
-            if segment.initial_env_result is not None
-            else None
-        )
-        episode_data = split_episode_data(segment.env_result.episode_data, sizes)
-        for index, (rank, stage, _) in enumerate(segment.sources):
-            yield (
-                (rank, stage),
-                TrajectorySegment(
-                    step_id=segment.step_id,
-                    epoch_id=segment.epoch_id,
-                    sources=[(rank, stage, sizes[index])],
-                    obs=split_batch_value(segment.obs, sizes)[index],
-                    next_obs=split_batch_value(segment.next_obs, sizes)[index],
-                    rollout_result=EmbodiedRolloutResult(
-                        **{
-                            name: values[index]
-                            for name, values in result_fields.items()
-                        }
+            episodes = split_episode_data(event.result.episode_data, sizes)
+            for index, source in enumerate(event.sources):
+                yield EnvStepResult(
+                    sources=[source],
+                    result=EnvResult(
+                        **{name: values[index] for name, values in fields.items()},
+                        episode_data=episodes[index],
                     ),
-                    env_result=EnvResult(
-                        **{name: values[index] for name, values in env_fields.items()},
-                        episode_data=episode_data[index],
-                    ),
-                    initial_env_result=(
-                        EnvResult(
-                            **{
-                                name: values[index]
-                                for name, values in initial_env_fields.items()
-                            }
+                    needs_terminal=event.needs_terminal,
+                )
+            return
+        if isinstance(event, TerminalResult):
+            values = split_batch_value(event.bootstrap_values, sizes)
+            inputs = split_batch_value(event.forward_inputs, sizes)
+            observations = split_batch_value(event.obs, sizes)
+            for index, source in enumerate(event.sources):
+                yield TerminalResult(
+                    sources=[source],
+                    obs=observations[index],
+                    bootstrap_values=values[index],
+                    forward_inputs=inputs[index],
+                )
+
+    def _merge_fragments(self, event):
+        source = event.sources[0]
+        key = (type(event), source.key)
+        fragments = self._fragments[key]
+        fragments.append(event)
+        received_size = sum(item.sources[0].size for item in fragments)
+        if received_size < self._source_batch_size:
+            return None
+        if received_size > self._source_batch_size:
+            raise ValueError(
+                f"Trajectory fragments exceed source batch size for {source.key}."
+            )
+        fragments.sort(key=lambda item: item.sources[0].offset)
+        offsets = [item.sources[0].offset for item in fragments]
+        sizes = [item.sources[0].size for item in fragments]
+        if any(offset != sum(sizes[:index]) for index, offset in enumerate(offsets)):
+            raise ValueError(f"Non-contiguous trajectory fragments: {offsets}.")
+        del self._fragments[key]
+        full_source = TrajectorySource(source.key, self._source_batch_size)
+        if isinstance(event, PolicyStep):
+            return PolicyStep(
+                sources=[full_source],
+                obs=merge_batch_values([item.obs for item in fragments]),
+                rollout_result=EmbodiedRolloutResult(
+                    **{
+                        name: merge_batch_values(
+                            [getattr(item.rollout_result, name) for item in fragments]
                         )
-                        if initial_env_fields is not None
-                        else None
-                    ),
-                    forward_inputs=split_batch_value(segment.forward_inputs, sizes)[
-                        index
-                    ],
+                        for name in event.rollout_result.__dataclass_fields__
+                    }
                 ),
             )
+        if isinstance(event, EnvStepResult):
+            return EnvStepResult(
+                sources=[full_source],
+                result=EnvResult(
+                    **{
+                        name: merge_batch_values(
+                            [getattr(item.result, name) for item in fragments]
+                        )
+                        for name in event.result.__dataclass_fields__
+                        if name != "episode_data"
+                    },
+                    episode_data=(
+                        merge_episode_data(
+                            [item.result.episode_data for item in fragments]
+                        )
+                        if event.result.episode_data is not None
+                        else None
+                    ),
+                ),
+                needs_terminal=event.needs_terminal,
+            )
+        return TerminalResult(
+            sources=[full_source],
+            obs=merge_batch_values([item.obs for item in fragments]),
+            bootstrap_values=merge_batch_values(
+                [item.bootstrap_values for item in fragments]
+            ),
+            forward_inputs=merge_batch_values(
+                [item.forward_inputs for item in fragments]
+            ),
+        )
 
-    def _append(self, segment: TrajectorySegment) -> None:
-        collectors = self._collectors
-        if not self.enable_online_lerobot:
-            collectors = self._step_collectors.setdefault(segment.step_id, {})
+    def _store_event(self, event) -> None:
+        for fragment in self._split_event(event):
+            complete = self._merge_fragments(fragment)
+            if complete is None:
+                continue
+            key = complete.sources[0].key
+            if key in self._completed_keys:
+                raise ValueError(f"Received duplicate trajectory event for {key}.")
+            if isinstance(complete, PolicyStep):
+                self._policy_steps[key] = complete
+                if key.chunk_id:
+                    self._try_complete(
+                        TrajectoryKey(
+                            key.step_id,
+                            key.epoch_id,
+                            key.env_rank,
+                            key.stage_id,
+                            key.chunk_id - 1,
+                        )
+                    )
+            elif isinstance(complete, EnvStepResult):
+                self._env_results[key] = complete
+            else:
+                self._terminal_results[key] = complete
+            self._try_complete(key)
+
+    def _try_complete(self, key: TrajectoryKey) -> None:
+        policy = self._policy_steps.get(key)
+        env = self._env_results.get(key)
+        if policy is None or env is None:
+            return
+        initial_key = (key.step_id, key.epoch_id, key.env_rank, key.stage_id)
+        if key.chunk_id == 0 and initial_key not in self._initial_results:
+            return
+        terminal = self._terminal_results.get(key)
+        next_policy = self._policy_steps.get(
+            TrajectoryKey(
+                key.step_id,
+                key.epoch_id,
+                key.env_rank,
+                key.stage_id,
+                key.chunk_id + 1,
+            )
+        )
+        if self.enable_online_lerobot:
+            next_obs = {}
+            next_inputs = None
+        elif env.needs_terminal:
+            if terminal is None:
+                return
+            next_obs = terminal.obs
+            next_inputs = terminal.forward_inputs
+            policy.rollout_result.bootstrap_values = terminal.bootstrap_values
+        else:
+            if next_policy is None:
+                return
+            next_obs = next_policy.obs
+            next_inputs = next_policy.rollout_result.forward_inputs
+
+        segment = _TrajectoryStep(
+            step_id=key.step_id,
+            epoch_id=key.epoch_id,
+            obs=policy.obs,
+            next_obs=next_obs,
+            rollout_result=policy.rollout_result,
+            env_result=env.result,
+            initial_env_result=self._initial_results.pop(initial_key, None),
+            forward_inputs=next_inputs,
+        )
+        self._append_one(
+            collectors := self._collectors_for(segment),
+            (key.env_rank, key.stage_id),
+            segment,
+        )
+        if (
+            key.chunk_id == self.chunk_count - 1
+            and not self.enable_online_lerobot
+            and self.collect_prev_infos
+        ):
+            self._collector(
+                collectors, (key.env_rank, key.stage_id)
+            ).append_final_value(terminal.bootstrap_values)
+        self._completed_keys.add(key)
+        del self._policy_steps[key]
+        del self._env_results[key]
+        self._terminal_results.pop(key, None)
+
+    def _collectors_for(
+        self, segment: _TrajectoryStep
+    ) -> dict[SourceID, TrajectoryCollector]:
         if self.use_training_pipeline:
-            key = (segment.step_id, segment.epoch_id)
-            collectors = self._pipeline_collectors.setdefault(key, {})
-        for source, source_segment in self._split_segments(segment):
-            self._append_one(collectors, source, source_segment)
+            return self._pipeline_collectors.setdefault(
+                (segment.step_id, segment.epoch_id), {}
+            )
+        if self.enable_online_lerobot:
+            return self._collectors
+        return self._step_collectors.setdefault(segment.step_id, {})
 
     def _append_one(
         self,
         collectors: dict[SourceID, TrajectoryCollector],
         source: SourceID,
-        segment: TrajectorySegment,
+        segment: _TrajectoryStep,
     ) -> None:
         collector = self._collector(collectors, source)
         result = segment.rollout_result
@@ -462,14 +645,37 @@ class TrajectoryWorker(Worker):
             src_rank=worker_address.rank,
             async_op=True,
         ).async_wait()
-        if isinstance(data, TrajectorySegment):
-            await asyncio.to_thread(self._append, data)
+        async with self._event_lock:
+            await self._apply_event(data)
+
+    async def _apply_event(self, data) -> None:
+        """Apply one received event while holding the assembly lock."""
+        if isinstance(data, (PolicyStep, EnvStepResult, TerminalResult)):
+            self._store_event(data)
+            step_ids = {source.key.step_id for source in data.sources}
+            for step_id in step_ids:
+                if step_id in self._finished_sources:
+                    await self._flush(step_id)
+            for source in data.sources:
+                epoch_key = (source.key.step_id, source.key.epoch_id)
+                if epoch_key in self._finished_epoch_sources:
+                    await self._flush_pipeline(epoch_key)
+        elif isinstance(data, TrajectoryStart):
+            key = data.source.key
+            self._initial_results[
+                (
+                    key.step_id,
+                    key.epoch_id,
+                    key.env_rank,
+                    key.stage_id,
+                )
+            ] = data.result
+            self._try_complete(key)
         elif isinstance(data, TrajectoryEnd):
             if not self.use_training_pipeline:
                 self._finished_sources.setdefault(data.step_id, set()).add(data.source)
                 await self._flush(data.step_id)
         elif isinstance(data, TrajectoryEpochEnd):
-            self._append_final_values(data)
             if self.use_training_pipeline:
                 key: SourceID = (data.step_id, data.epoch_id)
                 self._finished_epoch_sources.setdefault(key, set()).add(data.source)

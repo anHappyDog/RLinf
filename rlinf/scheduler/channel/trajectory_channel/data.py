@@ -20,28 +20,55 @@ import torch
 from rlinf.data.schema.embodied_types import (
     EmbodiedRolloutResult,
     EnvResult,
+    TrajectorySource,
     put_tensor_device,
 )
 
 
 @dataclass(kw_only=True)
-class TrajectorySegment:
-    """One append operation for a set of logical trajectory sources."""
+class PolicyStep:
+    """Policy inference associated with one or more environment sources."""
 
-    step_id: int
-    epoch_id: int
-    sources: list[tuple[int, int, int]]
+    sources: list[TrajectorySource]
     obs: dict[str, Any]
-    next_obs: dict[str, Any]
-    env_result: EnvResult
     rollout_result: EmbodiedRolloutResult
-    initial_env_result: EnvResult | None = None
-    forward_inputs: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        """Move segment payloads to CPU for transport."""
+        """Move inference payloads to CPU for transport."""
         self.obs = put_tensor_device(self.obs, "cpu")
-        self.next_obs = put_tensor_device(self.next_obs, "cpu")
+
+
+@dataclass(kw_only=True)
+class EnvStepResult:
+    """Environment outcome for policy actions identified by ``sources``."""
+
+    sources: list[TrajectorySource]
+    result: EnvResult
+    needs_terminal: bool = False
+
+
+@dataclass(kw_only=True)
+class TrajectoryStart:
+    """Initial environment state for one trajectory source and epoch."""
+
+    source: TrajectorySource
+    result: EnvResult
+
+
+@dataclass(kw_only=True)
+class TerminalResult:
+    """Policy-side processing result for terminal or final observations."""
+
+    sources: list[TrajectorySource]
+    obs: dict[str, Any]
+    bootstrap_values: torch.Tensor | None
+    forward_inputs: dict[str, Any] | None
+
+    def __post_init__(self) -> None:
+        """Move terminal payloads to CPU for transport."""
+        self.obs = put_tensor_device(self.obs, "cpu")
+        if self.bootstrap_values is not None:
+            self.bootstrap_values = self.bootstrap_values.cpu().contiguous()
         if self.forward_inputs is not None:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
 
@@ -56,22 +83,18 @@ class TrajectoryEnd:
 
 @dataclass(kw_only=True, frozen=True)
 class TrajectoryEpochEnd:
-    """Signal that one producer has finished a pipeline epoch."""
+    """Signal that one environment source has finished a pipeline epoch."""
 
     step_id: int
     epoch_id: int
     source: tuple[int, int]
-    sources: list[tuple[int, int, int]]
-    final_prev_values: torch.Tensor | None = None
-
-    def __post_init__(self) -> None:
-        """Move final values to contiguous CPU storage."""
-        if self.final_prev_values is not None:
-            object.__setattr__(
-                self,
-                "final_prev_values",
-                self.final_prev_values.cpu().contiguous(),
-            )
 
 
-TrajectoryData: TypeAlias = TrajectorySegment | TrajectoryEnd | TrajectoryEpochEnd
+TrajectoryData: TypeAlias = (
+    PolicyStep
+    | TrajectoryStart
+    | EnvStepResult
+    | TerminalResult
+    | TrajectoryEnd
+    | TrajectoryEpochEnd
+)

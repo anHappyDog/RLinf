@@ -181,6 +181,26 @@ class PolicyOutput:
             self.actions = self.actions.cpu().contiguous()
 
 
+@dataclass(frozen=True)
+class TrajectoryKey:
+    """Identity of one action chunk produced by a logical environment source."""
+
+    step_id: int
+    epoch_id: int
+    env_rank: int
+    stage_id: int
+    chunk_id: int
+
+
+@dataclass(frozen=True)
+class TrajectorySource:
+    """Trajectory key and batch size carried by one routed source shard."""
+
+    key: TrajectoryKey
+    size: int
+    offset: int = 0
+
+
 @dataclass(kw_only=True)
 class EnvResult:
     """Environment outcome associated with one policy output."""
@@ -189,7 +209,6 @@ class EnvResult:
     dones: torch.Tensor | None = None
     terminations: torch.Tensor | None = None
     truncations: torch.Tensor | None = None
-    final_obs: dict[str, Any] | None = None
     intervene_actions: torch.Tensor | None = None
     intervene_flags: torch.Tensor | None = None
     rlt_switch_flags: torch.Tensor | None = None
@@ -211,12 +230,12 @@ class EnvResult:
             value = getattr(self, field_name)
             if value is not None:
                 setattr(self, field_name, value.cpu().contiguous())
-        if self.final_obs is not None:
-            self.final_obs = put_tensor_device(self.final_obs, "cpu")
 
     @classmethod
     def from_env_output(
-        cls, env_output: EnvOutput, reward_model_output: torch.Tensor | None = None
+        cls,
+        env_output: EnvOutput,
+        reward_model_output: torch.Tensor | None = None,
     ) -> "EnvResult":
         """Build a transport result from an environment output."""
         return cls(
@@ -224,11 +243,6 @@ class EnvResult:
             dones=env_output.dones,
             terminations=env_output.terminations,
             truncations=env_output.truncations,
-            final_obs=(
-                env_output.prepare_observations(env_output.final_obs)
-                if env_output.final_obs is not None
-                else None
-            ),
             intervene_actions=env_output.intervene_actions,
             intervene_flags=env_output.intervene_flags,
             rlt_switch_flags=env_output.rlt_switch_flags,
@@ -238,12 +252,27 @@ class EnvResult:
 
 @dataclass(kw_only=True)
 class PolicyInput:
-    """Input to a policy and the result of its preceding action."""
+    """Observation and control metadata required for policy inference."""
 
     obs: dict[str, Any]
-    env_result: EnvResult
-    is_last: bool = False
-    sources: list[tuple[int, int, int]] = field(default_factory=list)
+    rlt_switch_flags: torch.Tensor | None = None
+    intervene_flags: torch.Tensor | None = None
+    sources: list[TrajectorySource] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.obs = put_tensor_device(self.obs, "cpu")
+        for name in ("rlt_switch_flags", "intervene_flags"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, value.cpu().contiguous())
+
+
+@dataclass(kw_only=True)
+class TerminalRequest:
+    """Terminal observations that require policy-side model processing."""
+
+    obs: dict[str, Any]
+    sources: list[TrajectorySource]
 
     def __post_init__(self) -> None:
         self.obs = put_tensor_device(self.obs, "cpu")
@@ -381,56 +410,73 @@ def merge_episode_data(data: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def split_trajectory_sources(
+    sources: list[TrajectorySource], split_sizes: list[int]
+) -> list[list[TrajectorySource]]:
+    """Split routed source metadata along the batch dimension."""
+    if not sources:
+        return [[] for _ in split_sizes]
+    result = [[] for _ in split_sizes]
+    source_index = 0
+    source_offset = 0
+    for result_index, split_size in enumerate(split_sizes):
+        remaining = split_size
+        while remaining:
+            source = sources[source_index]
+            take_size = min(remaining, source.size - source_offset)
+            result[result_index].append(
+                TrajectorySource(
+                    key=source.key,
+                    size=take_size,
+                    offset=source.offset + source_offset,
+                )
+            )
+            source_offset += take_size
+            remaining -= take_size
+            if source_offset == source.size:
+                source_index += 1
+                source_offset = 0
+    return result
+
+
 def split_policy_input(
     policy_input: PolicyInput, split_sizes: list[int]
 ) -> list[PolicyInput]:
     """Split a policy input on its batch dimension."""
 
-    def split_sources() -> list[list[tuple[int, int, int]]]:
-        if not policy_input.sources:
-            return [[] for _ in split_sizes]
-        result = [[] for _ in split_sizes]
-        source_index = 0
-        source_offset = 0
-        for result_index, split_size in enumerate(split_sizes):
-            remaining = split_size
-            while remaining:
-                rank, stage, source_size = policy_input.sources[source_index]
-                take_size = min(remaining, source_size - source_offset)
-                result[result_index].append((rank, stage, take_size))
-                source_offset += take_size
-                remaining -= take_size
-                if source_offset == source_size:
-                    source_index += 1
-                    source_offset = 0
-        return result
-
-    result_fields = {
-        field_name: split_batch_value(
-            getattr(policy_input.env_result, field_name), split_sizes
-        )
-        for field_name in policy_input.env_result.__dataclass_fields__
-        if field_name != "episode_data"
-    }
-    source_splits = split_sources()
-    episode_splits = split_episode_data(
-        policy_input.env_result.episode_data, split_sizes
-    )
+    source_splits = split_trajectory_sources(policy_input.sources, split_sizes)
+    rlt_splits = split_batch_value(policy_input.rlt_switch_flags, split_sizes)
+    intervene_splits = split_batch_value(policy_input.intervene_flags, split_sizes)
     return [
         PolicyInput(
             obs=obs,
-            env_result=EnvResult(
-                **{
-                    field_name: field_values[index]
-                    for field_name, field_values in result_fields.items()
-                }
-                | {"episode_data": episode_splits[index]}
-            ),
-            is_last=policy_input.is_last,
+            rlt_switch_flags=rlt_splits[index],
+            intervene_flags=intervene_splits[index],
             sources=source_splits[index],
         )
         for index, obs in enumerate(split_batch_value(policy_input.obs, split_sizes))
     ]
+
+
+def split_terminal_request(
+    request: TerminalRequest, split_sizes: list[int]
+) -> list[TerminalRequest]:
+    """Split a terminal request on its batch dimension."""
+    sources = split_trajectory_sources(request.sources, split_sizes)
+    return [
+        TerminalRequest(obs=obs, sources=sources[index])
+        for index, obs in enumerate(split_batch_value(request.obs, split_sizes))
+    ]
+
+
+def merge_terminal_requests(requests: list[TerminalRequest]) -> TerminalRequest:
+    """Merge independently routed terminal requests."""
+    if not requests:
+        raise ValueError("Cannot merge an empty list of terminal requests.")
+    return TerminalRequest(
+        obs=merge_batch_values([request.obs for request in requests]),
+        sources=[source for request in requests for source in request.sources],
+    )
 
 
 def merge_policy_inputs(policy_inputs: list[PolicyInput]) -> PolicyInput:
@@ -448,91 +494,45 @@ def merge_policy_inputs(policy_inputs: list[PolicyInput]) -> PolicyInput:
         raise ValueError("Cannot infer batch size from policy input observations.")
 
     observations = [policy_input.obs for policy_input in policy_inputs]
-    results = [policy_input.env_result for policy_input in policy_inputs]
 
-    def merge_optional_tensor(
-        field_name: str,
-        *,
-        fill_value: float | bool | None = None,
-    ) -> torch.Tensor | None:
-        values = [getattr(result, field_name) for result in results]
+    def merge_optional_tensor(field_name: str) -> torch.Tensor | None:
+        values = [getattr(item, field_name) for item in policy_inputs]
         if all(value is None for value in values):
             return None
         if any(value is None for value in values):
-            if fill_value is None:
-                raise ValueError(f"Inconsistent policy result field: {field_name}.")
             reference = next(value for value in values if value is not None)
             values = [
                 value
                 if value is not None
                 else torch.full(
                     (get_batch_size(obs), *reference.shape[1:]),
-                    fill_value,
+                    False,
                     dtype=reference.dtype,
                 )
                 for obs, value in zip(observations, values)
             ]
         return merge_batch_values(values)
 
-    final_observations = [result.final_obs for result in results]
-    merged_final_obs = None
-    if any(obs is not None for obs in final_observations):
-        merged_final_obs = merge_batch_values(
-            [
-                final_obs if final_obs is not None else obs
-                for obs, final_obs in zip(observations, final_observations)
-            ]
-        )
-
-    is_last = policy_inputs[0].is_last
-    if any(policy_input.is_last != is_last for policy_input in policy_inputs[1:]):
-        raise ValueError("Cannot merge final and non-final policy inputs.")
-
-    sources: list[tuple[int, int, int]] = []
+    sources: list[TrajectorySource] = []
     for policy_input in policy_inputs:
-        for rank, stage, size in policy_input.sources:
-            if sources and sources[-1][:2] == (rank, stage):
-                previous_rank, previous_stage, previous_size = sources[-1]
-                sources[-1] = (
-                    previous_rank,
-                    previous_stage,
-                    previous_size + size,
+        for source in policy_input.sources:
+            if (
+                sources
+                and sources[-1].key == source.key
+                and sources[-1].offset + sources[-1].size == source.offset
+            ):
+                sources[-1] = TrajectorySource(
+                    key=source.key,
+                    size=sources[-1].size + source.size,
+                    offset=sources[-1].offset,
                 )
             else:
-                sources.append((rank, stage, size))
-
-    episode_data_list = [result.episode_data for result in results]
-    if any(data is not None for data in episode_data_list):
-        if any(data is None for data in episode_data_list):
-            raise ValueError("Inconsistent policy result field: episode_data.")
-        episode_data = merge_episode_data(episode_data_list)
-    else:
-        episode_data = None
+                sources.append(source)
 
     return PolicyInput(
         obs=merge_batch_values(observations),
-        env_result=EnvResult(
-            rewards=merge_optional_tensor("rewards"),
-            dones=merge_optional_tensor("dones"),
-            terminations=merge_optional_tensor("terminations"),
-            truncations=merge_optional_tensor("truncations"),
-            final_obs=merged_final_obs,
-            intervene_actions=merge_optional_tensor(
-                "intervene_actions", fill_value=0.0
-            ),
-            intervene_flags=merge_optional_tensor("intervene_flags", fill_value=False),
-            rlt_switch_flags=merge_optional_tensor(
-                "rlt_switch_flags", fill_value=False
-            ),
-            reward_model_output=merge_optional_tensor("reward_model_output"),
-            reward_assign_lengths=merge_batch_values(
-                [result.reward_assign_lengths for result in results]
-            )
-            if any(result.reward_assign_lengths is not None for result in results)
-            else None,
-            episode_data=episode_data,
-        ),
-        is_last=is_last,
+        rlt_switch_flags=merge_optional_tensor("rlt_switch_flags"),
+        intervene_flags=merge_optional_tensor("intervene_flags"),
         sources=sources,
     )
 
@@ -762,6 +762,9 @@ __all__ = [
     "EnvResult",
     "PolicyInput",
     "PolicyOutput",
+    "TerminalRequest",
+    "TrajectoryKey",
+    "TrajectorySource",
     "RTCActionResponse",
     "RTCRequest",
     "Trajectory",
@@ -770,7 +773,10 @@ __all__ = [
     "merge_batch_values",
     "merge_episode_data",
     "merge_policy_inputs",
+    "merge_terminal_requests",
     "split_batch_value",
     "split_episode_data",
     "split_policy_input",
+    "split_terminal_request",
+    "split_trajectory_sources",
 ]

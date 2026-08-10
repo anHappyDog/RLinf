@@ -9,11 +9,10 @@ payloads with worker-to-worker communication.
 When RLinf Uses It
 ------------------
 
-Embodied runners create a ``TrajectoryChannel`` for the rollout-to-actor data
-path. The environment and rollout workers still exchange policy requests and
-actions through ordinary :doc:`Channel <channel>` objects. The rollout worker
-publishes the data needed for training after each action chunk, and the actor
-subscribes to completed training items.
+Embodied runners create a ``TrajectoryChannel`` for the Env/Rollout-to-Actor
+data path. Environment and rollout workers exchange inference requests through
+ordinary :doc:`Channel <channel>` objects. They publish their own training data
+directly to the trajectory worker, which joins the two streams by action chunk.
 
 This division keeps each component focused:
 
@@ -24,14 +23,14 @@ This division keeps each component focused:
    * - Component
      - Responsibility
    * - ``EnvWorker``
-     - Step environments and send ``PolicyInput`` values containing observations
-       and the preceding ``EnvResult``.
+     - Send ``PolicyInput`` values, execute actions, and publish the resulting
+       rewards, done flags, and algorithm-specific environment data.
    * - ``RolloutWorker``
-     - Run policy inference, return ``PolicyOutput`` actions, and publish
-       ``TrajectorySegment`` events.
+     - Run policy inference, return ``PolicyOutput`` actions, publish model
+       outputs, and process terminal observations while environments simulate.
    * - ``TrajectoryWorker``
-     - Preserve source ordering, append segments, apply delayed updates, and emit
-       actor-ready trajectories or pipeline micro-batches.
+     - Reassemble routed source fragments, join environment and model results,
+       apply delayed updates, and emit actor-ready data.
    * - ``ActorWorker``
      - Subscribe to completed items and perform the algorithm-specific update.
 
@@ -47,27 +46,31 @@ payloads to the policy-response path.
    EnvWorker              RolloutWorker         TrajectoryWorker       ActorWorker
        | PolicyInput            |                       |                    |
        |----------------------->|                       |                    |
+       |                        | PolicyStep            |                    |
+       |                        |---------------------->|                    |
        |     PolicyOutput       |                       |                    |
        |<-----------------------|                       |                    |
-       |                        | TrajectorySegment     |                    |
-       |                        |---------------------->| append by source   |
+       | simulate action        |                       |                    |
+       | EnvStepResult          |                       |                    |
+       |----------------------------------------------->| join by key        |
+       | TerminalRequest*       |                       |                    |
+       |----------------------->| TerminalResult*       |                    |
+       |                        |---------------------->| append when ready  |
        |          ... repeat for each action chunk ... |                    |
-       |                        | TrajectoryEpochEnd    |                    |
-       |                        |---------------------->| finalize epoch     |
-       |                        | TrajectoryEnd         |                    |
-       |                        |---------------------->| flush completed    |
+       | TrajectoryEnd          |                       |                    |
+       |----------------------------------------------->| flush completed    |
        |                        |                       | trajectory / batch |
        |                        |                       |------------------->|
 
-The rollout worker keeps one pending inference result per pipeline stage. When
-the next ``PolicyInput`` arrives, it now has both the result of the previous
-action and the next environment state, so it can publish one complete segment.
-The final policy input closes the last pending segment.
+``*`` marks terminal processing, which runs only for a terminal state or the
+last action chunk. The rollout worker may receive either request from any
+environment rank in decoupled mode. It does not keep cross-request trajectory
+state.
 
 Events and Results
 ------------------
 
-``TrajectoryChannel.publish()`` accepts one of three internal event types:
+``TrajectoryChannel.publish()`` accepts the following internal event types:
 
 .. list-table::
    :header-rows: 1
@@ -75,16 +78,22 @@ Events and Results
 
    * - Event
      - Meaning
-   * - ``TrajectorySegment``
-     - One append operation containing observations, the next observation,
-       environment results, ``EmbodiedRolloutResult``, and logical source
-       metadata.
+   * - ``TrajectoryStart``
+     - Initial done and termination state for one logical environment source.
+   * - ``PolicyStep``
+     - Observation, action, log-probability, value, version, and model forward
+       inputs produced by rollout inference.
+   * - ``EnvStepResult``
+     - Reward, done flags, interventions, reward-model output, and optional
+       online LeRobot episode data produced by the environment.
+   * - ``TerminalResult``
+     - Terminal observation, bootstrap value, and terminal model inputs produced
+       from a ``TerminalRequest``.
    * - ``TrajectoryEpochEnd``
-     - One producer finished an epoch. It also carries final values needed by
-       value-based advantage calculation.
+     - One logical environment source finished an epoch.
    * - ``TrajectoryEnd``
-     - One producer finished a training step. The worker flushes only after all
-       expected producers report completion.
+     - One logical environment source finished a training step. The worker
+       flushes only after every expected action key is complete.
 
 For ordinary training, ``subscribe()`` returns a complete ``Trajectory``. For
 online LeRobot DAgger it returns completed episode dictionaries. With training
@@ -94,10 +103,18 @@ receives prepared micro-batches.
 Routing and Ordering
 --------------------
 
-Each policy input records logical sources as ``(env_rank, stage_id, batch_size)``.
-Channel routing may split or merge a policy batch, but these source records stay
-with the data. The trajectory worker uses them to restore per-environment-rank,
-per-stage streams before appending segments.
+``TrajectoryKey`` identifies an action with ``step_id``, ``epoch_id``,
+``env_rank``, ``stage_id``, and ``chunk_id``. ``TrajectorySource`` adds the
+source shard's batch size and offset. Channel routing may split one environment
+batch across several rollout workers or merge unrelated sources. The trajectory
+worker restores the original batch by offset before joining events with the same
+key.
+
+In decoupled mode, ``PolicyInput`` and ``TerminalRequest`` use separate ordinary
+Channel tags. Either request may reach any available rollout worker. Only policy
+requests record a return route because only actions return to the environment.
+The trajectory worker, rather than rollout-worker affinity or a terminal
+barrier, determines when an action chunk is complete.
 
 Completed data is split according to the actor world size. This has two useful
 properties:
@@ -188,8 +205,8 @@ or placement settings:
      - Inspect the ordinary Env-to-Rollout ``Channel`` path; no trajectory event
        has been produced yet.
    * - Actor waits after rollout completes
-     - Confirm every rollout rank and pipeline stage published its matching end
-       event for the same ``step_id``.
+     - Confirm Env published ``EnvStepResult`` for every key and Rollout published
+       the matching ``PolicyStep`` and required ``TerminalResult``.
    * - Pipeline actor waits
      - Confirm the actor subscribes with ``actor:<rank>`` and that the configured
        batch size is divisible by ``actor.micro_batch_size``.

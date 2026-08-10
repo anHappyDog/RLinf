@@ -15,7 +15,6 @@
 from .data import (
     TrajectoryEnd,
     TrajectoryEpochEnd,
-    TrajectorySegment,
 )
 from .trajectory_channel import TrajectoryChannel
 
@@ -23,5 +22,4 @@ __all__ = [
     "TrajectoryChannel",
     "TrajectoryEnd",
     "TrajectoryEpochEnd",
-    "TrajectorySegment",
 ]
