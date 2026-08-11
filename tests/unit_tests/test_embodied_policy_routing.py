@@ -171,7 +171,7 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
                 torch.zeros(1, 1),
                 {
                     "forward_inputs": {"states": torch.tensor([[3]])},
-                    "prev_values": torch.tensor([[4.0]]),
+                    "prev_values": torch.tensor([[4.0, 5.0]]),
                 },
             ),
         ]
@@ -196,6 +196,7 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
     assert len(env_events) == 2
     assert torch.equal(env_events[0].forward_inputs["states"], torch.tensor([[2]]))
     assert torch.equal(env_events[1].bootstrap_values, torch.tensor([[4.0]]))
+    assert torch.equal(env_events[1].final_prev_values, torch.tensor([[4.0, 5.0]]))
     assert rollout._predict_rollout_actions.call_count == 3
 
 

@@ -706,12 +706,13 @@ class MultiStepRolloutWorker(Worker):
         trajectory_channel: TrajectoryChannel,
     ) -> None:
         bootstrap_values = None
+        final_prev_values = None
         if completion.requires_inference:
             _, result = self._predict_rollout_actions(completion.next_obs)
             values = result.get("prev_values")
-            bootstrap_values = (
-                values[:, :1].cpu().contiguous() if values is not None else None
-            )
+            if values is not None:
+                final_prev_values = values.cpu().contiguous()
+                bootstrap_values = final_prev_values[:, :1]
             forward_inputs = result.get("forward_inputs")
         trajectory_channel.publish(
             EnvStepResult(
@@ -720,6 +721,7 @@ class MultiStepRolloutWorker(Worker):
                 next_obs=completion.next_obs,
                 forward_inputs=forward_inputs,
                 bootstrap_values=bootstrap_values,
+                final_prev_values=final_prev_values,
             ),
             async_op=True,
         )

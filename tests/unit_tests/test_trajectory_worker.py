@@ -16,6 +16,7 @@ import asyncio
 from collections import defaultdict
 from unittest.mock import AsyncMock, Mock
 
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -37,6 +38,42 @@ from rlinf.scheduler.channel.trajectory_channel.trajectory_worker import (
     TrajectoryWorker,
     _TrajectoryStep,
 )
+from rlinf.scheduler.worker.worker import WorkerAddress
+
+
+def test_try_subscribe_returns_false_without_starting_recv():
+    worker = object.__new__(TrajectoryWorker)
+    worker._output_queues = defaultdict(asyncio.Queue)
+    worker.send = Mock()
+
+    ready = asyncio.run(
+        worker.try_subscribe(
+            WorkerAddress(root_group_name="actor", ranks=0), "default", 7
+        )
+    )
+
+    assert ready is False
+    worker.send.assert_not_called()
+
+
+def test_try_subscribe_dequeues_and_submits_async_send():
+    worker = object.__new__(TrajectoryWorker)
+    worker._output_queues = defaultdict(asyncio.Queue)
+    worker._output_queues["actor:0"].put_nowait("trajectory")
+    worker.send = Mock()
+    address = WorkerAddress(root_group_name="actor", ranks=0)
+
+    ready = asyncio.run(worker.try_subscribe(address, "actor:0", 11))
+
+    assert ready is True
+    assert worker._output_queues["actor:0"].empty()
+    worker.send.assert_called_once_with(
+        object="trajectory",
+        dst_group_name="actor",
+        dst_rank=0,
+        piggyback_payload=11,
+        async_op=True,
+    )
 
 
 def test_bootstrap_reward_uses_worker_config():
@@ -76,6 +113,28 @@ def test_flush_waits_for_expected_key_count():
     asyncio.run(worker._flush(3))
 
     assert worker._completed_keys == set()
+
+
+def test_flush_preserves_collector_state_when_conversion_fails():
+    worker = object.__new__(TrajectoryWorker)
+    key = TrajectoryKey(3, 0, 0, 0, 0)
+    collector = Mock()
+    collector.to_splited_trajectories.side_effect = RuntimeError("invalid trajectory")
+    worker._step_collectors = {3: {(0, 0): collector}}
+    worker._completed_keys = {key}
+    worker._output_queues = defaultdict(asyncio.Queue)
+    worker.enable_online_lerobot = False
+    worker.source_count = 1
+    worker.chunk_count = 1
+    worker.shards_per_source = 1
+    worker._cfg = OmegaConf.create({"env": {"train": {"rollout_epoch": 1}}})
+
+    with pytest.raises(RuntimeError, match="invalid trajectory"):
+        asyncio.run(worker._flush(3))
+
+    assert worker._step_collectors == {3: {(0, 0): collector}}
+    assert worker._completed_keys == {key}
+    assert worker._output_queues["default"].empty()
 
 
 def test_online_lerobot_flush_emits_one_item_per_shard():
@@ -203,6 +262,7 @@ def test_source_fragments_join_across_rollout_workers():
             next_obs={"states": torch.tensor([[20], [21]])},
             forward_inputs={"states": torch.tensor([[20], [21]])},
             bootstrap_values=None,
+            final_prev_values=None,
         )
     )
     worker._store_event(policy_fragment(key1, 0, 20))
@@ -226,12 +286,14 @@ def test_env_result_completes_final_transition():
     worker._completed_keys = set()
     worker._initial_results = {(0, 0, 0, 0): EnvResult()}
     worker.enable_online_lerobot = False
-    worker.collect_prev_infos = False
+    worker.collect_prev_infos = True
     worker.use_training_pipeline = False
     worker._step_collectors = {}
     captured = []
     worker._collectors_for = lambda _: {}
     worker._append_one = lambda _, source, segment: captured.append(segment)
+    collector = Mock()
+    worker._collector = Mock(return_value=collector)
     key = TrajectoryKey(0, 0, 0, 0, 0)
     source = TrajectorySource(key, 1)
 
@@ -251,6 +313,7 @@ def test_env_result_completes_final_transition():
             result=EnvResult(),
             next_obs={"states": torch.tensor([[3]])},
             bootstrap_values=torch.tensor([[4.0]]),
+            final_prev_values=torch.tensor([[4.0, 5.0]]),
             forward_inputs={"states": torch.tensor([[3]])},
         )
     )
@@ -259,6 +322,10 @@ def test_env_result_completes_final_transition():
     assert torch.equal(captured[0].next_obs["states"], torch.tensor([[3]]))
     assert torch.equal(
         captured[0].rollout_result.bootstrap_values, torch.tensor([[4.0]])
+    )
+    collector.append_final_value.assert_called_once()
+    assert torch.equal(
+        collector.append_final_value.call_args.args[0], torch.tensor([[4.0, 5.0]])
     )
 
 
@@ -309,6 +376,7 @@ def test_online_lerobot_step_uses_completed_env_result():
             next_obs={},
             forward_inputs=None,
             bootstrap_values=None,
+            final_prev_values=None,
         )
     )
 

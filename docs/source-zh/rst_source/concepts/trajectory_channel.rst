@@ -84,7 +84,8 @@ trajectory 状态。
        model forward input。
    * - ``EnvStepResult``
      - ``PolicyCompletion`` 携带的 environment outcome，以及 RolloutWorker 补齐的
-       next observation、bootstrap value 和 next model input。
+       next observation 和 next model input。用于 truncation reward 的标量
+       bootstrap value 与 trajectory 末尾追加的完整 value boundary 分开保存。
 
 TrajectoryWorker 根据 ``TrajectoryKey`` 自行推导完成状态，不再接收单独的 epoch-end
 或 trajectory-end 事件。Pipeline 模式下，同一 ``(step_id, epoch_id)`` 收齐
@@ -92,15 +93,17 @@ TrajectoryWorker 根据 ``TrajectoryKey`` 自行推导完成状态，不再接�
 ``step_id`` 收齐 ``source_count * rollout_epoch * chunk_count`` 个完整 key 后 flush
 一个训练 step。
 
-普通训练中，``subscribe()`` 返回完整 ``Trajectory``。Online LeRobot DAgger
-中，它返回已完成的 episode 字典。启用 training pipeline 后，Actor 从
-``actor:<rank>`` 队列订阅准备好的 micro-batch。
+普通训练中，``subscribe()`` 返回完整 ``Trajectory``。异步 Actor 使用
+``try_subscribe()``；没有已组装数据时，它在启动 P2P receive 前抛出
+``asyncio.QueueEmpty``。Online LeRobot DAgger 中，channel 返回已完成的 episode
+字典。启用 training pipeline 后，Actor 从 ``actor:<rank>`` 队列订阅准备好的
+micro-batch。
 
 路由与顺序
 ----------
 
 ``TrajectoryKey`` 使用 ``step_id``、``epoch_id``、``env_rank``、``stage_id`` 和
-``chunk_id`` 标识一个 action。``TrajectorySource`` 额外记录 source shard 的 batch
+``chunk_id`` 标识一个 action chunk。``TrajectorySource`` 额外记录 source shard 的 batch
 size 与 offset。Channel 路由可以将一个 environment batch 拆给多个 RolloutWorker，
 也可以合并无关 source。TrajectoryWorker 先按 offset 恢复原始 batch，再合并具有相同
 key 的事件。
@@ -142,9 +145,9 @@ Trajectory 组装目前只使用一个物理 ``TrajectoryWorker``。通过
 通信语义
 --------
 
-``publish()`` 和 ``subscribe()`` 是仅供 worker 内部使用的接口。每次操作使用小型
-Ray RPC 协调，并使用 RLinf P2P ``send``/``recv`` 传输 payload。在 RLinf
-``Worker`` 外调用任一接口都会抛出 ``RuntimeError``。
+``publish()``、``subscribe()`` 和 ``try_subscribe()`` 是仅供 worker 内部使用的
+接口。每次操作使用小型 Ray RPC 协调，并使用 RLinf P2P ``send``/``recv`` 传输
+payload。在 RLinf ``Worker`` 外调用这些接口都会抛出 ``RuntimeError``。
 
 两个接口都支持同步和异步完成。传入 ``async_op=True`` 可获得 ``AsyncWork``
 句柄，再调用 ``wait()`` 或 ``async_wait()``。完成状态同时覆盖控制操作与 payload

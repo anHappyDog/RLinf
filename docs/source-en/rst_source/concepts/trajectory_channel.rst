@@ -89,8 +89,9 @@ Events and Results
        inputs produced by rollout inference.
    * - ``EnvStepResult``
      - Environment outcome carried by ``PolicyCompletion``, together with the
-       next observation, bootstrap value, and next model inputs completed by the
-       rollout worker.
+       next observation and next model inputs completed by the rollout worker.
+       It keeps the scalar truncation bootstrap value separate from the full
+       value boundary appended at the end of the trajectory.
 
 The trajectory worker derives completion from ``TrajectoryKey`` values instead
 of receiving separate epoch-end or trajectory-end events. In pipeline mode it
@@ -99,15 +100,17 @@ for one ``(step_id, epoch_id)``. Otherwise, it flushes a training step after
 receiving ``source_count * rollout_epoch * chunk_count`` completed keys for one
 ``step_id``.
 
-For ordinary training, ``subscribe()`` returns a complete ``Trajectory``. For
-online LeRobot DAgger it returns completed episode dictionaries. With training
+For ordinary training, ``subscribe()`` returns a complete ``Trajectory``.
+Asynchronous actors use ``try_subscribe()``; it raises ``asyncio.QueueEmpty``
+without starting a P2P receive when no assembled item is ready. For online
+LeRobot DAgger the channel returns completed episode dictionaries. With training
 pipeline mode enabled, the actor subscribes to its ``actor:<rank>`` queue and
 receives prepared micro-batches.
 
 Routing and Ordering
 --------------------
 
-``TrajectoryKey`` identifies an action with ``step_id``, ``epoch_id``,
+``TrajectoryKey`` identifies an action chunk with ``step_id``, ``epoch_id``,
 ``env_rank``, ``stage_id``, and ``chunk_id``. ``TrajectorySource`` adds the
 source shard's batch size and offset. Channel routing may split one environment
 batch across several rollout workers or merge unrelated sources. The trajectory
@@ -155,9 +158,10 @@ change ``ChannelWorker`` placement or ordinary ``Channel`` routing.
 Communication Semantics
 -----------------------
 
-``publish()`` and ``subscribe()`` are worker-only APIs. They use a small Ray RPC
-to coordinate each operation and RLinf P2P ``send``/``recv`` for the payload.
-Calling either method outside an RLinf ``Worker`` raises ``RuntimeError``.
+``publish()``, ``subscribe()``, and ``try_subscribe()`` are worker-only APIs.
+They use a small Ray RPC to coordinate each operation and RLinf P2P
+``send``/``recv`` for the payload. Calling them outside an RLinf ``Worker``
+raises ``RuntimeError``.
 
 Both methods support synchronous and asynchronous completion. Pass
 ``async_op=True`` to receive an ``AsyncWork`` handle, then call ``wait()`` or

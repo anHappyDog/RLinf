@@ -47,6 +47,7 @@ class EnvStepResult:
     next_obs: dict[str, Any]
     forward_inputs: dict[str, Any] | None
     bootstrap_values: torch.Tensor | None
+    final_prev_values: torch.Tensor | None
 
     def __post_init__(self) -> None:
         """Move model-derived completion data to CPU for transport."""
@@ -55,6 +56,8 @@ class EnvStepResult:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.bootstrap_values is not None:
             self.bootstrap_values = self.bootstrap_values.cpu().contiguous()
+        if self.final_prev_values is not None:
+            self.final_prev_values = self.final_prev_values.cpu().contiguous()
 
 
 @dataclass(kw_only=True)

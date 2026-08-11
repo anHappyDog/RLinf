@@ -206,9 +206,11 @@ class TrajectoryWorker(Worker):
         if sum(key.step_id == step_id for key in self._completed_keys) != expected:
             return
 
-        collectors = self._collectors
-        if not self.enable_online_lerobot:
-            collectors = self._step_collectors.pop(step_id)
+        collectors = (
+            self._collectors
+            if self.enable_online_lerobot
+            else self._step_collectors[step_id]
+        )
         if len(collectors) != self.source_count:
             raise ValueError(
                 f"Expected {self.source_count} collectors, but got {len(collectors)}."
@@ -224,11 +226,14 @@ class TrajectoryWorker(Worker):
                     episode_chunk = episodes[shard :: self.shards_per_source]
                     await self._output_queues["default"].put(episode_chunk)
         else:
+            trajectories = []
             for collector in collectors.values():
-                for trajectory in collector.to_splited_trajectories(
-                    self.shards_per_source
-                ):
-                    await self._output_queues["default"].put(trajectory)
+                trajectories.extend(
+                    collector.to_splited_trajectories(self.shards_per_source)
+                )
+            for trajectory in trajectories:
+                await self._output_queues["default"].put(trajectory)
+            del self._step_collectors[step_id]
         self._completed_keys = {
             key for key in self._completed_keys if key.step_id != step_id
         }
@@ -389,6 +394,9 @@ class TrajectoryWorker(Worker):
                     bootstrap_values=split_batch_value(event.bootstrap_values, sizes)[
                         index
                     ],
+                    final_prev_values=split_batch_value(event.final_prev_values, sizes)[
+                        index
+                    ],
                 )
 
     def _merge_fragments(self, event):
@@ -449,6 +457,9 @@ class TrajectoryWorker(Worker):
                 bootstrap_values=merge_batch_values(
                     [item.bootstrap_values for item in fragments]
                 ),
+                final_prev_values=merge_batch_values(
+                    [item.final_prev_values for item in fragments]
+                ),
             )
         raise TypeError(f"Unexpected trajectory event: {type(event)}")
 
@@ -504,7 +515,7 @@ class TrajectoryWorker(Worker):
         ):
             self._collector(
                 collectors, (key.env_rank, key.stage_id)
-            ).append_final_value(env.bootstrap_values)
+            ).append_final_value(env.final_prev_values)
         self._completed_keys.add(key)
         del self._policy_steps[key]
         del self._env_results[key]
@@ -647,3 +658,21 @@ class TrajectoryWorker(Worker):
             piggyback_payload=query_id,
             async_op=True,
         ).async_wait()
+
+    async def try_subscribe(
+        self, worker_address: WorkerAddress, queue_key: str, query_id: int
+    ) -> bool:
+        """Submit a send if an assembled item is immediately available."""
+        try:
+            data = self._output_queues[queue_key].get_nowait()
+        except asyncio.QueueEmpty:
+            return False
+
+        self.send(
+            object=data,
+            dst_group_name=worker_address.root_group_name,
+            dst_rank=worker_address.rank,
+            piggyback_payload=query_id,
+            async_op=True,
+        )
+        return True

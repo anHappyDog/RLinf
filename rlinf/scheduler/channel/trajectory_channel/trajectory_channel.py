@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import uuid
 
 import ray
@@ -129,6 +130,35 @@ class TrajectoryChannel:
             async_op=True,
         )
 
+        async_subscribe_work = AsyncSubscribeWork(subscribe_ref, recv_work, query_id)
+        return async_subscribe_work if async_op else async_subscribe_work.wait()
+
+    def try_subscribe(
+        self, query_key: str = "default", async_op: bool = False
+    ) -> AsyncSubscribeWork | Trajectory:
+        """Subscribe without waiting when no assembled item is available.
+
+        Raises:
+            asyncio.QueueEmpty: If the trajectory worker's queue is empty.
+        """
+        if not self._current_worker:
+            raise RuntimeError(
+                "TrajectoryChannel methods must be called from within a Worker."
+            )
+        worker = self._current_worker
+        trajectory_worker_actor = self._trajectory_workers[0]
+        query_id = uuid.uuid4().int
+        subscribe_ref: ray.ObjectRef = trajectory_worker_actor.try_subscribe.remote(
+            worker.worker_address, query_key, query_id
+        )
+        if not ray.get(subscribe_ref):
+            raise asyncio.QueueEmpty
+
+        recv_work: AsyncWork = worker.recv(
+            src_group_name=self._trajectory_worker_group.worker_group_name,
+            src_rank=0,
+            async_op=True,
+        )
         async_subscribe_work = AsyncSubscribeWork(subscribe_ref, recv_work, query_id)
         return async_subscribe_work if async_op else async_subscribe_work.wait()
 
