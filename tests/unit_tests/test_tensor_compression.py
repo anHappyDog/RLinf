@@ -12,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from rlinf.scheduler.cluster.cluster import Cluster, ClusterEnvVar
+from rlinf.scheduler.collective.collective_group import (
+    CollectiveGroup,
+    CollectiveGroupOptions,
+)
 from rlinf.scheduler.collective.tensor_compression import (
     TensorCompressionOptions,
     TensorWorkspacePool,
 )
+from rlinf.scheduler.worker.worker import Worker
 
 
 def test_workspace_pool_prefers_a_reused_slot_and_its_buffer():
@@ -76,6 +86,7 @@ def test_workspace_slot_compresses_and_restores_a_tensor(codec):
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
+        ({"enabled": "yes"}, "boolean"),
         ({"codec": "invalid"}, "Unsupported"),
         ({"level": 0}, "level"),
         ({"min_bytes": 0}, "Minimum"),
@@ -86,3 +97,108 @@ def test_compression_options_validate_positive_limits(kwargs, message):
     """Invalid compression limits fail before a collective starts."""
     with pytest.raises(ValueError, match=message):
         TensorCompressionOptions(**kwargs)
+
+
+def test_compression_options_parse_cluster_yaml_mapping():
+    """Cluster YAML options retain their configured compression behavior."""
+    options = TensorCompressionOptions.from_dict(
+        {
+            "enabled": True,
+            "codec": "zstd",
+            "level": 3,
+            "min_bytes": 1024,
+            "max_inflight": 2,
+        }
+    )
+
+    assert options.enabled
+    assert options.codec == "zstd"
+    assert options.level == 3
+    assert options.min_bytes == 1024
+    assert options.max_inflight == 2
+
+
+def test_compression_options_reject_unknown_cluster_yaml_key():
+    """Typos in the public YAML interface fail clearly."""
+    with pytest.raises(ValueError, match="Unsupported"):
+        TensorCompressionOptions.from_dict({"min_byte": 1024})
+
+
+def test_disabled_compression_preserves_the_original_cpu_tensors():
+    """``enabled=False`` takes the raw path before acquiring any workspace."""
+    group = object.__new__(CollectiveGroup)
+    tensors = [torch.zeros(128 * 1024, dtype=torch.uint8)]
+    wire_tensors, metadata, lease = group._prepare_cpu_tensor_compression(
+        tensors,
+        tensors,
+        CollectiveGroupOptions(
+            tensor_compression=TensorCompressionOptions(enabled=False, min_bytes=1)
+        ),
+    )
+
+    assert wire_tensors is tensors
+    assert metadata is None
+    assert lease is None
+
+
+def test_cluster_serializes_validated_tensor_compression_config(monkeypatch):
+    """The public YAML config becomes the validated Worker configuration."""
+    env_var_name = Cluster.get_full_env_var_name(
+        ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
+    )
+    monkeypatch.delenv(env_var_name, raising=False)
+
+    Cluster._configure_tensor_compression_env(
+        {
+            "collective": {
+                "tensor_compression": {
+                    "enabled": False,
+                    "codec": "zstd",
+                    "level": 3,
+                    "min_bytes": 1024,
+                    "max_inflight": 2,
+                }
+            }
+        }
+    )
+
+    assert json.loads(os.environ[env_var_name]) == {
+        "enabled": False,
+        "codec": "zstd",
+        "level": 3,
+        "min_bytes": 1024,
+        "max_inflight": 2,
+    }
+
+
+def test_worker_uses_yaml_default_unless_a_call_overrides_it():
+    """A call-level compression option wins over the worker's YAML default."""
+    worker = object.__new__(Worker)
+    worker._default_tensor_compression = TensorCompressionOptions(min_bytes=1024)
+
+    default_options = worker._resolve_collective_options(None)
+    assert default_options is not None
+    assert default_options.tensor_compression == worker._default_tensor_compression
+
+    override = CollectiveGroupOptions(
+        tensor_compression=TensorCompressionOptions(enabled=False)
+    )
+    assert worker._resolve_collective_options(override) is override
+
+
+def test_cluster_yaml_overrides_the_internal_worker_environment(monkeypatch):
+    """Workers receive the YAML setting rather than a manually supplied value."""
+    env_var_name = Cluster.get_full_env_var_name(
+        ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
+    )
+    cluster = object.__new__(Cluster)
+    node = SimpleNamespace(env_vars={env_var_name: "manual-value"})
+    cluster._nodes = [node]
+
+    monkeypatch.setenv(env_var_name, '{"enabled": true}')
+    cluster._set_scheduler_env_vars()
+    assert node.env_vars[env_var_name] == '{"enabled": true}'
+
+    monkeypatch.delenv(env_var_name)
+    cluster._set_scheduler_env_vars()
+    assert env_var_name not in node.env_vars

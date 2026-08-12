@@ -1428,10 +1428,15 @@ class CollectiveGroup:
         compression_options = (
             options.tensor_compression if options is not None else None
         )
-        if compression_options is None or not any(
-            tensor.is_cpu
-            and tensor.numel() * tensor.element_size() >= compression_options.min_bytes
-            for tensor in tensors
+        if (
+            compression_options is None
+            or not compression_options.enabled
+            or not any(
+                tensor.is_cpu
+                and tensor.numel() * tensor.element_size()
+                >= compression_options.min_bytes
+                for tensor in tensors
+            )
         ):
             return cpu_tensors, None, None
 
