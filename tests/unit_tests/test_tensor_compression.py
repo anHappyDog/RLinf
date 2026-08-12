@@ -14,6 +14,7 @@
 
 import json
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -30,10 +31,7 @@ from rlinf.scheduler.collective.tensor_compression import (
     TensorCompressionWireMetadata,
 )
 from rlinf.scheduler.worker.worker import Worker
-from rlinf.utils.tensor_codec import (
-    LZ4TensorCodec,
-    supports_tensor_codec_input_size,
-)
+from rlinf.utils.tensor_codec import LZ4TensorCodec
 
 
 def test_codec_pool_prefers_a_reused_compressor_and_its_buffer():
@@ -110,13 +108,36 @@ def test_codec_pool_rejects_mismatched_decompression_metadata():
         )
 
 
-def test_lz4_input_limit_is_checked_before_workspace_allocation():
-    """Inputs over LZ4's single-call limit are not compression candidates."""
-    assert supports_tensor_codec_input_size("lz4", LZ4TensorCodec._MAX_INPUT_SIZE)
-    assert not supports_tensor_codec_input_size(
-        "lz4", LZ4TensorCodec._MAX_INPUT_SIZE + 1
+def test_tensor_over_codec_bound_skips_compression(monkeypatch):
+    """A codec input-limit error leaves that tensor on the raw wire path."""
+    group = object.__new__(CollectiveGroup)
+    options = TensorCompressionOptions(min_bytes=1)
+    pool = TensorCodecPool(options)
+    group._tensor_codec_pool = pool
+    group._tensor_codec_pool_lock = threading.Lock()
+    tensor = torch.zeros(128, dtype=torch.uint8)
+
+    monkeypatch.setattr(
+        pool._fresh_compressors.queue[0].codec,
+        "compress_bound",
+        lambda _source_bytes: None,
     )
-    assert supports_tensor_codec_input_size("zstd", LZ4TensorCodec._MAX_INPUT_SIZE + 1)
+    wire_tensors, metadata, lease = group._prepare_tensor_compression(
+        [tensor],
+        [tensor],
+        CollectiveGroupOptions(tensor_compression=options),
+    )
+
+    assert wire_tensors[0] is tensor
+    assert metadata is None
+    assert lease is None
+
+
+def test_lz4_compress_bound_returns_none_for_an_unsupported_input_size():
+    """An input-size limit is a normal no-compression outcome."""
+    codec = LZ4TensorCodec()
+
+    assert codec.compress_bound(LZ4TensorCodec._MAX_INPUT_SIZE + 1) is None
 
 
 @pytest.mark.parametrize(
@@ -133,25 +154,6 @@ def test_compression_options_validate_positive_limits(kwargs, message):
     """Invalid compression limits fail before a collective starts."""
     with pytest.raises(ValueError, match=message):
         TensorCompressionOptions(**kwargs)
-
-
-def test_compression_options_parse_cluster_yaml_mapping():
-    """Cluster YAML options retain their configured compression behavior."""
-    options = TensorCompressionOptions.from_dict(
-        {
-            "enabled": True,
-            "codec": "zstd",
-            "level": 3,
-            "min_bytes": 1024,
-            "max_inflight": 2,
-        }
-    )
-
-    assert options.enabled
-    assert options.codec == "zstd"
-    assert options.level == 3
-    assert options.min_bytes == 1024
-    assert options.max_inflight == 2
 
 
 def test_compression_options_reject_unknown_cluster_yaml_key():

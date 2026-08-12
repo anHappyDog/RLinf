@@ -25,8 +25,8 @@ class TensorCodec(ABC):
     """Compress tensors into preallocated uint8 tensors without Python bytes."""
 
     @abstractmethod
-    def compress_bound(self, source_bytes: int) -> int:
-        """Return the required worst-case destination capacity."""
+    def compress_bound(self, source_bytes: int) -> int | None:
+        """Return worst-case capacity, or ``None`` when the input is unsupported."""
 
     @abstractmethod
     def compress_into(self, source: torch.Tensor, destination: torch.Tensor) -> int:
@@ -40,11 +40,6 @@ class TensorCodec(ABC):
         destination: torch.Tensor,
     ) -> None:
         """Decompress source directly into destination."""
-
-    @classmethod
-    def supports_input_size(cls, source_bytes: int) -> bool:
-        """Return whether one compression call can process ``source_bytes``."""
-        return source_bytes >= 0
 
 
 class LZ4TensorCodec(TensorCodec):
@@ -75,20 +70,17 @@ class LZ4TensorCodec(TensorCodec):
         ]
         self._library.LZ4_decompress_safe.restype = ctypes.c_int
 
-    @classmethod
-    def supports_input_size(cls, source_bytes: int) -> bool:
-        """Return whether the LZ4 integer API can represent ``source_bytes``."""
-        return 0 <= source_bytes <= cls._MAX_INPUT_SIZE
-
-    def compress_bound(self, source_bytes: int) -> int:
+    def compress_bound(self, source_bytes: int) -> int | None:
         if not 0 <= source_bytes <= self._MAX_INPUT_SIZE:
-            raise ValueError(f"LZ4 source size must be in [0, {self._MAX_INPUT_SIZE}].")
+            return None
         return int(self._library.LZ4_compressBound(source_bytes))
 
     def compress_into(self, source: torch.Tensor, destination: torch.Tensor) -> int:
         source_bytes = _tensor_bytes(source, "source")
         destination_bytes = _byte_tensor(destination, "destination")
         required_bytes = self.compress_bound(source_bytes)
+        if required_bytes is None:
+            raise ValueError(f"LZ4 does not support source size {source_bytes}.")
         if destination_bytes < required_bytes:
             raise ValueError(
                 f"LZ4 destination requires {required_bytes} bytes, got "
@@ -179,15 +171,17 @@ class ZstdTensorCodec(TensorCodec):
             self, self._library.ZSTD_freeDCtx, self._decompression_context
         )
 
-    def compress_bound(self, source_bytes: int) -> int:
+    def compress_bound(self, source_bytes: int) -> int | None:
         if source_bytes < 0:
-            raise ValueError("Zstd source size must be non-negative.")
+            return None
         return int(self._library.ZSTD_compressBound(source_bytes))
 
     def compress_into(self, source: torch.Tensor, destination: torch.Tensor) -> int:
         source_bytes = _tensor_bytes(source, "source")
         destination_bytes = _byte_tensor(destination, "destination")
         required_bytes = self.compress_bound(source_bytes)
+        if required_bytes is None:
+            raise ValueError(f"Zstd does not support source size {source_bytes}.")
         if destination_bytes < required_bytes:
             raise ValueError(
                 f"Zstd destination requires {required_bytes} bytes, got "
@@ -238,15 +232,6 @@ def create_tensor_codec(name: str, *, level: int = 1) -> TensorCodec:
         return LZ4TensorCodec(acceleration=level)
     if name == "zstd":
         return ZstdTensorCodec(level=level)
-    raise ValueError(f"Unsupported tensor codec: {name!r}.")
-
-
-def supports_tensor_codec_input_size(name: str, source_bytes: int) -> bool:
-    """Return whether the named codec can compress one input of this size."""
-    if name == "lz4":
-        return LZ4TensorCodec.supports_input_size(source_bytes)
-    if name == "zstd":
-        return ZstdTensorCodec.supports_input_size(source_bytes)
     raise ValueError(f"Unsupported tensor codec: {name!r}.")
 
 
