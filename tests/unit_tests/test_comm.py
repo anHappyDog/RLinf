@@ -36,6 +36,7 @@ from rlinf.scheduler import (
 )
 from rlinf.scheduler.collective.collective_group import CollectiveGroup
 from rlinf.scheduler.collective.multi_channel_pg import MultiChannelProcessGroup
+from rlinf.scheduler.collective.tensor_compression import TensorCompressionOptions
 
 SENDER_GROUP_NAME = "sender_worker_group"
 RECEIVER_GROUP_NAME = "receiver_worker_group"
@@ -200,6 +201,29 @@ class SenderWorker(Worker):
         device = "cpu" if on_cpu else get_device()
         tensor_list = [torch.ones(2, 2, device=device) * i for i in range(4)]
         return self._send_data(tensor_list, async_op)
+
+    def test_send_compressed_tensor_list(self, async_op=False):
+        """Send a CPU tensor list through the collective compression path."""
+        tensor_list = [
+            torch.zeros(256 * 1024, dtype=torch.uint8),
+            torch.arange(64, dtype=torch.int64),
+        ]
+        peer_rank = get_send_peer_rank(self._rank, self._world_size)
+        work = self.send(
+            tensor_list,
+            RECEIVER_GROUP_NAME,
+            peer_rank,
+            async_op=async_op,
+            options=CollectiveGroupOptions(
+                tensor_compression=TensorCompressionOptions(
+                    min_bytes=1024,
+                    max_inflight=1,
+                )
+            ),
+        )
+        if async_op:
+            work.wait()
+        return True
 
     def test_send_tensor_dict(self, on_cpu, async_op=False):
         device = "cpu" if on_cpu else get_device()
@@ -1152,6 +1176,22 @@ class TestCommunication:
             for i, tensor in enumerate(res_list):
                 expected = torch.ones(2, 2) * i
                 assert torch.equal(tensor.cpu(), expected)
+
+    @pytest.mark.parametrize("async_op", [False, True], ids=["sync", "async_wait"])
+    def test_compressed_cpu_tensor_list_communication(self, worker_groups, async_op):
+        """Compressed CPU tensor lists preserve raw payload values."""
+        results = self._run_test(
+            worker_groups,
+            "test_send_compressed_tensor_list",
+            "test_recv_tensor_list",
+            (async_op,),
+            (async_op,),
+        )
+        for tensor_list in results:
+            assert torch.equal(
+                tensor_list[0], torch.zeros(256 * 1024, dtype=torch.uint8)
+            )
+            assert torch.equal(tensor_list[1], torch.arange(64, dtype=torch.int64))
 
     @pytest.mark.parametrize("async_op", [False, True], ids=["sync", "async_wait"])
     def test_mixed_tensor_list_communication(self, worker_groups, async_op):

@@ -14,7 +14,7 @@
 
 from .channel import Channel, ChannelWorker, WeightedItem
 from .cluster import Cluster, ClusterConfig
-from .collective import CollectiveGroupOptions
+from .collective import CollectiveGroupOptions, TensorCompressionOptions
 from .hardware import (
     AcceleratorType,
     AcceleratorUtil,
@@ -59,6 +59,7 @@ __all__ = [
     "GimArmHWInfo",
     "Turtle2HWInfo",
     "CollectiveGroupOptions",
+    "TensorCompressionOptions",
     "Cluster",
     "ClusterConfig",
     "ComponentPlacement",
