@@ -30,6 +30,10 @@ from rlinf.scheduler.collective.tensor_compression import (
     TensorCompressionWireMetadata,
 )
 from rlinf.scheduler.worker.worker import Worker
+from rlinf.utils.tensor_codec import (
+    LZ4TensorCodec,
+    supports_tensor_codec_input_size,
+)
 
 
 def test_codec_pool_prefers_a_reused_compressor_and_its_buffer():
@@ -104,6 +108,15 @@ def test_codec_pool_rejects_mismatched_decompression_metadata():
         pool.acquire_decompressor(
             TensorCompressionWireMetadata(codec="zstd", level=1, compressed_numel=(1,))
         )
+
+
+def test_lz4_input_limit_is_checked_before_workspace_allocation():
+    """Inputs over LZ4's single-call limit are not compression candidates."""
+    assert supports_tensor_codec_input_size("lz4", LZ4TensorCodec._MAX_INPUT_SIZE)
+    assert not supports_tensor_codec_input_size(
+        "lz4", LZ4TensorCodec._MAX_INPUT_SIZE + 1
+    )
+    assert supports_tensor_codec_input_size("zstd", LZ4TensorCodec._MAX_INPUT_SIZE + 1)
 
 
 @pytest.mark.parametrize(
