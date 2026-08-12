@@ -73,8 +73,9 @@ driver and propagates the same settings to every Worker, so ordinary
 - ``codec``: ``lz4`` or ``zstd``.
 - ``level``: positive codec compression level.
 - ``min_bytes``: only CPU tensors at least this large are candidates.
-- ``max_inflight``: maximum reusable compression workspace slots per
-  ``CollectiveGroup``.
+- ``max_inflight``: maximum codec slots per direction in each
+  ``CollectiveGroup``: compression slots own reusable workspaces, while
+  decompression slots own only decoder codecs.
 
 For each generic object transfer, a CPU tensor is compressed only when
 compression is enabled, it meets ``min_bytes``, and a workspace slot is
@@ -82,20 +83,23 @@ immediately available. A saturated pool never queues or blocks the sender: the
 transfer proceeds uncompressed. A transfer also falls back to its original
 tensor when the encoded payload is not smaller. When a slot is released, it is
 prioritized over never-used slots, which greedily reuses its workspace buffers.
-For asynchronous sends, the slot remains leased until every payload
-send completes.
+For asynchronous sends, the slot remains leased until every payload send
+completes. Received compressed payloads borrow a decoder slot only while they
+are restored; decoder slots have no workspace buffers.
 
-The sender records compression metadata in the wire format, so the receiver
-does not need a matching per-call option. Compression currently applies only
-to CPU tensors in generic ``send``/``recv`` object, list, dictionary, and
+Each ``CollectiveGroup`` owns one ``TensorCodecPool`` and therefore uses one
+codec and level for the lifetime of the group. The wire metadata identifies the
+compressed payload and validates that its codec matches the job-wide
+configuration propagated to the receiving Worker. Compression currently applies
+only to CPU tensors in generic ``send``/``recv`` object, list, dictionary, and
 dataclass paths. GPU/NCCL transfers, broadcasts, and direct
 ``send_tensor``/``recv_tensor`` calls remain uncompressed.
 
 YAML is the public control plane because it is versioned with the job and is
 propagated consistently across nodes. RLinf uses an internal environment
 variable to carry the validated setting to Worker processes; users should not
-set that variable directly. A specific send can override the job default by
-passing its own option, including ``enabled=False``:
+set that variable directly. A specific send can disable the job default by
+passing ``enabled=False``:
 
 .. code-block:: python
 
