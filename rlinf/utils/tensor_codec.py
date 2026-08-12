@@ -41,6 +41,11 @@ class TensorCodec(ABC):
     ) -> None:
         """Decompress source directly into destination."""
 
+    @classmethod
+    def supports_input_size(cls, source_bytes: int) -> bool:
+        """Return whether one compression call can process ``source_bytes``."""
+        return source_bytes >= 0
+
 
 class LZ4TensorCodec(TensorCodec):
     """LZ4-fast tensor codec backed by the system liblz4 library."""
@@ -69,6 +74,11 @@ class LZ4TensorCodec(TensorCodec):
             ctypes.c_int,
         ]
         self._library.LZ4_decompress_safe.restype = ctypes.c_int
+
+    @classmethod
+    def supports_input_size(cls, source_bytes: int) -> bool:
+        """Return whether the LZ4 integer API can represent ``source_bytes``."""
+        return 0 <= source_bytes <= cls._MAX_INPUT_SIZE
 
     def compress_bound(self, source_bytes: int) -> int:
         if not 0 <= source_bytes <= self._MAX_INPUT_SIZE:
@@ -228,6 +238,15 @@ def create_tensor_codec(name: str, *, level: int = 1) -> TensorCodec:
         return LZ4TensorCodec(acceleration=level)
     if name == "zstd":
         return ZstdTensorCodec(level=level)
+    raise ValueError(f"Unsupported tensor codec: {name!r}.")
+
+
+def supports_tensor_codec_input_size(name: str, source_bytes: int) -> bool:
+    """Return whether the named codec can compress one input of this size."""
+    if name == "lz4":
+        return LZ4TensorCodec.supports_input_size(source_bytes)
+    if name == "zstd":
+        return ZstdTensorCodec.supports_input_size(source_bytes)
     raise ValueError(f"Unsupported tensor codec: {name!r}.")
 
 

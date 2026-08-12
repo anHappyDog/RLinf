@@ -86,6 +86,8 @@ prioritized over never-used slots, which greedily reuses its workspace buffers.
 For asynchronous sends, the slot remains leased until every payload send
 completes. Received compressed payloads borrow a decoder slot only while they
 are restored; decoder slots have no workspace buffers.
+Tensor inputs outside the selected codec's one-call size limit (including LZ4
+inputs above roughly 2 GiB) are not compression candidates and are sent raw.
 
 Each ``CollectiveGroup`` owns one ``TensorCodecPool`` and therefore uses one
 codec and level for the lifetime of the group. The wire metadata identifies the
