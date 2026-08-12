@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reusable CPU workspaces for collective tensor compression."""
+"""Bounded codec and workspace pools for collective tensor compression."""
 
 from dataclasses import dataclass
 from queue import Empty, LifoQueue
@@ -73,7 +73,7 @@ class TensorCompressionWireMetadata:
     version: int = 1
 
 
-class TensorWorkspaceSlot:
+class TensorCompressionSlot:
     """Own one codec and reusable uint8 buffers for one in-flight send."""
 
     def __init__(self, options: TensorCompressionOptions) -> None:
@@ -95,13 +95,13 @@ class TensorWorkspaceSlot:
 class CompressionLease:
     """Keep one workspace slot exclusively owned until transfer completion."""
 
-    def __init__(self, pool: "TensorWorkspacePool", slot: TensorWorkspaceSlot) -> None:
+    def __init__(self, pool: "TensorCodecPool", slot: TensorCompressionSlot) -> None:
         """Bind the leased slot to its pool."""
         self._pool = pool
-        self._slot: Optional[TensorWorkspaceSlot] = slot
+        self._slot: Optional[TensorCompressionSlot] = slot
 
     @property
-    def slot(self) -> TensorWorkspaceSlot:
+    def slot(self) -> TensorCompressionSlot:
         """Return the owned workspace slot."""
         if self._slot is None:
             raise RuntimeError("CompressionLease has already been released.")
@@ -113,33 +113,81 @@ class CompressionLease:
             return
         slot = self._slot
         self._slot = None
-        self._pool.release(slot)
+        self._pool.release_compressor(slot)
 
 
-class TensorWorkspacePool:
-    """Bounded, non-blocking pool that prioritizes previously used slots."""
+class DecompressionLease:
+    """Keep one decoder exclusively owned while restoring a received payload."""
+
+    def __init__(self, pool: "TensorCodecPool", codec: TensorCodec) -> None:
+        """Bind the borrowed decoder to its pool."""
+        self._pool = pool
+        self._codec: Optional[TensorCodec] = codec
+
+    @property
+    def codec(self) -> TensorCodec:
+        """Return the exclusively owned decoder."""
+        if self._codec is None:
+            raise RuntimeError("DecompressionLease has already been released.")
+        return self._codec
+
+    def release(self) -> None:
+        """Return the decoder to the pool exactly once."""
+        if self._codec is None:
+            return
+        codec = self._codec
+        self._codec = None
+        self._pool.release_decompressor(codec)
+
+
+class TensorCodecPool:
+    """Own bounded compression workspaces and independent decoder codecs."""
 
     def __init__(self, options: TensorCompressionOptions) -> None:
-        """Create fresh slots without allocating their tensor buffers."""
-        self._fresh_slots: LifoQueue[TensorWorkspaceSlot] = LifoQueue(
+        """Create one codec per compression and decompression slot."""
+        self.options = options
+        self._fresh_compressors: LifoQueue[TensorCompressionSlot] = LifoQueue(
             maxsize=options.max_inflight
         )
-        self._reused_slots: LifoQueue[TensorWorkspaceSlot] = LifoQueue(
+        self._reused_compressors: LifoQueue[TensorCompressionSlot] = LifoQueue(
+            maxsize=options.max_inflight
+        )
+        self._decompressors: LifoQueue[TensorCodec] = LifoQueue(
             maxsize=options.max_inflight
         )
         for _ in range(options.max_inflight):
-            self._fresh_slots.put_nowait(TensorWorkspaceSlot(options))
+            self._fresh_compressors.put_nowait(TensorCompressionSlot(options))
+            self._decompressors.put_nowait(
+                create_tensor_codec(name=options.codec, level=options.level)
+            )
 
-    def try_acquire(self) -> Optional[CompressionLease]:
-        """Return a reusable slot without waiting, or ``None`` when saturated."""
+    def try_acquire_compressor(self) -> Optional[CompressionLease]:
+        """Return a preferred reusable compressor without waiting."""
         try:
-            return CompressionLease(self, self._reused_slots.get_nowait())
+            return CompressionLease(self, self._reused_compressors.get_nowait())
         except Empty:
             try:
-                return CompressionLease(self, self._fresh_slots.get_nowait())
+                return CompressionLease(self, self._fresh_compressors.get_nowait())
             except Empty:
                 return None
 
-    def release(self, slot: TensorWorkspaceSlot) -> None:
-        """Return a slot so it is preferred over never-used slots next time."""
-        self._reused_slots.put_nowait(slot)
+    def acquire_decompressor(
+        self, metadata: TensorCompressionWireMetadata
+    ) -> DecompressionLease:
+        """Borrow a decoder after checking the wire codec matches this pool."""
+        if (metadata.codec, metadata.level) != (
+            self.options.codec,
+            self.options.level,
+        ):
+            raise ValueError(
+                "Compression metadata does not match this collective's codec settings."
+            )
+        return DecompressionLease(self, self._decompressors.get())
+
+    def release_compressor(self, slot: TensorCompressionSlot) -> None:
+        """Return a compressor so it is preferred over unused slots next time."""
+        self._reused_compressors.put_nowait(slot)
+
+    def release_decompressor(self, codec: TensorCodec) -> None:
+        """Return a decoder after the received payload has been restored."""
+        self._decompressors.put_nowait(codec)

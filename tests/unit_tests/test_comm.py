@@ -627,6 +627,22 @@ class ReceiverWorker(Worker):
     def test_recv_tensor_list(self, async_op=False):
         return self._recv_data(async_op)
 
+    def test_recv_compressed_tensor_list(self, async_op=False):
+        """Receive a CPU tensor list using the collective compression config."""
+        peer_rank = get_recv_peer_rank(self._rank, self._world_size)
+        work = self.recv(
+            SENDER_GROUP_NAME,
+            peer_rank,
+            async_op=async_op,
+            options=CollectiveGroupOptions(
+                tensor_compression=TensorCompressionOptions(
+                    min_bytes=1024,
+                    max_inflight=1,
+                )
+            ),
+        )
+        return work.wait() if async_op else work
+
     def test_recv_tensor_dict(self, async_op=False):
         return self._recv_data(async_op)
 
@@ -1183,7 +1199,7 @@ class TestCommunication:
         results = self._run_test(
             worker_groups,
             "test_send_compressed_tensor_list",
-            "test_recv_tensor_list",
+            "test_recv_compressed_tensor_list",
             (async_op,),
             (async_op,),
         )

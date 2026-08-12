@@ -25,45 +25,47 @@ from rlinf.scheduler.collective.collective_group import (
     CollectiveGroupOptions,
 )
 from rlinf.scheduler.collective.tensor_compression import (
+    TensorCodecPool,
     TensorCompressionOptions,
-    TensorWorkspacePool,
+    TensorCompressionWireMetadata,
 )
 from rlinf.scheduler.worker.worker import Worker
 
 
-def test_workspace_pool_prefers_a_reused_slot_and_its_buffer():
+def test_codec_pool_prefers_a_reused_compressor_and_its_buffer():
     """A released slot outranks an unused slot and retains its workspace."""
-    pool = TensorWorkspacePool(TensorCompressionOptions(max_inflight=2))
+    pool = TensorCodecPool(TensorCompressionOptions(max_inflight=2))
 
-    first_lease = pool.try_acquire()
+    first_lease = pool.try_acquire_compressor()
     assert first_lease is not None
     first_slot = first_lease.slot
     first_buffer = first_slot.get_buffer(0, 128)
     first_lease.release()
 
-    reused_lease = pool.try_acquire()
+    reused_lease = pool.try_acquire_compressor()
     assert reused_lease is not None
     assert reused_lease.slot is first_slot
     assert reused_lease.slot.get_buffer(0, 64).data_ptr() == first_buffer.data_ptr()
     reused_lease.release()
 
 
-def test_workspace_pool_never_waits_for_a_busy_slot():
+def test_codec_pool_never_waits_for_a_busy_compressor():
     """Saturated pools report no slot instead of blocking a sender."""
-    pool = TensorWorkspacePool(TensorCompressionOptions(max_inflight=1))
+    pool = TensorCodecPool(TensorCompressionOptions(max_inflight=1))
 
-    lease = pool.try_acquire()
+    lease = pool.try_acquire_compressor()
     assert lease is not None
-    assert pool.try_acquire() is None
+    assert pool.try_acquire_compressor() is None
 
     lease.release()
 
 
 @pytest.mark.parametrize("codec", ["lz4", "zstd"])
-def test_workspace_slot_compresses_and_restores_a_tensor(codec):
+def test_codec_pool_compresses_and_restores_a_tensor(codec):
     """A slot's codec writes into its reusable buffer without altering bytes."""
-    pool = TensorWorkspacePool(TensorCompressionOptions(codec=codec))
-    lease = pool.try_acquire()
+    options = TensorCompressionOptions(codec=codec)
+    pool = TensorCodecPool(options)
+    lease = pool.try_acquire_compressor()
     assert lease is not None
 
     source = torch.zeros(128 * 1024, dtype=torch.uint8)
@@ -75,12 +77,33 @@ def test_workspace_slot_compresses_and_restores_a_tensor(codec):
         assert compressed_numel < source.numel()
 
         restored = torch.empty_like(source)
-        lease.slot.codec.decompress_into(
-            destination[:compressed_numel], compressed_numel, restored
+        decoder = pool.acquire_decompressor(
+            TensorCompressionWireMetadata(
+                codec=codec,
+                level=options.level,
+                compressed_numel=(compressed_numel,),
+            )
         )
+        try:
+            assert decoder.codec is not lease.slot.codec
+            decoder.codec.decompress_into(
+                destination[:compressed_numel], compressed_numel, restored
+            )
+        finally:
+            decoder.release()
         assert torch.equal(restored, source)
     finally:
         lease.release()
+
+
+def test_codec_pool_rejects_mismatched_decompression_metadata():
+    """A collective has one codec configuration for both directions."""
+    pool = TensorCodecPool(TensorCompressionOptions(codec="lz4", level=1))
+
+    with pytest.raises(ValueError, match="does not match"):
+        pool.acquire_decompressor(
+            TensorCompressionWireMetadata(codec="zstd", level=1, compressed_numel=(1,))
+        )
 
 
 @pytest.mark.parametrize(
@@ -128,7 +151,7 @@ def test_disabled_compression_preserves_the_original_cpu_tensors():
     """``enabled=False`` takes the raw path before acquiring any workspace."""
     group = object.__new__(CollectiveGroup)
     tensors = [torch.zeros(128 * 1024, dtype=torch.uint8)]
-    wire_tensors, metadata, lease = group._prepare_cpu_tensor_compression(
+    wire_tensors, metadata, lease = group._prepare_tensor_compression(
         tensors,
         tensors,
         CollectiveGroupOptions(

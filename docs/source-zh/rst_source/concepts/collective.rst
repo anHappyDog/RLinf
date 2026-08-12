@@ -76,22 +76,25 @@ Tensor 压缩
 - ``codec``：``lz4`` 或 ``zstd``。
 - ``level``：大于 0 的 codec 压缩等级。
 - ``min_bytes``：只有不小于此大小的 CPU 张量才会成为压缩候选。
-- ``max_inflight``：每个 ``CollectiveGroup`` 可复用的压缩 workspace slot 上限。
+- ``max_inflight``：每个 ``CollectiveGroup`` 两个方向的 codec slot 上限：压缩
+  slot 持有可复用 workspace，解压 slot 只持有 decoder codec。
 
 每次通用对象传输中，只有压缩已开启、CPU 张量达到 ``min_bytes``，并且能立即获取到
 空闲 workspace slot 时，才会尝试压缩。pool 饱和时不会排队或阻塞发送端，而是直接
 原样发送；若编码结果并未变小，也会回退为原始张量。slot 释放后会优先于从未使用过的
 slot 被获取，从而贪心复用其中的 workspace buffer。异步发送时，slot 会一直
-被占用到所有 payload send 完成。
+被占用到所有 payload send 完成。接收到压缩 payload 时，仅在恢复数据期间借用
+decoder slot；decoder slot 不持有 workspace buffer。
 
-发送端会把压缩元数据写入 wire format，因此接收端不需要设置匹配的 per-call option。
-当前压缩仅适用于通用 ``send``/``recv`` 的对象、列表、字典和 dataclass 路径中的 CPU
-张量；GPU/NCCL 传输、broadcast，以及直接调用 ``send_tensor``/``recv_tensor`` 的路径
-仍不会压缩。
+每个 ``CollectiveGroup`` 只持有一个 ``TensorCodecPool``，因此其整个生命周期只会使用
+一种 codec 与 level。wire metadata 标记压缩 payload，并校验它的 codec 与接收 Worker
+从作业级配置得到的 codec 一致。当前压缩仅适用于通用 ``send``/``recv`` 的对象、列表、
+字典和 dataclass 路径中的 CPU 张量；GPU/NCCL 传输、broadcast，以及直接调用
+``send_tensor``/``recv_tensor`` 的路径仍不会压缩。
 
 YAML 是公开的控制面：它会随作业一同版本化，并能保证跨节点下发一致。RLinf 仅使用
 内部环境变量把已校验的配置传递给 Worker 进程；用户不应直接设置该环境变量。单次发送
-也可以传入自己的 option 覆盖作业默认值，包括 ``enabled=False``：
+可以传入 ``enabled=False`` 关闭作业默认压缩：
 
 .. code-block:: python
 
