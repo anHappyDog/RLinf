@@ -85,8 +85,6 @@ Tensor 压缩
 slot 被获取，从而贪心复用其中的 workspace buffer。异步发送时，slot 会一直
 被占用到所有 payload send 完成。接收到压缩 payload 时，仅在恢复数据期间借用
 decoder slot；decoder slot 不持有 workspace buffer。
-超出所选 codec 单次输入大小上限的 tensor（包括大约超过 2 GiB 的 LZ4 输入）不是
-压缩候选，会原样发送。
 
 每个 ``CollectiveGroup`` 只持有一个 ``TensorCodecPool``，因此其整个生命周期只会使用
 一种 codec 与 level。wire metadata 标记压缩 payload，并校验它的 codec 与接收 Worker

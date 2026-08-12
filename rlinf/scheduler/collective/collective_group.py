@@ -28,8 +28,6 @@ import torch.distributed as dist
 from ray.cloudpickle import Pickler as CloudPickler
 from torch.multiprocessing.reductions import reduce_tensor
 
-from rlinf.utils.tensor_codec import supports_tensor_codec_input_size
-
 from ..cluster.utils import (
     DataclassTensorFieldsMetadata,
     extract_dataclass_tensor_fields,
@@ -1430,10 +1428,6 @@ class CollectiveGroup:
                 tensor.is_cpu
                 and tensor.numel() * tensor.element_size()
                 >= compression_options.min_bytes
-                and supports_tensor_codec_input_size(
-                    compression_options.codec,
-                    tensor.numel() * tensor.element_size(),
-                )
                 for tensor in tensors
             )
         ):
@@ -1455,21 +1449,17 @@ class CollectiveGroup:
                     continue
                 wire_tensor = tensor
                 tensor_bytes = tensor.numel() * tensor.element_size()
-                if (
-                    tensor_bytes >= compression_options.min_bytes
-                    and supports_tensor_codec_input_size(
-                        compression_options.codec, tensor_bytes
-                    )
-                ):
+                if tensor_bytes >= compression_options.min_bytes:
                     capacity = lease.slot.codec.compress_bound(tensor_bytes)
-                    destination = lease.slot.get_buffer(cpu_tensor_index, capacity)
-                    compressed_bytes = lease.slot.codec.compress_into(
-                        tensor, destination
-                    )
-                    if compressed_bytes < tensor_bytes:
-                        wire_tensor = destination[:compressed_bytes]
-                        compressed_numel[tensor_index] = compressed_bytes
-                        has_compressed_tensor = True
+                    if capacity is not None:
+                        destination = lease.slot.get_buffer(cpu_tensor_index, capacity)
+                        compressed_bytes = lease.slot.codec.compress_into(
+                            tensor, destination
+                        )
+                        if compressed_bytes < tensor_bytes:
+                            wire_tensor = destination[:compressed_bytes]
+                            compressed_numel[tensor_index] = compressed_bytes
+                            has_compressed_tensor = True
                 wire_cpu_tensors.append(wire_tensor)
                 cpu_tensor_index += 1
         except BaseException:
