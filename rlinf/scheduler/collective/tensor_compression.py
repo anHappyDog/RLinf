@@ -16,7 +16,7 @@
 
 from dataclasses import dataclass
 from queue import Empty, LifoQueue
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import torch
 
@@ -27,6 +27,7 @@ from rlinf.utils.tensor_codec import TensorCodec, create_tensor_codec
 class TensorCompressionOptions:
     """Configure optional CPU tensor compression for a collective send."""
 
+    enabled: bool = True
     codec: Literal["lz4", "zstd"] = "lz4"
     level: int = 1
     min_bytes: int = 64 * 1024
@@ -34,6 +35,8 @@ class TensorCompressionOptions:
 
     def __post_init__(self) -> None:
         """Validate compression settings."""
+        if not isinstance(self.enabled, bool):
+            raise ValueError("Compression enabled must be a boolean.")
         if self.codec not in ("lz4", "zstd"):
             raise ValueError(f"Unsupported tensor codec: {self.codec!r}.")
         if self.level < 1:
@@ -46,6 +49,18 @@ class TensorCompressionOptions:
             raise ValueError(
                 f"Maximum inflight compression tasks must be >= 1, got {self.max_inflight}."
             )
+
+    @classmethod
+    def from_dict(cls, config: dict[str, Any]) -> "TensorCompressionOptions":
+        """Build validated options from the ``cluster.collective`` YAML mapping."""
+        valid_keys = {"enabled", "codec", "level", "min_bytes", "max_inflight"}
+        unknown_keys = set(config) - valid_keys
+        if unknown_keys:
+            raise ValueError(
+                "Unsupported collective tensor compression options: "
+                + ", ".join(sorted(unknown_keys))
+            )
+        return cls(**config)
 
 
 @dataclass(frozen=True)
