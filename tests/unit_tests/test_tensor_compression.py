@@ -41,13 +41,29 @@ def test_codec_pool_prefers_a_reused_compressor_and_its_buffer():
     first_lease = pool.try_acquire_compressor()
     assert first_lease is not None
     first_slot = first_lease.slot
-    first_buffer = first_slot.get_buffer(0, 128)
+    first_buffer = first_slot.acquire_buffer(128)
     first_lease.release()
 
     reused_lease = pool.try_acquire_compressor()
     assert reused_lease is not None
     assert reused_lease.slot is first_slot
-    assert reused_lease.slot.get_buffer(0, 64).data_ptr() == first_buffer.data_ptr()
+    assert reused_lease.slot.acquire_buffer(64).data_ptr() == first_buffer.data_ptr()
+    reused_lease.release()
+
+
+def test_codec_slot_uses_best_fit_workspaces_independent_of_tensor_order():
+    """A slot chooses the smallest retained workspace that can hold each output."""
+    pool = TensorCodecPool(TensorCompressionOptions())
+    lease = pool.try_acquire_compressor()
+    assert lease is not None
+    large_buffer = lease.slot.acquire_buffer(512)
+    small_buffer = lease.slot.acquire_buffer(128)
+    lease.release()
+
+    reused_lease = pool.try_acquire_compressor()
+    assert reused_lease is not None
+    assert reused_lease.slot.acquire_buffer(100).data_ptr() == small_buffer.data_ptr()
+    assert reused_lease.slot.acquire_buffer(300).data_ptr() == large_buffer.data_ptr()
     reused_lease.release()
 
 
@@ -72,8 +88,8 @@ def test_codec_pool_compresses_and_restores_a_tensor(codec):
 
     source = torch.zeros(128 * 1024, dtype=torch.uint8)
     try:
-        destination = lease.slot.get_buffer(
-            0, lease.slot.codec.compress_bound(source.numel())
+        destination = lease.slot.acquire_buffer(
+            lease.slot.codec.compress_bound(source.numel())
         )
         compressed_numel = lease.slot.codec.compress_into(source, destination)
         assert compressed_numel < source.numel()

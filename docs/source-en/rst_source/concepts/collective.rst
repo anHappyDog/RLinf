@@ -83,9 +83,9 @@ immediately available. A saturated pool never queues or blocks the sender: the
 transfer proceeds uncompressed. A transfer also falls back to its original
 tensor when the encoded payload is not smaller. When a slot is released, it is
 prioritized over never-used slots, which greedily reuses its workspace buffers.
-For asynchronous sends, the slot remains leased until every payload send
-completes. Received compressed payloads borrow a decoder slot only while they
-are restored; decoder slots have no workspace buffers.
+The slot is released after its synchronous payload transfer finishes. Received
+compressed payloads borrow a decoder slot only while they are restored; decoder
+slots have no workspace buffers.
 
 Each ``CollectiveGroup`` owns one ``TensorCodecPool`` and therefore uses one
 codec and level for the lifetime of the group. The wire metadata identifies the

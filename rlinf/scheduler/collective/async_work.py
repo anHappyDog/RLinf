@@ -253,47 +253,6 @@ class AsyncCollWork(AsyncWork):
         return AsyncCollWork(self._works + other._works)
 
 
-class AsyncWorkGroup(AsyncWork):
-    """Wait for multiple asynchronous works as one operation."""
-
-    def __init__(self, works: Sequence[AsyncWork]) -> None:
-        """Initialize a non-empty group of already-started works."""
-        if not works:
-            raise ValueError("AsyncWorkGroup requires at least one work.")
-        self._works = list(works)
-        self._next_work: Optional[AsyncWork] = None
-
-    async def async_wait(self):
-        """Wait asynchronously for every work in the group."""
-        for work in self._works:
-            await work.async_wait()
-
-    def wait(self):
-        """Wait for every work in the group."""
-        for work in self._works:
-            work.wait()
-
-    def then(self, func: Callable, *args, **kwargs) -> "AsyncFuncWork":
-        """Run ``func`` after every work in the group has completed."""
-        first_work, *remaining_works = self._works
-
-        def wait_for_remaining() -> None:
-            for work in remaining_works:
-                work.wait()
-
-        completion_work = first_work.then(wait_for_remaining)
-        self._next_work = completion_work.then(func, *args, **kwargs)
-        return self._next_work
-
-    def done(self):
-        """Return whether every work in the group has completed."""
-        return all(work.done() for work in self._works)
-
-    def get_next_work(self):
-        """Return the callback work chained to this group, if any."""
-        return self._next_work
-
-
 class AsyncChannelWork(AsyncWork):
     """Asynchronous work for channel operations."""
 

@@ -82,9 +82,9 @@ Tensor 压缩
 每次通用对象传输中，只有压缩已开启、CPU 张量达到 ``min_bytes``，并且能立即获取到
 空闲 workspace slot 时，才会尝试压缩。pool 饱和时不会排队或阻塞发送端，而是直接
 原样发送；若编码结果并未变小，也会回退为原始张量。slot 释放后会优先于从未使用过的
-slot 被获取，从而贪心复用其中的 workspace buffer。异步发送时，slot 会一直
-被占用到所有 payload send 完成。接收到压缩 payload 时，仅在恢复数据期间借用
-decoder slot；decoder slot 不持有 workspace buffer。
+slot 被获取，从而贪心复用其中的 workspace buffer。payload 的同步传输完成后，slot 会
+立即释放。接收到压缩 payload 时，仅在恢复数据期间借用 decoder slot；decoder slot
+不持有 workspace buffer。
 
 每个 ``CollectiveGroup`` 只持有一个 ``TensorCodecPool``，因此其整个生命周期只会使用
 一种 codec 与 level。wire metadata 标记压缩 payload，并校验它的 codec 与接收 Worker
