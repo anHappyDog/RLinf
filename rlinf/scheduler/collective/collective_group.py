@@ -1412,7 +1412,7 @@ class CollectiveGroup:
                 )
             return self._tensor_codec_pool
 
-    def _prepare_tensor_compression(
+    def _compress_cpu_tensors(
         self,
         tensors: list[torch.Tensor],
         cpu_tensors: list[torch.Tensor],
@@ -1424,8 +1424,8 @@ class CollectiveGroup:
         """Compress eligible CPU tensors into a non-blocking workspace lease.
 
         A missing compression option, no eligible tensor, or a saturated pool all
-        preserve the original CPU tensors. The returned lease remains owned by
-        the caller only when at least one wire tensor was compressed.
+        preserve the original CPU tensors. The returned compressor remains owned
+        by the caller only when at least one wire tensor was compressed.
         """
         compression_options = self._tensor_compression
         if (
@@ -1440,10 +1440,10 @@ class CollectiveGroup:
         ):
             return cpu_tensors, None, None
 
-        lease = self._get_tensor_codec_pool(
+        compressor = self._get_tensor_codec_pool(
             compression_options
         ).try_acquire_compressor()
-        if lease is None:
+        if compressor is None:
             return cpu_tensors, None, None
 
         try:
@@ -1456,10 +1456,10 @@ class CollectiveGroup:
                 wire_tensor = tensor
                 tensor_bytes = tensor.numel() * tensor.element_size()
                 if tensor_bytes >= compression_options.min_bytes:
-                    capacity = lease.slot.codec.compress_bound(tensor_bytes)
+                    capacity = compressor.slot.codec.compress_bound(tensor_bytes)
                     if capacity is not None:
-                        destination = lease.slot.acquire_buffer(capacity)
-                        compressed_bytes = lease.slot.codec.compress_into(
+                        destination = compressor.slot.acquire_buffer(capacity)
+                        compressed_bytes = compressor.slot.codec.compress_into(
                             tensor, destination
                         )
                         if compressed_bytes < tensor_bytes:
@@ -1468,11 +1468,11 @@ class CollectiveGroup:
                             has_compressed_tensor = True
                 wire_cpu_tensors.append(wire_tensor)
         except BaseException:
-            lease.release()
+            compressor.release()
             raise
 
         if not has_compressed_tensor:
-            lease.release()
+            compressor.release()
             return cpu_tensors, None, None
         return (
             wire_cpu_tensors,
@@ -1481,7 +1481,7 @@ class CollectiveGroup:
                 level=compression_options.level,
                 compressed_numel=tuple(compressed_numel),
             ),
-            lease,
+            compressor,
         )
 
     def _recv_cpu_tensor_payloads(
@@ -1501,9 +1501,9 @@ class CollectiveGroup:
             raise ValueError(
                 "Compressed tensor payloads require tensor compression options on recv."
             )
-        decoder = self._get_tensor_codec_pool(compression_options).acquire_decompressor(
-            compression_metadata
-        )
+        decompressor = self._get_tensor_codec_pool(
+            compression_options
+        ).acquire_decompressor(compression_metadata)
         try:
             for tensor, wire_numel in cpu_entries:
                 if wire_numel is None:
@@ -1514,9 +1514,9 @@ class CollectiveGroup:
                     raise ValueError("Invalid compressed tensor size in metadata.")
                 wire_tensor = torch.empty(wire_numel, dtype=torch.uint8, device="cpu")
                 self._recv(wire_tensor, CollectiveGroup.CPU, comm_id)
-                decoder.codec.decompress_into(wire_tensor, wire_numel, tensor)
+                decompressor.codec.decompress_into(wire_tensor, wire_numel, tensor)
         finally:
-            decoder.release()
+            decompressor.release()
 
     def _get_object_info(self, object: torch.Tensor | Any) -> tuple[int, TensorData]:
         """Classify the object and build precomputed tensor metadata.
@@ -2314,8 +2314,8 @@ class CollectiveGroup:
         (
             cpu_tensors,
             compression_metadata,
-            compression_lease,
-        ) = self._prepare_tensor_compression(tensors, cpu_tensors)
+            compressor,
+        ) = self._compress_cpu_tensors(tensors, cpu_tensors)
 
         # First send tensor size list
         tensor_shape_dtype = [(tensor.shape, tensor.dtype) for tensor in tensors]
@@ -2348,8 +2348,8 @@ class CollectiveGroup:
                 async_op=False,
             )
         except BaseException:
-            if compression_lease is not None:
-                compression_lease.release()
+            if compressor is not None:
+                compressor.release()
             raise
 
         self._logger.debug(
@@ -2379,12 +2379,12 @@ class CollectiveGroup:
                                 comm_id=comm_id,
                             )
         except BaseException:
-            if compression_lease is not None:
-                compression_lease.release()
+            if compressor is not None:
+                compressor.release()
             raise
 
-        if compression_lease is not None:
-            compression_lease.release()
+        if compressor is not None:
+            compressor.release()
 
     def _recv_tensor_list(
         self,
