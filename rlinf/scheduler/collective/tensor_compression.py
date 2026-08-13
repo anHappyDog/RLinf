@@ -70,7 +70,6 @@ class TensorCompressionWireMetadata:
     codec: Literal["lz4", "zstd"]
     level: int
     compressed_numel: tuple[Optional[int], ...]
-    version: int = 1
 
 
 class TensorCodecSlot:
@@ -133,22 +132,22 @@ class CompressionLease:
 
 
 class DecompressionLease:
-    """Keep one decoder exclusively owned while restoring a received payload."""
+    """Keep one decompressor exclusively owned while restoring a payload."""
 
     def __init__(self, pool: "TensorCodecPool", codec: TensorCodec) -> None:
-        """Bind the borrowed decoder to its pool."""
+        """Bind the borrowed decompressor to its pool."""
         self._pool = pool
         self._codec: Optional[TensorCodec] = codec
 
     @property
     def codec(self) -> TensorCodec:
-        """Return the exclusively owned decoder."""
+        """Return the exclusively owned decompressor."""
         if self._codec is None:
             raise RuntimeError("DecompressionLease has already been released.")
         return self._codec
 
     def release(self) -> None:
-        """Return the decoder to the pool exactly once."""
+        """Return the decompressor to the pool exactly once."""
         if self._codec is None:
             return
         codec = self._codec
@@ -157,7 +156,7 @@ class DecompressionLease:
 
 
 class TensorCodecPool:
-    """Own bounded compression workspaces and independent decoder codecs."""
+    """Own bounded compression workspaces and independent decompressor codecs."""
 
     def __init__(self, options: TensorCompressionOptions) -> None:
         """Create one codec per compression and decompression slot."""
@@ -190,7 +189,7 @@ class TensorCodecPool:
     def acquire_decompressor(
         self, metadata: TensorCompressionWireMetadata
     ) -> DecompressionLease:
-        """Borrow a decoder after checking the wire codec matches this pool."""
+        """Borrow a decompressor after checking the wire codec matches this pool."""
         if (metadata.codec, metadata.level) != (
             self.options.codec,
             self.options.level,
@@ -206,5 +205,5 @@ class TensorCodecPool:
         self._reused_compressors.put_nowait(slot)
 
     def release_decompressor(self, codec: TensorCodec) -> None:
-        """Return a decoder after the received payload has been restored."""
+        """Return a decompressor after restoring the received payload."""
         self._decompressors.put_nowait(codec)

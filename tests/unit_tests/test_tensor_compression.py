@@ -95,7 +95,7 @@ def test_codec_pool_compresses_and_restores_a_tensor(codec):
         assert compressed_numel < source.numel()
 
         restored = torch.empty_like(source)
-        decoder = pool.acquire_decompressor(
+        decompressor = pool.acquire_decompressor(
             TensorCompressionWireMetadata(
                 codec=codec,
                 level=options.level,
@@ -103,12 +103,12 @@ def test_codec_pool_compresses_and_restores_a_tensor(codec):
             )
         )
         try:
-            assert decoder.codec is not lease.slot.codec
-            decoder.codec.decompress_into(
+            assert decompressor.codec is not lease.slot.codec
+            decompressor.codec.decompress_into(
                 destination[:compressed_numel], compressed_numel, restored
             )
         finally:
-            decoder.release()
+            decompressor.release()
         assert torch.equal(restored, source)
     finally:
         lease.release()
@@ -139,7 +139,7 @@ def test_tensor_over_codec_bound_skips_compression(monkeypatch):
         "compress_bound",
         lambda _source_bytes: None,
     )
-    wire_tensors, metadata, lease = group._prepare_tensor_compression(
+    wire_tensors, metadata, lease = group._compress_cpu_tensors(
         [tensor],
         [tensor],
     )
@@ -189,7 +189,7 @@ def test_disabled_compression_preserves_the_original_cpu_tensors():
     group = object.__new__(CollectiveGroup)
     group._tensor_compression = TensorCompressionOptions(enabled=False, min_bytes=1)
     tensors = [torch.zeros(128 * 1024, dtype=torch.uint8)]
-    wire_tensors, metadata, lease = group._prepare_tensor_compression(
+    wire_tensors, metadata, lease = group._compress_cpu_tensors(
         tensors,
         tensors,
     )
