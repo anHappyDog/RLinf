@@ -115,6 +115,7 @@ def test_tensor_over_codec_bound_skips_compression(monkeypatch):
     pool = TensorCodecPool(options)
     group._tensor_codec_pool = pool
     group._tensor_codec_pool_lock = threading.Lock()
+    group._tensor_compression = options
     tensor = torch.zeros(128, dtype=torch.uint8)
 
     monkeypatch.setattr(
@@ -125,7 +126,6 @@ def test_tensor_over_codec_bound_skips_compression(monkeypatch):
     wire_tensors, metadata, lease = group._prepare_tensor_compression(
         [tensor],
         [tensor],
-        CollectiveGroupOptions(tensor_compression=options),
     )
 
     assert wire_tensors[0] is tensor
@@ -138,6 +138,12 @@ def test_lz4_compress_bound_returns_none_for_an_unsupported_input_size():
     codec = LZ4TensorCodec()
 
     assert codec.compress_bound(LZ4TensorCodec._MAX_INPUT_SIZE + 1) is None
+
+
+def test_collective_group_options_exclude_tensor_compression():
+    """Tensor compression is not a per-call collective option."""
+    with pytest.raises(TypeError, match="tensor_compression"):
+        CollectiveGroupOptions(tensor_compression=TensorCompressionOptions())
 
 
 @pytest.mark.parametrize(
@@ -165,13 +171,11 @@ def test_compression_options_reject_unknown_cluster_yaml_key():
 def test_disabled_compression_preserves_the_original_cpu_tensors():
     """``enabled=False`` takes the raw path before acquiring any workspace."""
     group = object.__new__(CollectiveGroup)
+    group._tensor_compression = TensorCompressionOptions(enabled=False, min_bytes=1)
     tensors = [torch.zeros(128 * 1024, dtype=torch.uint8)]
     wire_tensors, metadata, lease = group._prepare_tensor_compression(
         tensors,
         tensors,
-        CollectiveGroupOptions(
-            tensor_compression=TensorCompressionOptions(enabled=False, min_bytes=1)
-        ),
     )
 
     assert wire_tensors is tensors
@@ -209,19 +213,17 @@ def test_cluster_serializes_validated_tensor_compression_config(monkeypatch):
     }
 
 
-def test_worker_uses_yaml_default_unless_a_call_overrides_it():
-    """A call-level compression option wins over the worker's YAML default."""
+def test_worker_loads_the_job_wide_tensor_compression_config(monkeypatch):
+    """Workers load the shared configuration propagated by Cluster."""
     worker = object.__new__(Worker)
-    worker._default_tensor_compression = TensorCompressionOptions(min_bytes=1024)
-
-    default_options = worker._resolve_collective_options(None)
-    assert default_options is not None
-    assert default_options.tensor_compression == worker._default_tensor_compression
-
-    override = CollectiveGroupOptions(
-        tensor_compression=TensorCompressionOptions(enabled=False)
+    env_var_name = Cluster.get_full_env_var_name(
+        ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
     )
-    assert worker._resolve_collective_options(override) is override
+    monkeypatch.setenv(env_var_name, '{"codec": "zstd", "min_bytes": 1024}')
+
+    assert worker._load_tensor_compression_options() == TensorCompressionOptions(
+        codec="zstd", min_bytes=1024
+    )
 
 
 def test_cluster_yaml_overrides_the_internal_worker_environment(monkeypatch):

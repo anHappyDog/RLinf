@@ -98,21 +98,8 @@ dataclass paths. GPU/NCCL transfers, broadcasts, and direct
 YAML is the public control plane because it is versioned with the job and is
 propagated consistently across nodes. RLinf uses an internal environment
 variable to carry the validated setting to Worker processes; users should not
-set that variable directly. A specific send can disable the job default by
-passing ``enabled=False``:
-
-.. code-block:: python
-
-   from rlinf.scheduler import CollectiveGroupOptions, TensorCompressionOptions
-
-   worker.send(
-       payload,
-       dst_group_name="rollout",
-       dst_rank=0,
-       options=CollectiveGroupOptions(
-           tensor_compression=TensorCompressionOptions(enabled=False)
-       ),
-   )
+set that variable directly. Individual Workers and individual transfers cannot
+override the job-wide setting.
 
 The common dependency installation installs the LZ4 and Zstandard system
 libraries required by these codecs. Ensure the same RLinf version and its

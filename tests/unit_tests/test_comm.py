@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+from omegaconf import OmegaConf
 from torch.distributed import distributed_c10d
 
 from rlinf.scheduler import (
@@ -36,7 +37,6 @@ from rlinf.scheduler import (
 )
 from rlinf.scheduler.collective.collective_group import CollectiveGroup
 from rlinf.scheduler.collective.multi_channel_pg import MultiChannelProcessGroup
-from rlinf.scheduler.collective.tensor_compression import TensorCompressionOptions
 
 SENDER_GROUP_NAME = "sender_worker_group"
 RECEIVER_GROUP_NAME = "receiver_worker_group"
@@ -214,12 +214,6 @@ class SenderWorker(Worker):
             RECEIVER_GROUP_NAME,
             peer_rank,
             async_op=async_op,
-            options=CollectiveGroupOptions(
-                tensor_compression=TensorCompressionOptions(
-                    min_bytes=1024,
-                    max_inflight=1,
-                )
-            ),
         )
         if async_op:
             work.wait()
@@ -634,12 +628,6 @@ class ReceiverWorker(Worker):
             SENDER_GROUP_NAME,
             peer_rank,
             async_op=async_op,
-            options=CollectiveGroupOptions(
-                tensor_compression=TensorCompressionOptions(
-                    min_bytes=1024,
-                    max_inflight=1,
-                )
-            ),
         )
         return work.wait() if async_op else work
 
@@ -1002,7 +990,23 @@ class CommCollectiveWorker(Worker):
 @pytest.fixture(scope="module")
 def cluster():
     """Provides a ClusterResource instance for the tests."""
-    return Cluster(num_nodes=1)
+    return Cluster(
+        cluster_cfg=OmegaConf.create(
+            {
+                "num_nodes": 1,
+                "component_placement": [],
+                "collective": {
+                    "tensor_compression": {
+                        "enabled": True,
+                        "codec": "lz4",
+                        "level": 1,
+                        "min_bytes": 1024,
+                        "max_inflight": 1,
+                    }
+                },
+            }
+        )
+    )
 
 
 @pytest.fixture(scope="class")

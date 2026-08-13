@@ -114,13 +114,15 @@ class CollectiveGroupOptions:
     share the same root WorkerGroup (a common pattern, e.g. actor -> all
     rollout ranks)."""
 
-    tensor_compression: Optional[TensorCompressionOptions] = None
-    """Optional CPU tensor compression for object send/recv operations."""
-
     def is_empty_options(self) -> bool:
-        """Check if the options are empty."""
-        empty_options = CollectiveGroupOptions()
-        return self == empty_options
+        """Return whether accelerator process-group options are unset."""
+        return (
+            self.accel_cluster_size is None
+            and self.accel_max_ctas is None
+            and self.accel_min_ctas is None
+            and not self.is_high_priority_stream
+            and not self.use_ring_broadcast
+        )
 
 
 class CollectiveWorkQueue:
@@ -244,6 +246,9 @@ class CollectiveGroup:
         self._cur_worker_address = cur_worker_address
         self._mc_group = None
         self._worker = Worker.current_worker
+        self._tensor_compression: Optional[TensorCompressionOptions] = (
+            self._worker._tensor_compression
+        )
         self._coll_manager = CollectiveManager.get_proxy()
         # The net emulation manager is only launched when cluster.net_emulation is
         # enabled. The driver advertises that through the env var, so that a manager
@@ -1406,7 +1411,6 @@ class CollectiveGroup:
         self,
         tensors: list[torch.Tensor],
         cpu_tensors: list[torch.Tensor],
-        options: Optional[CollectiveGroupOptions],
     ) -> tuple[
         list[torch.Tensor],
         Optional[TensorCompressionWireMetadata],
@@ -1418,9 +1422,7 @@ class CollectiveGroup:
         preserve the original CPU tensors. The returned lease remains owned by
         the caller only when at least one wire tensor was compressed.
         """
-        compression_options = (
-            options.tensor_compression if options is not None else None
-        )
+        compression_options = self._tensor_compression
         if (
             compression_options is None
             or not compression_options.enabled
@@ -1483,7 +1485,6 @@ class CollectiveGroup:
         self,
         cpu_entries: list[tuple[torch.Tensor, Optional[int]]],
         compression_metadata: Optional[TensorCompressionWireMetadata],
-        options: Optional[CollectiveGroupOptions],
         comm_id: int,
     ) -> None:
         """Receive raw CPU tensors and restore compressed CPU wire tensors."""
@@ -1492,9 +1493,7 @@ class CollectiveGroup:
                 self._recv(tensor, CollectiveGroup.CPU, comm_id)
             return
 
-        compression_options = (
-            options.tensor_compression if options is not None else None
-        )
+        compression_options = self._tensor_compression
         if compression_options is None:
             raise ValueError(
                 "Compressed tensor payloads require tensor compression options on recv."
@@ -2302,8 +2301,8 @@ class CollectiveGroup:
             piggyback_payload (Optional[Any]): The payload to piggyback on the send operation.
             work (Optional[AsyncFuncWork]): If provided, payload-transfer time is
                 attributed to this work via :meth:`_track_payload_time`.
-            options (Optional[CollectiveGroupOptions]): Compression and accelerator
-                communication options.
+            options (Optional[CollectiveGroupOptions]): Accelerator communication
+                options.
 
         Returns:
             Optional[AsyncWork]: If async_op is True, returns an AsyncWork object for the asynchronous operation. If async_op is False, returns None.
@@ -2319,7 +2318,7 @@ class CollectiveGroup:
             cpu_tensors,
             compression_metadata,
             compression_lease,
-        ) = self._prepare_tensor_compression(tensors, cpu_tensors, options)
+        ) = self._prepare_tensor_compression(tensors, cpu_tensors)
 
         # First send tensor size list
         tensor_shape_dtype = [(tensor.shape, tensor.dtype) for tensor in tensors]
@@ -2424,8 +2423,8 @@ class CollectiveGroup:
             comm_id (int): The ID for the recv operation.
             work (Optional[AsyncFuncWork]): If provided, payload-transfer time is
                 attributed to this work.
-            options (Optional[CollectiveGroupOptions]): Compression and accelerator
-                communication options.
+            options (Optional[CollectiveGroupOptions]): Accelerator communication
+                options.
 
         Returns:
             tuple[List[torch.Tensor], Any]: A tuple of the received list of tensors and the piggyback payload.
@@ -2499,7 +2498,6 @@ class CollectiveGroup:
             self._recv_cpu_tensor_payloads(
                 cpu_entries,
                 compression_metadata,
-                options,
                 comm_id,
             )
             if has_accel_tensor:
@@ -2544,8 +2542,8 @@ class CollectiveGroup:
             piggyback_payload (Optional[Any]): The payload to piggyback on the send operation.
             work (Optional[AsyncFuncWork]): If provided, payload-transfer time is
                 attributed to this work.
-            options (Optional[CollectiveGroupOptions]): Compression and accelerator
-                communication options.
+            options (Optional[CollectiveGroupOptions]): Accelerator communication
+                options.
 
         Returns:
             Optional[AsyncWork]: If async_op is True, returns an AsyncWork object for the asynchronous operation. If async_op is False, returns None.
@@ -2597,8 +2595,8 @@ class CollectiveGroup:
             comm_id (int): The ID for the recv operation.
             work (Optional[AsyncFuncWork]): If provided, payload-transfer time is
                 attributed to this work.
-            options (Optional[CollectiveGroupOptions]): Compression and accelerator
-                communication options.
+            options (Optional[CollectiveGroupOptions]): Accelerator communication
+                options.
 
         Returns:
             tuple[Dict[str, torch.Tensor], Any]: A tuple of the received dictionary of tensors and the piggyback payload.
@@ -2645,8 +2643,8 @@ class CollectiveGroup:
             piggyback_payload (Optional[Any]): Payload to piggyback with the skeleton.
             work (Optional[AsyncFuncWork]): If provided, payload-transfer time is
                 attributed to this work.
-            options (Optional[CollectiveGroupOptions]): Compression and accelerator
-                communication options.
+            options (Optional[CollectiveGroupOptions]): Accelerator communication
+                options.
 
         Returns:
             Optional[AsyncWork]: If async_op is True, returns an AsyncWork; otherwise None.
