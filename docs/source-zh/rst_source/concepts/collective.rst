@@ -74,7 +74,8 @@ Tensor 压缩
 未配置 ``tensor_compression`` 段，或设置 ``enabled: false`` 时，压缩关闭。各字段含义如下：
 
 - ``codec``：``lz4`` 或 ``zstd``。
-- ``level``：大于 0 的 codec 压缩等级。
+- ``level``：大于 0 的 codec 参数。对于 ``lz4``，它传给 LZ4 的
+  ``acceleration``（值越大越优先速度）；对于 ``zstd``，它是 Zstandard 的压缩等级。
 - ``min_bytes``：只有不小于此大小的 CPU 张量才会成为压缩候选。
 - ``max_inflight``：每个 ``CollectiveGroup`` 两个方向的 codec slot 上限：压缩
   slot 持有可复用 workspace，解压 slot 只持有 decoder codec。
@@ -87,8 +88,8 @@ slot 被获取，从而贪心复用其中的 workspace buffer。payload 的同�
 不持有 workspace buffer。
 
 每个 ``CollectiveGroup`` 只持有一个 ``TensorCodecPool``，因此其整个生命周期只会使用
-一种 codec 与 level。wire metadata 标记压缩 payload，并校验它的 codec 与接收 Worker
-从作业级配置得到的 codec 一致。当前压缩仅适用于通用 ``send``/``recv`` 的对象、列表、
+一种 codec 及其参数。wire metadata 标记压缩 payload，并校验其 codec 设置与接收 Worker
+从作业级配置得到的设置一致。当前压缩仅适用于通用 ``send``/``recv`` 的对象、列表、
 字典和 dataclass 路径中的 CPU 张量；GPU/NCCL 传输、broadcast，以及直接调用
 ``send_tensor``/``recv_tensor`` 的路径仍不会压缩。
 

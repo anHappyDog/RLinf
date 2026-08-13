@@ -71,7 +71,9 @@ driver and propagates the same settings to every Worker, so ordinary
 ``enabled: false``. Its fields are:
 
 - ``codec``: ``lz4`` or ``zstd``.
-- ``level``: positive codec compression level.
+- ``level``: positive codec parameter. For ``lz4``, this is LZ4's
+  ``acceleration`` (higher values prioritize speed); for ``zstd``, it is the
+  Zstandard compression level.
 - ``min_bytes``: only CPU tensors at least this large are candidates.
 - ``max_inflight``: maximum codec slots per direction in each
   ``CollectiveGroup``: compression slots own reusable workspaces, while
@@ -88,8 +90,8 @@ compressed payloads borrow a decoder slot only while they are restored; decoder
 slots have no workspace buffers.
 
 Each ``CollectiveGroup`` owns one ``TensorCodecPool`` and therefore uses one
-codec and level for the lifetime of the group. The wire metadata identifies the
-compressed payload and validates that its codec matches the job-wide
+codec and parameter for the lifetime of the group. The wire metadata identifies
+the compressed payload and validates that its codec settings match the job-wide
 configuration propagated to the receiving Worker. Compression currently applies
 only to CPU tensors in generic ``send``/``recv`` object, list, dictionary, and
 dataclass paths. GPU/NCCL transfers, broadcasts, and direct
