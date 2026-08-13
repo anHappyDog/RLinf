@@ -93,21 +93,8 @@ decoder slot；decoder slot 不持有 workspace buffer。
 ``send_tensor``/``recv_tensor`` 的路径仍不会压缩。
 
 YAML 是公开的控制面：它会随作业一同版本化，并能保证跨节点下发一致。RLinf 仅使用
-内部环境变量把已校验的配置传递给 Worker 进程；用户不应直接设置该环境变量。单次发送
-可以传入 ``enabled=False`` 关闭作业默认压缩：
-
-.. code-block:: python
-
-   from rlinf.scheduler import CollectiveGroupOptions, TensorCompressionOptions
-
-   worker.send(
-       payload,
-       dst_group_name="rollout",
-       dst_rank=0,
-       options=CollectiveGroupOptions(
-           tensor_compression=TensorCompressionOptions(enabled=False)
-       ),
-   )
+内部环境变量把已校验的配置传递给 Worker 进程；用户不应直接设置该环境变量。单个 Worker
+或单次传输都不能覆盖这份作业级配置。
 
 公共依赖安装会安装这两种 codec 所需的 LZ4 和 Zstandard 系统库。请确保所有 Worker 节点
 使用相同版本的 RLinf，并安装相应的 compression 依赖。

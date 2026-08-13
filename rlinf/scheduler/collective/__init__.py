@@ -23,7 +23,6 @@ from .async_work import (
 )
 from .collective import Collective
 from .collective_group import CollectiveGroup, CollectiveGroupOptions
-from .tensor_compression import TensorCompressionOptions
 
 __all__ = [
     "AsyncWork",
@@ -36,5 +35,4 @@ __all__ = [
     "CollectiveGroup",
     "Collective",
     "CollectiveGroupOptions",
-    "TensorCompressionOptions",
 ]
