@@ -258,3 +258,32 @@ def test_cluster_yaml_overrides_the_internal_worker_environment(monkeypatch):
     monkeypatch.delenv(env_var_name)
     cluster._set_scheduler_env_vars()
     assert env_var_name not in node.env_vars
+
+
+@pytest.mark.parametrize(
+    "scheduler_value",
+    ['{"codec": "lz4"}', None],
+    ids=["configured", "disabled"],
+)
+def test_worker_env_cannot_override_tensor_compression_config(
+    scheduler_value,
+):
+    """User environment merging cannot replace the job-wide codec settings."""
+    env_var_name = Cluster.get_full_env_var_name(
+        ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
+    )
+    scheduler_env_vars = (
+        {env_var_name: scheduler_value} if scheduler_value is not None else {}
+    )
+    worker_env_vars = {
+        env_var_name: '{"codec": "zstd"}',
+        "USER_SETTING": "preserved",
+    }
+
+    merged_env_vars = Cluster._enforce_scheduler_owned_env_vars(
+        worker_env_vars,
+        scheduler_env_vars,
+    )
+
+    assert merged_env_vars.get(env_var_name) == scheduler_value
+    assert merged_env_vars["USER_SETTING"] == "preserved"
