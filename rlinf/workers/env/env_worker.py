@@ -71,9 +71,9 @@ class EnvWorker(Worker):
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.stage_num = self.cfg.rollout.pipeline_stage_num
-        self.enable_rlt = (
-            OmegaConf.select(self.cfg, "algorithm.loss_type", default="") == "rlt_ac"
-        )
+        self.enable_rlt = OmegaConf.select(
+            self.cfg, "algorithm.loss_type", default=""
+        ) in {"rlt_ac", "rlt_td3"}
         self.use_training_pipeline = self.cfg.runner.get("use_training_pipeline", False)
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
@@ -162,6 +162,16 @@ class EnvWorker(Worker):
                 for _ in range(self.stage_num)
             ]
         self.env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
+
+        # TODO(agent): Smooth intervention skips rollout inference, so it must
+        # publish equivalent PolicyStep/EnvStepResult events before it can be
+        # enabled with TrajectoryChannel.
+        if self.enable_train and OmegaConf.select(
+            self.cfg, "env.train.smooth_intervene", default=False
+        ):
+            raise NotImplementedError(
+                "smooth_intervene is not yet supported with TrajectoryChannel"
+            )
 
         if self.env_decoupled_mode:
             # Init the batch_router for env decoupled mode
