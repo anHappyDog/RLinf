@@ -75,7 +75,7 @@ Tensor 压缩
 
 - ``codec``：``lz4`` 或 ``zstd``。
 - ``level``：大于 0 的 codec 参数。对于 ``lz4``，它传给 LZ4 的
-  ``acceleration``（值越大越优先速度）；对于 ``zstd``，它是 Zstandard 的压缩等级。
+  ``acceleration``\ （值越大越优先速度）；对于 ``zstd``，它是 Zstandard 的压缩等级。
 - ``min_bytes``：只有不小于此大小的 CPU 张量才会成为压缩候选。
 - ``max_inflight``：每个 ``CollectiveGroup`` 两个方向的 codec slot 上限：压缩
   slot 持有可复用 workspace，解压 slot 只持有 decoder codec。
