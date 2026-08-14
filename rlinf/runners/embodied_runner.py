@@ -173,6 +173,7 @@ class EmbodiedRunner:
         rollout_handle.wait()
         env_handle.wait()
         self.actor.init_worker().wait()
+        self.actor_channel.start_receivers(self.env, self.rollout)
 
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is None:

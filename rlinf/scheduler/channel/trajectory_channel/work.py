@@ -14,7 +14,6 @@
 
 import asyncio
 import threading
-import time
 from typing import Any
 
 import ray
@@ -24,64 +23,24 @@ from rlinf.scheduler.collective.async_work import AsyncWork
 
 
 class AsyncPublishWork(AsyncWork):
-    """Completion handle for a trajectory publish operation."""
+    """Completion handle for a trajectory payload transfer."""
 
-    def __init__(self, publish_ref: ray.ObjectRef, send_work: AsyncWork):
-        """Track the control RPC and P2P payload transfer."""
+    def __init__(self, send_work: AsyncWork):
+        """Track the P2P payload transfer."""
         super().__init__()
-        self._publish_ref = publish_ref
         self._send_work = send_work
-        self._completed = False
 
     async def async_wait(self) -> None:
         """Wait asynchronously for the publish operation."""
-        if self._completed:
-            return
-
-        results = await asyncio.gather(
-            self._send_work.async_wait(), self._publish_ref, return_exceptions=True
-        )
-        self._completed = True
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+        await self._send_work.async_wait()
 
     def wait(self) -> Any:
         """Wait synchronously for the publish operation."""
-        if self._completed:
-            return
-        publish_done: bool = False
-        send_done: bool = False
-        errors: list[BaseException] = []
-        while not (publish_done and send_done):
-            if not publish_done:
-                ready, _ = ray.wait([self._publish_ref], timeout=0.01)
-                if ready:
-                    try:
-                        ray.get(self._publish_ref)
-                    except BaseException as error:
-                        errors.append(error)
-                    finally:
-                        publish_done = True
-            if not send_done and self._send_work.done():
-                try:
-                    self._send_work.wait()
-                except BaseException as error:
-                    errors.append(error)
-                finally:
-                    send_done = True
-            if not (publish_done and send_done):
-                time.sleep(0.001)
-        self._completed = True
-        if errors:
-            raise errors[0]
+        return self._send_work.wait()
 
     def done(self) -> bool:
         """Return whether the publish operation has completed."""
-        if self._completed:
-            return True
-        ready, _ = ray.wait([self._publish_ref], timeout=0)
-        return self._send_work.done() and bool(ready)
+        return self._send_work.done()
 
 
 class AsyncSubscribeWork(AsyncWork):

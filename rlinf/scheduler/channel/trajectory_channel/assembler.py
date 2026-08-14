@@ -73,20 +73,37 @@ class TrajectoryEventAssembler:
         if not isinstance(event, (PolicyStep, DummyPolicyStep, EnvStepResult)):
             raise ValueError(f"Unexpected data type: {type(event)}")
 
+        if self._is_complete_source(event):
+            chunk = self._accept_complete_event(event)
+            return [chunk] if chunk is not None else []
+
         completed = []
         for fragment in self._split_event(event):
             merged = self._merge_fragments(fragment)
             if merged is None:
                 continue
-            key = merged.sources[0].key
-            if isinstance(merged, (PolicyStep, DummyPolicyStep)):
-                self._policy_steps[key] = merged
-            else:
-                self._env_results[key] = merged
-            chunk = self._try_complete(key)
+            chunk = self._accept_complete_event(merged)
             if chunk is not None:
                 completed.append(chunk)
         return completed
+
+    def _is_complete_source(self, event: PolicyEvent | EnvStepResult) -> bool:
+        """Return whether an event already contains one complete source batch."""
+        if len(event.sources) != 1:
+            return False
+        source = event.sources[0]
+        return source.offset == 0 and source.size == self._source_batch_size
+
+    def _accept_complete_event(
+        self, event: PolicyEvent | EnvStepResult
+    ) -> AssembledChunk | None:
+        """Store one complete event and join it with its counterpart if present."""
+        key = event.sources[0].key
+        if isinstance(event, (PolicyStep, DummyPolicyStep)):
+            self._policy_steps[key] = event
+        else:
+            self._env_results[key] = event
+        return self._try_complete(key)
 
     def acknowledge(self, key: TrajectoryKey) -> None:
         """Release a chunk after a collector has accepted it."""

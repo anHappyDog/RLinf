@@ -161,6 +161,7 @@ def _episode_data():
 
 def test_try_subscribe_returns_false_without_starting_recv():
     worker = object.__new__(TrajectoryWorker)
+    worker._receiver_error = None
     worker._output_queues = defaultdict(asyncio.Queue)
     worker.send = Mock()
 
@@ -176,6 +177,7 @@ def test_try_subscribe_returns_false_without_starting_recv():
 
 def test_try_subscribe_dequeues_and_submits_async_send():
     worker = object.__new__(TrajectoryWorker)
+    worker._receiver_error = None
     worker._output_queues = defaultdict(asyncio.Queue)
     worker._output_queues["actor:0"].put_nowait("trajectory")
     worker.send = Mock()
@@ -194,6 +196,35 @@ def test_try_subscribe_dequeues_and_submits_async_send():
     )
 
 
+def test_worker_starts_one_persistent_loop_per_producer():
+    async def run_test():
+        worker = object.__new__(TrajectoryWorker)
+        worker._receiver_tasks = {}
+        worker._receiver_error = None
+        release = asyncio.Event()
+        started = []
+
+        async def consume(address):
+            started.append(address)
+            await release.wait()
+
+        worker._consume = consume
+        addresses = [
+            WorkerAddress(root_group_name="env", ranks=0),
+            WorkerAddress(root_group_name="rollout", ranks=1),
+        ]
+
+        await worker.start_receivers(addresses)
+        assert started == addresses
+        assert set(worker._receiver_tasks) == set(addresses)
+
+        for task in worker._receiver_tasks.values():
+            task.cancel()
+        await asyncio.gather(*worker._receiver_tasks.values(), return_exceptions=True)
+
+    asyncio.run(run_test())
+
+
 def test_worker_enqueues_collector_outputs():
     worker = object.__new__(TrajectoryWorker)
     worker._output_queues = defaultdict(asyncio.Queue)
@@ -206,7 +237,7 @@ def test_worker_enqueues_collector_outputs():
     ]
     event = object()
 
-    asyncio.run(worker._apply_event(event))
+    worker._apply_event(event)
 
     worker._assembler.push.assert_called_once_with(event)
     worker._collector.collect.assert_called_once_with(chunk)
@@ -224,7 +255,7 @@ def test_worker_keeps_assembled_chunk_when_collection_fails():
     worker._collector.collect.side_effect = ValueError("invalid collection")
 
     with pytest.raises(ValueError, match="invalid collection"):
-        asyncio.run(worker._apply_event(object()))
+        worker._apply_event(object())
 
     worker._assembler.acknowledge.assert_not_called()
 
@@ -250,6 +281,27 @@ def test_assembler_joins_out_of_order_source_fragments():
     assert len(chunks) == 1
     assert torch.equal(chunks[0].policy.obs["states"], torch.tensor([[10], [11]]))
     assert torch.equal(chunks[0].env.next_obs["states"], torch.tensor([[20], [21]]))
+
+
+def test_assembler_reuses_complete_source_events():
+    assembler = TrajectoryEventAssembler(source_batch_size=2)
+    key = TrajectoryKey(0, 0, 0, 0, 0)
+    policy = _policy(key, size=2)
+    env = EnvStepResult(
+        sources=[_source(key, size=2)],
+        result=EnvResult(rewards=torch.ones(2, 1)),
+        next_obs={"states": torch.ones(2, 1)},
+        forward_inputs=None,
+        bootstrap_values=None,
+        final_prev_values=None,
+    )
+    assembler.push(TrajectoryStart(source=_source(key, size=2), result=EnvResult()))
+
+    assert assembler.push(policy) == []
+    chunks = assembler.push(env)
+
+    assert chunks[0].policy is policy
+    assert chunks[0].env is env
 
 
 def test_later_chunk_does_not_consume_initial_state():

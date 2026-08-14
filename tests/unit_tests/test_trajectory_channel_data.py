@@ -31,6 +31,12 @@ from rlinf.data.schema.embodied_types import (
     split_episode_data,
     split_policy_input,
 )
+from rlinf.scheduler.channel.trajectory_channel.data import PolicyStep
+from rlinf.scheduler.cluster.utils import (
+    TensorPlaceholder,
+    pack_dataclass_tensors,
+    unpack_dataclass_tensors,
+)
 
 
 def test_policy_output_supports_tensor_transport_skeleton():
@@ -57,6 +63,33 @@ def test_transport_results_store_contiguous_cpu_tensors():
     assert rollout_result.actions.device.type == "cpu"
     assert rollout_result.actions.is_contiguous()
     assert rollout_result.forward_inputs["states"].device.type == "cpu"
+
+
+def test_nested_dataclass_transport_separates_tensors_from_skeleton():
+    key = TrajectoryKey(0, 0, 0, 0, 0)
+    shared = torch.arange(4).reshape(2, 2)
+    event = PolicyStep(
+        sources=[TrajectorySource(key, 2)],
+        obs={"states": shared, "task_descriptions": ["a", "b"]},
+        rollout_result=EmbodiedRolloutResult(
+            actions=shared,
+            forward_inputs={"nested": {"states": shared}},
+            prev_values=torch.ones(2, 1),
+        ),
+    )
+
+    skeleton, tensors = pack_dataclass_tensors(event)
+    restored = unpack_dataclass_tensors(skeleton, tensors)
+
+    assert isinstance(skeleton.obs["states"], TensorPlaceholder)
+    assert isinstance(skeleton.rollout_result.actions, TensorPlaceholder)
+    assert isinstance(
+        skeleton.rollout_result.forward_inputs["nested"]["states"],
+        TensorPlaceholder,
+    )
+    assert len(tensors) == 2
+    assert restored.obs["states"] is restored.rollout_result.actions
+    assert torch.equal(restored.rollout_result.prev_values, torch.ones(2, 1))
 
 
 def test_policy_input_split_merge_preserves_sources_and_nested_payloads():

@@ -30,7 +30,7 @@ from rlinf.scheduler.channel.trajectory_channel.work import (
     AsyncSubscribeWork,
 )
 from rlinf.scheduler.collective import AsyncWork
-from rlinf.scheduler.worker.worker import Worker
+from rlinf.scheduler.worker.worker import Worker, WorkerAddress
 from rlinf.scheduler.worker.worker_group import WorkerGroup
 
 
@@ -91,12 +91,6 @@ class TrajectoryChannel:
                 "TrajectoryChannel methods must be called from within a Worker."
             )
         worker = self._current_worker
-        trajectory_worker_actor = self._trajectory_workers[0]
-
-        publish_ref: ray.ObjectRef = trajectory_worker_actor.publish.remote(
-            worker.worker_address
-        )
-
         send_work: AsyncWork = worker.send(
             object=data,
             dst_group_name=self._trajectory_worker_group.worker_group_name,
@@ -104,11 +98,31 @@ class TrajectoryChannel:
             async_op=True,
         )
 
-        async_publish_work = AsyncPublishWork(publish_ref, send_work)
+        async_publish_work = AsyncPublishWork(send_work)
         if async_op:
             return async_publish_work
         async_publish_work.wait()
         return None
+
+    def start_receivers(self, *producer_groups: WorkerGroup) -> None:
+        """Start one persistent receive loop for every producer worker."""
+        producer_addresses = [
+            WorkerAddress(group.worker_group_name, ranks=worker.rank)
+            for group in producer_groups
+            for worker in group.worker_info_list
+        ]
+        receiver_refs = [
+            actor.start_receivers.remote(producer_addresses)
+            for actor in self._trajectory_workers.values()
+        ]
+        producer_refs = [
+            worker.worker.initialize_p2p.remote(
+                self._trajectory_worker_group.worker_group_name, 0
+            )
+            for group in producer_groups
+            for worker in group.worker_info_list
+        ]
+        ray.get(receiver_refs + producer_refs)
 
     def subscribe(
         self, query_key: str = "default", async_op: bool = False

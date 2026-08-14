@@ -35,8 +35,11 @@ class TrajectoryWorker(Worker):
     def __init__(self, cfg: DictConfig, max_size: int = 0):
         """Initialize event assembly, collection, and output queues."""
         super().__init__()
+        if max_size != 0:
+            raise ValueError("Trajectory output queues must be unbounded.")
         self._cfg = cfg
-        self._event_lock = asyncio.Lock()
+        self._receiver_tasks: dict[WorkerAddress, asyncio.Task] = {}
+        self._receiver_error: BaseException | None = None
         self._output_queues: dict[str, asyncio.Queue] = defaultdict(
             lambda: asyncio.Queue(maxsize=max_size)
         )
@@ -74,28 +77,56 @@ class TrajectoryWorker(Worker):
             actor_world_size=actor_world_size,
         )
 
-    async def publish(self, worker_address: WorkerAddress) -> None:
-        """Receive and apply one trajectory event from a producer."""
-        data = await self.recv(
-            src_group_name=worker_address.root_group_name,
-            src_rank=worker_address.rank,
-            async_op=True,
-        ).async_wait()
-        async with self._event_lock:
-            await self._apply_event(data)
+    async def start_receivers(self, producer_addresses: list[WorkerAddress]) -> None:
+        """Start one long-running receive loop for every producer."""
+        if self._receiver_tasks:
+            raise RuntimeError("Trajectory receiver loops have already been started.")
+        if len(set(producer_addresses)) != len(producer_addresses):
+            raise ValueError("Trajectory producer addresses must be unique.")
 
-    async def _apply_event(self, data: TrajectoryData) -> None:
+        for address in producer_addresses:
+            task = asyncio.create_task(self._consume(address))
+            task.add_done_callback(self._on_receiver_done)
+            self._receiver_tasks[address] = task
+
+        # Let every task submit its first recv before producers begin publishing.
+        await asyncio.sleep(0)
+
+    async def _consume(self, worker_address: WorkerAddress) -> None:
+        """Receive trajectory events from one producer in send order."""
+        while True:
+            data = await self.recv(
+                src_group_name=worker_address.root_group_name,
+                src_rank=worker_address.rank,
+                async_op=True,
+            ).async_wait()
+            self._apply_event(data)
+
+    def _on_receiver_done(self, task: asyncio.Task) -> None:
+        """Retain unexpected receiver failures for subsequent subscribers."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None and self._receiver_error is None:
+            self._receiver_error = error
+            self.log_error(f"Trajectory receiver failed: {error}")
+
+    def _apply_event(self, data: TrajectoryData) -> None:
         """Assemble one event and enqueue any completed collector outputs."""
         for chunk in self._assembler.push(data):
             outputs = self._collector.collect(chunk)
             self._assembler.acknowledge(chunk.key)
             for output in outputs:
-                await self._output_queues[output.queue_key].put(output.data)
+                self._output_queues[output.queue_key].put_nowait(output.data)
 
     async def subscribe(
         self, worker_address: WorkerAddress, queue_key: str, query_id: int
     ) -> None:
         """Send the next queued item to a subscriber."""
+        if self._receiver_error is not None:
+            raise RuntimeError(
+                "A trajectory receiver has failed."
+            ) from self._receiver_error
         data = await self._output_queues[queue_key].get()
         await self.send(
             object=data,
@@ -109,6 +140,10 @@ class TrajectoryWorker(Worker):
         self, worker_address: WorkerAddress, queue_key: str, query_id: int
     ) -> bool:
         """Submit a send if an assembled item is immediately available."""
+        if self._receiver_error is not None:
+            raise RuntimeError(
+                "A trajectory receiver has failed."
+            ) from self._receiver_error
         try:
             data = self._output_queues[queue_key].get_nowait()
         except asyncio.QueueEmpty:
