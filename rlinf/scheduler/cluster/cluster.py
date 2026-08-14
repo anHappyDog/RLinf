@@ -151,6 +151,9 @@ class Cluster:
         "PKG_CONFIG_PATH",
         "CPATH",
     }
+    SCHEDULER_OWNED_ENV_VARS = {
+        ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION,
+    }
 
     class NamespaceConflictError(Exception):
         """Raised when there is a namespace conflict in Ray initialization."""
@@ -830,6 +833,10 @@ class Cluster:
             env_vars,
             path_env_merge_mode,
         )
+        merged_env_vars = self._enforce_scheduler_owned_env_vars(
+            merged_env_vars,
+            node.env_vars,
+        )
 
         # Update Python interpreter path
         python_interpreter_path = node.python_interpreter_path
@@ -949,6 +956,22 @@ class Cluster:
                 )
             else:
                 merged[key] = value
+        return merged
+
+    @classmethod
+    def _enforce_scheduler_owned_env_vars(
+        cls,
+        worker_env_vars: dict[str, str],
+        scheduler_env_vars: dict[str, str],
+    ) -> dict[str, str]:
+        """Restore job-wide environment values after user environment merging."""
+        merged = worker_env_vars.copy()
+        for env_var in cls.SCHEDULER_OWNED_ENV_VARS:
+            env_var_name = cls.get_full_env_var_name(env_var)
+            if env_var_name in scheduler_env_vars:
+                merged[env_var_name] = scheduler_env_vars[env_var_name]
+            else:
+                merged.pop(env_var_name, None)
         return merged
 
     @staticmethod
