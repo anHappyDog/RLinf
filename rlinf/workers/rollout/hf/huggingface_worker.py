@@ -30,6 +30,7 @@ from rlinf.algorithms.rlt import (
 )
 from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import (
+    DummyPolicyInput,
     EmbodiedRolloutResult,
     PolicyCompletion,
     PolicyInput,
@@ -42,6 +43,7 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.scheduler.channel.trajectory_channel.data import (
+    DummyPolicyStep,
     EnvStepResult,
     PolicyStep,
 )
@@ -771,28 +773,37 @@ class MultiStepRolloutWorker(Worker):
                 )
                 if policy_input.is_last:
                     raise ValueError("Received a final input in the policy stream.")
-                actions, result = self._predict_rollout_actions(
-                    policy_input.obs,
-                    rlt_switch_flags=policy_input.rlt_switch_flags,
-                    intervene_requested=policy_input.intervene_flags,
-                )
+                if isinstance(policy_input, DummyPolicyInput):
+                    actions = policy_input.actions
+                    forward_inputs = [None] * len(policy_input.request_sizes)
+                else:
+                    actions, result = self._predict_rollout_actions(
+                        policy_input.obs,
+                        rlt_switch_flags=policy_input.rlt_switch_flags,
+                        intervene_requested=policy_input.intervene_flags,
+                    )
+                    forward_inputs = split_batch_value(
+                        result.get("forward_inputs"), policy_input.request_sizes
+                    )
                 self._send_policy_output(
                     output_channel,
                     PolicyOutput(actions=actions.contiguous()),
                     stage_id,
                     split_sizes,
                 )
-                trajectory_channel.publish(
-                    PolicyStep(
+                if isinstance(policy_input, DummyPolicyInput):
+                    trajectory_event = DummyPolicyStep(
+                        sources=policy_input.sources,
+                        obs=policy_input.obs,
+                        actions=actions,
+                    )
+                else:
+                    trajectory_event = PolicyStep(
                         sources=policy_input.sources,
                         obs=policy_input.obs,
                         rollout_result=self._build_rollout_result(actions, result),
-                    ),
-                    async_op=True,
-                )
-                forward_inputs = split_batch_value(
-                    result.get("forward_inputs"), policy_input.request_sizes
-                )
+                    )
+                trajectory_channel.publish(trajectory_event, async_op=True)
                 for completion, next_inputs in zip(
                     policy_input.completions, forward_inputs
                 ):

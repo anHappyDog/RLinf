@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from rlinf.data.schema.embodied_types import (
+    DummyPolicyInput,
     EmbodiedRolloutResult,
     EnvResult,
     PolicyCompletion,
@@ -81,6 +82,23 @@ def test_policy_input_split_merge_preserves_sources_and_nested_payloads():
     assert torch.equal(merged.obs["states"], policy_input.obs["states"])
     assert np.array_equal(merged.obs["labels"], policy_input.obs["labels"])
     assert torch.equal(merged.rlt_switch_flags, policy_input.rlt_switch_flags)
+
+
+def test_dummy_policy_input_split_merge_preserves_actions_and_type():
+    key = TrajectoryKey(0, 0, 0, 0, 1)
+    policy_input = DummyPolicyInput(
+        obs={"states": torch.arange(12).reshape(4, 3)},
+        actions=torch.arange(24).reshape(4, 2, 3),
+        sources=[TrajectorySource(key, 4)],
+    )
+
+    shards = split_policy_input(policy_input, [1, 3])
+    merged = merge_policy_inputs(shards)
+
+    assert all(isinstance(shard, DummyPolicyInput) for shard in shards)
+    assert isinstance(merged, DummyPolicyInput)
+    assert torch.equal(merged.actions, policy_input.actions)
+    assert merged.sources == policy_input.sources
 
 
 def test_online_lerobot_payload_survives_source_routing():

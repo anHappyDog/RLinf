@@ -48,6 +48,7 @@ from rlinf.utils.nested_dict_process import (
 )
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.history_manager import HistoryManager
+from rlinf.workers.env.smooth_intervene import SmoothInterveneController
 
 
 class EnvWorker(Worker):
@@ -163,15 +164,16 @@ class EnvWorker(Worker):
             ]
         self.env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
 
-        # TODO(agent): Smooth intervention skips rollout inference, so it must
-        # publish equivalent PolicyStep/EnvStepResult events before it can be
-        # enabled with TrajectoryChannel.
-        if self.enable_train and OmegaConf.select(
-            self.cfg, "env.train.smooth_intervene", default=False
-        ):
-            raise NotImplementedError(
-                "smooth_intervene is not yet supported with TrajectoryChannel"
-            )
+        self.smooth_intervene = SmoothInterveneController.from_cfg(
+            self.cfg,
+            stage_num=self.stage_num,
+            enable_train=self.enable_train,
+            train_num_envs_per_stage=(
+                self.train_num_envs_per_stage if self.enable_train else 0
+            ),
+        )
+        if self.smooth_intervene.enabled and self.env_decoupled_mode:
+            raise ValueError("smooth_intervene does not support decoupled env mode")
 
         if self.env_decoupled_mode:
             # Init the batch_router for env decoupled mode
@@ -944,7 +946,17 @@ class EnvWorker(Worker):
                 stage_id,
                 chunk_id + 1,
             )
-        policy_input = self._build_policy_input(env_output)
+        continue_smooth = self.smooth_intervene.on_chunk_done(
+            stage_id, env_output.intervene_flags, env_output.dones
+        )
+        if continue_smooth and not is_last:
+            policy_input = self.smooth_intervene.build_dummy_policy_input(
+                stage_id,
+                env=self.env_list[stage_id],
+                obs=env_output.prepare_observations(env_output.obs),
+            )
+        else:
+            policy_input = self._build_policy_input(env_output)
         completion = PolicyCompletion(
             sources=[source],
             env_result=self._build_env_result(
@@ -987,7 +999,16 @@ class EnvWorker(Worker):
                 ),
                 async_op=True,
             )
-            policy_input = self._build_policy_input(env_outputs[stage_id])
+            if self.smooth_intervene.is_active(stage_id):
+                policy_input = self.smooth_intervene.build_dummy_policy_input(
+                    stage_id,
+                    env=self.env_list[stage_id],
+                    obs=env_outputs[stage_id].prepare_observations(
+                        env_outputs[stage_id].obs
+                    ),
+                )
+            else:
+                policy_input = self._build_policy_input(env_outputs[stage_id])
             policy_input.completions = [
                 completions.get(stage_id) if completions is not None else None
             ]

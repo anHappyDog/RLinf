@@ -20,6 +20,7 @@ from rlinf.data.schema.embodied_trajectory_builder import (
 )
 from rlinf.data.schema.embodied_types import (
     ChunkStepResult,
+    DummyPolicyInput,
     EmbodiedRolloutResult,
     EnvOutput,
     EnvResult,
@@ -52,6 +53,7 @@ __all__ = [
     "ChunkStepResult",
     "convert_trajectories_to_batch",
     "DynamicRolloutResult",
+    "DummyPolicyInput",
     "EmbodiedLerobotTrajectoryBuilder",
     "EmbodiedRolloutResult",
     "EnvResult",

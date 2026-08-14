@@ -284,6 +284,18 @@ class PolicyInput:
 
 
 @dataclass(kw_only=True)
+class DummyPolicyInput(PolicyInput):
+    """Policy request whose actions are supplied without model inference."""
+
+    actions: torch.Tensor
+
+    def __post_init__(self) -> None:
+        """Move the request payload to CPU for transport."""
+        super().__post_init__()
+        self.actions = self.actions.cpu().contiguous()
+
+
+@dataclass(kw_only=True)
 class EmbodiedRolloutResult:
     """Policy inference data retained for trajectory construction."""
 
@@ -486,8 +498,16 @@ def split_policy_input(
             )
             for index in range(len(split_sizes))
         ]
+    input_type = (
+        DummyPolicyInput if isinstance(policy_input, DummyPolicyInput) else PolicyInput
+    )
+    action_splits = (
+        split_batch_value(policy_input.actions, split_sizes)
+        if isinstance(policy_input, DummyPolicyInput)
+        else [None] * len(split_sizes)
+    )
     return [
-        PolicyInput(
+        input_type(
             obs=obs,
             rlt_switch_flags=rlt_splits[index],
             intervene_flags=intervene_splits[index],
@@ -495,6 +515,11 @@ def split_policy_input(
             completions=[completion_splits[index]],
             request_sizes=[split_sizes[index]],
             is_last=policy_input.is_last,
+            **(
+                {"actions": action_splits[index]}
+                if isinstance(policy_input, DummyPolicyInput)
+                else {}
+            ),
         )
         for index, obs in enumerate(split_batch_value(policy_input.obs, split_sizes))
     ]
@@ -504,6 +529,13 @@ def merge_policy_inputs(policy_inputs: list[PolicyInput]) -> PolicyInput:
     """Merge routed policy inputs in source order."""
     if not policy_inputs:
         raise ValueError("Cannot merge an empty list of policy inputs.")
+    dummy_inputs = [
+        policy_input
+        for policy_input in policy_inputs
+        if isinstance(policy_input, DummyPolicyInput)
+    ]
+    if dummy_inputs and len(dummy_inputs) != len(policy_inputs):
+        raise ValueError("Cannot merge inferred and dummy policy inputs.")
 
     def get_batch_size(obs: dict[str, Any]) -> int:
         for key in ("states", "main_images", "task_descriptions"):
@@ -550,7 +582,8 @@ def merge_policy_inputs(policy_inputs: list[PolicyInput]) -> PolicyInput:
             else:
                 sources.append(source)
 
-    return PolicyInput(
+    input_type = DummyPolicyInput if dummy_inputs else PolicyInput
+    return input_type(
         obs=merge_batch_values(observations),
         rlt_switch_flags=merge_optional_tensor("rlt_switch_flags"),
         intervene_flags=merge_optional_tensor("intervene_flags"),
@@ -566,6 +599,11 @@ def merge_policy_inputs(policy_inputs: list[PolicyInput]) -> PolicyInput:
             for size in policy_input.request_sizes
         ],
         is_last=policy_inputs[0].is_last,
+        **(
+            {"actions": merge_batch_values([item.actions for item in dummy_inputs])}
+            if dummy_inputs
+            else {}
+        ),
     )
 
 
@@ -789,6 +827,7 @@ def convert_trajectories_to_batch(
 
 __all__ = [
     "ChunkStepResult",
+    "DummyPolicyInput",
     "EmbodiedRolloutResult",
     "EnvOutput",
     "EnvResult",

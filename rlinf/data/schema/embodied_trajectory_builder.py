@@ -767,7 +767,7 @@ class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
     def append_chunk_episode_data(
         self,
         *,
-        policy_output: EmbodiedRolloutResult,
+        policy_output: EmbodiedRolloutResult | None,
         chunk_actions,
         obs_list,
         terminations,
@@ -785,12 +785,18 @@ class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
             num_chunks=num_chunks,
             action_dim=action_dim,
         )
-        intervene_flags = policy_output.intervene_flags
+        intervene_flags = (
+            policy_output.intervene_flags if policy_output is not None else None
+        )
         if intervene_flags is not None:
             intervene_flags = self._to_numpy(intervene_flags).reshape(
                 num_envs, num_chunks
             )
-        expert_actions = policy_output.forward_inputs.get("action", None)
+        expert_actions = (
+            policy_output.forward_inputs.get("action", None)
+            if policy_output is not None
+            else None
+        )
         if expert_actions is not None:
             expert_actions = self._reshape_chunk_actions(
                 expert_actions,

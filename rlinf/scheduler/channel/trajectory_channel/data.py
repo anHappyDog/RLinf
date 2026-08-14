@@ -39,6 +39,20 @@ class PolicyStep:
 
 
 @dataclass(kw_only=True)
+class DummyPolicyStep:
+    """Action chunk supplied without policy inference."""
+
+    sources: list[TrajectorySource]
+    obs: dict[str, Any]
+    actions: torch.Tensor
+
+    def __post_init__(self) -> None:
+        """Move the externally supplied action payload to CPU."""
+        self.obs = put_tensor_device(self.obs, "cpu")
+        self.actions = self.actions.cpu().contiguous()
+
+
+@dataclass(kw_only=True)
 class EnvStepResult:
     """Completed environment outcome for policy actions."""
 
@@ -68,4 +82,6 @@ class TrajectoryStart:
     result: EnvResult
 
 
-TrajectoryData: TypeAlias = PolicyStep | TrajectoryStart | EnvStepResult
+TrajectoryData: TypeAlias = (
+    PolicyStep | DummyPolicyStep | TrajectoryStart | EnvStepResult
+)
