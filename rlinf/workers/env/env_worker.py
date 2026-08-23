@@ -41,14 +41,13 @@ from rlinf.scheduler.channel.trajectory_channel.data import (
 from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
     TrajectoryChannel,
 )
+from rlinf.utils.env_helpers import HistoryManager, SmoothInterveneController
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.workers.env.history_manager import HistoryManager
-from rlinf.workers.env.smooth_intervene import SmoothInterveneController
 
 
 class EnvWorker(Worker):

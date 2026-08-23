@@ -37,8 +37,8 @@ from rlinf.scheduler.channel.trajectory_channel.data import (
     EnvStepResult,
     PolicyStep,
 )
+from rlinf.utils.env_helpers import SmoothInterveneController
 from rlinf.workers.env.env_worker import EnvWorker
-from rlinf.workers.env.smooth_intervene import SmoothInterveneController
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -187,6 +187,7 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
     rollout.n_train_chunk_steps = 2
     rollout.num_pipeline_stages = 1
     rollout.env_decoupled_mode = False
+    rollout.collect_final_values = True
     rollout.update_dagger_beta = Mock()
     rollout._send_policy_output = Mock()
     rollout._build_rollout_result = Mock(
@@ -281,6 +282,27 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
     assert torch.equal(env_events[1].bootstrap_values, torch.tensor([[4.0]]))
     assert torch.equal(env_events[1].final_prev_values, torch.tensor([[4.0, 5.0]]))
     assert rollout._predict_rollout_actions.call_count == 3
+
+
+def test_rollout_skips_completion_inference_when_final_values_disabled():
+    rollout = object.__new__(MultiStepRolloutWorker)
+    rollout.collect_final_values = False
+    rollout._predict_rollout_actions = Mock()
+    trajectory_channel = Mock()
+    key = TrajectoryKey(0, 0, 0, 0, 0)
+    completion = PolicyCompletion(
+        sources=[TrajectorySource(key, 1)],
+        env_result=EnvResult(),
+        next_obs={"states": torch.zeros(1, 4)},
+        requires_inference=True,
+    )
+
+    rollout._publish_completion(completion, None, trajectory_channel)
+
+    rollout._predict_rollout_actions.assert_not_called()
+    event = trajectory_channel.publish.call_args.args[0]
+    assert event.bootstrap_values is None
+    assert event.final_prev_values is None
 
 
 def test_rollout_routes_dummy_input_without_model_inference():

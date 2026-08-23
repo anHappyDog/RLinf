@@ -129,6 +129,7 @@ class MultiStepRolloutWorker(Worker):
                 // self.model_cfg.num_action_chunks
             )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
+        self.collect_final_values = self.cfg.rollout.get("collect_final_values", True)
         self.version = 0
         self.global_step = 0
         self.finished_episodes = None
@@ -709,7 +710,7 @@ class MultiStepRolloutWorker(Worker):
     ) -> None:
         bootstrap_values = None
         final_prev_values = None
-        if completion.requires_inference:
+        if completion.requires_inference and self.collect_final_values:
             _, result = self._predict_rollout_actions(completion.next_obs)
             values = result.get("prev_values")
             if values is not None:
