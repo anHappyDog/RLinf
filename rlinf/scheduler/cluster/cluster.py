@@ -587,7 +587,7 @@ class Cluster:
                 )
             buffer_pool_options = TensorBufferPoolOptions.from_dict(buffer_pool_cfg)
         os.environ[buffer_pool_env] = json.dumps(
-            {"max_bytes": buffer_pool_options.max_bytes}, sort_keys=True
+            buffer_pool_options.to_dict(), sort_keys=True
         )
 
         if compression_cfg is not None:
@@ -599,13 +599,7 @@ class Cluster:
                 )
             compression_options = TensorCompressionOptions.from_dict(compression_cfg)
             os.environ[compression_env] = json.dumps(
-                {
-                    "enabled": compression_options.enabled,
-                    "codec": compression_options.codec,
-                    "level": compression_options.level,
-                    "min_bytes": compression_options.min_bytes,
-                    "max_inflight": compression_options.max_inflight,
-                },
+                compression_options.to_dict(),
                 sort_keys=True,
             )
 

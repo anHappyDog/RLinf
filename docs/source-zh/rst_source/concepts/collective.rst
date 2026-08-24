@@ -45,8 +45,8 @@
   针对仅传输单个张量且接收端已分配好张量缓冲区的情况进行了优化，避免了额外的元数据往返。  
 
 .. note::
-   所有 **CUDA 张量必须是连续的**；非连续张量会触发错误提示。  
-   不允许在同一列表/字典中混合 CPU 与 CUDA 张量。  
+   所有 tensor 都必须连续；非连续 tensor 会触发错误提示。同一个受支持的 tensor 容器中
+   可以同时包含 CPU 与 accelerator tensor，系统会将它们划分到对应的通信路径。
 
 .. warning::
    ``send_tensor`` **必须** 与 ``recv_tensor`` 配对使用（反之亦然）。  
@@ -68,8 +68,23 @@ tensor 字段。对于同时包含 CPU 和 accelerator tensor 的容器，只有
 候选。通过 Worker send/recv 通信的 Channel 会继承相同行为。
 
 任意 pickled Python object、accelerator tensor、``broadcast``，以及直接调用
-``send_tensor``/``recv_tensor`` 的路径不会压缩。tensor list 的元素仍然是独立的 wire
-payload；该功能只减少每个 payload 的字节数，不会将它们拼凑起来。
+``send_tensor``/``recv_tensor`` 的路径不会压缩。这些边界是有意保留的：
+
+- 任意 object 路径主要承载控制数据和 metadata，其序列化 payload 通常很小；再执行一次
+  codec、申请 buffer 并发送压缩 header，开销通常会高于节省的字节数。包含大量 tensor 的
+  数据应使用 tensor list、dictionary 或 dataclass 路径，避免 tensor storage 经由 pickle，
+  并让符合条件的 CPU tensor 直接参与压缩。
+- accelerator tensor 通常使用 NCCL 类 collective 或同设备 IPC 等高吞吐设备通信。CPU
+  压缩会引入设备同步、device-to-host 与 host-to-device copy，破坏 accelerator 通信流水线；
+  常见的浮点模型 tensor 也可能难以压缩，因此额外工作可能带来负收益。
+- 直接 ``send_tensor``/``recv_tensor`` 的接收端已经持有目标 tensor，因此该路径会刻意
+  省略 metadata exchange。压缩会引入可变 wire size 和 framing metadata，从而破坏该快速
+  路径的契约。
+- ``broadcast`` 使用独立的多接收端、拓扑感知传输路径。本次改动只处理点对点 payload
+  ownership 与 fallback，不改变 broadcast scheduling 或 buffer lifetime。
+
+tensor list 的元素仍然是独立的 wire payload；该功能只减少每个 payload 的字节数，不会
+将它们拼凑起来。
 
 选择 Codec
 ~~~~~~~~~~
@@ -84,16 +99,15 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
 
    * - Codec
      - 特征
-     - ``level``
+     - Provider 参数
      - 适用情况
    * - ``lz4``
      - 优先保证压缩和解压缩速度，CPU 开销相对较低，但压缩率通常低于 Zstd。
-     - 作为 LZ4 ``acceleration`` 传入。值越高越偏向速度，并可能降低压缩率。
+     - ``acceleration`` 控制 LZ4 fast compression。值越高越偏向速度，并可能降低压缩率。
      - CPU 时间敏感，或链路仅中度受限。它是默认 codec。
    * - ``zstd``
      - 通常比 LZ4 减少更多 wire bytes，但压缩和解压缩开销更高。
-     - 作为 Zstandard compression level 传入。level 越高通常会用更多 CPU 时间换取更高
-       压缩率。
+     - ``level`` 控制压缩率与 CPU 的取舍；``max_inflight`` 限制并发复用的 context 数量。
      - 链路足够慢，减少 wire bytes 的收益高于 codec 开销。
 
 请使用有代表性的 payload 实测后再选择。已经压缩或高熵的 tensor 可能无法缩小，而包含
@@ -112,9 +126,25 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
        tensor_compression:
          enabled: true
          codec: lz4
-         level: 1
-         min_bytes: 65536
-         max_inflight: 4
+         min_bytes: 16384
+         excluded_dtypes: [float32]
+         params:
+           acceleration: 1
+
+使用 Zstd 时，需要选择对应 provider，并且只传入 Zstd 参数：
+
+.. code-block:: yaml
+
+   cluster:
+     collective:
+       tensor_compression:
+         enabled: true
+         codec: zstd
+         min_bytes: 16384
+         excluded_dtypes: [float32]
+         params:
+           level: 1
+           max_inflight: 4
 
 省略 ``tensor_compression``，或设置 ``enabled: false``，即可使用原始 wire 路径。压缩
 选项及默认值如下：
@@ -132,15 +162,49 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
    * - ``codec``
      - ``lz4``
      - 选择 ``lz4`` 或 ``zstd``。
-   * - ``level``
-     - ``1``
-     - 设置上文所述的 codec 参数；该值必须为正数。
    * - ``min_bytes``
-     - ``65536``
+     - ``16384``
      - 跳过 raw byte count 小于该值的 tensor。
-   * - ``max_inflight``
+   * - ``excluded_dtypes``
+     - ``[float32]``
+     - 跳过列表中 dtype 对应 tensor 的 codec attempt。设为 ``[]`` 可让所有 dtype
+       都参与判断。
+   * - ``params``
+     - 由 codec 决定
+     - 只配置当前选择的 provider。LZ4 接受 ``acceleration``\ （默认 ``1``）；Zstd
+       接受 ``level``\ （默认 ``1``）与 ``max_inflight``\ （默认 ``4``）。传入其他
+       provider 的参数会直接报错。
+
+``params`` 必须是嵌套在 ``tensor_compression`` 下的 mapping。provider contract 如下：
+
+.. list-table:: Provider 参数
+   :header-rows: 1
+   :widths: 16 20 14 50
+
+   * - Provider
+     - 参数
+     - 默认值
+     - 校验与行为
+   * - ``lz4``
+     - ``acceleration``
+     - ``1``
+     - 必须不小于 ``1``。值越高，LZ4 用于寻找 match 的时间通常越少，以压缩率换取速度。
+       LZ4 是无状态的，因此 Worker 共享一个 codec，不设 acquisition limit。
+   * - ``zstd``
+     - ``level``
+     - ``1``
+     - 必须不小于 ``1``。level 越高通常会使用更多 CPU 时间寻找更好的压缩率。
+   * - ``zstd``
+     - ``max_inflight``
      - ``4``
-     - 每个 Worker 分别创建该数量的 encoder instance 和 decoder instance。
+     - 必须不小于 ``1``。它在每个 Worker 内分别限制 compression 和 decompression 的
+       可复用 Zstd context。compressor pool 饱和时不会等待，而是保持 raw transfer；已经
+       收到 compressed payload 后，receiver 会等待 decoder。
+
+provider 参数不能作为 compression 的顶层选项。例如，顶层 ``level`` 或
+``max_inflight`` 是非法配置；LZ4 会拒绝 ``max_inflight``，Zstd 会拒绝
+``acceleration``。driver 会校验所选 provider 的配置，并统一序列化给所有 Worker；因此
+wire metadata 只需标识 codec，receiver 使用相同的作业级 provider 参数。
 
 ``tensor_buffer_pool`` 独立于 ``tensor_compression``。它的 ``max_bytes`` 限制单个
 Worker 内 active 与 cached CPU buffer 的总容量，默认值为 2 GiB。配置压缩但省略该段时，
@@ -150,17 +214,22 @@ Worker 内 active 与 cached CPU buffer 的总容量，默认值为 2 GiB。配�
 ~~~~~~~~~~
 
 每个 Worker 延迟创建一个 ``TensorCodecPool`` 和一个独立的 ``TensorBufferPool``，并由其
-所有 ``CollectiveGroup`` 共享。发送流程如下：
+所有 ``CollectiveGroup`` 共享。codec pool 根据 provider 选择 acquisition policy：LZ4
+无锁、无 slot 限制地共享一个无状态 codec；Zstd 则从有界 encoder/decoder pool 中独占
+native context。发送流程如下：
 
-1. 尝试获取一个 encoder，且不会等待。如果所有 encoder 都在使用，本次传输保持 raw。
-2. 按最坏情况输出容量从大到小排列候选 tensor，并分别尝试获取 buffer。当 codec 不支持
-   该 tensor 的大小，或者预算内没有可用 buffer 时，该 tensor 保持 raw。
+1. 获取 provider 的 encoder。LZ4 不会耗尽；Zstd encoder pool 饱和时不会等待，本次传输
+   保持 raw。
+2. 先根据 ``min_bytes`` 和 ``excluded_dtypes`` 筛选 tensor，再按最坏情况输出容量从大到
+   小排列候选 tensor，并分别尝试获取 buffer。当 codec 不支持该 tensor 的大小，或者预算
+   内没有可用 buffer 时，该 tensor 保持 raw。
 3. 只有压缩结果小于原始 tensor 时才使用它；否则保持 raw，并直接丢弃该 buffer，而不是
    将其放入 cache。
 4. 在现有 metadata 中发送每个 tensor 的压缩大小。接收端直接将压缩 tensor 恢复到预分配
    的目标 tensor。
-5. 保持压缩 payload 的 buffer lease，直到同步 payload send 完成，再将 buffer 返回 Worker
-   buffer pool。
+5. 压缩结束后立即释放 codec。仅保持压缩 payload 的 buffer lease，直到同步 payload send
+   完成，再将 buffer 返回 Worker buffer pool。接收端在 compressed wire payload 到达后才
+   获取 decoder，并在解压完成后立即释放。
 
 buffer pool 按 capacity 索引 idle buffer，并复用能够容纳请求的最小 size。相同 size 使用
 独立 list，active 与 cached 容量共同受 ``max_bytes`` 限制。当新分配需要空间时，pool 会

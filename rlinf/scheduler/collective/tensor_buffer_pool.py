@@ -46,6 +46,10 @@ class TensorBufferPoolOptions:
             )
         return cls(**config)
 
+    def to_dict(self) -> dict[str, int]:
+        """Serialize BufferPool options for Worker propagation."""
+        return {"max_bytes": self.max_bytes}
+
 
 class TensorBufferPool:
     """Share reusable CPU byte buffers within a fixed Worker memory budget."""
@@ -99,22 +103,20 @@ class TensorBufferPool:
 
     def try_acquire(self, capacity: int) -> Optional["BufferLease"]:
         """Acquire a best-fit buffer without exceeding the memory budget."""
-        if capacity > self.options.max_bytes:
-            return None
-
         with self._lock:
+            if capacity > self.options.max_bytes:
+                return None
+
             best_index = bisect_left(self._available_sizes, capacity)
             if best_index < len(self._available_sizes) and (
                 self._available_sizes[best_index] <= capacity * 2
                 or self._allocated_bytes + capacity > self.options.max_bytes
             ):
-                buffer = self._pop_cached_buffer(best_index)
-                return BufferLease(self, buffer)
+                return BufferLease(self, self._pop_cached_buffer(best_index))
 
             bytes_to_free = self._allocated_bytes + capacity - self.options.max_bytes
             if bytes_to_free > 0:
                 self._evict_cached_buffers(bytes_to_free)
-
             if self._allocated_bytes + capacity > self.options.max_bytes:
                 return None
 

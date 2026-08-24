@@ -41,8 +41,9 @@ With the process groups in place, ``CollectiveGroup`` can perform communications
   These avoid the extra round-trip of sending metadata.
 
 .. note::
-   All **CUDA tensors must be contiguous**; non-contiguity raises a helpful error.
-   Mixing CPU and CUDA tensors in a single list/dict is disallowed.
+   All tensors must be contiguous; non-contiguity raises a helpful error. CPU
+   and accelerator tensors may coexist in one supported tensor container and
+   are partitioned onto their respective communication paths.
 
 .. warning::
    ``send_tensor`` **must** be paired with ``recv_tensor`` (and vice versa). Do not mix them with the generic ``send``/``recv`` for the same message.
@@ -65,9 +66,30 @@ mixed CPU/accelerator container, only its CPU tensors are candidates. A Channel
 that communicates through Worker send/recv inherits the same behavior.
 
 Arbitrary pickled Python objects, accelerator tensors, ``broadcast``, and direct
-``send_tensor``/``recv_tensor`` calls are not compressed. Tensor-list elements
-also remain separate wire payloads; this feature reduces their byte counts but
-does not coalesce them.
+``send_tensor``/``recv_tensor`` calls are not compressed. These boundaries are
+deliberate:
+
+- The arbitrary-object path is intended for control data and metadata. Its
+  serialized payloads are usually small, so another codec pass, buffer, and
+  compression header would normally cost more than the bytes saved. Large
+  tensor-bearing data should use the tensor list, dictionary, or dataclass paths
+  so tensor storage does not pass through pickle and eligible CPU tensors can be
+  compressed directly.
+- Accelerator tensors normally use high-throughput device communication such as
+  NCCL-like collectives or same-device IPC. CPU compression would require device
+  synchronization and device-to-host and host-to-device copies, disrupting the
+  accelerator communication pipeline; common floating-point model tensors may
+  also compress poorly. The extra work can therefore produce a net slowdown.
+- Direct ``send_tensor``/``recv_tensor`` deliberately avoids metadata exchange
+  because the receiver already owns the destination. Compression would require
+  adding a variable wire size and framing metadata, which would break that fast
+  path's contract.
+- ``broadcast`` has separate multi-receiver and topology-aware transfer paths.
+  This change is limited to point-to-point payload ownership and fallback, so it
+  does not alter broadcast scheduling or buffer lifetime.
+
+Tensor-list elements also remain separate wire payloads; this feature reduces
+their byte counts but does not coalesce them.
 
 Choose a Codec
 ~~~~~~~~~~~~~~
@@ -83,20 +105,20 @@ intermediate Python ``bytes`` object.
 
    * - Codec
      - Characteristics
-     - ``level``
+     - Provider parameters
      - Choose it when
    * - ``lz4``
      - Prioritizes compression and decompression speed with relatively low CPU
        cost, usually at a lower compression ratio than Zstd.
-     - Passed as LZ4 ``acceleration``. Higher values favor speed and may reduce
-       the compression ratio.
+     - ``acceleration`` controls LZ4 fast compression. Higher values favor speed
+       and may reduce the compression ratio.
      - CPU time matters or the link is only moderately bandwidth-bound. This is
        the default codec.
    * - ``zstd``
      - Usually reduces wire bytes more than LZ4, with higher compression and
        decompression cost.
-     - Passed as the Zstandard compression level. Higher levels generally trade
-       more CPU time for a better compression ratio.
+     - ``level`` controls the compression ratio/CPU trade-off;
+       ``max_inflight`` bounds concurrent reusable contexts.
      - The network is slow enough that reducing bytes dominates codec time.
 
 Measure with representative payloads before choosing. Already compressed or
@@ -116,9 +138,25 @@ Configure Compression
        tensor_compression:
          enabled: true
          codec: lz4
-         level: 1
-         min_bytes: 65536
-         max_inflight: 4
+         min_bytes: 16384
+         excluded_dtypes: [float32]
+         params:
+           acceleration: 1
+
+For Zstd, select its provider and pass only Zstd parameters:
+
+.. code-block:: yaml
+
+   cluster:
+     collective:
+       tensor_compression:
+         enabled: true
+         codec: zstd
+         min_bytes: 16384
+         excluded_dtypes: [float32]
+         params:
+           level: 1
+           max_inflight: 4
 
 Omit ``tensor_compression`` or set ``enabled: false`` to use the original wire
 path. The compression options and defaults are:
@@ -136,16 +174,56 @@ path. The compression options and defaults are:
    * - ``codec``
      - ``lz4``
      - Selects ``lz4`` or ``zstd``.
-   * - ``level``
-     - ``1``
-     - Sets the codec parameter described above; it must be positive.
    * - ``min_bytes``
-     - ``65536``
+     - ``16384``
      - Skips tensors smaller than this raw byte count.
-   * - ``max_inflight``
+   * - ``excluded_dtypes``
+     - ``[float32]``
+     - Skips codec attempts for tensors whose dtype is listed. Set it to ``[]``
+       to make every dtype eligible.
+   * - ``params``
+     - codec-specific
+     - Configures only the selected provider. LZ4 accepts ``acceleration``
+       (default ``1``). Zstd accepts ``level`` (default ``1``) and
+       ``max_inflight`` (default ``4``). Parameters from another provider are
+       rejected.
+
+``params`` must be a mapping nested under ``tensor_compression``. The provider
+contract is exact:
+
+.. list-table:: Provider parameters
+   :header-rows: 1
+   :widths: 16 20 14 50
+
+   * - Provider
+     - Parameter
+     - Default
+     - Validation and behavior
+   * - ``lz4``
+     - ``acceleration``
+     - ``1``
+     - Must be at least ``1``. Higher values ask LZ4 to spend less time finding
+       matches, usually trading compression ratio for speed. LZ4 is stateless,
+       so the Worker shares one codec without an acquisition limit.
+   * - ``zstd``
+     - ``level``
+     - ``1``
+     - Must be at least ``1``. Higher levels generally spend more CPU time to
+       seek a better compression ratio.
+   * - ``zstd``
+     - ``max_inflight``
      - ``4``
-     - Creates this many encoder instances and this many decoder instances per
-       Worker.
+     - Must be at least ``1``. It bounds reusable Zstd contexts independently
+       for compression and decompression within each Worker. A saturated
+       compressor pool falls back to raw transfer without waiting; a receiver
+       waits for a decoder after an already-compressed payload arrives.
+
+Provider parameters are not accepted as top-level compression options. For
+example, top-level ``level`` or ``max_inflight`` is invalid, and LZ4 rejects
+``max_inflight`` while Zstd rejects ``acceleration``. The driver validates and
+serializes the selected provider configuration once for all Workers; wire
+metadata therefore identifies the codec, while each receiver uses the same
+job-wide provider parameters.
 
 ``tensor_buffer_pool`` is independent of ``tensor_compression``. Its
 ``max_bytes`` option limits the combined active and cached CPU buffer capacity
@@ -156,21 +234,27 @@ Runtime and Fallback
 ~~~~~~~~~~~~~~~~~~~~
 
 Each Worker lazily creates one ``TensorCodecPool`` and one independent
-``TensorBufferPool`` shared by all of its ``CollectiveGroup`` instances. A send
-uses them as follows:
+``TensorBufferPool`` shared by all of its ``CollectiveGroup`` instances. The
+codec pool selects an acquisition policy for the configured provider: LZ4
+shares one stateless codec without a lock or slot limit, while Zstd leases
+exclusive native contexts from bounded encoder and decoder pools. A send uses
+them as follows:
 
-1. It tries to acquire one encoder without waiting. If all encoders are busy,
-   the transfer remains uncompressed.
-2. It orders eligible tensors by worst-case output capacity, largest first, and
-   tries to lease a buffer for each tensor. A tensor stays raw when its codec
-   bound is unsupported or no buffer fits within the budget.
+1. It obtains the provider's encoder. LZ4 access cannot be saturated. Zstd does
+   not wait for a busy encoder pool; a saturated pool keeps the transfer raw.
+2. It filters tensors by ``min_bytes`` and ``excluded_dtypes``, then orders the
+   eligible tensors by worst-case output capacity, largest first. It tries to
+   lease a buffer for each tensor. A tensor stays raw when its codec bound is
+   unsupported or no buffer fits within the budget.
 3. It keeps the compressed result only when it is smaller than the original.
    Otherwise, the tensor stays raw and that buffer is discarded rather than
    cached.
 4. It sends per-tensor compression sizes in the existing metadata. The receiver
    restores compressed tensors directly into their preallocated destinations.
-5. It retains compressed payload buffers until their synchronous payload sends
-   finish, then returns them to the Worker buffer pool.
+5. It releases the codec immediately after compression. Compressed payload
+   buffers remain leased until their synchronous payload sends finish, then
+   return to the Worker buffer pool. The receiver acquires a decoder only after
+   the compressed wire payload has arrived and releases it after decompression.
 
 The buffer pool indexes idle buffers by capacity and reuses the smallest size
 that fits. It maintains separate lists for repeated sizes and tracks active plus
