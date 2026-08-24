@@ -65,6 +65,16 @@ class TrajectoryCollector(ABC):
     def collect(self, chunk: AssembledChunk) -> list[CollectorOutput]:
         """Consume one complete chunk and emit outputs for completed scopes."""
 
+    @property
+    @abstractmethod
+    def queue_keys(self) -> frozenset[str]:
+        """Return every output queue this collector can ever write to.
+
+        The trajectory worker validates subscriptions against this set so a
+        mistyped or misrouted key fails loudly instead of blocking forever on a
+        queue nothing will ever fill.
+        """
+
 
 class _TrajectoryBuilderCollector(TrajectoryCollector):
     """Shared trajectory-building behavior for rollout and pipeline modes."""
@@ -257,6 +267,11 @@ class RolloutTrajectoryCollector(_TrajectoryBuilderCollector):
         self._builders: dict[int, dict[SourceID, EmbodiedTrajectoryBuilder]] = {}
 
     @property
+    def queue_keys(self) -> frozenset[str]:
+        """Emit every trajectory shard on the shared default queue."""
+        return frozenset({"default"})
+
+    @property
     def _expected_key_count(self) -> int:
         return (
             self._source_count * self._cfg.env.train.rollout_epoch * self._chunk_count
@@ -276,9 +291,10 @@ class RolloutTrajectoryCollector(_TrajectoryBuilderCollector):
         scope: CollectionScope,
         builders: dict[SourceID, EmbodiedTrajectoryBuilder],
     ) -> list[CollectorOutput]:
+        # Sort by source so output order does not depend on event arrival order.
         return [
             CollectorOutput(queue_key="default", data=trajectory)
-            for builder in builders.values()
+            for _, builder in sorted(builders.items())
             for trajectory in builder.to_splited_trajectories(self._shards_per_source)
         ]
 
@@ -307,6 +323,13 @@ class PipelineTrajectoryCollector(_TrajectoryBuilderCollector):
         self._shuffle_rollout = cfg.algorithm.get("shuffle_rollout", True)
 
     @property
+    def queue_keys(self) -> frozenset[str]:
+        """Emit micro-batches on one queue per actor rank."""
+        return frozenset(
+            f"actor:{actor_rank}" for actor_rank in range(self._actor_world_size)
+        )
+
+    @property
     def _expected_key_count(self) -> int:
         return self._source_count * self._chunk_count
 
@@ -325,10 +348,9 @@ class PipelineTrajectoryCollector(_TrajectoryBuilderCollector):
         builders: dict[SourceID, EmbodiedTrajectoryBuilder],
     ) -> list[CollectorOutput]:
         batches_by_actor: dict[int, list[dict[str, torch.Tensor]]] = defaultdict(list)
-        for (rollout_rank, stage_id), builder in builders.items():
-            logical_rank = (
-                rollout_rank * self._cfg.rollout.pipeline_stage_num + stage_id
-            )
+        # Sort by source so batch order does not depend on event arrival order.
+        for (env_rank, stage_id), builder in sorted(builders.items()):
+            logical_rank = env_rank * self._cfg.rollout.pipeline_stage_num + stage_id
             actor_splits = CommMapper.get_dst_ranks(
                 batch_size=self._cfg.env.train.total_num_envs,
                 src_world_size=self._source_count,
@@ -445,6 +467,11 @@ class OnlineLerobotTrajectoryCollector(TrajectoryCollector):
         online_cfg = cfg.algorithm.dagger.online_lerobot
         self._only_success = bool(online_cfg.get("only_success", False))
 
+    @property
+    def queue_keys(self) -> frozenset[str]:
+        """Emit every episode shard on the shared default queue."""
+        return frozenset({"default"})
+
     def collect(self, chunk: AssembledChunk) -> list[CollectorOutput]:
         """Append episode data and drain completed episodes at step boundaries."""
         if chunk.key in self._completed_keys:
@@ -485,7 +512,8 @@ class OnlineLerobotTrajectoryCollector(TrajectoryCollector):
             )
 
         outputs = []
-        for source_builder in self._builders.values():
+        # Sort by source so output order does not depend on event arrival order.
+        for _, source_builder in sorted(self._builders.items()):
             episodes = source_builder.drain_episodes()
             outputs.extend(
                 CollectorOutput(

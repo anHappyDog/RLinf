@@ -15,6 +15,7 @@
 from dataclasses import replace
 
 import numpy as np
+import pytest
 import torch
 
 from rlinf.data.schema.embodied_types import (
@@ -26,8 +27,10 @@ from rlinf.data.schema.embodied_types import (
     PolicyOutput,
     TrajectoryKey,
     TrajectorySource,
+    merge_batch_values,
     merge_episode_data,
     merge_policy_inputs,
+    split_batch_value,
     split_episode_data,
     split_policy_input,
 )
@@ -191,3 +194,43 @@ def test_policy_completion_split_merge_preserves_offsets():
         merged.completions[1].next_obs["states"],
         torch.arange(12).reshape(4, 3)[1:],
     )
+
+
+def test_scalar_batch_leaves_survive_a_split_merge_round_trip():
+    """Scalars broadcast by a split must collapse back to the original value.
+
+    Source fragments carry scalar info flags (e.g. ``record_reset``) unchanged,
+    so reassembling them must not turn one flag into a list of per-shard copies.
+    """
+    for value in (True, 3, 1.5, "reset"):
+        shards = split_batch_value(value, [2, 2])
+        assert shards == [value, value]
+        assert merge_batch_values(shards) == value
+
+    nested = {"flag": True, "name": "abc", "states": torch.arange(4).reshape(4, 1)}
+    shards = split_batch_value(nested, [3, 1])
+    merged = merge_batch_values(shards)
+    assert merged["flag"] is True
+    assert merged["name"] == "abc"
+    assert torch.equal(merged["states"], nested["states"])
+
+
+def test_merging_conflicting_scalar_batch_values_is_rejected():
+    with pytest.raises(ValueError, match="conflicting scalar"):
+        merge_batch_values([True, False])
+
+
+def test_episode_data_round_trip_keeps_scalar_info_flags_intact():
+    episode_data = {
+        "chunk_actions": torch.arange(8, dtype=torch.float32).reshape(4, 2),
+        "obs_list": [{"states": torch.arange(4).reshape(4, 1)}],
+        "terminations": torch.zeros(4, 1, dtype=torch.bool),
+        "truncations": torch.zeros(4, 1, dtype=torch.bool),
+        "infos_list": [{"record_reset": True, "segment_advance": False}],
+    }
+
+    merged = merge_episode_data(split_episode_data(episode_data, [3, 1]))
+
+    assert merged["infos_list"][0]["record_reset"] is True
+    assert merged["infos_list"][0]["segment_advance"] is False
+    assert torch.equal(merged["chunk_actions"], episode_data["chunk_actions"])

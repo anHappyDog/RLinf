@@ -159,11 +159,17 @@ def _episode_data():
     }
 
 
-def test_try_subscribe_returns_false_without_starting_recv():
+def _stub_worker(queue_keys=("default", "actor:0")):
     worker = object.__new__(TrajectoryWorker)
     worker._receiver_error = None
     worker._output_queues = defaultdict(asyncio.Queue)
+    worker._collector = Mock(queue_keys=frozenset(queue_keys))
     worker.send = Mock()
+    return worker
+
+
+def test_try_subscribe_returns_false_without_starting_recv():
+    worker = _stub_worker()
 
     ready = asyncio.run(
         worker.try_subscribe(
@@ -176,11 +182,8 @@ def test_try_subscribe_returns_false_without_starting_recv():
 
 
 def test_try_subscribe_dequeues_and_submits_async_send():
-    worker = object.__new__(TrajectoryWorker)
-    worker._receiver_error = None
-    worker._output_queues = defaultdict(asyncio.Queue)
+    worker = _stub_worker()
     worker._output_queues["actor:0"].put_nowait("trajectory")
-    worker.send = Mock()
     address = WorkerAddress(root_group_name="actor", ranks=0)
 
     ready = asyncio.run(worker.try_subscribe(address, "actor:0", 11))
@@ -482,3 +485,51 @@ def test_online_lerobot_dummy_step_records_intervened_action():
     frame = collector._env_buffers[0][0]
     assert np.array_equal(frame["actions"], np.array([9.0, 8.0]))
     assert frame["intervene_flag"].item()
+
+
+def test_subscribe_rejects_a_queue_key_no_collector_output_can_fill():
+    worker = _stub_worker(queue_keys=("actor:0",))
+
+    with pytest.raises(KeyError, match="actor:3"):
+        asyncio.run(
+            worker.try_subscribe(
+                WorkerAddress(root_group_name="actor", ranks=3), "actor:3", 5
+            )
+        )
+
+    with pytest.raises(KeyError, match="actor:3"):
+        asyncio.run(
+            worker.subscribe(
+                WorkerAddress(root_group_name="actor", ranks=3), "actor:3", 5
+            )
+        )
+    worker.send.assert_not_called()
+
+
+def test_collector_queue_keys_match_the_outputs_each_mode_emits():
+    rollout = create_trajectory_collector(
+        _config(),
+        source_count=1,
+        chunk_count=1,
+        shards_per_source=1,
+        actor_world_size=1,
+    )
+    assert rollout.queue_keys == frozenset({"default"})
+
+    pipeline = create_trajectory_collector(
+        _config(runner={"use_training_pipeline": True}),
+        source_count=1,
+        chunk_count=1,
+        shards_per_source=1,
+        actor_world_size=3,
+    )
+    assert pipeline.queue_keys == frozenset({"actor:0", "actor:1", "actor:2"})
+
+    online = create_trajectory_collector(
+        _config(algorithm={"dagger": {"online_lerobot": {"enabled": True}}}),
+        source_count=1,
+        chunk_count=1,
+        shards_per_source=1,
+        actor_world_size=1,
+    )
+    assert online.queue_keys == frozenset({"default"})

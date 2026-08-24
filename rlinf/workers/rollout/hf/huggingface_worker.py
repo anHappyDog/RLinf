@@ -92,6 +92,7 @@ class MultiStepRolloutWorker(Worker):
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.enable_dagger = self.algorithm_cfg.get("loss_type") == "embodied_dagger"
         self.enable_opd = self.algorithm_cfg.get("adv_type") == "opd"
+        self.enable_rlt = self.algorithm_cfg.get("loss_type") in {"rlt_ac", "rlt_td3"}
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
@@ -598,7 +599,11 @@ class MultiStepRolloutWorker(Worker):
     ) -> EmbodiedRolloutResult:
         """Keep inference metadata locally until its environment result arrives."""
         intervene_flags = result.get("intervene_flags")
-        if intervene_flags is None and result.get("expert_label_flag", False):
+        if (
+            intervene_flags is None
+            and self.enable_dagger
+            and result.get("expert_label_flag", False)
+        ):
             intervene_flags = torch.ones(
                 (actions.shape[0], self.model_cfg.num_action_chunks),
                 dtype=torch.bool,
@@ -701,6 +706,20 @@ class MultiStepRolloutWorker(Worker):
         ).async_wait()
         return policy_input, None
 
+    def _terminal_inference_is_useful(self) -> bool:
+        """Return whether terminal-observation inference produces consumed data.
+
+        The extra forward pass is only worth its cost when the model can emit a
+        bootstrap value, or when RLT needs the terminal transition observation
+        from ``forward_inputs``. Without either, the trajectory worker discards
+        everything this pass would produce.
+        """
+        return (
+            hasattr(self.hf_model, "value_head")
+            or hasattr(self.hf_model, "q_head")
+            or self.enable_rlt
+        )
+
     def _publish_completion(
         self,
         completion: PolicyCompletion,
@@ -709,7 +728,7 @@ class MultiStepRolloutWorker(Worker):
     ) -> None:
         bootstrap_values = None
         final_prev_values = None
-        if completion.requires_inference:
+        if completion.requires_inference and self._terminal_inference_is_useful():
             _, result = self._predict_rollout_actions(completion.next_obs)
             values = result.get("prev_values")
             if values is not None:

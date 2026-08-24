@@ -115,7 +115,7 @@ def test_smooth_intervention_builds_dummy_input_without_policy_history():
         action_dim=3,
         enabled=True,
     )
-    env = SimpleNamespace(get_hold_actions=lambda: [[1.0, 2.0, 3.0]])
+    env = SimpleNamespace(get_hold_actions=lambda fallback=None: [[1.0, 2.0, 3.0]])
 
     policy_input = controller.build_dummy_policy_input(
         0, env=env, obs={"states": torch.zeros(1, 4)}
@@ -164,7 +164,9 @@ def test_env_sends_dummy_request_after_intervention_continues():
     env.n_train_chunk_steps = 2
     env.enable_online_lerobot = True
     env.env_decoupled_mode = False
-    env.env_list = [SimpleNamespace(get_hold_actions=lambda: [[1.0, 2.0]])]
+    env.env_list = [
+        SimpleNamespace(get_hold_actions=lambda fallback=None: [[1.0, 2.0]])
+    ]
     env.smooth_intervene = SmoothInterveneController(1, 1, 2, 2, enabled=True)
     env._build_env_result = Mock(return_value=EnvResult())
     env._send_policy_input = Mock()
@@ -187,6 +189,8 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
     rollout.n_train_chunk_steps = 2
     rollout.num_pipeline_stages = 1
     rollout.env_decoupled_mode = False
+    rollout.enable_rlt = False
+    rollout.hf_model = SimpleNamespace(value_head=object())
     rollout.update_dagger_beta = Mock()
     rollout._send_policy_output = Mock()
     rollout._build_rollout_result = Mock(
@@ -288,6 +292,8 @@ def test_rollout_routes_dummy_input_without_model_inference():
     rollout.n_train_chunk_steps = 2
     rollout.num_pipeline_stages = 1
     rollout.env_decoupled_mode = False
+    rollout.enable_rlt = False
+    rollout.hf_model = SimpleNamespace(value_head=object())
     rollout.update_dagger_beta = Mock()
     rollout._send_policy_output = Mock()
     rollout._build_rollout_result = Mock(
@@ -427,6 +433,7 @@ def test_env_closes_reward_stream_with_final_chunk():
     )
     env._maybe_wait_env_delay = AsyncMock()
     env._recv_policy_output = Mock(return_value=PolicyOutput(actions=torch.zeros(1, 4)))
+    env.smooth_intervene = SmoothInterveneController(1, 1, 2, 4)
     env.env_interact_step = Mock(
         return_value=(
             EnvOutput(
@@ -459,3 +466,74 @@ def test_env_closes_reward_stream_with_final_chunk():
     assert [
         call.kwargs["last_run"] for call in env.get_reward_model_output.call_args_list
     ] == [False, False, False, True]
+
+
+def test_smooth_intervention_holds_at_the_last_commanded_step():
+    controller = SmoothInterveneController(
+        stage_num=1,
+        num_envs_per_stage=1,
+        num_action_chunks=2,
+        action_dim=3,
+        enabled=True,
+    )
+    seen = []
+
+    def get_hold_actions(fallback=None):
+        seen.append(fallback)
+        return [[1.0, 2.0, 3.0]]
+
+    env = SimpleNamespace(get_hold_actions=get_hold_actions)
+    controller.remember_actions(0, torch.tensor([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]))
+
+    controller.build_dummy_policy_input(0, env=env, obs={"states": torch.zeros(1, 4)})
+
+    # The wrapper receives the final step of the chunk that was just executed,
+    # so it can hold that pose instead of snapping back to its own default.
+    assert len(seen) == 1
+    assert seen[0].tolist() == [[4.0, 5.0, 6.0]]
+
+
+def test_rollout_skips_terminal_inference_without_a_value_head():
+    rollout = object.__new__(MultiStepRolloutWorker)
+    rollout.enable_rlt = False
+    rollout.hf_model = SimpleNamespace()
+    rollout._predict_rollout_actions = Mock()
+    trajectory_channel = Mock()
+    completion = PolicyCompletion(
+        sources=[TrajectorySource(TrajectoryKey(0, 0, 0, 0, 0), 1)],
+        env_result=EnvResult(),
+        next_obs={"states": torch.zeros(1, 4)},
+        requires_inference=True,
+    )
+
+    rollout._publish_completion(completion, None, trajectory_channel)
+
+    rollout._predict_rollout_actions.assert_not_called()
+    event = trajectory_channel.publish.call_args.args[0]
+    assert event.bootstrap_values is None
+    assert event.final_prev_values is None
+
+
+def test_rollout_runs_terminal_inference_for_rlt_without_a_value_head():
+    rollout = object.__new__(MultiStepRolloutWorker)
+    rollout.enable_rlt = True
+    rollout.hf_model = SimpleNamespace()
+    rollout._predict_rollout_actions = Mock(
+        return_value=(
+            torch.zeros(1, 1),
+            {"forward_inputs": {"states": torch.ones(1, 1)}},
+        )
+    )
+    trajectory_channel = Mock()
+    completion = PolicyCompletion(
+        sources=[TrajectorySource(TrajectoryKey(0, 0, 0, 0, 0), 1)],
+        env_result=EnvResult(),
+        next_obs={"states": torch.zeros(1, 4)},
+        requires_inference=True,
+    )
+
+    rollout._publish_completion(completion, None, trajectory_channel)
+
+    rollout._predict_rollout_actions.assert_called_once()
+    event = trajectory_channel.publish.call_args.args[0]
+    assert torch.equal(event.forward_inputs["states"], torch.ones(1, 1))

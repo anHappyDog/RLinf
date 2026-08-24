@@ -344,12 +344,19 @@ def split_batch_value(value: Any, split_sizes: list[int]) -> list[Any]:
             offset += size
         return chunks
     if isinstance(value, (bool, float, int, str)):
+        # Scalars describe the whole batch, so every shard keeps the same value.
+        # ``merge_batch_values`` collapses them back to a single scalar.
         return [value] * len(split_sizes)
     raise TypeError(f"Unsupported batch value: {type(value)}")
 
 
 def merge_batch_values(values: list[Any]) -> Any:
-    """Merge recursively nested batches on their leading dimension."""
+    """Merge recursively nested batches on their leading dimension.
+
+    This is the inverse of :func:`split_batch_value`: batched leaves are
+    concatenated, while scalar leaves broadcast by the split are collapsed back
+    to the single value they came from.
+    """
     if not values:
         raise ValueError("Cannot merge an empty list of batch values.")
     if all(value is None for value in values):
@@ -371,7 +378,9 @@ def merge_batch_values(values: list[Any]) -> Any:
     if isinstance(first, list):
         return [item for value in values for item in value]
     if isinstance(first, (bool, float, int, str)):
-        return values
+        if any(value != first for value in values[1:]):
+            raise ValueError(f"Cannot merge conflicting scalar batch values: {values}.")
+        return first
     raise TypeError(f"Unsupported batch value: {type(first)}")
 
 
@@ -557,9 +566,8 @@ def merge_policy_inputs(policy_inputs: list[PolicyInput]) -> PolicyInput:
             values = [
                 value
                 if value is not None
-                else torch.full(
+                else torch.zeros(
                     (get_batch_size(obs), *reference.shape[1:]),
-                    False,
                     dtype=reference.dtype,
                 )
                 for obs, value in zip(observations, values)

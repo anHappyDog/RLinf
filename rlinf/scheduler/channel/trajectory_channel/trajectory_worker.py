@@ -32,17 +32,15 @@ from rlinf.scheduler.worker.worker import Worker, WorkerAddress
 class TrajectoryWorker(Worker):
     """Receive trajectory events and serve collector outputs."""
 
-    def __init__(self, cfg: DictConfig, max_size: int = 0):
+    def __init__(self, cfg: DictConfig):
         """Initialize event assembly, collection, and output queues."""
         super().__init__()
-        if max_size != 0:
-            raise ValueError("Trajectory output queues must be unbounded.")
         self._cfg = cfg
         self._receiver_tasks: dict[WorkerAddress, asyncio.Task] = {}
         self._receiver_error: BaseException | None = None
-        self._output_queues: dict[str, asyncio.Queue] = defaultdict(
-            lambda: asyncio.Queue(maxsize=max_size)
-        )
+        # Output queues are unbounded: a bounded queue would let a slow actor
+        # block the receive loops that feed every other actor.
+        self._output_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
         from rlinf.scheduler.cluster import Cluster
         from rlinf.utils.metric_utils import compute_split_num
@@ -119,14 +117,24 @@ class TrajectoryWorker(Worker):
             for output in outputs:
                 self._output_queues[output.queue_key].put_nowait(output.data)
 
-    async def subscribe(
-        self, worker_address: WorkerAddress, queue_key: str, query_id: int
-    ) -> None:
-        """Send the next queued item to a subscriber."""
+    def _check_subscription(self, queue_key: str) -> None:
+        """Reject subscriptions that no collector output can ever satisfy."""
         if self._receiver_error is not None:
             raise RuntimeError(
                 "A trajectory receiver has failed."
             ) from self._receiver_error
+        if queue_key not in self._collector.queue_keys:
+            raise KeyError(
+                f"Unknown trajectory queue key {queue_key!r}. "
+                f"{type(self._collector).__name__} only emits "
+                f"{sorted(self._collector.queue_keys)}."
+            )
+
+    async def subscribe(
+        self, worker_address: WorkerAddress, queue_key: str, query_id: int
+    ) -> None:
+        """Send the next queued item to a subscriber."""
+        self._check_subscription(queue_key)
         data = await self._output_queues[queue_key].get()
         await self.send(
             object=data,
@@ -140,15 +148,14 @@ class TrajectoryWorker(Worker):
         self, worker_address: WorkerAddress, queue_key: str, query_id: int
     ) -> bool:
         """Submit a send if an assembled item is immediately available."""
-        if self._receiver_error is not None:
-            raise RuntimeError(
-                "A trajectory receiver has failed."
-            ) from self._receiver_error
+        self._check_subscription(queue_key)
         try:
             data = self._output_queues[queue_key].get_nowait()
         except asyncio.QueueEmpty:
             return False
 
+        # The send is deliberately not awaited: the caller only posts its
+        # matching recv after this RPC returns, so waiting here would deadlock.
         self.send(
             object=data,
             dst_group_name=worker_address.root_group_name,

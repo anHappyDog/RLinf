@@ -1126,6 +1126,9 @@ class EnvWorker(Worker):
                         await asyncio.sleep(0)
 
                     policy_output = self._recv_policy_output(input_channel, stage_id)
+                    self.smooth_intervene.remember_actions(
+                        stage_id, policy_output.actions
+                    )
 
                     env_output, env_info, chunk_step_data = self.env_interact_step(
                         policy_output.actions, stage_id

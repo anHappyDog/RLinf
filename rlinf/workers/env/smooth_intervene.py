@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Realworld smooth-intervene helpers for EnvWorker orchestration."""
+"""Realworld smooth-intervene helpers for EnvWorker orchestration.
+
+Bypasses policy inference across action-chunk boundaries while human teleop
+continues. Requires ``algorithm.loss_type=embodied_dagger`` with online LeRobot
+collection enabled, a ``realworld`` env, and PICO teleop
+(``env.train.use_pico=True``); SpaceMouse is not supported. The env only
+supplies hold actions; this module owns dummy-request construction and the
+per-stage continue/skip state.
+"""
 
 from __future__ import annotations
 
@@ -48,6 +56,9 @@ class SmoothInterveneController:
         self.num_action_chunks = int(num_action_chunks)
         self.action_dim = int(action_dim)
         self.next_intervene_flags = [False for _ in range(self.stage_num)]
+        self.last_actions: list[torch.Tensor | None] = [
+            None for _ in range(self.stage_num)
+        ]
 
     @classmethod
     def from_cfg(
@@ -111,6 +122,31 @@ class SmoothInterveneController:
     def is_active(self, stage_id: int) -> bool:
         return self.enabled and self.next_intervene_flags[stage_id]
 
+    def remember_actions(self, stage_id: int, actions: torch.Tensor | None) -> None:
+        """Record the chunk a stage just executed.
+
+        Its last step seeds ``get_hold_actions``, so intervention wrappers that
+        hold at the previously commanded pose keep doing so across a dummy chunk
+        instead of snapping back to their own default.
+        """
+        if not self.enabled or actions is None:
+            return
+        self.last_actions[stage_id] = actions.detach()
+
+    def _fallback_actions(self, stage_id: int):
+        """Return the last commanded step for a stage, if one was recorded."""
+        actions = self.last_actions[stage_id]
+        if actions is None:
+            return None
+        if actions.ndim == 2:
+            actions = actions.reshape(actions.shape[0], self.num_action_chunks, -1)
+        elif actions.ndim != 3:
+            raise ValueError(
+                "smooth_intervene expects actions with shape [B, action_dim] or "
+                f"[B, T, action_dim], got {tuple(actions.shape)}"
+            )
+        return actions[:, -1, :].float().cpu().numpy()
+
     def build_dummy_policy_input(
         self,
         stage_id: int,
@@ -124,7 +160,9 @@ class SmoothInterveneController:
             raise ValueError(
                 "smooth_intervene requires the env to expose get_hold_actions()"
             )
-        hold_actions = torch.as_tensor(get_hold_actions(), dtype=torch.float32)
+        hold_actions = torch.as_tensor(
+            get_hold_actions(self._fallback_actions(stage_id)), dtype=torch.float32
+        )
         expected_shape = (self.num_envs_per_stage, self.action_dim)
         if tuple(hold_actions.shape) != expected_shape:
             raise ValueError(

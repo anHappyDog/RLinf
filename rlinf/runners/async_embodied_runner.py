@@ -141,11 +141,14 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             input_channel=self.env_channel,
             rollout_channel=self.rollout_channel,
         )
-        rollout_handle: Handle = self.rollout.evaluate(
-            input_channel=self.rollout_channel,
-            output_channel=self.env_channel,
-        )
         env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
+        # In decoupled mode the rollout worker keeps serving its own loop, so it
+        # is neither launched here nor joined below.
+        if not env_decoupled_mode:
+            rollout_handle: Handle = self.rollout.evaluate(
+                input_channel=self.rollout_channel,
+                output_channel=self.env_channel,
+            )
         env_results = env_handle.wait()
         if not env_decoupled_mode:
             rollout_handle.wait()

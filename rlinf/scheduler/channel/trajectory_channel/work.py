@@ -42,6 +42,14 @@ class AsyncPublishWork(AsyncWork):
         """Return whether the publish operation has completed."""
         return self._send_work.done()
 
+    def then(self, func, *args, **kwargs):
+        """Chain a callback onto the underlying payload transfer."""
+        return self._send_work.then(func, *args, **kwargs)
+
+    def get_next_work(self) -> AsyncWork | None:
+        """Return the work chained onto the underlying payload transfer."""
+        return self._send_work.get_next_work()
+
 
 class AsyncSubscribeWork(AsyncWork):
     """Completion handle for a trajectory subscription."""
@@ -53,6 +61,7 @@ class AsyncSubscribeWork(AsyncWork):
         self, subscribe_ref: ray.ObjectRef, recv_work: AsyncWork, query_id: int
     ):
         """Track the control RPC and P2P receive operation."""
+        super().__init__()
         self._subscribe_ref = subscribe_ref
         self._recv_work = recv_work
         self._data_future = Future()
@@ -106,6 +115,17 @@ class AsyncSubscribeWork(AsyncWork):
             return True
         ready, _ = ray.wait([self._subscribe_ref], timeout=0)
         return self._recv_work.done() and bool(ready)
+
+    def then(self, func, *args, **kwargs):
+        """Reject chaining: the subscribed item is demultiplexed after receive."""
+        raise NotImplementedError(
+            "AsyncSubscribeWork does not support then(); the received payload "
+            "may belong to another subscriber, so wait() must run first."
+        )
+
+    def get_next_work(self) -> AsyncWork | None:
+        """Return None: subscribe work is never chained."""
+        return None
 
     def _handle_received_data(self, query_id: int, data: Any) -> None:
         with self._store_lock:

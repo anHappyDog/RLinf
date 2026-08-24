@@ -46,6 +46,7 @@ class TrajectoryChannel:
         """Initialize a channel from its trajectory worker group."""
         self._cfg = cfg
         self._name = name
+        self._current_worker = Worker.current_worker
         self._trajectory_worker_group = trajectory_worker_group
         self._trajectory_workers: dict[WorkerGroup.WorkerRank, ray.ObjectRef] = {
             worker_info.rank: worker_info.worker
@@ -78,6 +79,8 @@ class TrajectoryChannel:
                 cluster=Cluster(),
                 name=f"{name}.trajectory_worker",
                 placement_strategy=NodePlacementStrategy([trajectory_node_rank]),
+                # Set max_concurrency to a high value so a large number of
+                # blocked subscribes cannot starve the receive loops.
                 max_concurrency=2**31 - 1,
             )
         return cls(cfg, name, trajectory_worker_group)

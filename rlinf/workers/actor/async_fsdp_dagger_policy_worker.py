@@ -62,14 +62,28 @@ class AsyncEmbodiedDAGGERFSDPPolicy(EmbodiedDAGGERFSDPPolicy):
         ``algorithm.dagger.online_lerobot.finalize_interval`` and are not part of training
         readiness.
         """
-        asyncio.run(self._recv_lerobot_episodes(input_channel))
-
-    async def _recv_lerobot_episodes(self, input_channel) -> None:
-        """Receive online LeRobot episode shards until the worker stops."""
+        send_num = self._component_placement.get_world_size("env") * self.stage_num
+        recv_num = self._component_placement.get_world_size("actor")
+        split_num = compute_split_num(send_num, recv_num)
+        # Poll with try_subscribe instead of the blocking subscribe used by the
+        # synchronous path: a blocking receive parks this thread inside the
+        # trajectory channel, so it would never re-check ``should_stop`` once
+        # rollout stops producing.
         while not self.should_stop:
-            await self._recv_lerobot_episodes_from_channel(input_channel)
+            received = 0
+            for _ in range(split_num):
+                try:
+                    episodes: list[list[dict]] = input_channel.try_subscribe()
+                except asyncio.QueueEmpty:
+                    break
+                received += 1
+                for ep_frames in episodes:
+                    if ep_frames:
+                        self._append_lerobot_episode(ep_frames)
             if self.dataset.is_ready():
                 self._ensure_lerobot_loader()
+            if not received:
+                time.sleep(0.01)
 
     def _recv_rollout_thread_main(self, input_channel):
         send_num = self._component_placement.get_world_size("env") * self.stage_num
