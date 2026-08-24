@@ -100,11 +100,8 @@ class EmbodiedRunner:
             "Actor",
             collector=EmbodiedTrajectoryCollector,
             cfg=self.cfg,
-            producers=[self.env.worker_group_name, self.rollout.worker_group_name],
-            consumers=[
-                f"{self.actor.worker_group_name}:{worker.rank}"
-                for worker in self.actor.worker_info_list
-            ],
+            producers=[self.env, self.rollout],
+            consumers=[self.actor],
         )
         if self.reward is not None:
             self.reward_channel = Channel.create("Reward")

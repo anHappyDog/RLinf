@@ -20,7 +20,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from rlinf.scheduler.channel.channel import DEFAULT_KEY
+from rlinf.scheduler.channel.channel import (
+    DEFAULT_KEY,
+    _consumer_ids,
+    _group_names,
+    _group_sizes,
+    _group_world_size,
+)
 from rlinf.scheduler.channel.channel_worker import ChannelWorker, PeekQueue
 from rlinf.scheduler.channel.hooks import (
     COLLECTOR_REGISTRY,
@@ -38,6 +44,7 @@ from rlinf.scheduler.channel.hooks import (
     resolve_collector,
     resolve_dispatcher,
 )
+from rlinf.scheduler.worker import WorkerAddress, WorkerGroup
 
 ACTORS = ("actor:0", "actor:1", "actor:2")
 
@@ -381,3 +388,75 @@ def test_collector_and_dispatcher_state_is_per_channel_not_global():
         counts[first._dispatcher.route(None, "k")] += 1
     assert counts == {"actor:0": 1, "actor:1": 1, "actor:2": 1}
     assert second._dispatcher.route(None, "k") == "actor:0"
+
+
+# --- producer / consumer resolution ------------------------------------------
+
+
+def test_group_specs_accept_worker_groups_names_and_mixtures():
+    group = object.__new__(WorkerGroup)
+    group._worker_group_name = "ActorGroup"
+
+    assert _group_names(None) == []
+    assert _group_names("EnvGroup") == ["EnvGroup"]
+    assert _group_names(group) == ["ActorGroup"]
+    assert _group_names([group, "EnvGroup"]) == ["ActorGroup", "EnvGroup"]
+
+
+def test_a_group_spec_of_the_wrong_type_is_rejected():
+    with pytest.raises(TypeError, match="WorkerGroup or a group name"):
+        _group_names([object()])
+
+
+def test_consumers_expand_to_one_id_per_rank_of_a_worker_group():
+    group = object.__new__(WorkerGroup)
+    group._worker_group_name = "ActorGroup"
+    group._workers = [Mock(rank=rank) for rank in range(3)]
+
+    assert _consumer_ids(group) == ["ActorGroup:0", "ActorGroup:1", "ActorGroup:2"]
+    assert _consumer_ids(None) == []
+
+
+def test_a_bare_group_name_gets_its_size_from_the_worker_manager(monkeypatch):
+    proxy = Mock()
+    proxy.get_worker_info.return_value = Mock(group_world_size=2)
+    monkeypatch.setattr(
+        "rlinf.scheduler.manager.WorkerManager.get_proxy", lambda: proxy
+    )
+
+    assert _consumer_ids("ActorGroup") == ["ActorGroup:0", "ActorGroup:1"]
+    proxy.get_worker_info.assert_called_once()
+
+
+def test_group_sizes_mixes_groups_and_names(monkeypatch):
+    group = object.__new__(WorkerGroup)
+    group._worker_group_name = "ActorGroup"
+    group._workers = [Mock(rank=0)]
+    proxy = Mock()
+    proxy.get_worker_info.return_value = Mock(group_world_size=4)
+    monkeypatch.setattr(
+        "rlinf.scheduler.manager.WorkerManager.get_proxy", lambda: proxy
+    )
+
+    assert _group_sizes([group, "EnvGroup"]) == [("ActorGroup", 1), ("EnvGroup", 4)]
+
+
+def test_naming_an_unlaunched_group_says_what_to_do_about_it(monkeypatch):
+    proxy = Mock()
+    proxy.get_worker_info.return_value = None
+    monkeypatch.setattr(
+        "rlinf.scheduler.manager.WorkerManager.get_proxy", lambda: proxy
+    )
+
+    with pytest.raises(ValueError, match="launch it before"):
+        _group_world_size("NeverLaunched")
+
+
+def test_consumer_ids_match_the_ids_the_worker_get_path_reports():
+    """The dispatcher keys on dst_addr.get_name(); expansion must agree."""
+    monkeypatch_size = 2
+    addresses = [
+        WorkerAddress(root_group_name="ActorGroup", ranks=rank).get_name()
+        for rank in range(monkeypatch_size)
+    ]
+    assert addresses == ["ActorGroup:0", "ActorGroup:1"]
