@@ -28,7 +28,7 @@ from rlinf.data.schema.embodied_types import (
     split_batch_value,
     split_episode_data,
 )
-from rlinf.scheduler.channel.trajectory_channel.data import (
+from rlinf.data.schema.trajectory_events import (
     DummyPolicyStep,
     EnvStepResult,
     PolicyStep,

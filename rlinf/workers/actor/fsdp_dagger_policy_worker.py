@@ -28,10 +28,7 @@ from rlinf.data.datasets.dagger import (
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
-from rlinf.scheduler import Worker
-from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
-    TrajectoryChannel,
-)
+from rlinf.scheduler import Channel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import append_to_dict, compute_split_num
@@ -290,7 +287,7 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             split_num = compute_split_num(send_num, recv_num)
             recv_list = []
             for _ in range(split_num):
-                trajectory: Trajectory = await input_channel.subscribe(
+                trajectory: Trajectory = await input_channel.get(
                     async_op=True
                 ).async_wait()
                 recv_list.append(trajectory)
@@ -308,9 +305,7 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         if intervene_traj_list:
             self.replay_buffer.add_trajectories(intervene_traj_list)
 
-    async def _recv_lerobot_episodes_from_channel(
-        self, input_channel: TrajectoryChannel
-    ) -> None:
+    async def _recv_lerobot_episodes_from_channel(self, input_channel: Channel) -> None:
         """Receive up to one actor-side split from the shared Actor channel.
 
         Each rank pulls exactly ``split_num`` messages per call so multi-actor
@@ -323,16 +318,14 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(send_num, recv_num)
         for _ in range(split_num):
-            episodes: list[list[dict]] = await input_channel.subscribe(
+            episodes: list[list[dict]] = await input_channel.get(
                 async_op=True
             ).async_wait()
             for ep_frames in episodes:
                 if ep_frames:
                     self._append_lerobot_episode(ep_frames)
 
-    async def recv_lerobot_rollout_trajectories(
-        self, input_channel: TrajectoryChannel
-    ) -> None:
+    async def recv_lerobot_rollout_trajectories(self, input_channel: Channel) -> None:
         """Receive episodes from EnvWorker and append them to the memory dataset.
 
         EnvWorkers collect completed episodes via ``EmbodiedLerobotTrajectoryBuilder``

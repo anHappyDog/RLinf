@@ -34,7 +34,7 @@ from rlinf.data.schema.embodied_types import (
     split_episode_data,
     split_policy_input,
 )
-from rlinf.scheduler.channel.trajectory_channel.data import PolicyStep
+from rlinf.data.schema.trajectory_events import PolicyStep
 from rlinf.scheduler.cluster.utils import (
     TensorPlaceholder,
     pack_dataclass_tensors,

@@ -73,7 +73,7 @@ class AsyncEmbodiedDAGGERFSDPPolicy(EmbodiedDAGGERFSDPPolicy):
             received = 0
             for _ in range(split_num):
                 try:
-                    episodes: list[list[dict]] = input_channel.try_subscribe()
+                    episodes: list[list[dict]] = input_channel.get_nowait()
                 except asyncio.QueueEmpty:
                     break
                 received += 1
@@ -92,7 +92,7 @@ class AsyncEmbodiedDAGGERFSDPPolicy(EmbodiedDAGGERFSDPPolicy):
         while not self.should_stop:
             for _ in range(split_num):
                 try:
-                    trajectory = input_channel.try_subscribe()
+                    trajectory = input_channel.get_nowait()
                 except asyncio.QueueEmpty:
                     time.sleep(0.01)
                     break

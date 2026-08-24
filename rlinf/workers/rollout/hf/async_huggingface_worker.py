@@ -17,9 +17,6 @@ import asyncio
 from omegaconf.omegaconf import DictConfig
 
 from rlinf.scheduler import Channel, Worker
-from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
-    TrajectoryChannel,
-)
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -46,7 +43,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self,
         input_channel: Channel,
         output_channel: Channel,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
         metric_channel: Channel,
     ):
         assert self._generate_task is None, (
@@ -66,7 +63,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self,
         input_channel: Channel,
         output_channel: Channel,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
         metric_channel: Channel,
     ):
         while True:

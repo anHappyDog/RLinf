@@ -22,11 +22,9 @@ from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
+from rlinf.data.schema.embodied_channel import EmbodiedTrajectoryCollector
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
-from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
-    TrajectoryChannel,
-)
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
@@ -96,7 +94,18 @@ class EmbodiedRunner:
         # Data channels
         self.env_channel = Channel.create("Env")
         self.rollout_channel = Channel.create("Rollout")
-        self.actor_channel = TrajectoryChannel.create(name="Actor", cfg=self.cfg)
+        # Trajectory assembly runs on the channel worker, so neither the env
+        # nor the rollout worker has to hold partial trajectory state.
+        self.actor_channel = Channel.create(
+            "Actor",
+            collector=EmbodiedTrajectoryCollector,
+            cfg=self.cfg,
+            producers=[self.env.worker_group_name, self.rollout.worker_group_name],
+            consumers=[
+                f"{self.actor.worker_group_name}:{worker.rank}"
+                for worker in self.actor.worker_info_list
+            ],
+        )
         if self.reward is not None:
             self.reward_channel = Channel.create("Reward")
         else:
@@ -173,7 +182,6 @@ class EmbodiedRunner:
         rollout_handle.wait()
         env_handle.wait()
         self.actor.init_worker().wait()
-        self.actor_channel.start_receivers(self.env, self.rollout)
 
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is None:

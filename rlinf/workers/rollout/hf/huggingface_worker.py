@@ -38,18 +38,15 @@ from rlinf.data.schema.embodied_types import (
     merge_policy_inputs,
     split_batch_value,
 )
-from rlinf.hybrid_engines.weight_syncer import WeightSyncer
-from rlinf.models import get_model
-from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
-from rlinf.scheduler.channel.trajectory_channel.data import (
+from rlinf.data.schema.trajectory_events import (
     DummyPolicyStep,
     EnvStepResult,
     PolicyStep,
 )
-from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
-    TrajectoryChannel,
-)
+from rlinf.hybrid_engines.weight_syncer import WeightSyncer
+from rlinf.models import get_model
+from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
 
 
@@ -724,7 +721,7 @@ class MultiStepRolloutWorker(Worker):
         self,
         completion: PolicyCompletion,
         forward_inputs: dict[str, Any] | None,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
     ) -> None:
         bootstrap_values = None
         final_prev_values = None
@@ -735,7 +732,7 @@ class MultiStepRolloutWorker(Worker):
                 final_prev_values = values.cpu().contiguous()
                 bootstrap_values = final_prev_values[:, :1]
             forward_inputs = result.get("forward_inputs")
-        trajectory_channel.publish(
+        trajectory_channel.put(
             EnvStepResult(
                 sources=completion.sources,
                 result=completion.env_result,
@@ -782,7 +779,7 @@ class MultiStepRolloutWorker(Worker):
         self,
         input_channel: Channel,
         output_channel: Channel,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
     ) -> None:
         self.update_dagger_beta()
         for _ in range(self.n_train_chunk_steps):
@@ -822,7 +819,7 @@ class MultiStepRolloutWorker(Worker):
                         obs=policy_input.obs,
                         rollout_result=self._build_rollout_result(actions, result),
                     )
-                trajectory_channel.publish(trajectory_event, async_op=True)
+                trajectory_channel.put(trajectory_event, async_op=True)
                 for completion, next_inputs in zip(
                     policy_input.completions, forward_inputs
                 ):
@@ -849,7 +846,7 @@ class MultiStepRolloutWorker(Worker):
         self,
         input_channel: Channel,
         output_channel: Channel,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
     ):
         if self.enable_offload:
             self.reload_model()

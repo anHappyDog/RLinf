@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
-from collections import defaultdict
 from unittest.mock import Mock
 
 import numpy as np
@@ -21,6 +19,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from rlinf.data.schema.embodied_channel import EmbodiedTrajectoryCollector
 from rlinf.data.schema.embodied_trajectory_builder import (
     EmbodiedLerobotTrajectoryBuilder,
 )
@@ -30,27 +29,25 @@ from rlinf.data.schema.embodied_types import (
     TrajectoryKey,
     TrajectorySource,
 )
-from rlinf.scheduler.channel.trajectory_channel.assembler import (
+from rlinf.data.schema.trajectory_assembler import (
     AssembledChunk,
     TrajectoryEventAssembler,
 )
-from rlinf.scheduler.channel.trajectory_channel.collectors import (
+from rlinf.data.schema.trajectory_collectors import (
     CollectorOutput,
     OnlineLerobotTrajectoryCollector,
     PipelineTrajectoryCollector,
     RolloutTrajectoryCollector,
     create_trajectory_collector,
 )
-from rlinf.scheduler.channel.trajectory_channel.data import (
+from rlinf.data.schema.trajectory_events import (
     DummyPolicyStep,
     EnvStepResult,
     PolicyStep,
     TrajectoryStart,
 )
-from rlinf.scheduler.channel.trajectory_channel.trajectory_worker import (
-    TrajectoryWorker,
-)
-from rlinf.scheduler.worker.worker import WorkerAddress
+from rlinf.scheduler.channel.channel import DEFAULT_KEY
+from rlinf.scheduler.channel.hooks import ChannelContext
 
 
 def _config(**overrides):
@@ -159,108 +156,62 @@ def _episode_data():
     }
 
 
-def _stub_worker(queue_keys=("default", "actor:0")):
-    worker = object.__new__(TrajectoryWorker)
-    worker._receiver_error = None
-    worker._output_queues = defaultdict(asyncio.Queue)
-    worker._collector = Mock(queue_keys=frozenset(queue_keys))
-    worker.send = Mock()
-    return worker
-
-
-def test_try_subscribe_returns_false_without_starting_recv():
-    worker = _stub_worker()
-
-    ready = asyncio.run(
-        worker.try_subscribe(
-            WorkerAddress(root_group_name="actor", ranks=0), "default", 7
-        )
-    )
-
-    assert ready is False
-    worker.send.assert_not_called()
-
-
-def test_try_subscribe_dequeues_and_submits_async_send():
-    worker = _stub_worker()
-    worker._output_queues["actor:0"].put_nowait("trajectory")
-    address = WorkerAddress(root_group_name="actor", ranks=0)
-
-    ready = asyncio.run(worker.try_subscribe(address, "actor:0", 11))
-
-    assert ready is True
-    assert worker._output_queues["actor:0"].empty()
-    worker.send.assert_called_once_with(
-        object="trajectory",
-        dst_group_name="actor",
-        dst_rank=0,
-        piggyback_payload=11,
-        async_op=True,
-    )
-
-
-def test_worker_starts_one_persistent_loop_per_producer():
-    async def run_test():
-        worker = object.__new__(TrajectoryWorker)
-        worker._receiver_tasks = {}
-        worker._receiver_error = None
-        release = asyncio.Event()
-        started = []
-
-        async def consume(address):
-            started.append(address)
-            await release.wait()
-
-        worker._consume = consume
-        addresses = [
-            WorkerAddress(root_group_name="env", ranks=0),
-            WorkerAddress(root_group_name="rollout", ranks=1),
-        ]
-
-        await worker.start_receivers(addresses)
-        assert started == addresses
-        assert set(worker._receiver_tasks) == set(addresses)
-
-        for task in worker._receiver_tasks.values():
-            task.cancel()
-        await asyncio.gather(*worker._receiver_tasks.values(), return_exceptions=True)
-
-    asyncio.run(run_test())
-
-
-def test_worker_enqueues_collector_outputs():
-    worker = object.__new__(TrajectoryWorker)
-    worker._output_queues = defaultdict(asyncio.Queue)
+def _stub_collector(outputs=None, collect_error=None):
+    """An EmbodiedTrajectoryCollector with its assembly internals mocked out."""
+    collector = object.__new__(EmbodiedTrajectoryCollector)
     chunk = Mock()
-    worker._assembler = Mock()
-    worker._assembler.push.return_value = [chunk]
-    worker._collector = Mock()
-    worker._collector.collect.return_value = [
-        CollectorOutput(queue_key="actor:2", data="batch")
-    ]
+    collector._assembler = Mock()
+    collector._assembler.push.return_value = [chunk]
+    collector._collector = Mock()
+    if collect_error is not None:
+        collector._collector.collect.side_effect = collect_error
+    else:
+        collector._collector.collect.return_value = outputs or []
+    return collector, chunk
+
+
+def test_collector_keys_pipeline_outputs_by_actor_rank():
+    collector, chunk = _stub_collector(
+        [CollectorOutput(queue_key="actor:2", data="batch")]
+    )
     event = object()
 
-    worker._apply_event(event)
-
-    worker._assembler.push.assert_called_once_with(event)
-    worker._collector.collect.assert_called_once_with(chunk)
-    worker._assembler.acknowledge.assert_called_once_with(chunk.key)
-    assert worker._output_queues["actor:2"].get_nowait() == "batch"
+    assert list(collector.collect(event, DEFAULT_KEY)) == [("actor:2", "batch")]
+    collector._assembler.push.assert_called_once_with(event)
+    collector._collector.collect.assert_called_once_with(chunk)
+    collector._assembler.acknowledge.assert_called_once_with(chunk.key)
 
 
-def test_worker_keeps_assembled_chunk_when_collection_fails():
-    worker = object.__new__(TrajectoryWorker)
-    worker._output_queues = defaultdict(asyncio.Queue)
-    chunk = Mock()
-    worker._assembler = Mock()
-    worker._assembler.push.return_value = [chunk]
-    worker._collector = Mock()
-    worker._collector.collect.side_effect = ValueError("invalid collection")
+def test_collector_maps_shared_outputs_onto_the_channel_default_key():
+    collector, _ = _stub_collector(
+        [CollectorOutput(queue_key="default", data="trajectory")]
+    )
+
+    assert list(collector.collect(object(), DEFAULT_KEY)) == [
+        (DEFAULT_KEY, "trajectory")
+    ]
+
+
+def test_collector_emits_nothing_until_a_chunk_completes():
+    collector, _ = _stub_collector([])
+
+    assert list(collector.collect(object(), DEFAULT_KEY)) == []
+
+
+def test_collector_keeps_the_assembled_chunk_when_collection_fails():
+    collector, _ = _stub_collector(collect_error=ValueError("invalid collection"))
 
     with pytest.raises(ValueError, match="invalid collection"):
-        worker._apply_event(object())
+        list(collector.collect(object(), DEFAULT_KEY))
 
-    worker._assembler.acknowledge.assert_not_called()
+    collector._assembler.acknowledge.assert_not_called()
+
+
+def test_collector_setup_requires_the_run_config():
+    collector = EmbodiedTrajectoryCollector()
+
+    with pytest.raises(ValueError, match="needs the run config"):
+        collector.setup(ChannelContext(name="Actor", cfg=None))
 
 
 def test_assembler_joins_out_of_order_source_fragments():
@@ -485,51 +436,3 @@ def test_online_lerobot_dummy_step_records_intervened_action():
     frame = collector._env_buffers[0][0]
     assert np.array_equal(frame["actions"], np.array([9.0, 8.0]))
     assert frame["intervene_flag"].item()
-
-
-def test_subscribe_rejects_a_queue_key_no_collector_output_can_fill():
-    worker = _stub_worker(queue_keys=("actor:0",))
-
-    with pytest.raises(KeyError, match="actor:3"):
-        asyncio.run(
-            worker.try_subscribe(
-                WorkerAddress(root_group_name="actor", ranks=3), "actor:3", 5
-            )
-        )
-
-    with pytest.raises(KeyError, match="actor:3"):
-        asyncio.run(
-            worker.subscribe(
-                WorkerAddress(root_group_name="actor", ranks=3), "actor:3", 5
-            )
-        )
-    worker.send.assert_not_called()
-
-
-def test_collector_queue_keys_match_the_outputs_each_mode_emits():
-    rollout = create_trajectory_collector(
-        _config(),
-        source_count=1,
-        chunk_count=1,
-        shards_per_source=1,
-        actor_world_size=1,
-    )
-    assert rollout.queue_keys == frozenset({"default"})
-
-    pipeline = create_trajectory_collector(
-        _config(runner={"use_training_pipeline": True}),
-        source_count=1,
-        chunk_count=1,
-        shards_per_source=1,
-        actor_world_size=3,
-    )
-    assert pipeline.queue_keys == frozenset({"actor:0", "actor:1", "actor:2"})
-
-    online = create_trajectory_collector(
-        _config(algorithm={"dagger": {"online_lerobot": {"enabled": True}}}),
-        source_count=1,
-        chunk_count=1,
-        shards_per_source=1,
-        actor_world_size=1,
-    )
-    assert online.queue_keys == frozenset({"default"})

@@ -44,9 +44,6 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Channel, Cluster, Worker
-from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
-    TrajectoryChannel,
-)
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
     get_reverse_idx,
@@ -1199,7 +1196,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.offload_param_and_grad(True)
 
     @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(self, input_channel: TrajectoryChannel) -> None:
+    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
         """
         Receive rollout trajectories from rollout workers.
 
@@ -1214,9 +1211,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         recv_list = []
         for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.subscribe(
-                query_key="default", async_op=True
-            ).async_wait()
+            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
 
         self.rollout_batch = convert_trajectories_to_batch(recv_list)

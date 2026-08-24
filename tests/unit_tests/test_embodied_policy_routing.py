@@ -32,7 +32,7 @@ from rlinf.data.schema import (
     merge_policy_inputs,
 )
 from rlinf.data.schema.embodied_types import EmbodiedRolloutResult
-from rlinf.scheduler.channel.trajectory_channel.data import (
+from rlinf.data.schema.trajectory_events import (
     DummyPolicyStep,
     EnvStepResult,
     PolicyStep,
@@ -277,7 +277,7 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
         )
     )
 
-    events = [call.args[0] for call in trajectory_channel.publish.call_args_list]
+    events = [call.args[0] for call in trajectory_channel.put.call_args_list]
     assert sum(isinstance(event, PolicyStep) for event in events) == 2
     env_events = [event for event in events if isinstance(event, EnvStepResult)]
     assert len(env_events) == 2
@@ -362,7 +362,7 @@ def test_rollout_routes_dummy_input_without_model_inference():
 
     asyncio.run(generate_one_epoch(rollout, Mock(), Mock(), trajectory_channel))
 
-    events = [call.args[0] for call in trajectory_channel.publish.call_args_list]
+    events = [call.args[0] for call in trajectory_channel.put.call_args_list]
     assert sum(isinstance(event, PolicyStep) for event in events) == 1
     dummy_event = next(event for event in events if isinstance(event, DummyPolicyStep))
     assert torch.equal(dummy_event.actions, dummy_actions)
@@ -509,7 +509,7 @@ def test_rollout_skips_terminal_inference_without_a_value_head():
     rollout._publish_completion(completion, None, trajectory_channel)
 
     rollout._predict_rollout_actions.assert_not_called()
-    event = trajectory_channel.publish.call_args.args[0]
+    event = trajectory_channel.put.call_args.args[0]
     assert event.bootstrap_values is None
     assert event.final_prev_values is None
 
@@ -535,5 +535,5 @@ def test_rollout_runs_terminal_inference_for_rlt_without_a_value_head():
     rollout._publish_completion(completion, None, trajectory_channel)
 
     rollout._predict_rollout_actions.assert_called_once()
-    event = trajectory_channel.publish.call_args.args[0]
+    event = trajectory_channel.put.call_args.args[0]
     assert torch.equal(event.forward_inputs["states"], torch.ones(1, 1))

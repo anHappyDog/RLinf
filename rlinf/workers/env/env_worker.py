@@ -30,17 +30,14 @@ from rlinf.data.schema.embodied_types import (
     TrajectorySource,
     split_policy_input,
 )
+from rlinf.data.schema.trajectory_events import (
+    TrajectoryStart,
+)
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import InsertDelay, RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
-from rlinf.scheduler.channel.trajectory_channel.data import (
-    TrajectoryStart,
-)
-from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
-    TrajectoryChannel,
-)
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
@@ -983,7 +980,7 @@ class EnvWorker(Worker):
     def _send_train_bootstrap(
         self,
         rollout_channel: Channel,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
         env_outputs: list[EnvOutput],
         step_id: int,
         epoch_id: int,
@@ -992,7 +989,7 @@ class EnvWorker(Worker):
         for stage_id in range(self.stage_num):
             key = TrajectoryKey(step_id, epoch_id, self._rank, stage_id, 0)
             source = TrajectorySource(key=key, size=self.train_num_envs_per_stage)
-            trajectory_channel.publish(
+            trajectory_channel.put(
                 TrajectoryStart(
                     source=source,
                     result=self._build_env_result(env_outputs[stage_id]),
@@ -1022,7 +1019,7 @@ class EnvWorker(Worker):
     def _bootstrap_and_send_train(
         self,
         rollout_channel: Channel,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
         step_id: int,
         epoch_id: int,
         completions: dict[int, PolicyCompletion] | None = None,
@@ -1041,7 +1038,7 @@ class EnvWorker(Worker):
     def prefetch_train_bootstrap(
         self,
         rollout_channel: Channel,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
     ) -> None:
         """Prepare and send the first env batch for the next training rollout."""
         if self._prefetched_train_bootstrap is not None:
@@ -1096,7 +1093,7 @@ class EnvWorker(Worker):
         input_channel: Channel,
         rollout_channel: Channel,
         reward_channel: Channel | None,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
@@ -1203,7 +1200,7 @@ class EnvWorker(Worker):
         input_channel: Channel,
         rollout_channel: Channel,
         reward_channel: Channel | None,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
     ):
         env_metrics = await self._run_interact_once(
             input_channel,

@@ -17,7 +17,6 @@ import asyncio
 from omegaconf.omegaconf import DictConfig
 
 from rlinf.scheduler import Channel, Worker
-from rlinf.scheduler.channel.trajectory_channel import TrajectoryChannel
 from rlinf.workers.env.env_worker import EnvWorker
 
 
@@ -36,7 +35,7 @@ class AsyncEnvWorker(EnvWorker):
         rollout_channel: Channel,
         reward_channel: Channel | None,
         metric_channel: Channel,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
     ):
         assert self._interact_task is None or self._interact_task.done(), (
             "Previous interact task is still running while a new interact call is made."
@@ -61,7 +60,7 @@ class AsyncEnvWorker(EnvWorker):
         rollout_channel: Channel,
         reward_channel: Channel | None,
         metric_channel: Channel,
-        trajectory_channel: TrajectoryChannel,
+        trajectory_channel: Channel,
     ):
         while True:
             env_metrics = await self._run_interact_once(

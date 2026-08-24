@@ -327,9 +327,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         recv_list = []
 
         for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.subscribe(
-                async_op=True
-            ).async_wait()
+            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
 
         self.replay_buffer.add_trajectories(recv_list)

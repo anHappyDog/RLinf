@@ -20,10 +20,8 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from rlinf.scheduler import Worker
-from rlinf.scheduler.channel.trajectory_channel.trajectory_channel import (
-    TrajectoryChannel,
-)
+from rlinf.data.schema.embodied_channel import actor_queue_key
+from rlinf.scheduler import Channel, Worker
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import compute_rollout_metrics
 from rlinf.utils.utils import unpack_batch
@@ -58,11 +56,11 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     def try_recv_micro_batch(
         self,
-        input_channel: TrajectoryChannel,
+        input_channel: Channel,
     ) -> dict[str, torch.Tensor] | None:
         if self._pending_micro_batch_work is None:
-            self._pending_micro_batch_work = input_channel.subscribe(
-                query_key=f"actor:{self._rank}", async_op=True
+            self._pending_micro_batch_work = input_channel.get(
+                key=actor_queue_key(self._rank), async_op=True
             )
         if not self._pending_micro_batch_work.done():
             return None
@@ -70,11 +68,9 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
         self._pending_micro_batch_work = None
         return unpack_batch(packed_batch)
 
-    def recv_micro_batch(
-        self, input_channel: TrajectoryChannel
-    ) -> dict[str, torch.Tensor]:
+    def recv_micro_batch(self, input_channel: Channel) -> dict[str, torch.Tensor]:
         if self._pending_micro_batch_work is None:
-            packed_batch = input_channel.subscribe(query_key=f"actor:{self._rank}")
+            packed_batch = input_channel.get(key=actor_queue_key(self._rank))
         else:
             packed_batch = self._pending_micro_batch_work.wait()
             self._pending_micro_batch_work = None
@@ -90,7 +86,7 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     @Worker.timer("run_training")
     def run_training(
-        self, input_channel: TrajectoryChannel
+        self, input_channel: Channel
     ) -> dict[str, dict[str, float] | dict]:
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)

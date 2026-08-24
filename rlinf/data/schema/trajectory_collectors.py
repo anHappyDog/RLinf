@@ -32,8 +32,8 @@ from rlinf.data.schema.embodied_types import (
     TrajectoryKey,
     convert_trajectories_to_batch,
 )
-from rlinf.scheduler.channel.trajectory_channel.assembler import AssembledChunk
-from rlinf.scheduler.channel.trajectory_channel.data import (
+from rlinf.data.schema.trajectory_assembler import AssembledChunk
+from rlinf.data.schema.trajectory_events import (
     DummyPolicyStep,
     PolicyStep,
 )
@@ -64,16 +64,6 @@ class TrajectoryCollector(ABC):
     @abstractmethod
     def collect(self, chunk: AssembledChunk) -> list[CollectorOutput]:
         """Consume one complete chunk and emit outputs for completed scopes."""
-
-    @property
-    @abstractmethod
-    def queue_keys(self) -> frozenset[str]:
-        """Return every output queue this collector can ever write to.
-
-        The trajectory worker validates subscriptions against this set so a
-        mistyped or misrouted key fails loudly instead of blocking forever on a
-        queue nothing will ever fill.
-        """
 
 
 class _TrajectoryBuilderCollector(TrajectoryCollector):
@@ -267,11 +257,6 @@ class RolloutTrajectoryCollector(_TrajectoryBuilderCollector):
         self._builders: dict[int, dict[SourceID, EmbodiedTrajectoryBuilder]] = {}
 
     @property
-    def queue_keys(self) -> frozenset[str]:
-        """Emit every trajectory shard on the shared default queue."""
-        return frozenset({"default"})
-
-    @property
     def _expected_key_count(self) -> int:
         return (
             self._source_count * self._cfg.env.train.rollout_epoch * self._chunk_count
@@ -321,13 +306,6 @@ class PipelineTrajectoryCollector(_TrajectoryBuilderCollector):
         ] = {}
         self._generators: dict[int, torch.Generator] = {}
         self._shuffle_rollout = cfg.algorithm.get("shuffle_rollout", True)
-
-    @property
-    def queue_keys(self) -> frozenset[str]:
-        """Emit micro-batches on one queue per actor rank."""
-        return frozenset(
-            f"actor:{actor_rank}" for actor_rank in range(self._actor_world_size)
-        )
 
     @property
     def _expected_key_count(self) -> int:
@@ -466,11 +444,6 @@ class OnlineLerobotTrajectoryCollector(TrajectoryCollector):
         self._builders: dict[SourceID, EmbodiedLerobotTrajectoryBuilder] = {}
         online_cfg = cfg.algorithm.dagger.online_lerobot
         self._only_success = bool(online_cfg.get("only_success", False))
-
-    @property
-    def queue_keys(self) -> frozenset[str]:
-        """Emit every episode shard on the shared default queue."""
-        return frozenset({"default"})
 
     def collect(self, chunk: AssembledChunk) -> list[CollectorOutput]:
         """Append episode data and drain completed episodes at step boundaries."""

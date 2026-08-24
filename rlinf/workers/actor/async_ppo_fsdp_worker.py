@@ -100,7 +100,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
     def _recv_rollout_thread_main(self, input_channel):
         while not self.should_stop:
             try:
-                trajectory: Trajectory = input_channel.try_subscribe()
+                trajectory: Trajectory = input_channel.get_nowait()
             except asyncio.QueueEmpty:
                 time.sleep(0.01)
                 continue
