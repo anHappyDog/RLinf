@@ -84,6 +84,28 @@ def test_buffer_pool_uses_best_fit_buffers_independent_of_tensor_order():
     large_reuse.release()
 
 
+def test_buffer_pool_reuses_same_size_bucket_and_tracks_cached_bytes():
+    """Equal-sized buffers share a bucket and update cached accounting eagerly."""
+    pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=1024))
+    leases = [pool.try_acquire(128), pool.try_acquire(128), pool.try_acquire(256)]
+    assert all(lease is not None for lease in leases)
+    pointers = {lease.tensor.data_ptr() for lease in leases}
+
+    for lease in leases:
+        lease.release()
+    assert pool.cached_bytes == 512
+
+    first = pool.try_acquire(100)
+    second = pool.try_acquire(200)
+    assert first is not None
+    assert second is not None
+    assert first.tensor.data_ptr() in pointers
+    assert second.tensor.data_ptr() in pointers
+    assert pool.cached_bytes == 128
+    first.release(cache=False)
+    second.release(cache=False)
+
+
 def test_buffer_pool_never_exceeds_its_worker_budget():
     """Active buffers make later acquisitions fall back without overallocating."""
     pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=512))
@@ -106,6 +128,21 @@ def test_buffer_pool_evicts_idle_buffers_to_fit_a_new_shape():
     replacement = pool.try_acquire(512)
     assert replacement is not None
     assert pool.allocated_bytes == 512
+    replacement.release()
+
+
+def test_buffer_pool_evicts_an_entire_size_bucket_in_one_step():
+    """A new large allocation can replace many equal-sized idle buffers."""
+    pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=512))
+    leases = [pool.try_acquire(128) for _ in range(4)]
+    assert all(lease is not None for lease in leases)
+    for lease in leases:
+        lease.release()
+
+    replacement = pool.try_acquire(512)
+    assert replacement is not None
+    assert pool.allocated_bytes == 512
+    assert pool.cached_bytes == 0
     replacement.release()
 
 
@@ -424,7 +461,7 @@ def test_compression_uses_the_default_tensor_buffer_pool_config(monkeypatch):
         {"collective": {"tensor_compression": {"enabled": True}}}
     )
 
-    assert json.loads(os.environ[buffer_pool_env]) == {"max_bytes": 1024**3}
+    assert json.loads(os.environ[buffer_pool_env]) == {"max_bytes": 2 * 1024**3}
 
 
 def test_tensor_buffer_pool_can_be_configured_without_compression(monkeypatch):

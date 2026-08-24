@@ -15,6 +15,7 @@
 """Bounded reusable CPU tensor buffers for collective payload processing."""
 
 import threading
+from bisect import bisect_left, insort
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -25,7 +26,7 @@ import torch
 class TensorBufferPoolOptions:
     """Configure the Worker-wide collective tensor buffer pool."""
 
-    max_bytes: int = 1024**3
+    max_bytes: int = 2 * 1024**3
 
     def __post_init__(self) -> None:
         """Validate the buffer budget."""
@@ -53,7 +54,9 @@ class TensorBufferPool:
         """Create an empty buffer cache bounded by ``options.max_bytes``."""
         self.options = options
         self._allocated_bytes = 0
-        self._available_buffers: list[torch.Tensor] = []
+        self._cached_bytes = 0
+        self._buffers_by_size: dict[int, list[torch.Tensor]] = {}
+        self._available_sizes: list[int] = []
         self._lock = threading.Lock()
 
     @property
@@ -66,7 +69,33 @@ class TensorBufferPool:
     def cached_bytes(self) -> int:
         """Return bytes currently available for reuse."""
         with self._lock:
-            return sum(buffer.numel() for buffer in self._available_buffers)
+            return self._cached_bytes
+
+    def _pop_cached_buffer(self, size_index: int) -> torch.Tensor:
+        """Remove one cached buffer from the indexed size bucket."""
+        size = self._available_sizes[size_index]
+        buffers = self._buffers_by_size[size]
+        buffer = buffers.pop()
+        if not buffers:
+            del self._buffers_by_size[size]
+            self._available_sizes.pop(size_index)
+        self._cached_bytes -= size
+        return buffer
+
+    def _evict_cached_buffers(self, bytes_to_free: int) -> None:
+        """Discard large idle buffers until at least ``bytes_to_free`` are free."""
+        while bytes_to_free > 0 and self._available_sizes:
+            size = self._available_sizes[-1]
+            buffers = self._buffers_by_size[size]
+            count = min(len(buffers), (bytes_to_free + size - 1) // size)
+            del buffers[-count:]
+            freed_bytes = count * size
+            self._allocated_bytes -= freed_bytes
+            self._cached_bytes -= freed_bytes
+            bytes_to_free -= freed_bytes
+            if not buffers:
+                del self._buffers_by_size[size]
+                self._available_sizes.pop()
 
     def try_acquire(self, capacity: int) -> Optional["BufferLease"]:
         """Acquire a best-fit buffer without exceeding the memory budget."""
@@ -74,29 +103,17 @@ class TensorBufferPool:
             return None
 
         with self._lock:
-            best_index = min(
-                (
-                    index
-                    for index, buffer in enumerate(self._available_buffers)
-                    if buffer.numel() >= capacity
-                ),
-                key=lambda index: self._available_buffers[index].numel(),
-                default=None,
-            )
-            if best_index is not None and (
-                self._available_buffers[best_index].numel() <= capacity * 2
+            best_index = bisect_left(self._available_sizes, capacity)
+            if best_index < len(self._available_sizes) and (
+                self._available_sizes[best_index] <= capacity * 2
                 or self._allocated_bytes + capacity > self.options.max_bytes
             ):
-                buffer = self._available_buffers.pop(best_index)
+                buffer = self._pop_cached_buffer(best_index)
                 return BufferLease(self, buffer)
 
-            while (
-                self._allocated_bytes + capacity > self.options.max_bytes
-                and self._available_buffers
-            ):
-                evicted = self._available_buffers.pop(0)
-                self._allocated_bytes -= evicted.numel()
-                del evicted
+            bytes_to_free = self._allocated_bytes + capacity - self.options.max_bytes
+            if bytes_to_free > 0:
+                self._evict_cached_buffers(bytes_to_free)
 
             if self._allocated_bytes + capacity > self.options.max_bytes:
                 return None
@@ -108,10 +125,17 @@ class TensorBufferPool:
     def release(self, buffer: torch.Tensor, *, cache: bool) -> None:
         """Return a buffer to the cache or remove it from the budget."""
         with self._lock:
+            size = buffer.numel()
             if cache:
-                self._available_buffers.append(buffer)
+                buffers = self._buffers_by_size.get(size)
+                if buffers is None:
+                    self._buffers_by_size[size] = [buffer]
+                    insort(self._available_sizes, size)
+                else:
+                    buffers.append(buffer)
+                self._cached_bytes += size
             else:
-                self._allocated_bytes -= buffer.numel()
+                self._allocated_bytes -= size
 
 
 class BufferLease:

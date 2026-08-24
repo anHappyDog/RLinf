@@ -65,7 +65,7 @@ Tensor 压缩
    cluster:
      collective:
        tensor_buffer_pool:
-         max_bytes: 1073741824
+         max_bytes: 2147483648
        tensor_compression:
          enabled: true
          codec: lz4
@@ -83,7 +83,7 @@ Tensor 压缩
   decoder codec lease 上限。
 
 ``tensor_buffer_pool`` 独立于压缩配置。它的 ``max_bytes`` 限制单个 Worker 内 active
-与 cached CPU tensor buffer 的总字节数，默认值为 1 GiB。配置压缩但省略该段时，会自动
+与 cached CPU tensor buffer 的总字节数，默认值为 2 GiB。配置压缩但省略该段时，会自动
 使用默认 buffer pool。
 
 每次通用对象传输中，只有压缩已开启、CPU 张量达到 ``min_bytes``，并且能立即获取 codec
