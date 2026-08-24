@@ -41,8 +41,8 @@ from ..manager import (
 )
 from ..worker import Worker, WorkerAddress
 from .async_work import AsyncFuncWork, AsyncWork
+from .tensor_buffer_pool import BufferLease
 from .tensor_compression import (
-    CompressionLease,
     TensorCompressionOptions,
     TensorCompressionWireMetadata,
 )
@@ -1398,13 +1398,13 @@ class CollectiveGroup:
     ) -> tuple[
         list[torch.Tensor],
         Optional[TensorCompressionWireMetadata],
-        Optional[CompressionLease],
+        list[BufferLease],
     ]:
-        """Compress eligible CPU tensors into non-blocking buffer leases.
+        """Compress eligible CPU tensors into independently leased buffers.
 
         A missing compression option, no eligible tensor, or a saturated pool all
-        preserve the original CPU tensors. The returned compressor remains owned
-        by the caller only when at least one wire tensor was compressed.
+        preserve the original CPU tensors. Codecs are returned as soon as CPU
+        compression completes; only the returned buffers span the wire transfer.
         """
         compression_options = self._tensor_compression
         if (
@@ -1417,7 +1417,7 @@ class CollectiveGroup:
                 for tensor in tensors
             )
         ):
-            return cpu_tensors, None, None
+            return cpu_tensors, None, []
 
         codec_pool = self._worker._get_tensor_codec_pool()
         buffer_pool = self._worker._get_tensor_buffer_pool()
@@ -1425,8 +1425,9 @@ class CollectiveGroup:
         assert buffer_pool is not None
         compressor = codec_pool.try_acquire_compressor()
         if compressor is None:
-            return cpu_tensors, None, None
+            return cpu_tensors, None, []
 
+        payload_buffers: list[BufferLease] = []
         try:
             compressed_numel: list[Optional[int]] = [None] * len(tensors)
             wire_cpu_tensors = list(cpu_tensors)
@@ -1470,16 +1471,18 @@ class CollectiveGroup:
                     wire_cpu_tensors[cpu_index] = buffer.tensor[:compressed_bytes]
                     compressed_numel[tensor_index] = compressed_bytes
                     has_compressed_tensor = True
-                    compressor.retain_buffer(buffer)
+                    payload_buffers.append(buffer)
                 else:
                     buffer.release(cache=False)
         except BaseException:
-            compressor.release()
+            for buffer in payload_buffers:
+                buffer.release()
             raise
+        finally:
+            compressor.release()
 
         if not has_compressed_tensor:
-            compressor.release()
-            return cpu_tensors, None, None
+            return cpu_tensors, None, []
         return (
             wire_cpu_tensors,
             TensorCompressionWireMetadata(
@@ -1487,7 +1490,7 @@ class CollectiveGroup:
                 level=compression_options.level,
                 compressed_numel=tuple(compressed_numel),
             ),
-            compressor,
+            payload_buffers,
         )
 
     def _recv_cpu_tensor_payloads(
@@ -1512,20 +1515,32 @@ class CollectiveGroup:
             raise ValueError(
                 "Compressed tensor payloads require tensor compression on recv."
             )
-        decompressor = codec_pool.acquire_decompressor(compression_metadata)
-        try:
-            for tensor, wire_numel in cpu_entries:
-                if wire_numel is None:
-                    self._recv(tensor, CollectiveGroup.CPU, comm_id)
-                    continue
-                tensor_bytes = tensor.numel() * tensor.element_size()
-                if type(wire_numel) is not int or not 0 < wire_numel < tensor_bytes:
-                    raise ValueError("Invalid compressed tensor size in metadata.")
-                wire_tensor = torch.empty(wire_numel, dtype=torch.uint8, device="cpu")
+        buffer_pool = self._worker._get_tensor_buffer_pool()
+        assert buffer_pool is not None
+        for tensor, wire_numel in cpu_entries:
+            if wire_numel is None:
+                self._recv(tensor, CollectiveGroup.CPU, comm_id)
+                continue
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if type(wire_numel) is not int or not 0 < wire_numel < tensor_bytes:
+                raise ValueError("Invalid compressed tensor size in metadata.")
+
+            wire_buffer = buffer_pool.try_acquire(wire_numel)
+            wire_tensor = (
+                wire_buffer.tensor[:wire_numel]
+                if wire_buffer is not None
+                else torch.empty(wire_numel, dtype=torch.uint8, device="cpu")
+            )
+            try:
                 self._recv(wire_tensor, CollectiveGroup.CPU, comm_id)
-                decompressor.codec.decompress_into(wire_tensor, wire_numel, tensor)
-        finally:
-            decompressor.release()
+                decompressor = codec_pool.acquire_decompressor(compression_metadata)
+                try:
+                    decompressor.codec.decompress_into(wire_tensor, wire_numel, tensor)
+                finally:
+                    decompressor.release()
+            finally:
+                if wire_buffer is not None:
+                    wire_buffer.release()
 
     def _get_object_info(self, object: torch.Tensor | Any) -> tuple[int, TensorData]:
         """Classify the object and build precomputed tensor metadata.
@@ -2323,27 +2338,28 @@ class CollectiveGroup:
         (
             cpu_tensors,
             compression_metadata,
-            compressor,
+            payload_buffers,
         ) = self._compress_cpu_tensors(tensors, cpu_tensors)
 
-        # First send tensor size list
-        tensor_shape_dtype = [(tensor.shape, tensor.dtype) for tensor in tensors]
-        assert len(cpu_tensor_mask) == len(tensors), (
-            f"Length mismatch for precomputed tensor device flags: expected {len(tensors)}, got {len(cpu_tensor_mask)}"
-        )
-        metadata = {
-            "meta": tensor_shape_dtype,
-            "pb": piggyback_payload,
-            "cpu_tensor_mask": cpu_tensor_mask,
-        }
-        if compression_metadata is not None:
-            metadata["compression"] = compression_metadata
-        self._logger.debug(
-            f"Sending tensor metadata {metadata} to Rank {dst_rank_in_group} in group {self._group_info.group_name}"
-        )
-        metadata_tensor, metadata_tensor_size = self._object_to_tensor(metadata, "cpu")
-
         try:
+            # First send tensor size list
+            tensor_shape_dtype = [(tensor.shape, tensor.dtype) for tensor in tensors]
+            assert len(cpu_tensor_mask) == len(tensors), (
+                f"Length mismatch for precomputed tensor device flags: expected {len(tensors)}, got {len(cpu_tensor_mask)}"
+            )
+            metadata = {
+                "meta": tensor_shape_dtype,
+                "pb": piggyback_payload,
+                "cpu_tensor_mask": cpu_tensor_mask,
+            }
+            if compression_metadata is not None:
+                metadata["compression"] = compression_metadata
+            self._logger.debug(
+                f"Sending tensor metadata {metadata} to Rank {dst_rank_in_group} in group {self._group_info.group_name}"
+            )
+            metadata_tensor, metadata_tensor_size = self._object_to_tensor(
+                metadata, "cpu"
+            )
             self._send(
                 metadata_tensor_size,
                 device=CollectiveGroup.CPU,
@@ -2356,16 +2372,9 @@ class CollectiveGroup:
                 comm_id=comm_id,
                 async_op=False,
             )
-        except BaseException:
-            if compressor is not None:
-                compressor.release()
-            raise
-
-        self._logger.debug(
-            f"Sending list of {len(tensors)} tensors to Rank {dst_rank_in_group} in group {self._group_info.group_name}"
-        )
-
-        try:
+            self._logger.debug(
+                f"Sending list of {len(tensors)} tensors to Rank {dst_rank_in_group} in group {self._group_info.group_name}"
+            )
             with self._track_payload_time(work=work):
                 for tensor in cpu_tensors:
                     self._send(
@@ -2387,13 +2396,9 @@ class CollectiveGroup:
                                 device=CollectiveGroup.ACCEL,
                                 comm_id=comm_id,
                             )
-        except BaseException:
-            if compressor is not None:
-                compressor.release()
-            raise
-
-        if compressor is not None:
-            compressor.release()
+        finally:
+            for buffer in payload_buffers:
+                buffer.release()
 
     def _recv_tensor_list(
         self,
