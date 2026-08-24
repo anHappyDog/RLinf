@@ -114,7 +114,7 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
          codec: lz4
          level: 1
          min_bytes: 65536
-         max_inflight: 2
+         max_inflight: 4
 
 省略 ``tensor_compression``，或设置 ``enabled: false``，即可使用原始 wire 路径。压缩
 选项及默认值如下：
@@ -139,7 +139,7 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
      - ``65536``
      - 跳过 raw byte count 小于该值的 tensor。
    * - ``max_inflight``
-     - ``1``
+     - ``4``
      - 每个 Worker 分别创建该数量的 encoder instance 和 decoder instance。
 
 ``tensor_buffer_pool`` 独立于 ``tensor_compression``。它的 ``max_bytes`` 限制单个

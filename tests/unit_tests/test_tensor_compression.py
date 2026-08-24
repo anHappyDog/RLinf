@@ -175,6 +175,14 @@ def test_codec_pool_never_waits_for_a_busy_compressor():
     lease.release()
 
 
+def test_codec_pool_defaults_to_four_slots_per_direction():
+    """The default pool supports several concurrent CollectiveGroups."""
+    pool = TensorCodecPool(TensorCompressionOptions())
+
+    assert pool._fresh_compressors.qsize() == 4
+    assert pool._decompressors.qsize() == 4
+
+
 @pytest.mark.parametrize("codec", ["lz4", "zstd"])
 def test_codec_pool_compresses_and_restores_a_tensor(codec):
     """A slot's codec writes into its reusable buffer without altering bytes."""
@@ -225,7 +233,7 @@ def test_codec_pool_rejects_mismatched_decompression_metadata():
 def test_tensor_over_codec_bound_skips_compression(monkeypatch):
     """A codec input-limit error leaves that tensor on the raw wire path."""
     group = object.__new__(CollectiveGroup)
-    options = TensorCompressionOptions(min_bytes=1)
+    options = TensorCompressionOptions(min_bytes=1, max_inflight=1)
     pool = TensorCodecPool(options)
     buffer_pool = TensorBufferPool(TensorBufferPoolOptions())
     group._worker = SimpleNamespace(
@@ -300,7 +308,7 @@ def test_buffer_budget_can_compress_part_of_a_tensor_list():
 
 def test_unhelpful_compression_does_not_cache_its_buffer(monkeypatch):
     """A buffer that does not reduce wire bytes is discarded immediately."""
-    options = TensorCompressionOptions(min_bytes=1)
+    options = TensorCompressionOptions(min_bytes=1, max_inflight=1)
     pool = TensorCodecPool(options)
     buffer_pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=1024))
     group = object.__new__(CollectiveGroup)

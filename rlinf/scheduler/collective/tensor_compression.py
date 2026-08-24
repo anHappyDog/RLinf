@@ -31,7 +31,7 @@ class TensorCompressionOptions:
     codec: Literal["lz4", "zstd"] = "lz4"
     level: int = 1
     min_bytes: int = 64 * 1024
-    max_inflight: int = 1
+    max_inflight: int = 4
 
     def __post_init__(self) -> None:
         """Validate compression settings."""
