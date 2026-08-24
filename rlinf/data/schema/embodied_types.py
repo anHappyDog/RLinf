@@ -16,7 +16,7 @@
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, TypeAlias
 
 import numpy as np
 import torch
@@ -252,12 +252,17 @@ class EnvResult:
 
 @dataclass(kw_only=True)
 class PolicyCompletion:
-    """Environment outcome completed by a subsequent policy request."""
+    """Environment outcome completed by a subsequent policy request.
+
+    ``initial_result`` carries the state before chunk zero; later chunks leave
+    it unset.
+    """
 
     sources: list[TrajectorySource]
     env_result: EnvResult
     next_obs: dict[str, Any]
     requires_inference: bool
+    initial_result: EnvResult | None = None
 
     def __post_init__(self) -> None:
         self.next_obs = put_tensor_device(self.next_obs, "cpu")
@@ -308,6 +313,7 @@ class EmbodiedRolloutResult:
     versions: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
+        """Move inference outputs to contiguous CPU storage for transport."""
         self.actions = self.actions.cpu().contiguous()
         self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         for field_name in (
@@ -320,6 +326,66 @@ class EmbodiedRolloutResult:
             value = getattr(self, field_name)
             if value is not None:
                 setattr(self, field_name, value.cpu().contiguous())
+
+
+@dataclass(kw_only=True)
+class PolicyPart:
+    """Policy-owned data for one or more routed action chunks.
+
+    Exactly one of ``rollout_result`` and ``external_actions`` must be present.
+    The latter represents an online intervention that skipped model inference.
+    """
+
+    sources: list[TrajectorySource]
+    obs: dict[str, Any]
+    rollout_result: EmbodiedRolloutResult | None = None
+    external_actions: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the policy variant and move payloads to CPU."""
+        if (self.rollout_result is None) == (self.external_actions is None):
+            raise ValueError(
+                "PolicyPart requires exactly one of rollout_result and "
+                "external_actions."
+            )
+        self.obs = put_tensor_device(self.obs, "cpu")
+        if self.external_actions is not None:
+            self.external_actions = self.external_actions.cpu().contiguous()
+
+    @property
+    def inferred(self) -> bool:
+        """Return whether this part came from model inference."""
+        return self.rollout_result is not None
+
+
+@dataclass(kw_only=True)
+class EnvPart:
+    """Environment-owned data completing one or more routed action chunks.
+
+    ``initial_result`` is present only for chunk zero and represents the state
+    immediately before its first action.
+    """
+
+    sources: list[TrajectorySource]
+    result: EnvResult
+    next_obs: dict[str, Any]
+    forward_inputs: dict[str, Any] | None
+    bootstrap_values: torch.Tensor | None
+    final_prev_values: torch.Tensor | None
+    initial_result: EnvResult | None = None
+
+    def __post_init__(self) -> None:
+        """Move model-derived completion data to CPU for transport."""
+        self.next_obs = put_tensor_device(self.next_obs, "cpu")
+        if self.forward_inputs is not None:
+            self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
+        if self.bootstrap_values is not None:
+            self.bootstrap_values = self.bootstrap_values.cpu().contiguous()
+        if self.final_prev_values is not None:
+            self.final_prev_values = self.final_prev_values.cpu().contiguous()
+
+
+TrajectoryPart: TypeAlias = PolicyPart | EnvPart
 
 
 def split_batch_value(value: Any, split_sizes: list[int]) -> list[Any]:
@@ -498,12 +564,18 @@ def split_policy_input(
         completion_sources = split_trajectory_sources(completion.sources, split_sizes)
         env_results = split_env_result(completion.env_result, split_sizes)
         next_observations = split_batch_value(completion.next_obs, split_sizes)
+        initial_results = (
+            split_env_result(completion.initial_result, split_sizes)
+            if completion.initial_result is not None
+            else [None] * len(split_sizes)
+        )
         completion_splits = [
             PolicyCompletion(
                 sources=completion_sources[index],
                 env_result=env_results[index],
                 next_obs=next_observations[index],
                 requires_inference=completion.requires_inference,
+                initial_result=initial_results[index],
             )
             for index in range(len(split_sizes))
         ]
@@ -652,9 +724,7 @@ class ChunkStepResult:
 
 @dataclass
 class Trajectory:
-    """
-    trajectory contains multiple episodes.
-    """
+    """Actor-facing tensors collected from one rollout source."""
 
     max_episode_length: int = 0
     model_weights_id: str = ""
@@ -671,43 +741,8 @@ class Trajectory:
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
 
-    @staticmethod
-    def _generate_field_mask(
-        ref_tensor: torch.Tensor, mask: torch.Tensor, traj_len: int
-    ) -> torch.Tensor:
-        """
-        Generate a mask for terminations/truncations/dones based on their original shape.
-        """
-
-        assert mask.dim() == 1, f"Expected 1D mask, got {mask.shape=}"
-        if ref_tensor.shape[0] == traj_len:
-            return mask
-        if ref_tensor.shape[0] > traj_len:
-            extra = int(ref_tensor.shape[0] - traj_len)
-            assert traj_len % extra == 0, (
-                f"Trajectory length {traj_len} is not divisible by extra {extra} for terminations/truncations/dones"
-            )
-            epoch_len = traj_len // extra
-            field_mask = torch.zeros(
-                ref_tensor.shape[0], dtype=torch.bool, device=mask.device
-            )
-            original_indices = torch.arange(ref_tensor.shape[0], device=mask.device)
-            epoch_idx = original_indices // (epoch_len + 1)
-            step_idx = original_indices % (epoch_len + 1)
-            field_mask[step_idx == 0] = True
-            valid_mask = step_idx >= 1
-            mask_idx = epoch_idx[valid_mask] * epoch_len + (step_idx[valid_mask] - 1)
-            valid_original_indices = original_indices[valid_mask]
-            valid_mask_idx = mask_idx < len(mask)
-            field_mask[valid_original_indices[valid_mask_idx]] = mask[
-                mask_idx[valid_mask_idx]
-            ].to(dtype=torch.bool)
-            return field_mask
-        raise ValueError(
-            f"Reference tensor length {ref_tensor.shape[0]} < traj_len {traj_len}"
-        )
-
     def extract_intervene_traj(self, mode="any"):
+        """Return per-environment trajectories containing intervened actions."""
         if self.intervene_flags is None or (~self.intervene_flags).all():
             return None
         if mode == "any":
@@ -769,6 +804,41 @@ class Trajectory:
                 )
             )
         return filtered_trajectories if filtered_trajectories else None
+
+    @staticmethod
+    def _generate_field_mask(
+        ref_tensor: torch.Tensor, mask: torch.Tensor, traj_len: int
+    ) -> torch.Tensor:
+        """Align an action mask with boundary fields that include epoch starts."""
+        assert mask.dim() == 1, f"Expected 1D mask, got {mask.shape=}"
+        if ref_tensor.shape[0] == traj_len:
+            return mask
+        if ref_tensor.shape[0] > traj_len:
+            extra = int(ref_tensor.shape[0] - traj_len)
+            assert traj_len % extra == 0, (
+                f"Trajectory length {traj_len} is not divisible by extra {extra} "
+                "for terminations/truncations/dones"
+            )
+            epoch_len = traj_len // extra
+            field_mask = torch.zeros(
+                ref_tensor.shape[0], dtype=torch.bool, device=mask.device
+            )
+            original_indices = torch.arange(ref_tensor.shape[0], device=mask.device)
+            epoch_idx = original_indices // (epoch_len + 1)
+            step_idx = original_indices % (epoch_len + 1)
+            # Every epoch-start boundary is retained even though it has no action.
+            field_mask[step_idx == 0] = True
+            valid_mask = step_idx >= 1
+            mask_idx = epoch_idx[valid_mask] * epoch_len + (step_idx[valid_mask] - 1)
+            valid_original_indices = original_indices[valid_mask]
+            valid_mask_idx = mask_idx < len(mask)
+            field_mask[valid_original_indices[valid_mask_idx]] = mask[
+                mask_idx[valid_mask_idx]
+            ].to(dtype=torch.bool)
+            return field_mask
+        raise ValueError(
+            f"Reference tensor length {ref_tensor.shape[0]} < traj_len {traj_len}"
+        )
 
 
 def convert_trajectories_to_batch(
@@ -837,12 +907,15 @@ __all__ = [
     "ChunkStepResult",
     "DummyPolicyInput",
     "EmbodiedRolloutResult",
+    "EnvPart",
     "EnvOutput",
     "EnvResult",
     "PolicyCompletion",
     "PolicyInput",
     "PolicyOutput",
+    "PolicyPart",
     "TrajectoryKey",
+    "TrajectoryPart",
     "TrajectorySource",
     "RTCActionResponse",
     "RTCRequest",

@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import asyncio
+import inspect
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import torch
@@ -23,22 +24,24 @@ from omegaconf import OmegaConf
 from rlinf.data.schema import (
     DummyPolicyInput,
     EnvOutput,
+    EnvPart,
     EnvResult,
     PolicyCompletion,
     PolicyInput,
     PolicyOutput,
+    PolicyPart,
     TrajectoryKey,
     TrajectorySource,
     merge_policy_inputs,
 )
 from rlinf.data.schema.embodied_types import EmbodiedRolloutResult
-from rlinf.data.schema.trajectory_events import (
-    DummyPolicyStep,
-    EnvStepResult,
-    PolicyStep,
-)
+from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
+from rlinf.workers.env.async_env_worker import AsyncEnvWorker
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.env.smooth_intervene import SmoothInterveneController
+from rlinf.workers.rollout.hf.async_huggingface_worker import (
+    AsyncMultiStepRolloutWorker,
+)
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -46,6 +49,71 @@ def _policy_input() -> PolicyInput:
     return PolicyInput(
         obs={"states": torch.zeros(16, 4)},
     )
+
+
+def test_sync_and_async_workers_share_the_part_channel_contract():
+    """Only Rollout publishes parts; Env communicates exclusively with Rollout."""
+    assert "actor_channel" not in inspect.signature(EnvWorker.interact).parameters
+    assert "actor_channel" not in inspect.signature(AsyncEnvWorker.interact).parameters
+    assert (
+        "actor_channel" in inspect.signature(MultiStepRolloutWorker.generate).parameters
+    )
+    assert (
+        "actor_channel"
+        in inspect.signature(AsyncMultiStepRolloutWorker.generate).parameters
+    )
+
+
+def test_decoupled_evaluation_service_is_reused_and_cancelled_on_stop():
+    async def run():
+        worker = object.__new__(AsyncMultiStepRolloutWorker)
+        worker.env_decoupled_mode = True
+        worker._generate_task = None
+        worker._evaluate_task = None
+        blocker = asyncio.Event()
+        calls = 0
+
+        async def serve(_input_channel, _output_channel):
+            nonlocal calls
+            calls += 1
+            await blocker.wait()
+
+        worker._run_evaluate_service = serve
+        await worker.ensure_evaluate_service(Mock(), Mock())
+        first_task = worker._evaluate_task
+        await worker.ensure_evaluate_service(Mock(), Mock())
+
+        assert worker._evaluate_task is first_task
+        assert calls == 1
+
+        worker.stop()
+        await asyncio.sleep(0)
+        assert first_task.cancelled()
+
+    asyncio.run(run())
+
+
+def test_async_runner_reuses_decoupled_evaluation_service_across_validations():
+    runner = object.__new__(AsyncEmbodiedRunner)
+    runner.cfg = OmegaConf.create({"runner": {"enable_decoupled_mode": True}})
+    runner.env_channel = Mock()
+    runner.rollout_channel = Mock()
+    runner.rollout = Mock()
+    runner.rollout.ensure_evaluate_service.return_value = Mock(
+        wait=Mock(return_value=None)
+    )
+    runner.env = Mock()
+    runner.env.evaluate.return_value = Mock(wait=Mock(return_value=[{}]))
+
+    with patch(
+        "rlinf.runners.async_embodied_runner.compute_evaluate_metrics",
+        return_value={},
+    ):
+        runner.evaluate()
+        runner.evaluate()
+
+    assert runner.rollout.ensure_evaluate_service.call_count == 2
+    runner.rollout.evaluate.assert_not_called()
 
 
 def test_decoupled_policy_route_round_trip():
@@ -176,7 +244,7 @@ def test_env_sends_dummy_request_after_intervention_continues():
         intervene_flags=torch.tensor([[False, True]]),
     )
 
-    env._publish_step(Mock(), env_output, None, {}, 0, 0, 0)
+    env._publish_step(Mock(), env_output, EnvResult(), None, {}, 0, 0, 0)
 
     policy_input = env._send_policy_input.call_args.args[1]
     assert isinstance(policy_input, DummyPolicyInput)
@@ -212,6 +280,7 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
         env_result=EnvResult(),
         next_obs={"states": torch.tensor([[2]])},
         requires_inference=False,
+        initial_result=EnvResult(dones=torch.zeros(1, 1, dtype=torch.bool)),
     )
     completion1 = PolicyCompletion(
         sources=[TrajectorySource(key1, 1)],
@@ -263,7 +332,7 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
             ),
         ]
     )
-    trajectory_channel = Mock()
+    actor_channel = Mock()
     generate_one_epoch = MultiStepRolloutWorker.generate_one_epoch
     while hasattr(generate_one_epoch, "__wrapped__"):
         generate_one_epoch = generate_one_epoch.__wrapped__
@@ -273,17 +342,18 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
             rollout,
             input_channel=Mock(),
             output_channel=Mock(),
-            trajectory_channel=trajectory_channel,
+            actor_channel=actor_channel,
         )
     )
 
-    events = [call.args[0] for call in trajectory_channel.put.call_args_list]
-    assert sum(isinstance(event, PolicyStep) for event in events) == 2
-    env_events = [event for event in events if isinstance(event, EnvStepResult)]
-    assert len(env_events) == 2
-    assert torch.equal(env_events[0].forward_inputs["states"], torch.tensor([[2]]))
-    assert torch.equal(env_events[1].bootstrap_values, torch.tensor([[4.0]]))
-    assert torch.equal(env_events[1].final_prev_values, torch.tensor([[4.0, 5.0]]))
+    parts = [call.args[0] for call in actor_channel.put.call_args_list]
+    assert sum(isinstance(part, PolicyPart) for part in parts) == 2
+    env_parts = [part for part in parts if isinstance(part, EnvPart)]
+    assert len(env_parts) == 2
+    assert env_parts[0].initial_result is completion0.initial_result
+    assert torch.equal(env_parts[0].forward_inputs["states"], torch.tensor([[2]]))
+    assert torch.equal(env_parts[1].bootstrap_values, torch.tensor([[4.0]]))
+    assert torch.equal(env_parts[1].final_prev_values, torch.tensor([[4.0, 5.0]]))
     assert rollout._predict_rollout_actions.call_count == 3
 
 
@@ -355,17 +425,22 @@ def test_rollout_routes_dummy_input_without_model_inference():
             {"forward_inputs": {"action": torch.ones(1, 6)}},
         )
     )
-    trajectory_channel = Mock()
+    actor_channel = Mock()
     generate_one_epoch = MultiStepRolloutWorker.generate_one_epoch
     while hasattr(generate_one_epoch, "__wrapped__"):
         generate_one_epoch = generate_one_epoch.__wrapped__
 
-    asyncio.run(generate_one_epoch(rollout, Mock(), Mock(), trajectory_channel))
+    asyncio.run(generate_one_epoch(rollout, Mock(), Mock(), actor_channel))
 
-    events = [call.args[0] for call in trajectory_channel.put.call_args_list]
-    assert sum(isinstance(event, PolicyStep) for event in events) == 1
-    dummy_event = next(event for event in events if isinstance(event, DummyPolicyStep))
-    assert torch.equal(dummy_event.actions, dummy_actions)
+    parts = [call.args[0] for call in actor_channel.put.call_args_list]
+    inferred_parts = [
+        part for part in parts if isinstance(part, PolicyPart) and part.inferred
+    ]
+    assert len(inferred_parts) == 1
+    external_part = next(
+        part for part in parts if isinstance(part, PolicyPart) and not part.inferred
+    )
+    assert torch.equal(external_part.external_actions, dummy_actions)
     assert rollout._predict_rollout_actions.call_count == 1
     assert torch.equal(
         rollout._send_policy_output.call_args_list[1].args[1].actions, dummy_actions
@@ -389,6 +464,7 @@ def test_decoupled_final_completion_uses_next_bootstrap():
     completion = env._publish_step(
         rollout_channel=Mock(),
         env_output=env_output,
+        initial_result=EnvResult(),
         reward_model_output=None,
         chunk_step_data=None,
         epoch_id=0,
@@ -397,11 +473,11 @@ def test_decoupled_final_completion_uses_next_bootstrap():
     )
 
     assert completion is not None
+    assert completion.initial_result is not None
     env._send_policy_input.assert_not_called()
 
     env._send_train_bootstrap(
         rollout_channel=Mock(),
-        trajectory_channel=Mock(),
         env_outputs=[env_output],
         step_id=1,
         epoch_id=0,
@@ -423,6 +499,7 @@ def test_env_closes_reward_stream_with_final_chunk():
     env.env_list = [SimpleNamespace()]
     env.use_training_pipeline = False
     env.env_decoupled_mode = False
+    env.enable_online_lerobot = False
     env.cfg = SimpleNamespace(
         env=SimpleNamespace(
             train=SimpleNamespace(auto_reset=True, ignore_terminations=False)
@@ -449,15 +526,12 @@ def test_env_closes_reward_stream_with_final_chunk():
     env.record_env_metrics = Mock()
     env.store_last_obs_and_intervened_info = Mock()
     env.finish_rollout = Mock()
-    trajectory_channel = Mock()
-
     asyncio.run(
         EnvWorker._run_interact_once.__wrapped__(
             env,
             input_channel=Mock(),
             rollout_channel=Mock(),
             reward_channel=Mock(),
-            trajectory_channel=trajectory_channel,
             cooperative_yield=False,
         )
     )
@@ -498,7 +572,7 @@ def test_rollout_skips_terminal_inference_without_a_value_head():
     rollout.enable_rlt = False
     rollout.hf_model = SimpleNamespace()
     rollout._predict_rollout_actions = Mock()
-    trajectory_channel = Mock()
+    actor_channel = Mock()
     completion = PolicyCompletion(
         sources=[TrajectorySource(TrajectoryKey(0, 0, 0, 0, 0), 1)],
         env_result=EnvResult(),
@@ -506,12 +580,12 @@ def test_rollout_skips_terminal_inference_without_a_value_head():
         requires_inference=True,
     )
 
-    rollout._publish_completion(completion, None, trajectory_channel)
+    rollout._publish_completion(completion, None, actor_channel)
 
     rollout._predict_rollout_actions.assert_not_called()
-    event = trajectory_channel.put.call_args.args[0]
-    assert event.bootstrap_values is None
-    assert event.final_prev_values is None
+    part = actor_channel.put.call_args.args[0]
+    assert part.bootstrap_values is None
+    assert part.final_prev_values is None
 
 
 def test_rollout_runs_terminal_inference_for_rlt_without_a_value_head():
@@ -524,7 +598,7 @@ def test_rollout_runs_terminal_inference_for_rlt_without_a_value_head():
             {"forward_inputs": {"states": torch.ones(1, 1)}},
         )
     )
-    trajectory_channel = Mock()
+    actor_channel = Mock()
     completion = PolicyCompletion(
         sources=[TrajectorySource(TrajectoryKey(0, 0, 0, 0, 0), 1)],
         env_result=EnvResult(),
@@ -532,8 +606,8 @@ def test_rollout_runs_terminal_inference_for_rlt_without_a_value_head():
         requires_inference=True,
     )
 
-    rollout._publish_completion(completion, None, trajectory_channel)
+    rollout._publish_completion(completion, None, actor_channel)
 
     rollout._predict_rollout_actions.assert_called_once()
-    event = trajectory_channel.put.call_args.args[0]
-    assert torch.equal(event.forward_inputs["states"], torch.ones(1, 1))
+    part = actor_channel.put.call_args.args[0]
+    assert torch.equal(part.forward_inputs["states"], torch.ones(1, 1))

@@ -1,96 +1,194 @@
-使用 Channel 进行通信
-=======================
+使用 Channel Hook 定制数据流
+============================
 
-channel 模块为 Worker 之间的异步数据交换提供了一个高层次的 **分布式生产者–消费者队列** 抽象。  
-一个 ``Channel`` 允许一个或多个生产者 Worker 向命名队列中 ``put`` 数据项，  
-并允许一个或多个消费者 Worker ``get`` 这些数据项，  
-同时可以选择基于每个数据项的权重来累积 **批次**。
+使用 ``Channel`` 在 WorkerGroup 之间传输数据。当数据入队前需要转换时添加
+``Collector``；当每个输出需要分配给指定消费者时添加 ``Dispatcher``。
 
-Channel 的创建与连接
---------------------------------
+Hook 执行模型
+-------------
 
-可以通过如下方式创建一个新的 channel::
+每次 ``put`` 都会在 ``ChannelWorker`` 上按固定顺序执行：
 
-    Worker.create_channel(
-        channel_name,
-        node_id=0,
-        maxsize=0
-    )
+.. code-block:: text
 
-该方法：
+   producer.put(item, key)
+            |
+            v
+   Collector.collect(item, key)
+            |
+            |  零个或多个 (output_key, output_item)
+            v
+   Dispatcher.route(output_item, output_key)
+            |
+            v
+   共享队列或某个消费者的私有队列
 
-- **确定放置位置** — 如果未指定 ``group_affinity`` 或 ``group_rank_affinity``，则 channel 会托管在当前 Worker 的 **group** 和 **rank** 上（即相同节点和 GPU）。  
-- **启动专用的 channel actor** — 使用 ``PackedPlacementStrategy`` 在所选节点/GPU 上启动一个 ``ChannelWorker`` （实际持有队列），并设置 ``num_processes=1``。  
-- **返回** 一个 ``Channel`` 对象，用于封装该 actor。channel actor 的地址为 ``channel_name:0``。  
+两个 hook 解决不同问题：
 
-若要从其他 Worker 连接到已存在的 channel，请使用::
+.. list-table::
+   :header-rows: 1
+   :widths: 22 39 39
 
-    Worker.connect_channel(channel_name)
+   * - Hook
+     - 输入
+     - 决策
+   * - ``Collector``
+     - 传给 ``put`` 的一个数据项
+     - 丢弃、转换、合并、拆分或修改 key。
+   * - ``Dispatcher``
+     - Collector 产生的每个数据项
+     - 保持共享，或分配给一个消费者。
 
-该方法会在 Ray 命名空间中查找对应的 channel actor，并返回一个与该 actor 和当前 Worker 绑定的 ``Channel`` 对象。  
+两个 hook 都是同步且有状态的。流量开始前，``setup(ctx)`` 只执行一次。之后
+``collect()`` 和 ``route()`` 在 channel worker 上串行执行，因此内部状态不需要锁。
 
+注册 Collector 和 Dispatcher
+-----------------------------
 
-向 Channel 中放入数据
---------------------------------
+在可导入模块中定义 hook，例如 ``my_project/channel_hooks.py``：
 
-使用 ``channel.put(item, weight=0, key="default", async_op=False)`` 发送数据。
+.. code-block:: python
 
-- 发送 Worker 首先将 ``item`` 传输给实际拥有目标队列的 ``ChannelWorker``。  
-- ``ChannelWorker`` 接收数据后，将其封装为一个带有指定 ``weight`` 的 ``WeightedItem``，并放入指定队列。  
-  如果队列设置了大小限制（``maxsize`` > 0）且已满，则入队会阻塞，直到队列有空间可用。  
-
-
-从 Channel 中获取数据
---------------------------------
-
-使用 ``channel.get(key="default", async_op=False)`` 获取数据，这实际上是 ``put`` 的逆过程。  
-
-- ``ChannelWorker`` 会先从指定队列中取出一个数据项。  
-- 然后将该数据项发送给请求的 Worker，并最终返回给调用者。  
-
-
-批量获取
---------------------------------
-
-使用 ``channel.get_batch(batch_weight, key="default", async_op=False)`` 一次获取多个数据。
-
-- ``ChannelWorker`` 会不断从队列中取出数据项，并累加其权重值。  
-- 当累计权重达到或超过 ``batch_weight`` 时，停止取数。  
-- 所有取出的数据项会组合成一个列表，并通过一次消息发送给请求的 Worker。  
-
-该功能适合在处理体验或任务时动态形成批次，  
-当每个数据项有不同的开销或大小（权重）时，可以保证批次大致均匀。  
+   from rlinf.scheduler import (
+       Collector,
+       Dispatcher,
+       register_collector,
+       register_dispatcher,
+   )
 
 
-负载均衡
---------------
+   @register_collector("flatten_batch")
+   class FlattenBatchCollector(Collector):
+       """Emit each sample in an incoming batch as one queue item."""
 
-在 Rollout 阶段，轨迹长度往往差异较大。  
-如果不加设计地直接分配到各个数据并行（DP）训练组，会导致严重的负载不均。
-
-为了解决这一问题，我们实现了基于 channel 的负载均衡机制。  
-具体来说，生成阶段的所有生成器会依次将完整的 rollout 轨迹 ``put`` 到共享的 ``rollout_output_queue`` 中。  
-由于轨迹按时间顺序插入，``rollout_output_queue`` 中的序列长度会随时间逐渐增长。
-
-然后使用轮询策略，我们不断从 ``rollout_output_queue`` 中 ``get`` 轨迹，  
-并依次分配给每个 DP 训练组。  
-这种方式能够近似实现各个 DP 训练组之间的工作量均衡，  
-从而确保训练过程中的更好利用率和效率。  
+       def collect(self, item, key):
+           for sample in item:
+               yield key, sample
 
 
-示例
---------
+   @register_dispatcher("even")
+   class EvenDispatcher(Dispatcher):
+       """Assign items to consumers in a fixed rotation."""
 
-.. autoclass:: rlinf.scheduler.Channel
-   :no-members:
-   :no-index:
-   :no-inherited-members:
-   :exclude-members: __init__, __new__
+       def setup(self, ctx):
+           self.consumers = sorted(ctx.consumers)
+           self.next_consumer = 0
 
+       def route(self, item, key):
+           if not self.consumers:
+               return None
+           consumer = self.consumers[
+               self.next_consumer % len(self.consumers)
+           ]
+           self.next_consumer += 1
+           return consumer
 
-总结
---------------------------------
+装饰器使用小写名称注册每个类。``Channel.create`` 也接受 hook 实例、hook 类或
+``"module:ClassName"`` 路径。对于应用内部 hook，直接传类最简单：
 
-`Channel` 组件为 Worker 通信提供了一个分布式生产者–消费者队列。  
-它在集体通信 send/recv 机制的基础上进行了封装，提供了直观的接口，支持优先级和批处理，  
-实现了解耦的、异步的数据流，非常适合在并行数据采集与批量消费的强化学习场景中使用。  
+.. code-block:: python
+
+   from my_project.channel_hooks import EvenDispatcher, FlattenBatchCollector
+   from rlinf.scheduler import Channel
+
+   sample_channel = Channel.create(
+       "Samples",
+       collector=FlattenBatchCollector,
+       dispatcher=EvenDispatcher,
+       producers=[rollout_group],
+       consumers=[actor_group],
+   )
+
+``rollout_group`` 和 ``actor_group`` 是已启动的 WorkerGroup。Channel setup 将
+``actor_group`` 展开为 ``actor:0``、``actor:1`` 和 ``actor:2`` 等稳定消费者 id，
+并通过 ``ctx.consumers`` 提供给 hook。
+
+如果 ChannelWorker 进程已经导入注册模块，也可以用注册名称选择 hook：
+
+.. code-block:: python
+
+   sample_channel = Channel.create(
+       "Samples",
+       collector="flatten_batch",
+       dispatcher="even",
+       producers=[rollout_group],
+       consumers=[actor_group],
+   )
+
+框架内置 hook 通常使用注册名称。外部模块始终可以使用
+``"my_project.channel_hooks:FlattenBatchCollector"``，或直接传入类。
+
+跟踪一个 Batch 的 Hook 流程
+----------------------------
+
+假设一个生产者发送六个 sample：
+
+.. code-block:: python
+
+   sample_channel.put(["s0", "s1", "s2", "s3", "s4", "s5"])
+
+Collector 将一个输入 batch 转换为六个队列项。Dispatcher 随后在三个消费者之间
+轮转：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 38 38
+
+   * - 消费者
+     - 第一次分配
+     - 第二次分配
+   * - ``actor:0``
+     - ``s0``
+     - ``s3``
+   * - ``actor:1``
+     - ``s1``
+     - ``s4``
+   * - ``actor:2``
+     - ``s2``
+     - ``s5``
+
+每个 Actor 使用相同 queue key 调用 ``sample_channel.get()``。Channel 自动识别
+调用方，并读取其私有队列。当输出数量不能整除消费者数量时，各消费者的分配数量
+最多相差一。
+
+选择队列行为
+------------
+
+在确实需要数据转换或消费者所有权前，保留默认行为：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 29 31 40
+
+   * - Dispatcher
+     - 队列所有权
+     - 适用场景
+   * - ``None`` 或 ``"shared"``
+     - 每个 key 一个共享队列
+     - 任意消费者都可以处理任意数据项。
+   * - ``"round_robin"``
+     - 每个消费者一个私有队列
+     - 分配必须确定且均匀。
+   * - ``"least_loaded"``
+     - 每个消费者一个私有队列
+     - 生产端需要平衡累计分配数量。
+   * - ``"least_loaded_stealing"``
+     - 支持 stealing 的私有队列
+     - 慢消费者不能阻塞空闲 peer。
+
+Dispatcher 返回 ``None`` 时，数据项留在共享队列；返回消费者 id 时，数据项会在
+任何消费者调用 ``get`` 之前完成分配。只有阻塞消费者允许从 peer 取任务时才需要
+重写 ``rebalance()``。
+
+使用 Channel Key 和 Weight
+---------------------------
+
+``put(item, key=...)`` 和 ``get(key=...)`` 选择相互独立的逻辑队列。Collector 可以
+修改收到的 key，Dispatcher 则在每个输出 key 内独立路由。
+
+当数据项开销不同时，在 ``put`` 时设置 ``weight``，并调用
+``get_batch(target_weight=...)`` 形成近似等权 batch。Hook 路由在加权数据项进入
+队列之前完成。
+
+完整方法签名参见 :doc:`../reference/api/channel`。要了解一个用于拼接具身 rollout
+数据的生产级 Collector，请继续阅读 :doc:`trajectory_collector`。

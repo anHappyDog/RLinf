@@ -24,6 +24,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self._generate_task: asyncio.Task = None
+        self._evaluate_task: asyncio.Task = None
         self.staleness_threshold = cfg.algorithm.get("staleness_threshold", None)
         assert not self.enable_offload, (
             "Offload not supported in AsyncMultiStepRolloutWorker"
@@ -43,16 +44,14 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self,
         input_channel: Channel,
         output_channel: Channel,
-        trajectory_channel: Channel,
+        actor_channel: Channel,
         metric_channel: Channel,
     ):
         assert self._generate_task is None, (
             "generate task is not None but generate function is called."
         )
         self._generate_task = asyncio.create_task(
-            self._generate(
-                input_channel, output_channel, trajectory_channel, metric_channel
-            )
+            self._generate(input_channel, output_channel, actor_channel, metric_channel)
         )
         try:
             await self._generate_task
@@ -63,7 +62,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self,
         input_channel: Channel,
         output_channel: Channel,
-        trajectory_channel: Channel,
+        actor_channel: Channel,
         metric_channel: Channel,
     ):
         while True:
@@ -75,7 +74,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 await self.generate_one_epoch(
                     input_channel,
                     output_channel,
-                    trajectory_channel,
+                    actor_channel,
                 )
             if self.finished_episodes is not None:
                 self.finished_episodes += self.total_num_train_envs * self.rollout_epoch
@@ -106,9 +105,68 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 break
             await asyncio.sleep(0.01)
 
+    async def _run_evaluate_service(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+    ) -> None:
+        """Serve decoupled evaluation requests until the worker is stopped."""
+        await super().evaluate(input_channel, output_channel)
+
+    async def ensure_evaluate_service(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+    ) -> None:
+        """Start one persistent decoupled evaluation consumer if needed.
+
+        The base decoupled ``evaluate`` loop is intentionally unbounded. Running
+        it directly for every validation leaks one consumer per call. Keeping
+        the task on the rollout worker makes repeated validation idempotent and
+        also lets callers detect if the service exited unexpectedly.
+        """
+        if not self.env_decoupled_mode:
+            raise RuntimeError(
+                "The persistent evaluation service is only used in decoupled mode."
+            )
+        if self._evaluate_task is not None and not self._evaluate_task.done():
+            return
+        if self._evaluate_task is not None:
+            if self._evaluate_task.cancelled():
+                self._evaluate_task = None
+            else:
+                error = self._evaluate_task.exception()
+                self._evaluate_task = None
+                if error is not None:
+                    raise RuntimeError(
+                        "The decoupled evaluation service exited unexpectedly."
+                    ) from error
+                raise RuntimeError(
+                    "The decoupled evaluation service returned unexpectedly."
+                )
+
+        self._evaluate_task = asyncio.create_task(
+            self._run_evaluate_service(input_channel, output_channel)
+        )
+        # Give the service a chance to enter its first channel receive and
+        # surface immediate initialization failures to the runner.
+        await asyncio.sleep(0)
+        if self._evaluate_task.done():
+            error = self._evaluate_task.exception()
+            self._evaluate_task = None
+            if error is not None:
+                raise RuntimeError(
+                    "Failed to start the decoupled evaluation service."
+                ) from error
+            raise RuntimeError(
+                "The decoupled evaluation service returned during startup."
+            )
+
     def stop(self):
         if self._generate_task is not None and not self._generate_task.done():
             self._generate_task.cancel()
+        if self._evaluate_task is not None and not self._evaluate_task.done():
+            self._evaluate_task.cancel()
 
     async def _recv_and_apply_actor_sync(self) -> int:
         await super().sync_model_from_actor()

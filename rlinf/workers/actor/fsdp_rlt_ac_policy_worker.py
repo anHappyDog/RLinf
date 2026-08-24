@@ -524,15 +524,15 @@ class RLTACReplayMixin:
                 if curr_obs is None:
                     raise ValueError(
                         "RLT transition replay requires curr_obs. Ensure "
-                        "TrajectoryWorker populated transition observations "
+                        "TrajectoryCollector populated transition observations "
                         f"before replay ingestion, got row index {idx}."
                     )
                 transition.curr_obs = curr_obs
 
                 # Dones have one extra initial slot, so transition t reads
                 # terminal flags from t+1. Rewards are already action-aligned
-                # by EmbodiedTrajectoryBuilder because the initial empty reward is
-                # skipped and the final reward is appended after rollout.
+                # by the trajectory accumulator because the initial empty reward
+                # is skipped and the final reward is appended after rollout.
                 done_idx = min(
                     t + 1,
                     int(trajectory.dones.shape[0]) - 1
@@ -565,7 +565,7 @@ class RLTACReplayMixin:
                 else:
                     raise ValueError(
                         "RLT transition replay requires next_obs for non-terminal "
-                        "transitions. Ensure TrajectoryWorker populated "
+                        "transitions. Ensure TrajectoryCollector populated "
                         f"transition obs before replay ingestion, got row index {idx}."
                     )
 

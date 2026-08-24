@@ -25,6 +25,7 @@ from rlinf.data.schema.embodied_types import (
     PolicyCompletion,
     PolicyInput,
     PolicyOutput,
+    PolicyPart,
     TrajectoryKey,
     TrajectorySource,
     merge_batch_values,
@@ -34,7 +35,6 @@ from rlinf.data.schema.embodied_types import (
     split_episode_data,
     split_policy_input,
 )
-from rlinf.data.schema.trajectory_events import PolicyStep
 from rlinf.scheduler.cluster.utils import (
     TensorPlaceholder,
     pack_dataclass_tensors,
@@ -71,7 +71,7 @@ def test_transport_results_store_contiguous_cpu_tensors():
 def test_nested_dataclass_transport_separates_tensors_from_skeleton():
     key = TrajectoryKey(0, 0, 0, 0, 0)
     shared = torch.arange(4).reshape(2, 2)
-    event = PolicyStep(
+    event = PolicyPart(
         sources=[TrajectorySource(key, 2)],
         obs={"states": shared, "task_descriptions": ["a", "b"]},
         rollout_result=EmbodiedRolloutResult(
@@ -178,6 +178,7 @@ def test_policy_completion_split_merge_preserves_offsets():
                 env_result=EnvResult(rewards=torch.arange(4).reshape(4, 1)),
                 next_obs={"states": torch.arange(12).reshape(4, 3)},
                 requires_inference=False,
+                initial_result=EnvResult(dones=torch.zeros(4, 1, dtype=torch.bool)),
             )
         ],
     )
@@ -190,6 +191,10 @@ def test_policy_completion_split_merge_preserves_offsets():
         TrajectorySource(previous_key, 3, offset=1)
     ]
     assert merged.request_sizes == [1, 3]
+    assert torch.equal(
+        shards[1].completions[0].initial_result.dones,
+        torch.zeros(3, 1, dtype=torch.bool),
+    )
     assert torch.equal(
         merged.completions[1].next_obs["states"],
         torch.arange(12).reshape(4, 3)[1:],

@@ -1,92 +1,203 @@
-Use Channel for Communication
-==============================
+Customize Data Flow with Channel Hooks
+======================================
 
-The channel module provides a high-level **distributed producer–consumer queue** abstraction for workers to exchange data asynchronously.  
-A ``Channel`` allows one or more producer workers to ``put`` items into a named queue and one or more consumer workers to ``get`` them, optionally accumulating **batches** based on per-item weights.
+Use a ``Channel`` to move items between WorkerGroups. Add a ``Collector`` when
+items must be transformed before enqueueing, and add a ``Dispatcher`` when each
+output must be assigned to a specific consumer.
 
-Channel Creation and Connection
---------------------------------
+Hook Execution Model
+--------------------
 
-A new channel can be created using::
+Every ``put`` follows one ordered path on the ``ChannelWorker``:
 
-    Worker.create_channel(
-        channel_name,
-        node_id=0,
-        maxsize=0
-    )
+.. code-block:: text
 
-This method:
+   producer.put(item, key)
+            |
+            v
+   Collector.collect(item, key)
+            |
+            |  zero or more (output_key, output_item) pairs
+            v
+   Dispatcher.route(output_item, output_key)
+            |
+            v
+   shared queue or one consumer's private queue
 
-- **Determines placement** — If ``group_affinity`` or ``group_rank_affinity`` are not specified, the channel is hosted in the current worker’s **group** and **rank** (same node and GPU).
-- **Launches a dedicated channel actor** — Uses ``PackedPlacementStrategy`` to start a ``ChannelWorker`` (that actually holds the queue) with ``num_processes=1`` on the selected node/GPU.
-- **Returns** a ``Channel`` object that wraps the actor. The channel actor’s address is ``channel_name:0``.
+The two hooks solve different problems:
 
-To connect to an existing channel from another worker, use::
+.. list-table::
+   :header-rows: 1
+   :widths: 22 39 39
 
-    Worker.connect_channel(channel_name)
+   * - Hook
+     - Input
+     - Decision
+   * - ``Collector``
+     - One item passed to ``put``
+     - Drop, transform, merge, split, or re-key it.
+   * - ``Dispatcher``
+     - Each item emitted by the Collector
+     - Keep it shared or assign it to one consumer.
 
-This looks up the channel actor in the Ray namespace and returns a ``Channel`` object bound to both the actor and the current worker.
+Both hooks are synchronous and stateful. ``setup(ctx)`` runs once before
+traffic starts. ``collect()`` and ``route()`` then run serially on the channel
+worker, so their state does not need locks.
 
+Register a Collector and Dispatcher
+-----------------------------------
 
+Define hooks in an importable module, for example
+``my_project/channel_hooks.py``:
 
-Putting Items into the Channel
---------------------------------
+.. code-block:: python
 
-Use ``channel.put(item, weight=0, key="default", async_op=False)`` to send data.
-
-- The sending worker first transmits the ``item`` to the ``ChannelWorker`` that actually owns the target queue.  
-- The ``ChannelWorker`` receives the data, wraps it as a ``WeightedItem`` (with the given ``weight``), and enqueues it into the specified queue.  
-  If the queue has a size limit (``maxsize`` > 0) and is full, the enqueue will block until space becomes available.
-
-Getting Items from the Channel
---------------------------------
-
-Use ``channel.get(key="default", async_op=False)`` to retrieve data which is essentially the reverse of ``put``.  
-
-- The ``ChannelWorker`` first dequeues an item from the specified queue.  
-- It then sends this item to the worker that requested it, where it is returned to the caller.
-
-Batch Retrieval
---------------------------------
-
-Use ``channel.get_batch(batch_weight, key="default", async_op=False)`` to retrieve multiple items at once.
-
-- The ``ChannelWorker`` repeatedly dequeues items from the queue, summing their weight values.  
-- Once the accumulated weight reaches or exceeds ``batch_weight``, it stops.  
-- All dequeued items are combined into a list and sent to the requesting worker in one message.
-
-This feature is useful for dynamically forming batches of experiences or workers to process, where each item has a cost or size (the weight) and you want to process roughly uniform batch sizes. 
-
-Load Balancing
---------------
-
-During the Rollout stage, trajectories often vary significantly in length. If these are distributed to each data parallel (DP) training group without any design, it can result in severe load imbalance.
-
-To address this issue, we implement a channel-based load balancing mechanism. Specifically, all generators in the generation stage sequentially ``put`` complete rollout trajectories into a shared ``rollout_output_queue``. 
-Since the trajectories are inserted in temporal order, the sequence lengths in the ``rollout_output_queue`` tend to grow over time.
-
-Using a round-robin strategy, we continuously ``get`` trajectories from the ``rollout_output_queue`` and assign them to each DP training group in turn. This method helps approximate balanced workload distribution across all training DP groups, ensuring better utilization and efficiency during training.
+   from rlinf.scheduler import (
+       Collector,
+       Dispatcher,
+       register_collector,
+       register_dispatcher,
+   )
 
 
+   @register_collector("flatten_batch")
+   class FlattenBatchCollector(Collector):
+       """Emit each sample in an incoming batch as one queue item."""
 
-Example
---------
-
-.. autoclass:: rlinf.scheduler.Channel
-   :no-members:
-   :no-index:
-   :no-inherited-members:
-   :exclude-members: __init__, __new__
-
-Summary
---------------------------------
-
-The `Channel` component offers a distributed producer-consumer queue for worker communication. 
-It wraps the collective send/recv mechanism with an intuitive interface supporting priority and batching, 
-enabling decoupled, asynchronous data flow—ideal for reinforcement learning scenarios with parallel data collection and batched consumption.
+       def collect(self, item, key):
+           for sample in item:
+               yield key, sample
 
 
+   @register_dispatcher("even")
+   class EvenDispatcher(Dispatcher):
+       """Assign items to consumers in a fixed rotation."""
 
+       def setup(self, ctx):
+           self.consumers = sorted(ctx.consumers)
+           self.next_consumer = 0
 
+       def route(self, item, key):
+           if not self.consumers:
+               return None
+           consumer = self.consumers[
+               self.next_consumer % len(self.consumers)
+           ]
+           self.next_consumer += 1
+           return consumer
 
+The decorators register each class under a lowercase name. ``Channel.create``
+also accepts a hook instance, a hook class, or a ``"module:ClassName"`` path.
+Passing the class directly is the simplest choice for application-local hooks:
 
+.. code-block:: python
+
+   from my_project.channel_hooks import EvenDispatcher, FlattenBatchCollector
+   from rlinf.scheduler import Channel
+
+   sample_channel = Channel.create(
+       "Samples",
+       collector=FlattenBatchCollector,
+       dispatcher=EvenDispatcher,
+       producers=[rollout_group],
+       consumers=[actor_group],
+   )
+
+``rollout_group`` and ``actor_group`` are launched WorkerGroups. Channel setup
+expands ``actor_group`` into stable consumer ids such as ``actor:0``,
+``actor:1``, and ``actor:2`` and exposes them through ``ctx.consumers``.
+
+If the registration module is imported in the ChannelWorker process, select a
+hook by its registered name instead:
+
+.. code-block:: python
+
+   sample_channel = Channel.create(
+       "Samples",
+       collector="flatten_batch",
+       dispatcher="even",
+       producers=[rollout_group],
+       consumers=[actor_group],
+   )
+
+Framework-integrated hooks normally use registered names. External modules can
+always use ``"my_project.channel_hooks:FlattenBatchCollector"`` or pass the
+class directly.
+
+Follow One Batch Through the Hooks
+----------------------------------
+
+Assume one producer sends six samples:
+
+.. code-block:: python
+
+   sample_channel.put(["s0", "s1", "s2", "s3", "s4", "s5"])
+
+The Collector converts one input batch into six queue items. The Dispatcher
+then rotates over three consumers:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 38 38
+
+   * - Consumer
+     - First Assignment
+     - Second Assignment
+   * - ``actor:0``
+     - ``s0``
+     - ``s3``
+   * - ``actor:1``
+     - ``s1``
+     - ``s4``
+   * - ``actor:2``
+     - ``s2``
+     - ``s5``
+
+Each Actor calls ``sample_channel.get()`` with the same queue key. The Channel
+identifies the calling worker and reads its private queue. Assignment counts
+differ by at most one when the number of outputs is not divisible by the
+consumer count.
+
+Choose the Queue Behavior
+-------------------------
+
+Use the defaults until data transformation or consumer ownership is required:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 29 31 40
+
+   * - Dispatcher
+     - Queue Ownership
+     - Use It When
+   * - ``None`` or ``"shared"``
+     - One shared queue per key
+     - Any consumer may process any item.
+   * - ``"round_robin"``
+     - One private queue per consumer
+     - Assignment must be deterministic and even.
+   * - ``"least_loaded"``
+     - One private queue per consumer
+     - Producers should balance total assignments.
+   * - ``"least_loaded_stealing"``
+     - Private queues with stealing
+     - Slow consumers must not hold idle peers back.
+
+A Dispatcher that returns ``None`` leaves an item in the shared queue. Returning
+a consumer id assigns the item before any consumer calls ``get``. Override
+``rebalance()`` only when a blocking consumer may steal from a peer.
+
+Use Channel Keys and Weights
+----------------------------
+
+``put(item, key=...)`` and ``get(key=...)`` select an independent logical queue.
+A Collector may change the key it received. A Dispatcher routes independently
+within each output key.
+
+Set ``weight`` on ``put`` and call ``get_batch(target_weight=...)`` when items
+have different costs and consumers need approximately weighted batches. Hook
+routing happens before weighted items enter their queues.
+
+For exact method signatures, see :doc:`../reference/api/channel`. For a
+production Collector that joins embodied rollout data, continue with
+:doc:`trajectory_collector`.

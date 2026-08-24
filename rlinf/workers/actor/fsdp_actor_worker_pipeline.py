@@ -20,8 +20,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from rlinf.data.schema.embodied_channel import actor_queue_key
-from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler import Channel, CommMapper, Worker
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import compute_rollout_metrics
 from rlinf.utils.utils import unpack_batch
@@ -60,7 +59,10 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
     ) -> dict[str, torch.Tensor] | None:
         if self._pending_micro_batch_work is None:
             self._pending_micro_batch_work = input_channel.get(
-                key=actor_queue_key(self._rank), async_op=True
+                key=CommMapper.build_channel_key(
+                    self._rank, self._rank, "pipeline_actor"
+                ),
+                async_op=True,
             )
         if not self._pending_micro_batch_work.done():
             return None
@@ -70,7 +72,11 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     def recv_micro_batch(self, input_channel: Channel) -> dict[str, torch.Tensor]:
         if self._pending_micro_batch_work is None:
-            packed_batch = input_channel.get(key=actor_queue_key(self._rank))
+            packed_batch = input_channel.get(
+                key=CommMapper.build_channel_key(
+                    self._rank, self._rank, "pipeline_actor"
+                )
+            )
         else:
             packed_batch = self._pending_micro_batch_work.wait()
             self._pending_micro_batch_work = None

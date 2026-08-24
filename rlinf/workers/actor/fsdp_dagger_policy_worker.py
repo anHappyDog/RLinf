@@ -328,10 +328,10 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
     async def recv_lerobot_rollout_trajectories(self, input_channel: Channel) -> None:
         """Receive episodes from EnvWorker and append them to the memory dataset.
 
-        EnvWorkers collect completed episodes via ``EmbodiedLerobotTrajectoryBuilder``
-        and the trajectory worker sends one shard per expected actor receive each
-        interact round. A shard may be empty when no episode completes; if the
-        dataset is still below ``min_frames``, training is skipped later.
+        The trajectory collector sends one episode shard per expected Actor
+        receive each interact round. A shard may be empty when no episode
+        completes; if the dataset is still below ``min_frames``, training is
+        skipped later.
         """
         await self._recv_lerobot_episodes_from_channel(input_channel)
         if self.dataset.is_ready():

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Embodied rollout accumulators that build trajectories/episodes."""
+"""Private state accumulators owned by the trajectory collector."""
 
 import copy
 from dataclasses import dataclass, field
@@ -35,41 +35,51 @@ from rlinf.utils.nested_dict_process import (
 
 
 @dataclass(kw_only=True)
-class EmbodiedTrajectoryBuilder:
-    """
-    Collect chunk-step results and transitions during rollout,
-    and convert them into trajectory tensors.
+class TrajectoryAccumulator:
+    """Accumulate joined chunks and materialize actor-facing trajectories.
+
+    Tensor fields remain as one entry per action chunk until materialization.
+    Boundary fields may additionally contain the state before or after an
+    epoch, as required by advantage computation.
     """
 
     max_episode_length: int = 0
 
-    actions: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
-    intervene_flags: list[torch.Tensor] = field(
-        default_factory=list
-    )  # trajectory_length
-    rewards: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
-    terminations: list[torch.Tensor] = field(
-        default_factory=list
-    )  # trajectory_length + rollout_epoch
-    truncations: list[torch.Tensor] = field(
-        default_factory=list
-    )  # trajectory_length + rollout_epoch
-    dones: list[torch.Tensor] = field(
-        default_factory=list
-    )  # trajectory_length + rollout_epoch
-    prev_logprobs: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
-    prev_values: list[torch.Tensor] = field(
-        default_factory=list
-    )  # trajectory_length + rollout_epoch
-    versions: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
-    forward_inputs: list[dict[str, Any]] = field(
-        default_factory=list
-    )  # trajectory_length
+    # One entry per completed action chunk unless noted otherwise.
+    actions: list[torch.Tensor] = field(default_factory=list)
+    intervene_flags: list[torch.Tensor] = field(default_factory=list)
+    rewards: list[torch.Tensor] = field(default_factory=list)
+    # State-boundary sequences include the pre-rollout state.
+    terminations: list[torch.Tensor] = field(default_factory=list)
+    truncations: list[torch.Tensor] = field(default_factory=list)
+    dones: list[torch.Tensor] = field(default_factory=list)
+    prev_logprobs: list[torch.Tensor] = field(default_factory=list)
+    # Value sequences may also include the post-rollout bootstrap value.
+    prev_values: list[torch.Tensor] = field(default_factory=list)
+    versions: list[torch.Tensor] = field(default_factory=list)
+    forward_inputs: list[dict[str, Any]] = field(default_factory=list)
 
-    curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
-    next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
+    # Transition observations are populated only for off-policy/RLT modes.
+    curr_obs: list[dict[str, Any]] = field(default_factory=list)
+    next_obs: list[dict[str, Any]] = field(default_factory=list)
+
+    def append_initial_state(
+        self,
+        *,
+        dones: torch.Tensor | None,
+        truncations: torch.Tensor | None,
+        terminations: torch.Tensor | None,
+    ) -> None:
+        """Append the state boundary immediately before a rollout epoch."""
+        if dones is not None:
+            self.dones.append(dones.cpu().contiguous())
+        if truncations is not None:
+            self.truncations.append(truncations.cpu().contiguous())
+        if terminations is not None:
+            self.terminations.append(terminations.cpu().contiguous())
 
     def append_step_result(self, result: ChunkStepResult):
+        """Append every present field from one completed action chunk."""
         if result.actions is not None:
             self.actions.append(result.actions)
             self.intervene_flags.append(
@@ -97,44 +107,22 @@ class EmbodiedTrajectoryBuilder:
         if value is not None:
             self.prev_values.append(value.cpu().contiguous())
 
-    def append_initial_state(
-        self,
-        *,
-        dones: torch.Tensor | None,
-        truncations: torch.Tensor | None,
-        terminations: torch.Tensor | None,
-    ) -> None:
-        """Append the state boundary immediately before a rollout epoch."""
-        if dones is not None:
-            self.dones.append(dones.cpu().contiguous())
-        if truncations is not None:
-            self.truncations.append(truncations.cpu().contiguous())
-        if terminations is not None:
-            self.terminations.append(terminations.cpu().contiguous())
-
-    def mark_last_step_with_intervene_flags(self, intervene_flags: torch.Tensor):
-        if not self.intervene_flags:
-            return
-
-        if intervene_flags.dim() == 1:
-            intervene_flags = intervene_flags[:, None]
-        assert intervene_flags.dim() == 2, (
-            f"Expected 2D tensor, got {intervene_flags.shape=}"
-        )
-
-        last_action = self.actions[-1]
-        bsz, num_action_chunks = intervene_flags.shape
-        expanded_flags = intervene_flags.reshape(bsz, num_action_chunks, 1).expand_as(
-            last_action.reshape(bsz, num_action_chunks, -1)
-        )
-        self.intervene_flags[-1] = expanded_flags.reshape(bsz, -1).to(torch.bool)
+    def append_transitions(self, curr_obs=None, next_obs=None):
+        """Record one transition pair without non-tensor task descriptions."""
+        assert curr_obs is not None and next_obs is not None
+        if "task_descriptions" in curr_obs:
+            curr_obs.pop("task_descriptions")
+        if "task_descriptions" in next_obs:
+            next_obs.pop("task_descriptions")
+        self.curr_obs.append(curr_obs)
+        self.next_obs.append(next_obs)
 
     def update_last_actions(
         self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor
     ):
-        # action: [bsz, num-chunk-size x action-dim]
-        # intervene_actions: [bsz, num-chunk-size x action-dim]
-        # intervene_flags: [bsz, num-chunk-size]
+        """Replace intervened actions and keep flags and forward inputs aligned."""
+
+        # Actions are flattened as [batch, chunk_count * action_dim].
 
         if self.actions and len(self.actions) > 0:
             last_action = self.actions[-1]
@@ -170,30 +158,26 @@ class EmbodiedTrajectoryBuilder:
                     )
                 last_fi.pop("model_action", None)
 
-    def append_transitions(self, curr_obs=None, next_obs=None):
-        assert curr_obs is not None and next_obs is not None
-        if "task_descriptions" in curr_obs:
-            curr_obs.pop("task_descriptions")
-        if "task_descriptions" in next_obs:
-            next_obs.pop("task_descriptions")
-        self.curr_obs.append(curr_obs)
-        self.next_obs.append(next_obs)
+    def mark_last_step_with_intervene_flags(self, intervene_flags: torch.Tensor):
+        """Expand chunk-level intervention flags over the last action tensor."""
+        if not self.intervene_flags:
+            return
 
-    def clear(self):
-        self.actions.clear()
-        self.intervene_flags.clear()
-        self.rewards.clear()
-        self.terminations.clear()
-        self.truncations.clear()
-        self.dones.clear()
-        self.prev_logprobs.clear()
-        self.prev_values.clear()
-        self.versions.clear()
-        self.forward_inputs.clear()
-        self.curr_obs.clear()
-        self.next_obs.clear()
+        if intervene_flags.dim() == 1:
+            intervene_flags = intervene_flags[:, None]
+        assert intervene_flags.dim() == 2, (
+            f"Expected 2D tensor, got {intervene_flags.shape=}"
+        )
+
+        last_action = self.actions[-1]
+        bsz, num_action_chunks = intervene_flags.shape
+        expanded_flags = intervene_flags.reshape(bsz, num_action_chunks, 1).expand_as(
+            last_action.reshape(bsz, num_action_chunks, -1)
+        )
+        self.intervene_flags[-1] = expanded_flags.reshape(bsz, -1).to(torch.bool)
 
     def to_trajectory(self) -> Trajectory:
+        """Stack chunk lists into one contiguous CPU trajectory."""
         trajectory = Trajectory(
             max_episode_length=self.max_episode_length,
         )
@@ -250,6 +234,7 @@ class EmbodiedTrajectoryBuilder:
         return trajectory
 
     def to_splited_trajectories(self, split_size: int) -> list[Trajectory]:
+        """Split the batch dimension into equal actor-consumable shards."""
         all_trajectory: Trajectory = self.to_trajectory()
         splited_trajectories: list[Trajectory] = [
             Trajectory() for _ in range(split_size)
@@ -303,6 +288,7 @@ class EmbodiedTrajectoryBuilder:
     def to_splited_trajectories_by_sizes(
         self, split_sizes: list[int]
     ) -> list[Trajectory]:
+        """Split the batch dimension using explicit shard sizes."""
         trajectory = self.to_trajectory()
         trajectories = [Trajectory() for _ in split_sizes]
 
@@ -330,99 +316,25 @@ class EmbodiedTrajectoryBuilder:
 
         return trajectories
 
+    def clear(self):
+        """Discard all accumulated chunks while retaining configuration."""
+        self.actions.clear()
+        self.intervene_flags.clear()
+        self.rewards.clear()
+        self.terminations.clear()
+        self.truncations.clear()
+        self.dones.clear()
+        self.prev_logprobs.clear()
+        self.prev_values.clear()
+        self.versions.clear()
+        self.forward_inputs.clear()
+        self.curr_obs.clear()
+        self.next_obs.clear()
+
 
 @dataclass(kw_only=True)
-class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
-    """Online LeRobot episode collector for embodied env workers.
-
-    EnvWorker creates one collector per pipeline stage when
-    ``algorithm.dagger.online_lerobot.enabled`` is set. Completed episodes are
-    sent in memory to the actor for DAgger training; no manual instantiation is
-    required.
-
-    **Configuration**: Set ``algorithm.dagger.online_lerobot`` in the training
-    yaml. EnvWorker and Actor both read that block directly. A minimal example
-    is shown below; see
-    ``examples/embodiment/config/libero_spatial_dagger_openpi_lerobot.yaml`` for
-    a full reference config.
-
-    Example yaml::
-
-        algorithm:
-          dagger:
-            online_lerobot:
-              enabled: true
-              only_success: true
-              robot_type: "panda"
-              fps: 10
-              finalize_interval: 8
-              data_path: /path/to/shards
-              rolling_lerobot_window_size: 50000
-              enable_decoded_cache: true
-              decoded_cache_capacity: 25000
-              cache_ingest_mode: new_shards
-              lerobot_num_workers: 0
-
-    **Integration**: When online LeRobot collection is enabled, EnvWorker builds
-    this class and the actor loads
-    :class:`~rlinf.data.datasets.dagger.RollingLeRobotDataset`. Each training
-    chunk calls :meth:`append_chunk_episode_data`; at the end of
-    :meth:`interact`, completed episodes flow through
-    :meth:`drain_episodes` → ``EnvWorker.send_lerobot_episodes`` →
-    ``EmbodiedDAGGERFSDPPolicy.recv_lerobot_rollout_trajectories``. Do not
-    enable ``env.train.data_collection`` on the same train env; that wrapper is
-    for offline disk export only.
-
-    **Responsibilities**:
-
-    1. Accumulate per-env, in-progress episode frames from each
-       ``env_interact_step`` call.
-    2. Detect episode boundaries (termination / truncation), apply
-       ``only_success`` filtering, and enqueue completed episodes.
-    3. Preserve unfinished episodes across multiple ``interact`` rounds until
-       each parallel env finishes its current episode.
-    4. Optionally retain per-chunk ``rewards`` for history-buffer reward-model
-       back-propagation (see :meth:`append_step_result`).
-
-    **Episode semantics**: Frame construction follows the same rules as offline
-    :class:`CollectEpisode`.
-
-    1. Auto-reset envs: ``final_observation`` is attributed to the finished
-       episode; post-reset observations are carried via ``_pending_obs``.
-    2. DAgger intervention: ``EmbodiedRolloutResult.intervene_flags`` and expert actions
-       override recorded actions and set ``intervene_flag``.
-    3. Real-world hooks: ``record_reset``, ``pre_record``, and
-       ``segment_advance`` info flags are honored.
-    4. ``only_success=True`` (from
-       ``algorithm.dagger.online_lerobot.only_success``): only successful
-       terminations are exported; failed episodes are discarded.
-
-    Each exported frame is a ``dict`` compatible with
-    ``LeRobotDatasetWriter.add_episode`` and
-    :class:`~rlinf.data.datasets.dagger.RollingLeRobotDataset`, with fields such
-    as ``state``, ``actions``, ``task``, ``image``, ``intervene_flag``,
-    ``segment_id``, ``is_success``, and ``done``.
-
-    **Runtime lifecycle inside EnvWorker**:
-
-    1. First ``interact`` round: create one collector per pipeline stage.
-    2. Later ``interact`` rounds: ``rewards.clear()`` only; episode buffers
-       persist until each env finishes its episode.
-    3. Every chunk: ``append_chunk_episode_data(policy_output=..., **payload)``.
-    4. End of ``interact``: ``drain_episodes()`` and send to the actor.
-    5. Non auto-reset bootstrap ``env.reset()``: :meth:`reset_episode_buffers`.
-
-    **Offline vs online collection**: Offline collection uses
-    ``env.train.data_collection.enabled`` and writes shards to disk via
-    :class:`CollectEpisode` (for example ``collect_real_data.py``). Online
-    collection uses ``algorithm.dagger.online_lerobot.enabled`` and sends
-    episodes to the actor in memory (for example
-    ``libero_spatial_dagger_openpi_lerobot.yaml``).
-
-    **Differences from** :class:`EmbodiedTrajectoryBuilder`: This collector does not
-    build PPO trajectories. :meth:`update_last_actions` and
-    :meth:`append_transitions` are intentionally no-ops. Use
-    :class:`EmbodiedTrajectoryBuilder` when online LeRobot collection is disabled.
+class LerobotEpisodeAccumulator(TrajectoryAccumulator):
+    """Accumulate private per-environment state for online LeRobot episodes.
 
     Args:
         max_episode_length: Inherited upper bound used by the parent class.
@@ -448,322 +360,10 @@ class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
     _episode_success: list[bool] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self):
+        """Allocate per-environment episode state."""
         self._reset_episode_state()
 
-    def append_step_result(self, result: ChunkStepResult):
-        if result.rewards is not None:
-            self.rewards.append(result.rewards)
-
-    def update_last_actions(
-        self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor
-    ):
-        return
-
-    def append_transitions(self, curr_obs=None, next_obs=None):
-        return
-
-    def reset_episode_buffers(self) -> None:
-        self._env_buffers = [[] for _ in range(self.num_envs)]
-        self._pending_obs = [None] * self.num_envs
-        self._pending_info = [None] * self.num_envs
-        self._segment_ids = [0] * self.num_envs
-        self._episode_success = [False] * self.num_envs
-
-    def _reset_episode_state(self) -> None:
-        self.reset_episode_buffers()
-        self.episodes = []
-
-    @staticmethod
-    def _to_numpy(data):
-        if data is None:
-            return None
-        if isinstance(data, np.ndarray):
-            return data
-        if isinstance(data, torch.Tensor):
-            return data.detach().cpu().numpy()
-        return np.asarray(data)
-
-    @staticmethod
-    def _to_uint8(arr: np.ndarray) -> np.ndarray:
-        if arr.dtype == np.uint8:
-            return arr
-        return (
-            (arr * 255).astype(np.uint8) if arr.max() <= 1.0 else arr.astype(np.uint8)
-        )
-
-    @staticmethod
-    def _expand_multi_view_images(
-        base_key: str, arr: np.ndarray | None
-    ) -> dict[str, np.ndarray]:
-        if arr is None:
-            return {}
-        if arr.ndim == 3:
-            return {base_key: arr}
-        if arr.ndim == 4:
-            if arr.shape[0] == 1:
-                return {base_key: arr[0]}
-            return {f"{base_key}-{i}": arr[i] for i in range(arr.shape[0])}
-        return {base_key: arr}
-
-    @staticmethod
-    def _slice_data(data, env_idx: int, num_envs: int):
-        if isinstance(data, torch.Tensor):
-            return (
-                data[env_idx] if data.dim() > 0 and data.shape[0] == num_envs else data
-            )
-        if isinstance(data, np.ndarray):
-            return (
-                data[env_idx] if data.ndim > 0 and data.shape[0] == num_envs else data
-            )
-        if isinstance(data, dict):
-            return {
-                k: EmbodiedLerobotTrajectoryBuilder._slice_data(v, env_idx, num_envs)
-                for k, v in data.items()
-            }
-        if isinstance(data, list):
-            return data[env_idx] if len(data) == num_envs else data
-        return data
-
-    @staticmethod
-    def _scalar_flag(flags, env_idx: int, num_envs: int) -> bool:
-        if isinstance(flags, torch.Tensor):
-            if flags.dim() > 1:
-                return bool(flags[env_idx, -1].item())
-            if flags.dim() == 1 and flags.shape[0] == num_envs:
-                return bool(flags[env_idx].item())
-            return bool(flags.item())
-        if isinstance(flags, np.ndarray):
-            if flags.ndim > 0 and flags.shape[0] == num_envs:
-                return bool(flags[env_idx])
-            return bool(flags)
-        return bool(flags)
-
-    @staticmethod
-    def _extract_obs_image_state(obs):
-        if not isinstance(obs, dict):
-            return None, None, None, None, "unknown task"
-        image = obs.get("main_images", obs.get("image", obs.get("full_image")))
-        wrist_image = obs.get("wrist_images", obs.get("wrist_image"))
-        extra_view_image = obs.get("extra_view_images", obs.get("extra_view_image"))
-        state = obs.get("states", obs.get("state"))
-        task = obs.get("task_descriptions", "unknown task")
-        if isinstance(task, (list, tuple)):
-            task = task[0] if task else "unknown task"
-        return (
-            EmbodiedLerobotTrajectoryBuilder._to_numpy(image),
-            EmbodiedLerobotTrajectoryBuilder._to_numpy(wrist_image),
-            EmbodiedLerobotTrajectoryBuilder._to_numpy(extra_view_image),
-            EmbodiedLerobotTrajectoryBuilder._to_numpy(state),
-            str(task),
-        )
-
-    @staticmethod
-    def _bool_from_env_info(env_info: Any, key: str) -> bool:
-        if not isinstance(env_info, dict) or env_info.get(key) is None:
-            return False
-        return bool(np.asarray(env_info[key]).any())
-
-    @staticmethod
-    def _extract_success_from_info(info: Any) -> bool | None:
-        if not isinstance(info, dict):
-            return None
-        for src in (info.get("episode"), info):
-            if not isinstance(src, dict):
-                continue
-            for key in ("success_once", "success_at_end", "success"):
-                val = src.get(key)
-                if val is None:
-                    continue
-                arr = EmbodiedLerobotTrajectoryBuilder._to_numpy(val)
-                if arr is not None:
-                    return bool(np.asarray(arr).reshape(-1).any())
-        return None
-
-    @staticmethod
-    def _intervene_flag_from_info(info: Any) -> bool:
-        if not isinstance(info, dict):
-            return False
-        val = info.get("intervene_flag")
-        if val is None:
-            return False
-        arr = EmbodiedLerobotTrajectoryBuilder._to_numpy(val)
-        if arr is None:
-            return False
-        return bool(np.asarray(arr, dtype=bool).reshape(-1).any())
-
-    @staticmethod
-    def _reshape_chunk_actions(
-        actions,
-        *,
-        num_envs: int,
-        num_chunks: int,
-        action_dim: int,
-    ) -> np.ndarray | None:
-        if actions is None:
-            return None
-        arr = EmbodiedLerobotTrajectoryBuilder._to_numpy(actions)
-        batch_size = arr.shape[0]
-        flat_dim = num_chunks * action_dim
-        if arr.ndim == 3:
-            return arr
-        if arr.ndim == 2:
-            if arr.shape[-1] == flat_dim:
-                return arr.reshape(batch_size, num_chunks, action_dim)
-            if arr.shape[-1] == action_dim:
-                return arr[:, None, :]
-        raise ValueError(
-            f"Unexpected chunk action shape {arr.shape}; expected "
-            f"[{num_envs}, {num_chunks}, {action_dim}] or flat dim {flat_dim}."
-        )
-
-    @staticmethod
-    def _normalize_intervene_in_info(env_info: Any, action_dim: int) -> None:
-        if not isinstance(env_info, dict) or "intervene_action" not in env_info:
-            return
-        intervene_action = EmbodiedLerobotTrajectoryBuilder._to_numpy(
-            env_info["intervene_action"]
-        )
-        if intervene_action.size <= action_dim:
-            env_info["intervene_action"] = intervene_action.reshape(-1)[:action_dim]
-            return
-        chunk_size = intervene_action.reshape(-1, action_dim).shape[0]
-        env_info["intervene_action"] = intervene_action.reshape(-1, action_dim)[-1]
-        if "intervene_flag" in env_info:
-            intervene_flag = EmbodiedLerobotTrajectoryBuilder._to_numpy(
-                env_info["intervene_flag"]
-            )
-            env_info["intervene_flag"] = intervene_flag.reshape(chunk_size, -1)[-1, 0]
-
-    @staticmethod
-    def _inject_expert_into_step_info(
-        step_info: dict,
-        expert_actions: np.ndarray,
-        intervene_flags,
-        *,
-        step_idx: int,
-        step_term,
-        step_trunc,
-    ) -> None:
-        if (
-            expert_actions is None
-            or intervene_flags is None
-            or "intervene_action" in step_info
-        ):
-            return
-        step_intervene_flags = intervene_flags[:, step_idx]
-        step_expert = expert_actions[:, step_idx]
-        if "final_info" in step_info:
-            step_info["final_info"]["intervene_action"] = expert_actions
-            step_info["final_info"]["intervene_flag"] = intervene_flags
-            step_info["intervene_action"] = step_expert
-            term = EmbodiedLerobotTrajectoryBuilder._to_numpy(step_term)
-            trunc = EmbodiedLerobotTrajectoryBuilder._to_numpy(step_trunc)
-            step_info["intervene_flag"] = step_intervene_flags & ~(term | trunc)
-        else:
-            step_info["intervene_action"] = step_expert
-            step_info["intervene_flag"] = step_intervene_flags
-
-    def _update_episode_success(self, env_idx: int, env_info: Any) -> None:
-        success = self._extract_success_from_info(env_info)
-        if success is not None:
-            self._episode_success[env_idx] = self._episode_success[env_idx] or success
-
-    def _get_episode_success(self, env_idx: int) -> bool:
-        if self._episode_success[env_idx]:
-            return True
-        found_any = False
-        is_success = False
-        for frame in self._env_buffers[env_idx]:
-            frame_success = frame.get("_frame_success")
-            if frame_success is not None:
-                found_any = True
-                is_success = is_success or bool(frame_success)
-        if found_any:
-            return is_success
-        return self._episode_success[env_idx]
-
-    def _resolve_step_obs_info(
-        self,
-        *,
-        step_obs: Any,
-        step_info: Any,
-        env_idx: int,
-        env_done: bool,
-    ) -> tuple[Any, Any]:
-        has_final_obs = isinstance(step_info, dict) and "final_observation" in step_info
-        if has_final_obs and env_done:
-            final_observation = step_info["final_observation"]
-            final_info_batch = step_info["final_info"]
-            info_no_reset = copy.deepcopy(step_info)
-            info_no_reset.pop("final_observation")
-            info_no_reset.pop("final_info")
-            env_obs = self._slice_data(final_observation, env_idx, self.num_envs)
-            env_info = self._slice_data(final_info_batch, env_idx, self.num_envs)
-            self._pending_obs[env_idx] = self._slice_data(
-                step_obs, env_idx, self.num_envs
-            )
-            self._pending_info[env_idx] = self._slice_data(
-                info_no_reset, env_idx, self.num_envs
-            )
-        else:
-            env_obs = self._slice_data(step_obs, env_idx, self.num_envs)
-            env_info = self._slice_data(step_info, env_idx, self.num_envs)
-            if isinstance(env_info, dict):
-                env_info = copy.deepcopy(env_info)
-                env_info.pop("final_observation", None)
-                env_info.pop("final_info", None)
-        return env_obs, env_info
-
-    def _consume_pending_obs(self, env_idx: int) -> tuple[Any | None, Any | None]:
-        pending_obs = self._pending_obs[env_idx]
-        pending_info = self._pending_info[env_idx]
-        self._pending_obs[env_idx] = None
-        self._pending_info[env_idx] = None
-        return pending_obs, pending_info
-
-    def _reset_env_buffer(self, env_idx: int) -> None:
-        self._env_buffers[env_idx] = []
-        self._episode_success[env_idx] = False
-        self._segment_ids[env_idx] = 0
-        pending_obs, pending_info = self._consume_pending_obs(env_idx)
-        if pending_obs is not None:
-            self._env_buffers[env_idx].append(
-                {
-                    "_pending_seed": True,
-                    "obs": pending_obs,
-                    "info": pending_info if pending_info is not None else {},
-                }
-            )
-
-    def _flush_env_episode(self, env_idx: int, is_success: bool) -> None:
-        buf = self._env_buffers[env_idx]
-        frames = [entry for entry in buf if not entry.get("_pending_seed")]
-        if not frames:
-            return
-        for frame_entry in frames:
-            frame_entry.pop("_frame_success", None)
-            frame_entry["is_success"] = np.array([is_success], dtype=bool)
-        frames[-1]["done"] = np.array([True], dtype=bool)
-        self.episodes.append(frames)
-
-    def _maybe_flush_env(
-        self,
-        env_idx: int,
-        *,
-        done_by_term: bool,
-        done_by_trunc: bool,
-    ) -> None:
-        is_success = self._get_episode_success(env_idx)
-        if self.only_success:
-            if is_success and done_by_term:
-                self._flush_env_episode(env_idx, is_success)
-                self._reset_env_buffer(env_idx)
-            elif done_by_trunc or done_by_term:
-                self._reset_env_buffer(env_idx)
-        elif done_by_trunc or done_by_term:
-            self._flush_env_episode(env_idx, is_success)
-            self._reset_env_buffer(env_idx)
-
+    # Public episode API.
     def append_chunk_episode_data(
         self,
         *,
@@ -774,6 +374,39 @@ class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
         truncations,
         infos_list,
     ) -> None:
+        """Convert one vectorized action chunk into per-environment frames."""
+        self._append_chunk_episode_data(
+            policy_output=policy_output,
+            chunk_actions=chunk_actions,
+            obs_list=obs_list,
+            terminations=terminations,
+            truncations=truncations,
+            infos_list=infos_list,
+        )
+
+    def drain_episodes(self) -> list[list[dict[str, Any]]]:
+        """Return completed episodes and clear the output buffer."""
+        episodes = self.episodes
+        self.episodes = []
+        return episodes
+
+    def clear(self):
+        """Discard trajectory and episode state."""
+        super().clear()
+        self._reset_episode_state()
+
+    # Core conversion runs directly behind the public episode API.
+    def _append_chunk_episode_data(
+        self,
+        *,
+        policy_output: EmbodiedRolloutResult | None,
+        chunk_actions,
+        obs_list,
+        terminations,
+        truncations,
+        infos_list,
+    ) -> None:
+        """Implement vectorized chunk-to-frame conversion."""
         chunk_size = len(obs_list) if isinstance(obs_list, (list, tuple)) else 1
         num_envs = self.num_envs
         num_chunks = self.num_action_chunks
@@ -845,6 +478,8 @@ class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
                     env_done=env_done,
                 )
 
+                # Real-data collection can explicitly restart recording without
+                # reporting an environment termination.
                 if self._bool_from_env_info(env_info, "record_reset"):
                     self._env_buffers[env_idx] = []
                     self._episode_success[env_idx] = False
@@ -869,6 +504,8 @@ class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
                 frame_obs = env_obs
                 frame_info = env_info
                 buf = self._env_buffers[env_idx]
+                # Auto-reset returns the next episode's observation alongside
+                # the previous episode's terminal info; consume it one step later.
                 if buf and buf[0].get("_pending_seed"):
                     seed = buf.pop(0)
                     frame_obs = seed["obs"]
@@ -936,11 +573,341 @@ class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
                         done_by_trunc=done_by_trunc,
                     )
 
-    def drain_episodes(self) -> list[list[dict[str, Any]]]:
-        episodes = self.episodes
-        self.episodes = []
-        return episodes
+    # Parent hooks not used by episode export.
+    def append_step_result(self, result: ChunkStepResult):
+        """Retain rewards only; episode frames use their own storage."""
+        if result.rewards is not None:
+            self.rewards.append(result.rewards)
 
-    def clear(self):
-        super().clear()
-        self._reset_episode_state()
+    def update_last_actions(
+        self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor
+    ):
+        """Ignore trajectory action updates in episode-export mode."""
+        return
+
+    def append_transitions(self, curr_obs=None, next_obs=None):
+        """Ignore trajectory transitions in episode-export mode."""
+        return
+
+    def reset_episode_buffers(self) -> None:
+        """Reset in-progress buffers for every parallel environment."""
+        self._env_buffers = [[] for _ in range(self.num_envs)]
+        self._pending_obs = [None] * self.num_envs
+        self._pending_info = [None] * self.num_envs
+        self._segment_ids = [0] * self.num_envs
+        self._episode_success = [False] * self.num_envs
+
+    def _reset_episode_state(self) -> None:
+        """Reset both in-progress buffers and completed episode output."""
+        self.reset_episode_buffers()
+        self.episodes = []
+
+    @staticmethod
+    def _to_numpy(data):
+        """Convert tensor-like input to a detached NumPy array."""
+        if data is None:
+            return None
+        if isinstance(data, np.ndarray):
+            return data
+        if isinstance(data, torch.Tensor):
+            return data.detach().cpu().numpy()
+        return np.asarray(data)
+
+    @staticmethod
+    def _to_uint8(arr: np.ndarray) -> np.ndarray:
+        """Convert normalized or byte-scale image data to ``uint8``."""
+        if arr.dtype == np.uint8:
+            return arr
+        return (
+            (arr * 255).astype(np.uint8) if arr.max() <= 1.0 else arr.astype(np.uint8)
+        )
+
+    @staticmethod
+    def _expand_multi_view_images(
+        base_key: str, arr: np.ndarray | None
+    ) -> dict[str, np.ndarray]:
+        """Map a single or stacked camera array to stable frame keys."""
+        if arr is None:
+            return {}
+        if arr.ndim == 3:
+            return {base_key: arr}
+        if arr.ndim == 4:
+            if arr.shape[0] == 1:
+                return {base_key: arr[0]}
+            return {f"{base_key}-{i}": arr[i] for i in range(arr.shape[0])}
+        return {base_key: arr}
+
+    @staticmethod
+    def _slice_data(data, env_idx: int, num_envs: int):
+        """Select one environment from a recursively nested batch."""
+        if isinstance(data, torch.Tensor):
+            return (
+                data[env_idx] if data.dim() > 0 and data.shape[0] == num_envs else data
+            )
+        if isinstance(data, np.ndarray):
+            return (
+                data[env_idx] if data.ndim > 0 and data.shape[0] == num_envs else data
+            )
+        if isinstance(data, dict):
+            return {
+                k: LerobotEpisodeAccumulator._slice_data(v, env_idx, num_envs)
+                for k, v in data.items()
+            }
+        if isinstance(data, list):
+            return data[env_idx] if len(data) == num_envs else data
+        return data
+
+    @staticmethod
+    def _scalar_flag(flags, env_idx: int, num_envs: int) -> bool:
+        """Read one environment's terminal flag from supported layouts."""
+        if isinstance(flags, torch.Tensor):
+            if flags.dim() > 1:
+                return bool(flags[env_idx, -1].item())
+            if flags.dim() == 1 and flags.shape[0] == num_envs:
+                return bool(flags[env_idx].item())
+            return bool(flags.item())
+        if isinstance(flags, np.ndarray):
+            if flags.ndim > 0 and flags.shape[0] == num_envs:
+                return bool(flags[env_idx])
+            return bool(flags)
+        return bool(flags)
+
+    @staticmethod
+    def _extract_obs_image_state(obs):
+        """Extract normalized camera, state, and task fields from an observation."""
+        if not isinstance(obs, dict):
+            return None, None, None, None, "unknown task"
+        image = obs.get("main_images", obs.get("image", obs.get("full_image")))
+        wrist_image = obs.get("wrist_images", obs.get("wrist_image"))
+        extra_view_image = obs.get("extra_view_images", obs.get("extra_view_image"))
+        state = obs.get("states", obs.get("state"))
+        task = obs.get("task_descriptions", "unknown task")
+        if isinstance(task, (list, tuple)):
+            task = task[0] if task else "unknown task"
+        return (
+            LerobotEpisodeAccumulator._to_numpy(image),
+            LerobotEpisodeAccumulator._to_numpy(wrist_image),
+            LerobotEpisodeAccumulator._to_numpy(extra_view_image),
+            LerobotEpisodeAccumulator._to_numpy(state),
+            str(task),
+        )
+
+    @staticmethod
+    def _bool_from_env_info(env_info: Any, key: str) -> bool:
+        """Return whether an environment info flag contains any true value."""
+        if not isinstance(env_info, dict) or env_info.get(key) is None:
+            return False
+        return bool(np.asarray(env_info[key]).any())
+
+    @staticmethod
+    def _extract_success_from_info(info: Any) -> bool | None:
+        """Read success from common top-level or episode info fields."""
+        if not isinstance(info, dict):
+            return None
+        for src in (info.get("episode"), info):
+            if not isinstance(src, dict):
+                continue
+            for key in ("success_once", "success_at_end", "success"):
+                val = src.get(key)
+                if val is None:
+                    continue
+                arr = LerobotEpisodeAccumulator._to_numpy(val)
+                if arr is not None:
+                    return bool(np.asarray(arr).reshape(-1).any())
+        return None
+
+    @staticmethod
+    def _intervene_flag_from_info(info: Any) -> bool:
+        """Return whether a step contains an active intervention."""
+        if not isinstance(info, dict):
+            return False
+        val = info.get("intervene_flag")
+        if val is None:
+            return False
+        arr = LerobotEpisodeAccumulator._to_numpy(val)
+        if arr is None:
+            return False
+        return bool(np.asarray(arr, dtype=bool).reshape(-1).any())
+
+    @staticmethod
+    def _reshape_chunk_actions(
+        actions,
+        *,
+        num_envs: int,
+        num_chunks: int,
+        action_dim: int,
+    ) -> np.ndarray | None:
+        """Normalize flat or chunked actions to ``[env, chunk, action]``."""
+        if actions is None:
+            return None
+        arr = LerobotEpisodeAccumulator._to_numpy(actions)
+        batch_size = arr.shape[0]
+        flat_dim = num_chunks * action_dim
+        if arr.ndim == 3:
+            return arr
+        if arr.ndim == 2:
+            if arr.shape[-1] == flat_dim:
+                return arr.reshape(batch_size, num_chunks, action_dim)
+            if arr.shape[-1] == action_dim:
+                return arr[:, None, :]
+        raise ValueError(
+            f"Unexpected chunk action shape {arr.shape}; expected "
+            f"[{num_envs}, {num_chunks}, {action_dim}] or flat dim {flat_dim}."
+        )
+
+    @staticmethod
+    def _normalize_intervene_in_info(env_info: Any, action_dim: int) -> None:
+        """Reduce chunk-level intervention metadata to the executed final action."""
+        if not isinstance(env_info, dict) or "intervene_action" not in env_info:
+            return
+        intervene_action = LerobotEpisodeAccumulator._to_numpy(
+            env_info["intervene_action"]
+        )
+        if intervene_action.size <= action_dim:
+            env_info["intervene_action"] = intervene_action.reshape(-1)[:action_dim]
+            return
+        chunk_size = intervene_action.reshape(-1, action_dim).shape[0]
+        env_info["intervene_action"] = intervene_action.reshape(-1, action_dim)[-1]
+        if "intervene_flag" in env_info:
+            intervene_flag = LerobotEpisodeAccumulator._to_numpy(
+                env_info["intervene_flag"]
+            )
+            env_info["intervene_flag"] = intervene_flag.reshape(chunk_size, -1)[-1, 0]
+
+    @staticmethod
+    def _inject_expert_into_step_info(
+        step_info: dict,
+        expert_actions: np.ndarray,
+        intervene_flags,
+        *,
+        step_idx: int,
+        step_term,
+        step_trunc,
+    ) -> None:
+        """Attach policy intervention data when the environment omitted it."""
+        if (
+            expert_actions is None
+            or intervene_flags is None
+            or "intervene_action" in step_info
+        ):
+            return
+        step_intervene_flags = intervene_flags[:, step_idx]
+        step_expert = expert_actions[:, step_idx]
+        if "final_info" in step_info:
+            step_info["final_info"]["intervene_action"] = expert_actions
+            step_info["final_info"]["intervene_flag"] = intervene_flags
+            step_info["intervene_action"] = step_expert
+            term = LerobotEpisodeAccumulator._to_numpy(step_term)
+            trunc = LerobotEpisodeAccumulator._to_numpy(step_trunc)
+            step_info["intervene_flag"] = step_intervene_flags & ~(term | trunc)
+        else:
+            step_info["intervene_action"] = step_expert
+            step_info["intervene_flag"] = step_intervene_flags
+
+    def _update_episode_success(self, env_idx: int, env_info: Any) -> None:
+        """Accumulate success across all frames of one episode."""
+        success = self._extract_success_from_info(env_info)
+        if success is not None:
+            self._episode_success[env_idx] = self._episode_success[env_idx] or success
+
+    def _get_episode_success(self, env_idx: int) -> bool:
+        """Resolve episode success from aggregate and retained frame metadata."""
+        if self._episode_success[env_idx]:
+            return True
+        found_any = False
+        is_success = False
+        for frame in self._env_buffers[env_idx]:
+            frame_success = frame.get("_frame_success")
+            if frame_success is not None:
+                found_any = True
+                is_success = is_success or bool(frame_success)
+        if found_any:
+            return is_success
+        return self._episode_success[env_idx]
+
+    def _resolve_step_obs_info(
+        self,
+        *,
+        step_obs: Any,
+        step_info: Any,
+        env_idx: int,
+        env_done: bool,
+    ) -> tuple[Any, Any]:
+        """Separate terminal data from auto-reset data for one environment."""
+        has_final_obs = isinstance(step_info, dict) and "final_observation" in step_info
+        if has_final_obs and env_done:
+            final_observation = step_info["final_observation"]
+            final_info_batch = step_info["final_info"]
+            info_no_reset = copy.deepcopy(step_info)
+            info_no_reset.pop("final_observation")
+            info_no_reset.pop("final_info")
+            env_obs = self._slice_data(final_observation, env_idx, self.num_envs)
+            env_info = self._slice_data(final_info_batch, env_idx, self.num_envs)
+            self._pending_obs[env_idx] = self._slice_data(
+                step_obs, env_idx, self.num_envs
+            )
+            self._pending_info[env_idx] = self._slice_data(
+                info_no_reset, env_idx, self.num_envs
+            )
+        else:
+            env_obs = self._slice_data(step_obs, env_idx, self.num_envs)
+            env_info = self._slice_data(step_info, env_idx, self.num_envs)
+            if isinstance(env_info, dict):
+                env_info = copy.deepcopy(env_info)
+                env_info.pop("final_observation", None)
+                env_info.pop("final_info", None)
+        return env_obs, env_info
+
+    def _consume_pending_obs(self, env_idx: int) -> tuple[Any | None, Any | None]:
+        """Take and clear the auto-reset observation saved for the next episode."""
+        pending_obs = self._pending_obs[env_idx]
+        pending_info = self._pending_info[env_idx]
+        self._pending_obs[env_idx] = None
+        self._pending_info[env_idx] = None
+        return pending_obs, pending_info
+
+    def _reset_env_buffer(self, env_idx: int) -> None:
+        """Reset one environment and seed it with pending auto-reset data."""
+        self._env_buffers[env_idx] = []
+        self._episode_success[env_idx] = False
+        self._segment_ids[env_idx] = 0
+        pending_obs, pending_info = self._consume_pending_obs(env_idx)
+        if pending_obs is not None:
+            self._env_buffers[env_idx].append(
+                {
+                    "_pending_seed": True,
+                    "obs": pending_obs,
+                    "info": pending_info if pending_info is not None else {},
+                }
+            )
+
+    def _flush_env_episode(self, env_idx: int, is_success: bool) -> None:
+        """Finalize buffered frames and append one completed episode."""
+        buf = self._env_buffers[env_idx]
+        frames = [entry for entry in buf if not entry.get("_pending_seed")]
+        if not frames:
+            return
+        for frame_entry in frames:
+            frame_entry.pop("_frame_success", None)
+            frame_entry["is_success"] = np.array([is_success], dtype=bool)
+        frames[-1]["done"] = np.array([True], dtype=bool)
+        self.episodes.append(frames)
+
+    def _maybe_flush_env(
+        self,
+        env_idx: int,
+        *,
+        done_by_term: bool,
+        done_by_trunc: bool,
+    ) -> None:
+        """Apply success filtering and finalize a terminated episode."""
+        is_success = self._get_episode_success(env_idx)
+        if self.only_success:
+            if is_success and done_by_term:
+                self._flush_env_episode(env_idx, is_success)
+                self._reset_env_buffer(env_idx)
+            elif done_by_trunc or done_by_term:
+                self._reset_env_buffer(env_idx)
+        elif done_by_trunc or done_by_term:
+            self._flush_env_episode(env_idx, is_success)
+            self._reset_env_buffer(env_idx)

@@ -14,23 +14,22 @@
 
 """Schema-layer entrypoints for data module."""
 
-from rlinf.data.schema.embodied_trajectory_builder import (
-    EmbodiedLerobotTrajectoryBuilder,
-    EmbodiedTrajectoryBuilder,
-)
 from rlinf.data.schema.embodied_types import (
     ChunkStepResult,
     DummyPolicyInput,
     EmbodiedRolloutResult,
     EnvOutput,
+    EnvPart,
     EnvResult,
     PolicyCompletion,
     PolicyInput,
     PolicyOutput,
+    PolicyPart,
     RTCActionResponse,
     RTCRequest,
     Trajectory,
     TrajectoryKey,
+    TrajectoryPart,
     TrajectorySource,
     convert_trajectories_to_batch,
     get_model_weights_id,
@@ -48,21 +47,30 @@ from rlinf.data.schema.reasoning_results import (
     DynamicRolloutResult,
     RolloutResult,
 )
+from rlinf.data.schema.trajectory_collector import (
+    TrajectoryCollector,
+    TrajectoryMode,
+    TrajectoryPlan,
+)
 
 __all__ = [
     "ChunkStepResult",
     "convert_trajectories_to_batch",
     "DynamicRolloutResult",
     "DummyPolicyInput",
-    "EmbodiedLerobotTrajectoryBuilder",
     "EmbodiedRolloutResult",
     "EnvResult",
+    "EnvPart",
     "PolicyCompletion",
     "PolicyInput",
     "PolicyOutput",
+    "PolicyPart",
+    "TrajectoryCollector",
+    "TrajectoryMode",
+    "TrajectoryPart",
+    "TrajectoryPlan",
     "TrajectoryKey",
     "TrajectorySource",
-    "EmbodiedTrajectoryBuilder",
     "EnvOutput",
     "FinishReasonEnum",
     "RTCActionResponse",

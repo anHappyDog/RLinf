@@ -137,13 +137,18 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         self._pending_rollout_weight_sync = (rollout_handle, actor_handle)
 
     def evaluate(self):
+        env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
+        if env_decoupled_mode:
+            # The rollout-side loop is unbounded by design. Ensure one service
+            # exists and reuse it across every validation cycle.
+            self.rollout.ensure_evaluate_service(
+                input_channel=self.rollout_channel,
+                output_channel=self.env_channel,
+            ).wait()
         env_handle: Handle = self.env.evaluate(
             input_channel=self.env_channel,
             rollout_channel=self.rollout_channel,
         )
-        env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
-        # In decoupled mode the rollout worker keeps serving its own loop, so it
-        # is neither launched here nor joined below.
         if not env_decoupled_mode:
             rollout_handle: Handle = self.rollout.evaluate(
                 input_channel=self.rollout_channel,
@@ -167,12 +172,11 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             rollout_channel=self.rollout_channel,
             reward_channel=self.reward_channel,
             metric_channel=self.env_metric_channel,
-            trajectory_channel=self.actor_channel,
         )
         rollout_handle: Handle = self.rollout.generate(
             input_channel=self.rollout_channel,
             output_channel=self.env_channel,
-            trajectory_channel=self.actor_channel,
+            actor_channel=self.actor_channel,
             metric_channel=self.rollout_metric_channel,
         )
         if self.reward is not None:

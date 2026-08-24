@@ -14,39 +14,37 @@
 
 from unittest.mock import Mock, patch
 
-import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.data.schema.embodied_channel import (
-    OnlineLerobotTrajectoryCollector,
-    PipelineTrajectoryCollector,
-    RolloutGeometry,
-    RolloutTrajectoryCollector,
-    select_trajectory_collector,
-)
-from rlinf.data.schema.embodied_trajectory_builder import (
-    EmbodiedLerobotTrajectoryBuilder,
-)
 from rlinf.data.schema.embodied_types import (
     EmbodiedRolloutResult,
+    EnvPart,
     EnvResult,
+    PolicyPart,
     TrajectoryKey,
     TrajectorySource,
 )
-from rlinf.data.schema.trajectory_assembler import (
-    AssembledChunk,
-    TrajectoryEventAssembler,
-)
-from rlinf.data.schema.trajectory_events import (
-    DummyPolicyStep,
-    EnvStepResult,
-    PolicyStep,
-    TrajectoryStart,
+from rlinf.data.schema.trajectory_accumulator import LerobotEpisodeAccumulator
+from rlinf.data.schema.trajectory_collector import (
+    RolloutGeometry,
+    TrajectoryCollector,
+    TrajectoryMode,
+    TrajectoryPlan,
+    select_trajectory_collector,
+    select_trajectory_dispatcher,
 )
 from rlinf.scheduler.channel.channel import DEFAULT_KEY
 from rlinf.scheduler.channel.hooks import ChannelContext
+
+
+def test_accumulators_are_not_public_schema_api():
+    import rlinf.data.schema as schema
+
+    assert not hasattr(schema, "TrajectoryAccumulator")
+    assert not hasattr(schema, "EmbodiedTrajectoryBuilder")
+    assert not hasattr(schema, "EmbodiedLerobotTrajectoryBuilder")
 
 
 def _config(**overrides):
@@ -57,6 +55,7 @@ def _config(**overrides):
                     "auto_reset": True,
                     "ignore_terminations": False,
                     "max_episode_steps": 4,
+                    "max_steps_per_rollout_epoch": 1,
                     "rollout_epoch": 1,
                     "total_num_envs": 1,
                 }
@@ -74,6 +73,7 @@ def _config(**overrides):
             "algorithm": {
                 "adv_type": "gae",
                 "dagger": {"online_lerobot": {"enabled": False}},
+                "gae_lambda": 1.0,
                 "gamma": 0.5,
                 "group_size": 1,
                 "loss_type": "actor_critic",
@@ -82,7 +82,11 @@ def _config(**overrides):
                 "shuffle_rollout": False,
             },
             "reward": {"env_reward_weight": 1.0, "reward_weight": 1.0},
-            "runner": {"task_type": "embodied", "use_training_pipeline": False},
+            "runner": {
+                "enable_decoupled_mode": False,
+                "task_type": "embodied",
+                "use_training_pipeline": False,
+            },
         }
     )
     return OmegaConf.merge(cfg, overrides)
@@ -92,56 +96,57 @@ def _source(key: TrajectoryKey, size: int = 1, offset: int = 0):
     return TrajectorySource(key, size, offset)
 
 
-def _policy(key: TrajectoryKey, value: float = 1.0, **source_kwargs):
+def _policy(
+    key: TrajectoryKey,
+    value: float = 1.0,
+    *,
+    external: bool = False,
+    **source_kwargs,
+):
     value_tensor = torch.tensor([[value]])
-    return PolicyStep(
+    kwargs = (
+        {"external_actions": value_tensor.unsqueeze(1)}
+        if external
+        else {
+            "rollout_result": EmbodiedRolloutResult(
+                actions=value_tensor,
+                forward_inputs={"action": value_tensor},
+                prev_logprobs=torch.zeros(1, 1),
+                prev_values=torch.zeros(1, 1),
+                versions=torch.full((1, 1), 7.0),
+            )
+        }
+    )
+    return PolicyPart(
         sources=[_source(key, **source_kwargs)],
         obs={"states": value_tensor},
-        rollout_result=EmbodiedRolloutResult(
-            actions=value_tensor,
-            forward_inputs={"action": value_tensor},
-            prev_logprobs=torch.zeros(1, 1),
-            prev_values=torch.zeros(1, 1),
-        ),
+        **kwargs,
     )
 
 
-def _env_step(
+def _env_part(
     key: TrajectoryKey,
     *,
     episode_data=None,
+    initial_result=None,
     value: float = 2.0,
     **source_kwargs,
 ):
     value_tensor = torch.tensor([[value]])
-    return EnvStepResult(
+    return EnvPart(
         sources=[_source(key, **source_kwargs)],
         result=EnvResult(
             rewards=torch.ones(1, 1),
             dones=torch.ones(1, 1, dtype=torch.bool),
             truncations=torch.ones(1, 1, dtype=torch.bool),
+            terminations=torch.zeros(1, 1, dtype=torch.bool),
             episode_data=episode_data,
         ),
         next_obs={"states": value_tensor},
         forward_inputs={"states": value_tensor},
         bootstrap_values=torch.tensor([[4.0]]),
         final_prev_values=torch.tensor([[5.0]]),
-    )
-
-
-def _chunk(
-    key: TrajectoryKey,
-    *,
-    policy=None,
-    env=None,
-    initial_env_result=None,
-):
-    return AssembledChunk(
-        key=key,
-        source=(key.env_rank, key.stage_id),
-        policy=policy or _policy(key),
-        env=env or _env_step(key),
-        initial_env_result=initial_env_result,
+        initial_result=initial_result,
     )
 
 
@@ -155,11 +160,8 @@ def _episode_data():
     }
 
 
-def _make(collector_cls, cfg=None, **geometry):
-    """Build a collector as a channel would, with the geometry supplied directly.
-
-    Deriving the geometry needs a live cluster, so tests pass it in instead.
-    """
+def _make(cfg=None, **geometry):
+    """Build the public collector with a deterministic cluster geometry."""
     shape = {
         "source_count": 1,
         "chunk_count": 1,
@@ -167,7 +169,7 @@ def _make(collector_cls, cfg=None, **geometry):
         "actor_world_size": 1,
     }
     shape.update(geometry)
-    collector = collector_cls()
+    collector = TrajectoryCollector()
     with patch.object(
         RolloutGeometry, "from_cfg", return_value=RolloutGeometry(**shape)
     ):
@@ -177,278 +179,455 @@ def _make(collector_cls, cfg=None, **geometry):
     return collector
 
 
-def _stub_collector(outputs=None, emit_error=None):
-    """A collector whose assembler and emit step are mocked out."""
-    collector = object.__new__(RolloutTrajectoryCollector)
-    chunk = Mock()
-    collector._assembler = Mock()
-    collector._assembler.push.return_value = [chunk]
-    if emit_error is not None:
-        collector.emit = Mock(side_effect=emit_error)
-    else:
-        collector.emit = Mock(return_value=iter(outputs or []))
-    return collector, chunk
+def _collect(collector, *parts):
+    outputs = []
+    for part in parts:
+        outputs.extend(collector.collect(part, DEFAULT_KEY))
+    return outputs
 
 
-def test_collect_assembles_an_event_then_emits_what_it_completed():
-    collector, chunk = _stub_collector([("actor:2", "batch")])
-    event = object()
+def test_policy_part_requires_exactly_one_policy_payload():
+    key = TrajectoryKey(0, 0, 0, 0, 0)
+    common = {"sources": [_source(key)], "obs": {"states": torch.zeros(1, 1)}}
 
-    assert list(collector.collect(event, DEFAULT_KEY)) == [("actor:2", "batch")]
-    collector._assembler.push.assert_called_once_with(event)
-    collector.emit.assert_called_once_with(chunk)
-    collector._assembler.acknowledge.assert_called_once_with(chunk.key)
+    with pytest.raises(ValueError, match="exactly one"):
+        PolicyPart(**common)
+    with pytest.raises(ValueError, match="exactly one"):
+        PolicyPart(
+            **common,
+            rollout_result=EmbodiedRolloutResult(
+                actions=torch.zeros(1, 1), forward_inputs={}
+            ),
+            external_actions=torch.zeros(1, 1),
+        )
 
 
-def test_collect_emits_nothing_until_a_chunk_completes():
-    collector, _ = _stub_collector([])
-
-    assert list(collector.collect(object(), DEFAULT_KEY)) == []
-
-
-def test_collect_keeps_the_assembled_chunk_when_emitting_fails():
-    collector, _ = _stub_collector(emit_error=ValueError("invalid collection"))
-
-    with pytest.raises(ValueError, match="invalid collection"):
-        list(collector.collect(object(), DEFAULT_KEY))
-
-    collector._assembler.acknowledge.assert_not_called()
+def test_setup_requires_the_run_config():
+    with pytest.raises(ValueError, match="needs the run config"):
+        TrajectoryCollector().setup(ChannelContext(name="Actor", cfg=None))
 
 
 @pytest.mark.parametrize(
-    "collector_cls",
+    ("overrides", "mode", "dispatcher"),
     [
-        RolloutTrajectoryCollector,
-        PipelineTrajectoryCollector,
-        OnlineLerobotTrajectoryCollector,
+        ({}, TrajectoryMode.ROLLOUT, "least_loaded"),
+        (
+            {"runner": {"enable_decoupled_mode": False}},
+            TrajectoryMode.ROLLOUT,
+            "least_loaded",
+        ),
+        (
+            {"runner": {"enable_decoupled_mode": True}},
+            TrajectoryMode.ROLLOUT,
+            "least_loaded",
+        ),
+        (
+            {"runner": {"use_training_pipeline": True}},
+            TrajectoryMode.PIPELINE,
+            None,
+        ),
+        (
+            {"algorithm": {"dagger": {"online_lerobot": {"enabled": True}}}},
+            TrajectoryMode.LEROBOT,
+            "least_loaded",
+        ),
+    ],
+    ids=["sync", "async", "decoupled", "pipeline", "lerobot"],
+)
+def test_plan_is_the_single_mode_and_dispatcher_source(overrides, mode, dispatcher):
+    cfg = _config(**overrides)
+
+    assert TrajectoryPlan.mode_from_cfg(cfg) is mode
+    assert select_trajectory_collector(cfg) is TrajectoryCollector
+    assert select_trajectory_dispatcher(cfg) == dispatcher
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "runner": {
+                "enable_decoupled_mode": True,
+                "use_training_pipeline": True,
+            }
+        },
+        {
+            "runner": {"use_training_pipeline": True},
+            "algorithm": {"dagger": {"online_lerobot": {"enabled": True}}},
+        },
+        {
+            "runner": {"use_training_pipeline": True},
+            "algorithm": {"adv_type": "opd"},
+        },
+    ],
+    ids=["pipeline-decoupled", "pipeline-lerobot", "pipeline-opd"],
+)
+def test_plan_rejects_unsupported_mode_combinations(overrides):
+    with pytest.raises(ValueError, match="does not support"):
+        TrajectoryPlan.mode_from_cfg(_config(**overrides))
+
+
+@pytest.mark.parametrize(
+    ("decoupled", "part_order"),
+    [
+        (False, ("policy", "env")),
+        (False, ("env", "policy")),
+        (True, ("policy", "env")),
+        (True, ("env", "policy")),
+    ],
+    ids=[
+        "sync-policy-first",
+        "sync-env-first",
+        "decoupled-policy-first",
+        "decoupled-env-first",
     ],
 )
-def test_setup_requires_the_run_config(collector_cls):
-    with pytest.raises(ValueError, match="needs the run config"):
-        collector_cls().setup(ChannelContext(name="Actor", cfg=None))
-
-
-def test_selection_matches_the_mode_the_config_asks_for():
-    assert select_trajectory_collector(_config()) is RolloutTrajectoryCollector
-    assert (
-        select_trajectory_collector(_config(runner={"use_training_pipeline": True}))
-        is PipelineTrajectoryCollector
+def test_rollout_output_matches_main_fields_for_sync_and_decoupled(
+    decoupled, part_order
+):
+    """Assert the fields built by main's EnvWorker remain byte-for-byte equal."""
+    cfg = _config(runner={"enable_decoupled_mode": decoupled})
+    collector = _make(cfg)
+    key = TrajectoryKey(3, 0, 0, 0, 0)
+    initial = EnvResult(
+        dones=torch.zeros(1, 1, dtype=torch.bool),
+        truncations=torch.zeros(1, 1, dtype=torch.bool),
+        terminations=torch.zeros(1, 1, dtype=torch.bool),
     )
-    assert (
-        select_trajectory_collector(
-            _config(algorithm={"dagger": {"online_lerobot": {"enabled": True}}})
-        )
-        is OnlineLerobotTrajectoryCollector
+    parts = {
+        "policy": _policy(key),
+        "env": _env_part(key, initial_result=initial),
+    }
+
+    [(_, trajectory)] = _collect(collector, *(parts[name] for name in part_order))
+
+    # These are the exact values main appends in EnvWorker._run_interact_once:
+    # one initial boundary, one policy step, and gamma * terminal bootstrap.
+    assert torch.equal(trajectory.actions, torch.tensor([[[1.0]]]))
+    assert torch.equal(trajectory.prev_logprobs, torch.tensor([[[0.0]]]))
+    assert torch.equal(trajectory.prev_values, torch.tensor([[[0.0]], [[5.0]]]))
+    assert torch.equal(trajectory.rewards, torch.tensor([[[3.0]]]))
+    assert torch.equal(trajectory.dones, torch.tensor([[[False]], [[True]]]))
+    assert torch.equal(trajectory.truncations, torch.tensor([[[False]], [[True]]]))
+    assert torch.equal(trajectory.terminations, torch.tensor([[[False]], [[False]]]))
+    assert torch.equal(trajectory.versions, torch.tensor([[[7.0]]]))
+    assert torch.equal(trajectory.forward_inputs["action"], torch.tensor([[[1.0]]]))
+
+
+@pytest.mark.parametrize("decoupled", [False, True], ids=["async", "decoupled"])
+def test_rollout_sources_flush_independently_like_main_env_workers(decoupled):
+    """A slow env source must not add a global barrier outside pipeline mode."""
+    cfg = _config(
+        env={"train": {"total_num_envs": 2}},
+        runner={"enable_decoupled_mode": decoupled},
+    )
+    collector = _make(cfg, source_count=2)
+    initial = EnvResult(
+        dones=torch.zeros(1, 1, dtype=torch.bool),
+        truncations=torch.zeros(1, 1, dtype=torch.bool),
+        terminations=torch.zeros(1, 1, dtype=torch.bool),
     )
 
+    first_key = TrajectoryKey(4, 0, 0, 0, 0)
+    first_outputs = _collect(
+        collector,
+        _policy(first_key),
+        _env_part(first_key, initial_result=initial),
+    )
+    assert len(first_outputs) == 1
 
-def test_assembler_joins_out_of_order_source_fragments():
-    assembler = TrajectoryEventAssembler(source_batch_size=2)
+    second_key = TrajectoryKey(4, 0, 1, 0, 0)
+    second_outputs = _collect(
+        collector,
+        _env_part(second_key, initial_result=initial),
+        _policy(second_key),
+    )
+    assert len(second_outputs) == 1
+
+
+def test_collector_joins_out_of_order_routed_fragments_and_initial_state():
+    collector = _make(source_count=1, chunk_count=1, shards_per_source=1)
+    collector._joiner._source_batch_size = 2
     key = TrajectoryKey(0, 0, 0, 0, 0)
-    assembler.push(TrajectoryStart(source=_source(key, size=2), result=EnvResult()))
-
-    assert assembler.push(_policy(key, 11, size=1, offset=1)) == []
-    assert assembler.push(_policy(key, 10, size=1, offset=0)) == []
-    chunks = assembler.push(
-        EnvStepResult(
-            sources=[_source(key, size=2)],
-            result=EnvResult(rewards=torch.ones(2, 1)),
-            next_obs={"states": torch.tensor([[20], [21]])},
-            forward_inputs={"states": torch.tensor([[20], [21]])},
-            bootstrap_values=None,
-            final_prev_values=None,
-        )
-    )
-
-    assert len(chunks) == 1
-    assert torch.equal(chunks[0].policy.obs["states"], torch.tensor([[10], [11]]))
-    assert torch.equal(chunks[0].env.next_obs["states"], torch.tensor([[20], [21]]))
-
-
-def test_assembler_reuses_complete_source_events():
-    assembler = TrajectoryEventAssembler(source_batch_size=2)
-    key = TrajectoryKey(0, 0, 0, 0, 0)
-    policy = _policy(key, size=2)
-    env = EnvStepResult(
+    initial = EnvResult(dones=torch.zeros(2, 1, dtype=torch.bool))
+    policy_tail = _policy(key, 11.0, size=1, offset=1)
+    policy_head = _policy(key, 10.0, size=1, offset=0)
+    env = EnvPart(
         sources=[_source(key, size=2)],
-        result=EnvResult(rewards=torch.ones(2, 1)),
-        next_obs={"states": torch.ones(2, 1)},
+        result=EnvResult(
+            rewards=torch.ones(2, 1),
+            dones=torch.ones(2, 1, dtype=torch.bool),
+            truncations=torch.zeros(2, 1, dtype=torch.bool),
+        ),
+        next_obs={"states": torch.tensor([[20], [21]])},
         forward_inputs=None,
         bootstrap_values=None,
         final_prev_values=None,
+        initial_result=initial,
     )
-    assembler.push(TrajectoryStart(source=_source(key, size=2), result=EnvResult()))
 
-    assert assembler.push(policy) == []
-    chunks = assembler.push(env)
+    assert _collect(collector, policy_tail, policy_head) == []
+    [(_, trajectory)] = _collect(collector, env)
 
-    assert chunks[0].policy is policy
-    assert chunks[0].env is env
-
-
-def test_later_chunk_does_not_consume_initial_state():
-    assembler = TrajectoryEventAssembler(source_batch_size=1)
-    first_key = TrajectoryKey(0, 0, 0, 0, 0)
-    later_key = TrajectoryKey(0, 0, 0, 0, 1)
-    initial = EnvResult(dones=torch.zeros(1, 1, dtype=torch.bool))
-    assembler.push(TrajectoryStart(source=_source(first_key), result=initial))
-
-    assembler.push(_policy(later_key))
-    later_chunks = assembler.push(_env_step(later_key))
-    assembler.push(_policy(first_key))
-    first_chunks = assembler.push(_env_step(first_key))
-
-    assert later_chunks[0].initial_env_result is None
-    assert first_chunks[0].initial_env_result is initial
+    assert torch.equal(trajectory.actions, torch.tensor([[[10.0], [11.0]]]))
+    assert torch.equal(trajectory.dones[0], initial.dones)
 
 
-def test_trajectory_start_completes_waiting_chunk():
-    assembler = TrajectoryEventAssembler(source_batch_size=1)
-    key = TrajectoryKey(2, 1, 0, 0, 0)
-    assembler.push(_policy(key))
-    assert assembler.push(_env_step(key)) == []
+def test_collector_rejects_initial_state_after_chunk_zero():
+    collector = _make()
+    key = TrajectoryKey(0, 0, 0, 0, 1)
 
-    chunks = assembler.push(TrajectoryStart(source=_source(key), result=EnvResult()))
-
-    assert len(chunks) == 1
-    assert chunks[0].key == key
+    _collect(collector, _policy(key))
+    with pytest.raises(ValueError, match="Only chunk zero"):
+        _collect(collector, _env_part(key, initial_result=EnvResult()))
 
 
-def test_rollout_collector_bootstraps_reward_and_emits_trajectory():
-    collector = _make(
-        RolloutTrajectoryCollector,
-        _config(),
-        source_count=1,
-        chunk_count=1,
-        shards_per_source=1,
-    )
-    key = TrajectoryKey(3, 0, 0, 0, 0)
+def test_collector_requires_initial_state_for_chunk_zero():
+    collector = _make()
+    key = TrajectoryKey(0, 0, 0, 0, 0)
 
-    outputs = list(collector.emit(_chunk(key, initial_env_result=EnvResult())))
-
-    assert len(outputs) == 1
-    assert outputs[0][0] == DEFAULT_KEY
-    assert torch.equal(outputs[0][1].rewards, torch.tensor([[[3.0]]]))
+    _collect(collector, _policy(key))
+    with pytest.raises(ValueError, match="missing its initial state"):
+        _collect(collector, _env_part(key))
 
 
-def test_rollout_collector_preserves_scope_when_conversion_fails():
-    collector = _make(
-        RolloutTrajectoryCollector,
-        _config(),
-        source_count=1,
-        chunk_count=1,
-        shards_per_source=1,
-    )
-    key = TrajectoryKey(3, 0, 0, 0, 0)
-    builder = Mock()
-    builder.to_splited_trajectories.side_effect = RuntimeError("invalid trajectory")
-    collector._builders = {3: {(0, 0): builder}}
+def test_collector_keeps_joined_parts_when_output_materialization_fails():
+    collector = _make()
+    key = TrajectoryKey(0, 0, 0, 0, 0)
+    policy = _policy(key)
+    env = _env_part(key, initial_result=EnvResult())
+    original_emit = collector._output.emit
+    collector._output.emit = Mock(side_effect=RuntimeError("invalid output"))
 
-    with pytest.raises(RuntimeError, match="invalid trajectory"):
-        list(collector.emit(_chunk(key)))
+    _collect(collector, policy)
+    with pytest.raises(RuntimeError, match="invalid output"):
+        _collect(collector, env)
 
-    assert collector._builders == {3: {(0, 0): builder}}
-    assert collector._completed_keys == {key}
+    collector._output.emit = original_emit
+    assert len(_collect(collector, policy)) == 1
 
 
 def test_rollout_collector_rejects_duplicate_completed_key():
     cfg = _config(env={"train": {"rollout_epoch": 2}})
-    collector = _make(
-        RolloutTrajectoryCollector,
-        cfg,
-        source_count=1,
-        chunk_count=1,
-        shards_per_source=1,
-    )
+    collector = _make(cfg)
     key = TrajectoryKey(3, 0, 0, 0, 0)
-    list(collector.emit(_chunk(key)))
 
+    assert (
+        _collect(collector, _policy(key), _env_part(key, initial_result=EnvResult()))
+        == []
+    )
     with pytest.raises(ValueError, match="duplicate trajectory event"):
-        list(collector.emit(_chunk(key)))
+        _collect(collector, _policy(key), _env_part(key, initial_result=EnvResult()))
 
 
-def test_online_lerobot_collector_accepts_dummy_step_and_emits_shards():
+def test_history_reward_assignment_matches_main_across_chunks():
+    cfg = _config(
+        env={
+            "train": {
+                "auto_reset": False,
+                "max_steps_per_rollout_epoch": 2,
+            }
+        },
+        reward={
+            "env_reward_weight": 1.0,
+            "history_reward_assign": True,
+            "reward_mode": "history_buffer",
+            "reward_weight": 2.0,
+        },
+    )
+    collector = _make(cfg, chunk_count=2)
+    initial = EnvResult(
+        dones=torch.zeros(1, 1, dtype=torch.bool),
+        truncations=torch.zeros(1, 1, dtype=torch.bool),
+        terminations=torch.zeros(1, 1, dtype=torch.bool),
+    )
+    first_key = TrajectoryKey(3, 0, 0, 0, 0)
+    second_key = TrajectoryKey(3, 0, 0, 0, 1)
+    first_env = _env_part(first_key, initial_result=initial)
+    first_env.result.dones = torch.zeros(1, 1, dtype=torch.bool)
+    first_env.result.truncations = torch.zeros(1, 1, dtype=torch.bool)
+    second_env = _env_part(second_key)
+    second_env.result.reward_model_output = torch.tensor([[3.0]])
+    second_env.result.reward_assign_lengths = [2]
+
+    assert _collect(collector, _policy(first_key), first_env) == []
+    [(_, trajectory)] = _collect(
+        collector,
+        second_env,
+        _policy(second_key),
+    )
+
+    # Current reward: 1 + 2 * 3. History assignment adds 2 * 3 to step 0.
+    assert torch.equal(trajectory.rewards, torch.tensor([[[7.0]], [[7.0]]]))
+
+
+@pytest.mark.parametrize("loss_type", ["rlt_ac", "rlt_td3"])
+def test_rlt_output_matches_main_transition_and_intervention_behavior(loss_type):
+    collector = _make(_config(algorithm={"loss_type": loss_type}))
+    key = TrajectoryKey(3, 0, 0, 0, 0)
+    current_ref_chunk = torch.tensor([[1.0, 2.0]])
+    intervened_chunk = torch.tensor([[9.0, 8.0]])
+    policy = PolicyPart(
+        sources=[_source(key)],
+        obs={"states": torch.zeros(1, 1)},
+        rollout_result=EmbodiedRolloutResult(
+            actions=current_ref_chunk,
+            forward_inputs={
+                "action": current_ref_chunk,
+                "z_rl": torch.tensor([[3.0, 4.0]]),
+                "proprio": torch.tensor([[5.0, 6.0, 7.0]]),
+                "ref_chunk": current_ref_chunk,
+            },
+            prev_logprobs=torch.zeros(1, 1),
+            prev_values=torch.zeros(1, 1),
+        ),
+    )
+    env = EnvPart(
+        sources=[_source(key)],
+        result=EnvResult(
+            rewards=torch.ones(1, 1),
+            dones=torch.zeros(1, 1, dtype=torch.bool),
+            truncations=torch.zeros(1, 1, dtype=torch.bool),
+            intervene_actions=intervened_chunk,
+            intervene_flags=torch.ones(1, 1, dtype=torch.bool),
+        ),
+        next_obs={"states": torch.ones(1, 1)},
+        forward_inputs={
+            "rlt_transition_z_rl": torch.tensor([[13.0, 14.0]]),
+            "rlt_transition_proprio": torch.tensor([[15.0, 16.0, 17.0]]),
+            "rlt_transition_ref_chunk": torch.tensor([[11.0, 12.0]]),
+        },
+        bootstrap_values=None,
+        final_prev_values=None,
+        initial_result=EnvResult(),
+    )
+
+    [(_, trajectory)] = _collect(collector, env, policy)
+
+    assert set(trajectory.curr_obs) == {"z_rl", "proprio", "ref_chunk"}
+    assert set(trajectory.next_obs) == {"z_rl", "proprio", "ref_chunk"}
+    assert torch.equal(trajectory.curr_obs["ref_chunk"][0], intervened_chunk)
+    assert torch.equal(
+        trajectory.next_obs["ref_chunk"][0], torch.tensor([[11.0, 12.0]])
+    )
+
+
+def test_pipeline_output_contains_main_actor_training_fields():
+    collector = _make(
+        _config(runner={"use_training_pipeline": True}),
+        actor_world_size=1,
+    )
+    key = TrajectoryKey(2, 0, 0, 0, 0)
+    initial = EnvResult(
+        dones=torch.zeros(1, 1, dtype=torch.bool),
+        truncations=torch.zeros(1, 1, dtype=torch.bool),
+        terminations=torch.zeros(1, 1, dtype=torch.bool),
+    )
+
+    [(queue_key, batch)] = _collect(
+        collector,
+        _policy(key),
+        _env_part(key, initial_result=initial),
+    )
+
+    assert queue_key == "0_0_pipeline_actor"
+    assert {
+        "actions",
+        "advantages",
+        "dones",
+        "prev_logprobs",
+        "prev_values",
+        "returns",
+        "rewards",
+    } <= batch.keys()
+    assert batch["actions"].shape[0] == 1
+    assert batch["advantages"].shape == batch["returns"].shape
+
+
+def test_pipeline_waits_for_all_sources_and_routes_each_actor_like_main():
+    cfg = _config(
+        env={"train": {"total_num_envs": 2}},
+        runner={"use_training_pipeline": True},
+    )
+    collector = _make(
+        cfg,
+        source_count=2,
+        actor_world_size=2,
+    )
+    initial = EnvResult(
+        dones=torch.zeros(1, 1, dtype=torch.bool),
+        truncations=torch.zeros(1, 1, dtype=torch.bool),
+        terminations=torch.zeros(1, 1, dtype=torch.bool),
+    )
+    first_key = TrajectoryKey(2, 0, 0, 0, 0)
+    second_key = TrajectoryKey(2, 0, 1, 0, 0)
+
+    assert (
+        _collect(
+            collector,
+            _policy(first_key),
+            _env_part(first_key, initial_result=initial),
+        )
+        == []
+    )
+    outputs = _collect(
+        collector,
+        _env_part(second_key, initial_result=initial),
+        _policy(second_key),
+    )
+
+    assert {queue_key for queue_key, _ in outputs} == {
+        "0_0_pipeline_actor",
+        "1_1_pipeline_actor",
+    }
+    assert all("advantages" in batch for _, batch in outputs)
+
+
+def test_pipeline_flushes_each_epoch_to_the_actor_specific_key():
+    collector = _make(
+        _config(runner={"use_training_pipeline": True}),
+        actor_world_size=1,
+    )
+    collector._output._prepare_pipeline_batch = lambda trajectory: {"value": trajectory}
+    collector._output._pipeline_micro_batches = lambda batch, actor_rank: [batch]
+
+    for epoch_id in (0, 1):
+        key = TrajectoryKey(2, epoch_id, 0, 0, 0)
+        outputs = _collect(
+            collector,
+            _env_part(key, initial_result=EnvResult()),
+            _policy(key),
+        )
+        assert outputs[0][0] == "0_0_pipeline_actor"
+        assert (2, epoch_id) not in collector._output._accumulators
+
+
+def test_online_lerobot_accepts_external_policy_actions_and_emits_shards():
     cfg = _config(
         algorithm={"dagger": {"online_lerobot": {"enabled": True}}},
     )
-    collector = _make(
-        OnlineLerobotTrajectoryCollector,
-        cfg,
-        source_count=1,
-        chunk_count=1,
-        shards_per_source=2,
-    )
+    collector = _make(cfg, shards_per_source=2)
     key = TrajectoryKey(3, 0, 0, 0, 0)
-    dummy = DummyPolicyStep(
-        sources=[_source(key)],
-        obs={"states": torch.zeros(1, 1)},
-        actions=torch.zeros(1, 1, 1),
-    )
-    env = _env_step(key, episode_data=_episode_data())
 
-    outputs = list(collector.emit(_chunk(key, policy=dummy, env=env)))
+    outputs = _collect(
+        collector,
+        _policy(key, external=True),
+        _env_part(key, episode_data=_episode_data(), initial_result=EnvResult()),
+    )
 
     assert len(outputs) == 2
     assert all(key == DEFAULT_KEY for key, _ in outputs)
 
 
-def test_pipeline_collector_routes_completed_epoch_to_actor():
-    cfg = _config(runner={"use_training_pipeline": True})
-    collector = _make(
-        PipelineTrajectoryCollector,
-        cfg,
-        source_count=1,
-        chunk_count=1,
-        actor_world_size=1,
-    )
-    collector._prepare_pipeline_batch = lambda trajectory: {"value": trajectory}
-    collector._pipeline_micro_batches = lambda batch, actor_rank: [batch]
-    key = TrajectoryKey(2, 1, 0, 0, 0)
-
-    outputs = list(collector.emit(_chunk(key, initial_env_result=EnvResult())))
-
-    assert len(outputs) == 1
-    assert outputs[0][0] == "actor:0"
-    assert (2, 1) not in collector._builders
-
-
-@pytest.mark.parametrize(
-    ("overrides", "expected_type"),
-    [
-        ({}, RolloutTrajectoryCollector),
-        (
-            {"runner": {"use_training_pipeline": True}},
-            PipelineTrajectoryCollector,
-        ),
-        (
-            {"algorithm": {"dagger": {"online_lerobot": {"enabled": True}}}},
-            OnlineLerobotTrajectoryCollector,
-        ),
-    ],
-)
-def test_collector_factory_selects_configured_strategy(overrides, expected_type):
-    assert select_trajectory_collector(_config(**overrides)) is expected_type
-
-
-def test_collector_factory_rejects_pipeline_with_online_lerobot():
-    cfg = _config(
-        runner={"use_training_pipeline": True},
-        algorithm={"dagger": {"online_lerobot": {"enabled": True}}},
-    )
-
-    with pytest.raises(ValueError, match="does not support online LeRobot"):
-        select_trajectory_collector(cfg)
-
-
-def test_online_lerobot_dummy_step_records_intervened_action():
-    collector = EmbodiedLerobotTrajectoryBuilder(
+def test_online_lerobot_accumulator_records_external_intervened_action():
+    accumulator = LerobotEpisodeAccumulator(
         max_episode_length=4,
         num_envs=1,
         num_action_chunks=1,
         action_dim=2,
     )
 
-    collector.append_chunk_episode_data(
+    accumulator.append_chunk_episode_data(
         policy_output=None,
         chunk_actions=torch.tensor([[[1.0, 2.0]]]),
         obs_list=[
@@ -457,7 +636,7 @@ def test_online_lerobot_dummy_step_records_intervened_action():
                 "task_descriptions": ["pick"],
             }
         ],
-        terminations=torch.tensor([[False]]),
+        terminations=torch.tensor([[True]]),
         truncations=torch.tensor([[False]]),
         infos_list=[
             {
@@ -467,6 +646,7 @@ def test_online_lerobot_dummy_step_records_intervened_action():
         ],
     )
 
-    frame = collector._env_buffers[0][0]
-    assert np.array_equal(frame["actions"], np.array([9.0, 8.0]))
-    assert frame["intervene_flag"].item()
+    [episode] = accumulator.drain_episodes()
+    assert torch.equal(
+        torch.from_numpy(episode[0]["actions"]), torch.tensor([9.0, 8.0])
+    )

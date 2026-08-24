@@ -32,16 +32,13 @@ from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import (
     DummyPolicyInput,
     EmbodiedRolloutResult,
+    EnvPart,
     PolicyCompletion,
     PolicyInput,
     PolicyOutput,
+    PolicyPart,
     merge_policy_inputs,
     split_batch_value,
-)
-from rlinf.data.schema.trajectory_events import (
-    DummyPolicyStep,
-    EnvStepResult,
-    PolicyStep,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
@@ -721,10 +718,11 @@ class MultiStepRolloutWorker(Worker):
         self,
         completion: PolicyCompletion,
         forward_inputs: dict[str, Any] | None,
-        trajectory_channel: Channel,
+        actor_channel: Channel,
     ) -> None:
         bootstrap_values = None
         final_prev_values = None
+        # Terminal inference contributes values or transition features only.
         if completion.requires_inference and self._terminal_inference_is_useful():
             _, result = self._predict_rollout_actions(completion.next_obs)
             values = result.get("prev_values")
@@ -732,14 +730,16 @@ class MultiStepRolloutWorker(Worker):
                 final_prev_values = values.cpu().contiguous()
                 bootstrap_values = final_prev_values[:, :1]
             forward_inputs = result.get("forward_inputs")
-        trajectory_channel.put(
-            EnvStepResult(
+        # Republish environment-owned data here to keep one Actor-channel writer.
+        actor_channel.put(
+            EnvPart(
                 sources=completion.sources,
                 result=completion.env_result,
                 next_obs=completion.next_obs,
                 forward_inputs=forward_inputs,
                 bootstrap_values=bootstrap_values,
                 final_prev_values=final_prev_values,
+                initial_result=completion.initial_result,
             ),
             async_op=True,
         )
@@ -779,7 +779,7 @@ class MultiStepRolloutWorker(Worker):
         self,
         input_channel: Channel,
         output_channel: Channel,
-        trajectory_channel: Channel,
+        actor_channel: Channel,
     ) -> None:
         self.update_dagger_beta()
         for _ in range(self.n_train_chunk_steps):
@@ -808,25 +808,26 @@ class MultiStepRolloutWorker(Worker):
                     split_sizes,
                 )
                 if isinstance(policy_input, DummyPolicyInput):
-                    trajectory_event = DummyPolicyStep(
+                    trajectory_part = PolicyPart(
                         sources=policy_input.sources,
                         obs=policy_input.obs,
-                        actions=actions,
+                        external_actions=actions,
                     )
                 else:
-                    trajectory_event = PolicyStep(
+                    trajectory_part = PolicyPart(
                         sources=policy_input.sources,
                         obs=policy_input.obs,
                         rollout_result=self._build_rollout_result(actions, result),
                     )
-                trajectory_channel.put(trajectory_event, async_op=True)
+                # Publish model-owned data immediately; its environment half
+                # arrives later through a PolicyCompletion with the same key.
+                actor_channel.put(trajectory_part, async_op=True)
                 for completion, next_inputs in zip(
                     policy_input.completions, forward_inputs
                 ):
                     if completion is not None:
-                        self._publish_completion(
-                            completion, next_inputs, trajectory_channel
-                        )
+                        # This completion closes a previously executed chunk.
+                        self._publish_completion(completion, next_inputs, actor_channel)
 
         if self.env_decoupled_mode:
             return
@@ -839,14 +840,16 @@ class MultiStepRolloutWorker(Worker):
                 raise ValueError("Expected a final policy input at epoch end.")
             for completion in policy_input.completions:
                 if completion is not None:
-                    self._publish_completion(completion, None, trajectory_channel)
+                    # The final message carries the last chunk without requesting
+                    # another action from the policy.
+                    self._publish_completion(completion, None, actor_channel)
 
     @Worker.timer("rollout/generate")
     async def generate(
         self,
         input_channel: Channel,
         output_channel: Channel,
-        trajectory_channel: Channel,
+        actor_channel: Channel,
     ):
         if self.enable_offload:
             self.reload_model()
@@ -859,7 +862,7 @@ class MultiStepRolloutWorker(Worker):
             await self.generate_one_epoch(
                 input_channel,
                 output_channel,
-                trajectory_channel,
+                actor_channel,
             )
         if self.enable_offload:
             self.offload_model()

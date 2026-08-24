@@ -1,86 +1,101 @@
 Embodied Data Interface
-========================
+=======================
 
-This section describes the core data structures used during rollout and training
-in embodied settings: `EnvOutput`, `PolicyOutput`, `ChunkStepResult`,
-`EmbodiedTrajectoryBuilder`, and `Trajectory`. Together, they connect environment
-outputs, policy communication, chunk-step accumulation, trajectory construction,
-and training batches.
+The embodied data interface separates runtime communication from Actor-facing
+training data:
 
-Relationships
--------------
+.. code-block:: text
 
-- `EnvOutput`: raw environment outputs per chunk step (obs, reward, done, etc.).
-- `PolicyOutput`: policy/rollout-worker outputs for one communication round
-  (actions, log-probabilities, values, etc.).
-- `ChunkStepResult`: env-side per-chunk package combining policy outputs with
-  reward and termination signals.
-- `EmbodiedTrajectoryBuilder`: accumulates chunk-step results and transitions.
-- `Trajectory`: aggregated trajectory tensors (typically `[T, B, ...]`).
+   EnvOutput
+       -> PolicyInput (+ previous PolicyCompletion)
+       -> PolicyOutput(actions)
 
-Typical flow::
+   PolicyPart + EnvPart
+       -> TrajectoryCollector
+       -> Trajectory / episode shard / pipeline micro-batch
 
-   EnvOutput -> PolicyOutput -> ChunkStepResult -> EmbodiedTrajectoryBuilder -> Trajectory
+See :doc:`../../concepts/trajectory_collector` for the lifecycle, data
+ownership, and execution-mode semantics.
 
-`EmbodiedTrajectoryBuilder.to_splited_trajectories()` can split trajectories along the
-batch dimension for Channel distribution to multiple Actor/Trainer workers.
+Environment and policy messages
+-------------------------------
 
-EnvOutput
----------
-
-`EnvOutput` describes environment-side outputs, including observations and
-episode-termination signals. During initialization, tensors are moved to CPU
-and made contiguous.
+``EnvOutput`` is the local result of environment reset or action execution.
+``PolicyInput`` transports observations to Rollout and may carry the previous
+action's ``PolicyCompletion``. ``PolicyOutput`` is the action-only response sent
+back to Env.
 
 .. autoclass:: rlinf.data.schema.embodied_types.EnvOutput
    :members:
    :member-order: bysource
 
-PolicyOutput
-------------
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyInput
+   :members:
+   :member-order: bysource
 
-`PolicyOutput` is the message sent from the rollout worker to the env worker for
-one communication round. It carries actions and optional training signals such
-as log-probabilities, values, intervene flags, and forward inputs.
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyCompletion
+   :members:
+   :member-order: bysource
 
 .. autoclass:: rlinf.data.schema.embodied_types.PolicyOutput
    :members:
    :member-order: bysource
 
-ChunkStepResult
----------------
+Trajectory parts
+----------------
 
-`ChunkStepResult` represents per-step inference results and training signals,
-including actions, log-probabilities, value estimates, and extra forward inputs.
-Tensors are moved to CPU on initialization.
+``PolicyPart`` and ``EnvPart`` are the only Actor channel input types. They are
+matched by ``TrajectoryKey``. ``TrajectorySource`` preserves source size and
+offset when channel routing splits a batch.
 
-.. autoclass:: rlinf.data.schema.embodied_types.ChunkStepResult
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectoryKey
    :members:
    :member-order: bysource
 
-EmbodiedTrajectoryBuilder
---------------------------
-
-`EmbodiedTrajectoryBuilder` accumulates chunk-step results and transitions during
-rollout, and provides conversion utilities:
-
-- `append_step_result()`: append chunk-step results
-- `append_transitions()`: append current/next transition observations
-- `to_trajectory()`: concatenate into trajectory tensors
-- `to_splited_trajectories()`: split trajectories along the batch dimension
-
-.. autoclass:: rlinf.data.schema.embodied_trajectory_builder.EmbodiedTrajectoryBuilder
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectorySource
    :members:
    :member-order: bysource
 
-Trajectory
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyPart
+   :members:
+   :member-order: bysource
+
+.. autoclass:: rlinf.data.schema.embodied_types.EnvPart
+   :members:
+   :member-order: bysource
+
+Collection
 ----------
 
-`Trajectory` is the final trajectory representation for training. It includes
-actions, rewards, termination flags, observations, and model forward inputs.
-The typical tensor shape is `[T, B, ...]`, where **T is the chunk-step count**
-and **B is the number of parallel environments** (batch dimension).
+``TrajectoryPlan`` validates the configured output mode and derives rollout
+geometry. ``TrajectoryCollector`` is the one public channel collector for every
+embodied mode.
+
+.. autoclass:: rlinf.data.schema.trajectory_collector.TrajectoryMode
+   :members:
+
+.. autoclass:: rlinf.data.schema.trajectory_collector.TrajectoryPlan
+   :members:
+   :member-order: bysource
+
+.. autoclass:: rlinf.data.schema.trajectory_collector.TrajectoryCollector
+   :members:
+   :member-order: bysource
+
+Actor output
+------------
+
+``Trajectory`` contains the tensors used by non-pipeline Actor workers. Its
+typical layout is ``[T, B, ...]``. Boundary and bootstrap fields may have
+``T + 1`` entries.
+
+``ChunkStepResult`` describes the data retained for one joined action chunk.
+Sequence accumulation is a private collector implementation detail.
 
 .. autoclass:: rlinf.data.schema.embodied_types.Trajectory
+   :members:
+   :member-order: bysource
+
+.. autoclass:: rlinf.data.schema.embodied_types.ChunkStepResult
    :members:
    :member-order: bysource

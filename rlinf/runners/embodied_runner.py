@@ -22,7 +22,10 @@ from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
-from rlinf.data.schema.embodied_channel import select_trajectory_collector
+from rlinf.data.schema.trajectory_collector import (
+    select_trajectory_collector,
+    select_trajectory_dispatcher,
+)
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
@@ -99,8 +102,9 @@ class EmbodiedRunner:
         self.actor_channel = Channel.create(
             "Actor",
             collector=select_trajectory_collector(self.cfg),
+            dispatcher=select_trajectory_dispatcher(self.cfg),
             cfg=self.cfg,
-            producers=[self.env, self.rollout],
+            producers=[self.rollout],
             consumers=[self.actor],
         )
         if self.reward is not None:
@@ -511,12 +515,11 @@ class EmbodiedRunner:
                         input_channel=self.env_channel,
                         rollout_channel=self.rollout_channel,
                         reward_channel=self.reward_channel,
-                        trajectory_channel=self.actor_channel,
                     )
                     rollout_handle: Handle = self.rollout.generate(
                         input_channel=self.rollout_channel,
                         output_channel=self.env_channel,
-                        trajectory_channel=self.actor_channel,
+                        actor_channel=self.actor_channel,
                     )
                     reward_handle = None
                     if self.reward is not None:
@@ -544,7 +547,6 @@ class EmbodiedRunner:
                     if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
                         env_bootstrap_handle = self.env.prefetch_train_bootstrap(
                             rollout_channel=self.rollout_channel,
-                            trajectory_channel=self.actor_channel,
                         )
 
                     actor_training_metrics = actor_training_handle.wait()
@@ -597,12 +599,11 @@ class EmbodiedRunner:
                     input_channel=self.env_channel,
                     rollout_channel=self.rollout_channel,
                     reward_channel=self.reward_channel,
-                    trajectory_channel=self.actor_channel,
                 )
                 rollout_handle: Handle = self.rollout.generate(
                     input_channel=self.rollout_channel,
                     output_channel=self.env_channel,
-                    trajectory_channel=self.actor_channel,
+                    actor_channel=self.actor_channel,
                 )
                 reward_handle = None
                 if self.reward is not None:
@@ -623,7 +624,6 @@ class EmbodiedRunner:
                 if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
                     env_bootstrap_handle = self.env.prefetch_train_bootstrap(
                         rollout_channel=self.rollout_channel,
-                        trajectory_channel=self.actor_channel,
                     )
 
                 actor_results = actor_training_handle.wait()
