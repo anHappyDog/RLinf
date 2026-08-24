@@ -61,7 +61,7 @@ driver and propagates the same settings to every Worker, so ordinary
    cluster:
      collective:
        tensor_buffer_pool:
-         max_bytes: 1073741824
+         max_bytes: 2147483648
        tensor_compression:
          enabled: true
          codec: lz4
@@ -81,7 +81,7 @@ driver and propagates the same settings to every Worker, so ordinary
   ``CollectiveGroup`` instances in one Worker.
 
 ``tensor_buffer_pool`` is independent of compression. Its ``max_bytes`` field
-limits active plus cached CPU tensor buffers in one Worker and defaults to 1
+limits active plus cached CPU tensor buffers in one Worker and defaults to 2
 GiB. When compression is configured without this block, the default pool is
 created automatically.
 
