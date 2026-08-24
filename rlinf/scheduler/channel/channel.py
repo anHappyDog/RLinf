@@ -14,7 +14,7 @@
 
 import asyncio
 import uuid
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 import ray
 import ray.actor
@@ -28,6 +28,7 @@ from ..collective import (
 )
 from ..placement import NodePlacementStrategy
 from ..worker import Worker, WorkerGroup
+from .hooks import ChannelContext
 
 if TYPE_CHECKING:
     from .channel_worker import ChannelWorker, LocalChannel
@@ -147,6 +148,12 @@ class Channel:
         node_rank: int = 0,
         local: bool = False,
         disable_distributed_log: bool = True,
+        collector: Any = None,
+        dispatcher: Any = None,
+        cfg: Any = None,
+        producers: Optional[Iterable[str]] = None,
+        consumers: Optional[Iterable[str]] = None,
+        hook_options: Optional[dict[str, Any]] = None,
     ) -> "Channel":
         """Create a new channel with the specified name, node ID, and accelerator ID.
 
@@ -157,6 +164,16 @@ class Channel:
             node_rank (int): The node rank of the current worker. Only valid when distributed is False.
             local (bool): Create the channel for intra-process communication. A local channel cannot be connected by other workers, and its data cannot be shared among different processes.
             disable_distributed_log (bool): Whether to disable distributed log for the channel.
+            collector (Any): Transforms items on the way into the channel. A registered name,
+                a ``"module:ClassName"`` import path, a :class:`~rlinf.scheduler.channel.Collector`
+                subclass, or an instance. Defaults to passing items through unchanged.
+            dispatcher (Any): Chooses which consumer receives each item, in the same forms.
+                Defaults to one shared queue per key, which every consumer competes for.
+            cfg (Any): Run configuration handed to the hooks' ``setup``.
+            producers (Iterable[str]): Worker group names expected to put into this channel.
+            consumers (Iterable[str]): Consumer ids expected to get from it, each
+                ``"<group>:<rank>"``. A dealing dispatcher needs these to split work evenly.
+            hook_options (dict): Free-form options handed to the hooks' ``setup``.
 
         Returns:
             Channel: A new instance of the Channel class.
@@ -184,8 +201,20 @@ class Channel:
             placement = NodePlacementStrategy(node_ranks=list(range(cluster.num_nodes)))
         else:
             placement = NodePlacementStrategy(node_ranks=[node_rank])
+        context = ChannelContext(
+            name=name,
+            cfg=cfg,
+            producers=tuple(producers or ()),
+            consumers=tuple(consumers or ()),
+            options=dict(hook_options or {}),
+        )
         try:
-            channel_worker_group = ChannelWorker.create_group(maxsize=maxsize).launch(
+            channel_worker_group = ChannelWorker.create_group(
+                maxsize=maxsize,
+                collector=collector,
+                dispatcher=dispatcher,
+                context=context,
+            ).launch(
                 cluster=cluster,
                 name=name,
                 placement_strategy=placement,
@@ -310,11 +339,13 @@ class Channel:
         """Get the actor handle for a channel rank, falling back to the main actor."""
         return self._channel_actors_by_rank.get(rank, self._main_channel_worker_actor)
 
-    def qsize(self, key: Any = DEFAULT_KEY) -> int:
+    def qsize(self, key: Any = DEFAULT_KEY, consumer: Optional[str] = None) -> int:
         """Get the size of the channel queue.
 
         Args:
             key (Any): check the queue associated with the key.
+            consumer (str): With a dealing dispatcher, report only this consumer's
+                share instead of the total outstanding across all consumers.
 
         Returns:
             int: The number of items in the channel queue.
@@ -324,7 +355,7 @@ class Channel:
             return self._local_channel.qsize(key)
         target_rank = self._get_channel_rank_by_key(key)
         target_actor = self._get_channel_actor(target_rank)
-        return ray.get(target_actor.qsize.remote(key))
+        return ray.get(target_actor.qsize.remote(key, consumer))
 
     def empty(self, key: Any = DEFAULT_KEY) -> bool:
         """Check if the channel queue is empty.
