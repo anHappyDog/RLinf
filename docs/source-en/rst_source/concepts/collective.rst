@@ -118,7 +118,7 @@ Configure Compression
          codec: lz4
          level: 1
          min_bytes: 65536
-         max_inflight: 2
+         max_inflight: 4
 
 Omit ``tensor_compression`` or set ``enabled: false`` to use the original wire
 path. The compression options and defaults are:
@@ -143,7 +143,7 @@ path. The compression options and defaults are:
      - ``65536``
      - Skips tensors smaller than this raw byte count.
    * - ``max_inflight``
-     - ``1``
+     - ``4``
      - Creates this many encoder instances and this many decoder instances per
        Worker.
 
