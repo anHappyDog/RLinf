@@ -25,6 +25,10 @@ from rlinf.scheduler.collective.collective_group import (
     CollectiveGroup,
     CollectiveGroupOptions,
 )
+from rlinf.scheduler.collective.tensor_buffer_pool import (
+    TensorBufferPool,
+    TensorBufferPoolOptions,
+)
 from rlinf.scheduler.collective.tensor_compression import (
     TensorCodecPool,
     TensorCompressionOptions,
@@ -35,36 +39,92 @@ from rlinf.utils.tensor_codec import LZ4TensorCodec
 
 
 def test_codec_pool_prefers_a_reused_compressor_and_its_buffer():
-    """A released slot outranks an unused slot and retains its workspace."""
-    pool = TensorCodecPool(TensorCompressionOptions(max_inflight=2))
+    """Released codecs and buffers are preferred over unused resources."""
+    codec_pool = TensorCodecPool(TensorCompressionOptions(max_inflight=2))
+    buffer_pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=512))
 
-    first_lease = pool.try_acquire_compressor()
+    first_lease = codec_pool.try_acquire_compressor()
     assert first_lease is not None
-    first_slot = first_lease.slot
-    first_buffer = first_slot.acquire_buffer(128)
+    first_codec = first_lease.codec
+    first_buffer_lease = buffer_pool.try_acquire(128)
+    assert first_buffer_lease is not None
+    first_buffer = first_buffer_lease.tensor
+    first_lease.retain_buffer(first_buffer_lease)
     first_lease.release()
 
-    reused_lease = pool.try_acquire_compressor()
+    reused_lease = codec_pool.try_acquire_compressor()
     assert reused_lease is not None
-    assert reused_lease.slot is first_slot
-    assert reused_lease.slot.acquire_buffer(64).data_ptr() == first_buffer.data_ptr()
+    assert reused_lease.codec is first_codec
+    reused_buffer = buffer_pool.try_acquire(64)
+    assert reused_buffer is not None
+    assert reused_buffer.tensor.data_ptr() == first_buffer.data_ptr()
+    reused_lease.retain_buffer(reused_buffer)
     reused_lease.release()
 
 
-def test_codec_slot_uses_best_fit_workspaces_independent_of_tensor_order():
-    """A slot chooses the smallest retained workspace that can hold each output."""
-    pool = TensorCodecPool(TensorCompressionOptions())
-    lease = pool.try_acquire_compressor()
-    assert lease is not None
-    large_buffer = lease.slot.acquire_buffer(512)
-    small_buffer = lease.slot.acquire_buffer(128)
-    lease.release()
+def test_buffer_pool_uses_best_fit_buffers_independent_of_tensor_order():
+    """The Worker-wide pool chooses the smallest tensor buffer that fits."""
+    pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=1024))
+    large_lease = pool.try_acquire(512)
+    small_lease = pool.try_acquire(128)
+    assert large_lease is not None
+    assert small_lease is not None
+    large_buffer = large_lease.tensor
+    small_buffer = small_lease.tensor
+    large_lease.release()
+    small_lease.release()
 
-    reused_lease = pool.try_acquire_compressor()
-    assert reused_lease is not None
-    assert reused_lease.slot.acquire_buffer(100).data_ptr() == small_buffer.data_ptr()
-    assert reused_lease.slot.acquire_buffer(300).data_ptr() == large_buffer.data_ptr()
-    reused_lease.release()
+    small_reuse = pool.try_acquire(100)
+    large_reuse = pool.try_acquire(300)
+    assert small_reuse is not None
+    assert large_reuse is not None
+    assert small_reuse.tensor.data_ptr() == small_buffer.data_ptr()
+    assert large_reuse.tensor.data_ptr() == large_buffer.data_ptr()
+    small_reuse.release()
+    large_reuse.release()
+
+
+def test_buffer_pool_never_exceeds_its_worker_budget():
+    """Active buffers make later acquisitions fall back without overallocating."""
+    pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=512))
+    buffer = pool.try_acquire(400)
+    assert buffer is not None
+    assert pool.try_acquire(200) is None
+    assert pool.allocated_bytes == 400
+
+    buffer.release(cache=False)
+    assert pool.allocated_bytes == 0
+
+
+def test_buffer_pool_evicts_idle_buffers_to_fit_a_new_shape():
+    """Historical shapes cannot make the bounded cache grow indefinitely."""
+    pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=512))
+    old_buffer = pool.try_acquire(128)
+    assert old_buffer is not None
+    old_buffer.release()
+
+    replacement = pool.try_acquire(512)
+    assert replacement is not None
+    assert pool.allocated_bytes == 512
+    replacement.release()
+
+
+def test_buffer_pool_preserves_a_large_buffer_when_a_small_one_can_fit():
+    """A speculative small compression cannot consume a much larger buffer."""
+    pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=256))
+    large_lease = pool.try_acquire(128)
+    assert large_lease is not None
+    large_buffer = large_lease.tensor
+    large_lease.release()
+
+    small_lease = pool.try_acquire(1)
+    assert small_lease is not None
+    assert small_lease.tensor.data_ptr() != large_buffer.data_ptr()
+    small_lease.release(cache=False)
+    reused_large = pool.try_acquire(100)
+    assert reused_large is not None
+    assert reused_large.tensor.data_ptr() == large_buffer.data_ptr()
+    reused_large.release()
 
 
 def test_codec_pool_never_waits_for_a_busy_compressor():
@@ -82,20 +142,21 @@ def test_codec_pool_never_waits_for_a_busy_compressor():
 def test_codec_pool_compresses_and_restores_a_tensor(codec):
     """A slot's codec writes into its reusable buffer without altering bytes."""
     options = TensorCompressionOptions(codec=codec)
-    pool = TensorCodecPool(options)
-    lease = pool.try_acquire_compressor()
+    codec_pool = TensorCodecPool(options)
+    buffer_pool = TensorBufferPool(TensorBufferPoolOptions())
+    lease = codec_pool.try_acquire_compressor()
     assert lease is not None
 
     source = torch.zeros(128 * 1024, dtype=torch.uint8)
     try:
-        destination = lease.slot.acquire_buffer(
-            lease.slot.codec.compress_bound(source.numel())
-        )
-        compressed_numel = lease.slot.codec.compress_into(source, destination)
+        buffer = buffer_pool.try_acquire(lease.codec.compress_bound(source.numel()))
+        assert buffer is not None
+        compressed_numel = lease.codec.compress_into(source, buffer.tensor)
         assert compressed_numel < source.numel()
+        lease.retain_buffer(buffer)
 
         restored = torch.empty_like(source)
-        decompressor = pool.acquire_decompressor(
+        decompressor = codec_pool.acquire_decompressor(
             TensorCompressionWireMetadata(
                 codec=codec,
                 level=options.level,
@@ -103,9 +164,9 @@ def test_codec_pool_compresses_and_restores_a_tensor(codec):
             )
         )
         try:
-            assert decompressor.codec is not lease.slot.codec
+            assert decompressor.codec is not lease.codec
             decompressor.codec.decompress_into(
-                destination[:compressed_numel], compressed_numel, restored
+                buffer.tensor[:compressed_numel], compressed_numel, restored
             )
         finally:
             decompressor.release()
@@ -129,13 +190,16 @@ def test_tensor_over_codec_bound_skips_compression(monkeypatch):
     group = object.__new__(CollectiveGroup)
     options = TensorCompressionOptions(min_bytes=1)
     pool = TensorCodecPool(options)
-    group._tensor_codec_pool = pool
-    group._tensor_codec_pool_lock = threading.Lock()
+    buffer_pool = TensorBufferPool(TensorBufferPoolOptions())
+    group._worker = SimpleNamespace(
+        _get_tensor_codec_pool=lambda: pool,
+        _get_tensor_buffer_pool=lambda: buffer_pool,
+    )
     group._tensor_compression = options
     tensor = torch.zeros(128, dtype=torch.uint8)
 
     monkeypatch.setattr(
-        pool._fresh_compressors.queue[0].codec,
+        pool._fresh_compressors.queue[0],
         "compress_bound",
         lambda _source_bytes: None,
     )
@@ -147,6 +211,110 @@ def test_tensor_over_codec_bound_skips_compression(monkeypatch):
     assert wire_tensors[0] is tensor
     assert metadata is None
     assert lease is None
+
+
+def test_buffer_budget_exhaustion_preserves_the_raw_tensor():
+    """A tensor that cannot fit the Worker budget follows the baseline wire path."""
+    options = TensorCompressionOptions(min_bytes=1)
+    pool = TensorCodecPool(options)
+    buffer_pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=64))
+    group = object.__new__(CollectiveGroup)
+    group._worker = SimpleNamespace(
+        _get_tensor_codec_pool=lambda: pool,
+        _get_tensor_buffer_pool=lambda: buffer_pool,
+    )
+    group._tensor_compression = options
+    tensor = torch.zeros(128, dtype=torch.uint8)
+
+    wire_tensors, metadata, lease = group._compress_cpu_tensors([tensor], [tensor])
+
+    assert wire_tensors[0] is tensor
+    assert metadata is None
+    assert lease is None
+    assert buffer_pool.allocated_bytes == 0
+
+
+def test_buffer_budget_can_compress_part_of_a_tensor_list():
+    """One exhausted list entry falls back without discarding earlier compression."""
+    options = TensorCompressionOptions(min_bytes=1)
+    pool = TensorCodecPool(options)
+    buffer_pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=160))
+    group = object.__new__(CollectiveGroup)
+    group._worker = SimpleNamespace(
+        _get_tensor_codec_pool=lambda: pool,
+        _get_tensor_buffer_pool=lambda: buffer_pool,
+    )
+    group._tensor_compression = options
+    tensors = [
+        torch.zeros(128, dtype=torch.uint8),
+        torch.zeros(128, dtype=torch.uint8),
+    ]
+
+    wire_tensors, metadata, lease = group._compress_cpu_tensors(tensors, tensors)
+
+    assert metadata is not None
+    assert metadata.compressed_numel[0] is not None
+    assert metadata.compressed_numel[1] is None
+    assert wire_tensors[0] is not tensors[0]
+    assert wire_tensors[1] is tensors[1]
+    assert lease is not None
+    lease.release()
+
+
+def test_unhelpful_compression_does_not_cache_its_buffer(monkeypatch):
+    """A buffer that does not reduce wire bytes is discarded immediately."""
+    options = TensorCompressionOptions(min_bytes=1)
+    pool = TensorCodecPool(options)
+    buffer_pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=1024))
+    group = object.__new__(CollectiveGroup)
+    group._worker = SimpleNamespace(
+        _get_tensor_codec_pool=lambda: pool,
+        _get_tensor_buffer_pool=lambda: buffer_pool,
+    )
+    group._tensor_compression = options
+    tensor = torch.zeros(128, dtype=torch.uint8)
+    codec = pool._fresh_compressors.queue[0]
+    monkeypatch.setattr(codec, "compress_into", lambda source, destination: 128)
+
+    wire_tensors, metadata, lease = group._compress_cpu_tensors([tensor], [tensor])
+
+    assert wire_tensors[0] is tensor
+    assert metadata is None
+    assert lease is None
+    assert buffer_pool.allocated_bytes == 0
+
+
+def test_worker_lazily_shares_independent_codec_and_buffer_pools():
+    """CollectiveGroups share Worker-wide codec and buffer pools."""
+    worker = object.__new__(Worker)
+    worker._tensor_buffer_pool_options = TensorBufferPoolOptions()
+    worker._tensor_compression = TensorCompressionOptions()
+    worker._tensor_buffer_pool = None
+    worker._tensor_buffer_pool_lock = threading.Lock()
+    worker._tensor_codec_pool = None
+    worker._tensor_codec_pool_lock = threading.Lock()
+
+    first_codec_pool = worker._get_tensor_codec_pool()
+    second_codec_pool = worker._get_tensor_codec_pool()
+    first_buffer_pool = worker._get_tensor_buffer_pool()
+    second_buffer_pool = worker._get_tensor_buffer_pool()
+
+    assert first_codec_pool is not None
+    assert second_codec_pool is first_codec_pool
+    assert first_buffer_pool is not None
+    assert second_buffer_pool is first_buffer_pool
+    assert not hasattr(first_codec_pool, "buffer_pool")
+
+
+def test_worker_does_not_create_a_codec_pool_when_compression_is_disabled():
+    """Disabled compression does not load codec libraries or allocate contexts."""
+    worker = object.__new__(Worker)
+    worker._tensor_compression = TensorCompressionOptions(enabled=False)
+    worker._tensor_codec_pool = None
+    worker._tensor_codec_pool_lock = threading.Lock()
+
+    assert worker._get_tensor_codec_pool() is None
+    assert worker._tensor_codec_pool is None
 
 
 def test_lz4_compress_bound_returns_none_for_an_unsupported_input_size():
@@ -184,8 +352,18 @@ def test_compression_options_reject_unknown_cluster_yaml_key():
         TensorCompressionOptions.from_dict({"min_byte": 1024})
 
 
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [({"max_bytes": 0}, "buffer pool"), ({"max_byte": 1024}, "Unsupported")],
+)
+def test_tensor_buffer_pool_options_validate_public_config(config, message):
+    """Invalid tensor buffer settings fail before Workers start."""
+    with pytest.raises(ValueError, match=message):
+        TensorBufferPoolOptions.from_dict(config)
+
+
 def test_disabled_compression_preserves_the_original_cpu_tensors():
-    """``enabled=False`` takes the raw path before acquiring any workspace."""
+    """``enabled=False`` takes the raw path before acquiring any buffer."""
     group = object.__new__(CollectiveGroup)
     group._tensor_compression = TensorCompressionOptions(enabled=False, min_bytes=1)
     tensors = [torch.zeros(128 * 1024, dtype=torch.uint8)]
@@ -199,34 +377,72 @@ def test_disabled_compression_preserves_the_original_cpu_tensors():
     assert lease is None
 
 
-def test_cluster_serializes_validated_tensor_compression_config(monkeypatch):
-    """The public YAML config becomes the validated Worker configuration."""
-    env_var_name = Cluster.get_full_env_var_name(
+def test_cluster_serializes_validated_tensor_pool_and_compression_config(monkeypatch):
+    """The public YAML config becomes validated Worker configuration."""
+    compression_env = Cluster.get_full_env_var_name(
         ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
     )
-    monkeypatch.delenv(env_var_name, raising=False)
+    buffer_pool_env = Cluster.get_full_env_var_name(
+        ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL
+    )
+    monkeypatch.delenv(compression_env, raising=False)
+    monkeypatch.delenv(buffer_pool_env, raising=False)
 
-    Cluster._configure_tensor_compression_env(
+    Cluster._configure_collective_tensor_envs(
         {
             "collective": {
+                "tensor_buffer_pool": {"max_bytes": 4096},
                 "tensor_compression": {
                     "enabled": False,
                     "codec": "zstd",
                     "level": 3,
                     "min_bytes": 1024,
                     "max_inflight": 2,
-                }
+                },
             }
         }
     )
 
-    assert json.loads(os.environ[env_var_name]) == {
+    assert json.loads(os.environ[compression_env]) == {
         "enabled": False,
         "codec": "zstd",
         "level": 3,
         "min_bytes": 1024,
         "max_inflight": 2,
     }
+    assert json.loads(os.environ[buffer_pool_env]) == {"max_bytes": 4096}
+
+
+def test_compression_uses_the_default_tensor_buffer_pool_config(monkeypatch):
+    """Compression gets a bounded buffer pool without extra YAML."""
+    buffer_pool_env = Cluster.get_full_env_var_name(
+        ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL
+    )
+    monkeypatch.delenv(buffer_pool_env, raising=False)
+
+    Cluster._configure_collective_tensor_envs(
+        {"collective": {"tensor_compression": {"enabled": True}}}
+    )
+
+    assert json.loads(os.environ[buffer_pool_env]) == {"max_bytes": 1024**3}
+
+
+def test_tensor_buffer_pool_can_be_configured_without_compression(monkeypatch):
+    """The generic buffer pool does not depend on compression being enabled."""
+    compression_env = Cluster.get_full_env_var_name(
+        ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
+    )
+    buffer_pool_env = Cluster.get_full_env_var_name(
+        ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL
+    )
+    monkeypatch.setenv(compression_env, '{"enabled": true}')
+
+    Cluster._configure_collective_tensor_envs(
+        {"collective": {"tensor_buffer_pool": {"max_bytes": 4096}}}
+    )
+
+    assert compression_env not in os.environ
+    assert json.loads(os.environ[buffer_pool_env]) == {"max_bytes": 4096}
 
 
 def test_worker_loads_the_job_wide_tensor_compression_config(monkeypatch):
@@ -239,6 +455,19 @@ def test_worker_loads_the_job_wide_tensor_compression_config(monkeypatch):
 
     assert worker._load_tensor_compression_options() == TensorCompressionOptions(
         codec="zstd", min_bytes=1024
+    )
+
+
+def test_worker_loads_the_job_wide_tensor_buffer_pool_config(monkeypatch):
+    """Workers load the independent shared tensor-buffer configuration."""
+    worker = object.__new__(Worker)
+    env_var_name = Cluster.get_full_env_var_name(
+        ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL
+    )
+    monkeypatch.setenv(env_var_name, '{"max_bytes": 4096}')
+
+    assert worker._load_tensor_buffer_pool_options() == TensorBufferPoolOptions(
+        max_bytes=4096
     )
 
 
@@ -261,22 +490,31 @@ def test_cluster_yaml_overrides_the_internal_worker_environment(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "scheduler_value",
-    ['{"codec": "lz4"}', None],
-    ids=["configured", "disabled"],
+    ("env_var", "scheduler_value", "worker_value"),
+    [
+        (
+            ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION,
+            '{"codec": "lz4"}',
+            '{"codec": "zstd"}',
+        ),
+        (
+            ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL,
+            '{"max_bytes": 4096}',
+            '{"max_bytes": 8192}',
+        ),
+        (ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION, None, '{"codec": "zstd"}'),
+    ],
 )
-def test_worker_env_cannot_override_tensor_compression_config(
-    scheduler_value,
+def test_worker_env_cannot_override_collective_tensor_config(
+    env_var, scheduler_value, worker_value
 ):
-    """User environment merging cannot replace the job-wide codec settings."""
-    env_var_name = Cluster.get_full_env_var_name(
-        ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
-    )
+    """User environment merging cannot replace scheduler-owned tensor settings."""
+    env_var_name = Cluster.get_full_env_var_name(env_var)
     scheduler_env_vars = (
         {env_var_name: scheduler_value} if scheduler_value is not None else {}
     )
     worker_env_vars = {
-        env_var_name: '{"codec": "zstd"}',
+        env_var_name: worker_value,
         "USER_SETTING": "preserved",
     }
 

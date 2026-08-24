@@ -111,6 +111,9 @@ class ClusterEnvVar(str, Enum):
     COLLECTIVE_TENSOR_COMPRESSION = "COLLECTIVE_TENSOR_COMPRESSION"
     """Serialized ``cluster.collective.tensor_compression`` configuration."""
 
+    COLLECTIVE_TENSOR_BUFFER_POOL = "COLLECTIVE_TENSOR_BUFFER_POOL"
+    """Serialized ``cluster.collective.tensor_buffer_pool`` configuration."""
+
 
 class PathEnvMergeMode(str, Enum):
     """Merge mode for path-like worker env vars."""
@@ -141,6 +144,7 @@ class Cluster:
         ClusterEnvVar.PATH_ENV_MERGE_MODE: PathEnvMergeMode.APPEND.value,
         ClusterEnvVar.CODE_WORKING_DIR: "0",
         ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION: None,
+        ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL: None,
     }
     PATH_LIKE_ENV_VARS = {
         "PYTHONPATH",
@@ -153,6 +157,7 @@ class Cluster:
     }
     SCHEDULER_OWNED_ENV_VARS = {
         ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION,
+        ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL,
     }
 
     class NamespaceConflictError(Exception):
@@ -415,7 +420,7 @@ class Cluster:
         else:
             net_emu_cfg = None
 
-        self._configure_tensor_compression_env(cluster_cfg)
+        self._configure_collective_tensor_envs(cluster_cfg)
 
         # Set environment variables
         self._set_scheduler_env_vars()
@@ -544,14 +549,18 @@ class Cluster:
         return f"{Cluster.SYS_NAME.upper()}_{var.value}"
 
     @classmethod
-    def _configure_tensor_compression_env(
+    def _configure_collective_tensor_envs(
         cls, cluster_cfg: Optional[DictConfig]
     ) -> None:
-        """Validate and serialize public compression config for Worker processes."""
-        env_var_name = cls.get_full_env_var_name(
+        """Validate and serialize collective tensor settings for Workers."""
+        compression_env = cls.get_full_env_var_name(
             ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
         )
-        os.environ.pop(env_var_name, None)
+        buffer_pool_env = cls.get_full_env_var_name(
+            ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL
+        )
+        os.environ.pop(compression_env, None)
+        os.environ.pop(buffer_pool_env, None)
 
         collective_cfg = cluster_cfg.get("collective", None) if cluster_cfg else None
         if collective_cfg is None:
@@ -560,26 +569,45 @@ class Cluster:
             raise ValueError("cluster.collective must be a mapping.")
 
         compression_cfg = collective_cfg.get("tensor_compression", None)
-        if compression_cfg is None:
+        buffer_pool_cfg = collective_cfg.get("tensor_buffer_pool", None)
+        if compression_cfg is None and buffer_pool_cfg is None:
             return
-        if isinstance(compression_cfg, DictConfig):
-            compression_cfg = OmegaConf.to_container(compression_cfg, resolve=True)
-        if not isinstance(compression_cfg, dict):
-            raise ValueError("cluster.collective.tensor_compression must be a mapping.")
 
+        from ..collective.tensor_buffer_pool import TensorBufferPoolOptions
         from ..collective.tensor_compression import TensorCompressionOptions
 
-        compression_options = TensorCompressionOptions.from_dict(compression_cfg)
-        os.environ[env_var_name] = json.dumps(
-            {
-                "enabled": compression_options.enabled,
-                "codec": compression_options.codec,
-                "level": compression_options.level,
-                "min_bytes": compression_options.min_bytes,
-                "max_inflight": compression_options.max_inflight,
-            },
-            sort_keys=True,
+        if buffer_pool_cfg is None:
+            buffer_pool_options = TensorBufferPoolOptions()
+        else:
+            if isinstance(buffer_pool_cfg, DictConfig):
+                buffer_pool_cfg = OmegaConf.to_container(buffer_pool_cfg, resolve=True)
+            if not isinstance(buffer_pool_cfg, dict):
+                raise ValueError(
+                    "cluster.collective.tensor_buffer_pool must be a mapping."
+                )
+            buffer_pool_options = TensorBufferPoolOptions.from_dict(buffer_pool_cfg)
+        os.environ[buffer_pool_env] = json.dumps(
+            {"max_bytes": buffer_pool_options.max_bytes}, sort_keys=True
         )
+
+        if compression_cfg is not None:
+            if isinstance(compression_cfg, DictConfig):
+                compression_cfg = OmegaConf.to_container(compression_cfg, resolve=True)
+            if not isinstance(compression_cfg, dict):
+                raise ValueError(
+                    "cluster.collective.tensor_compression must be a mapping."
+                )
+            compression_options = TensorCompressionOptions.from_dict(compression_cfg)
+            os.environ[compression_env] = json.dumps(
+                {
+                    "enabled": compression_options.enabled,
+                    "codec": compression_options.codec,
+                    "level": compression_options.level,
+                    "min_bytes": compression_options.min_bytes,
+                    "max_inflight": compression_options.max_inflight,
+                },
+                sort_keys=True,
+            )
 
     def _set_scheduler_env_vars(self):
         """Set default environment variables for the system."""
@@ -587,7 +615,7 @@ class Cluster:
         for node in self._nodes:
             for env_var in env_var_list:
                 env_var_name = Cluster.get_full_env_var_name(env_var)
-                if env_var == ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION:
+                if env_var in Cluster.SCHEDULER_OWNED_ENV_VARS:
                     if env_var_name in os.environ:
                         node.env_vars[env_var_name] = os.environ[env_var_name]
                     else:

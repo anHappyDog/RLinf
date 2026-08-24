@@ -43,6 +43,8 @@ from .routing import split_channel_message
 
 if TYPE_CHECKING:
     from ..collective import CollectiveGroupOptions
+    from ..collective.tensor_buffer_pool import TensorBufferPool
+    from ..collective.tensor_compression import TensorCodecPool
     from ..manager import WorkerInfo
     from .worker_group import WorkerGroup
 
@@ -476,7 +478,12 @@ class Worker(metaclass=WorkerMeta):
         # Init ray and managers
         self._manager_proxy = None
         self._collective = None
+        self._tensor_buffer_pool_options = self._load_tensor_buffer_pool_options()
         self._tensor_compression = self._load_tensor_compression_options()
+        self._tensor_buffer_pool: Optional["TensorBufferPool"] = None
+        self._tensor_buffer_pool_lock = threading.Lock()
+        self._tensor_codec_pool: Optional["TensorCodecPool"] = None
+        self._tensor_codec_pool_lock = threading.Lock()
         self._setup_managers()
 
         # Setup MASTER_ADDR and MASTER_PORT
@@ -580,6 +587,54 @@ class Worker(metaclass=WorkerMeta):
         from ..collective.tensor_compression import TensorCompressionOptions
 
         return TensorCompressionOptions.from_dict(config)
+
+    def _load_tensor_buffer_pool_options(self):
+        """Load the job-wide tensor-buffer configuration propagated by Cluster."""
+        raw_config = Cluster.get_sys_env_var(
+            ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL
+        )
+        if raw_config is None:
+            return None
+        try:
+            config = json.loads(raw_config)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "Invalid collective tensor buffer pool configuration."
+            ) from error
+        if not isinstance(config, dict):
+            raise ValueError(
+                "Collective tensor buffer pool configuration must be a mapping."
+            )
+
+        from ..collective.tensor_buffer_pool import TensorBufferPoolOptions
+
+        return TensorBufferPoolOptions.from_dict(config)
+
+    def _get_tensor_buffer_pool(self) -> Optional["TensorBufferPool"]:
+        """Return the lazily initialized Worker-wide tensor buffer pool."""
+        options = self._tensor_buffer_pool_options
+        if options is None:
+            return None
+
+        with self._tensor_buffer_pool_lock:
+            if self._tensor_buffer_pool is None:
+                from ..collective.tensor_buffer_pool import TensorBufferPool
+
+                self._tensor_buffer_pool = TensorBufferPool(options)
+            return self._tensor_buffer_pool
+
+    def _get_tensor_codec_pool(self) -> Optional["TensorCodecPool"]:
+        """Return the lazily initialized Worker-wide tensor codec pool."""
+        options = self._tensor_compression
+        if options is None or not options.enabled:
+            return None
+
+        with self._tensor_codec_pool_lock:
+            if self._tensor_codec_pool is None:
+                from ..collective.tensor_compression import TensorCodecPool
+
+                self._tensor_codec_pool = TensorCodecPool(options)
+            return self._tensor_codec_pool
 
     def send(
         self,

@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bounded codec and workspace pools for collective tensor compression."""
+"""Bounded codec pools for collective tensor compression."""
 
 from dataclasses import dataclass
 from queue import Empty, LifoQueue
 from typing import Any, Literal, Optional
 
-import torch
-
 from rlinf.utils.tensor_codec import TensorCodec, create_tensor_codec
+
+from .tensor_buffer_pool import BufferLease
 
 
 @dataclass(frozen=True)
@@ -53,7 +53,13 @@ class TensorCompressionOptions:
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> "TensorCompressionOptions":
         """Build validated options from the ``cluster.collective`` YAML mapping."""
-        valid_keys = {"enabled", "codec", "level", "min_bytes", "max_inflight"}
+        valid_keys = {
+            "enabled",
+            "codec",
+            "level",
+            "min_bytes",
+            "max_inflight",
+        }
         unknown_keys = set(config) - valid_keys
         if unknown_keys:
             raise ValueError(
@@ -72,63 +78,38 @@ class TensorCompressionWireMetadata:
     compressed_numel: tuple[Optional[int], ...]
 
 
-class TensorCodecSlot:
-    """Own one codec and reusable uint8 buffers for one in-flight send."""
-
-    def __init__(self, options: TensorCompressionOptions) -> None:
-        """Create the slot's non-thread-safe codec and empty buffer cache."""
-        self.codec: TensorCodec = create_tensor_codec(
-            name=options.codec, level=options.level
-        )
-        self._available_buffers: list[torch.Tensor] = []
-        self._leased_buffers: list[torch.Tensor] = []
-
-    def acquire_buffer(self, capacity: int) -> torch.Tensor:
-        """Reserve the smallest reusable buffer that fits ``capacity``."""
-        best_index = min(
-            (
-                index
-                for index, buffer in enumerate(self._available_buffers)
-                if buffer.numel() >= capacity
-            ),
-            key=lambda index: self._available_buffers[index].numel(),
-            default=None,
-        )
-        if best_index is None:
-            buffer = torch.empty(capacity, dtype=torch.uint8, device="cpu")
-        else:
-            buffer = self._available_buffers.pop(best_index)
-        self._leased_buffers.append(buffer)
-        return buffer[:capacity]
-
-    def release_buffers(self) -> None:
-        """Make this lease's workspaces available to the next compression."""
-        self._available_buffers.extend(self._leased_buffers)
-        self._leased_buffers.clear()
-
-
 class CompressionLease:
-    """Keep one workspace slot exclusively owned until transfer completion."""
+    """Own one encoder and the buffers backing its wire payloads."""
 
-    def __init__(self, pool: "TensorCodecPool", slot: TensorCodecSlot) -> None:
-        """Bind the leased slot to its pool."""
+    def __init__(self, pool: "TensorCodecPool", codec: TensorCodec) -> None:
+        """Bind the encoder and future payload buffers to their pools."""
         self._pool = pool
-        self._slot: Optional[TensorCodecSlot] = slot
+        self._codec: Optional[TensorCodec] = codec
+        self._buffers: list[BufferLease] = []
 
     @property
-    def slot(self) -> TensorCodecSlot:
-        """Return the owned workspace slot."""
-        if self._slot is None:
+    def codec(self) -> TensorCodec:
+        """Return the exclusively owned encoder."""
+        if self._codec is None:
             raise RuntimeError("CompressionLease has already been released.")
-        return self._slot
+        return self._codec
+
+    def retain_buffer(self, buffer: BufferLease) -> None:
+        """Keep a tensor buffer alive until the compressed transfer completes."""
+        if self._codec is None:
+            raise RuntimeError("CompressionLease has already been released.")
+        self._buffers.append(buffer)
 
     def release(self) -> None:
-        """Return the slot to the reusable pool exactly once."""
-        if self._slot is None:
+        """Return the encoder and retained buffers exactly once."""
+        if self._codec is None:
             return
-        slot = self._slot
-        self._slot = None
-        self._pool.release_compressor(slot)
+        codec = self._codec
+        self._codec = None
+        for buffer in self._buffers:
+            buffer.release()
+        self._buffers.clear()
+        self._pool.release_compressor(codec)
 
 
 class DecompressionLease:
@@ -156,22 +137,24 @@ class DecompressionLease:
 
 
 class TensorCodecPool:
-    """Own bounded compression workspaces and independent decompressor codecs."""
+    """Own the Worker-wide compression and decompression codecs."""
 
     def __init__(self, options: TensorCompressionOptions) -> None:
         """Create one codec per compression and decompression slot."""
         self.options = options
-        self._fresh_compressors: LifoQueue[TensorCodecSlot] = LifoQueue(
+        self._fresh_compressors: LifoQueue[TensorCodec] = LifoQueue(
             maxsize=options.max_inflight
         )
-        self._reused_compressors: LifoQueue[TensorCodecSlot] = LifoQueue(
+        self._reused_compressors: LifoQueue[TensorCodec] = LifoQueue(
             maxsize=options.max_inflight
         )
         self._decompressors: LifoQueue[TensorCodec] = LifoQueue(
             maxsize=options.max_inflight
         )
         for _ in range(options.max_inflight):
-            self._fresh_compressors.put_nowait(TensorCodecSlot(options))
+            self._fresh_compressors.put_nowait(
+                create_tensor_codec(name=options.codec, level=options.level)
+            )
             self._decompressors.put_nowait(
                 create_tensor_codec(name=options.codec, level=options.level)
             )
@@ -199,10 +182,9 @@ class TensorCodecPool:
             )
         return DecompressionLease(self, self._decompressors.get())
 
-    def release_compressor(self, slot: TensorCodecSlot) -> None:
+    def release_compressor(self, codec: TensorCodec) -> None:
         """Return a compressor so it is preferred over unused slots next time."""
-        slot.release_buffers()
-        self._reused_compressors.put_nowait(slot)
+        self._reused_compressors.put_nowait(codec)
 
     def release_decompressor(self, codec: TensorCodec) -> None:
         """Return a decompressor after restoring the received payload."""

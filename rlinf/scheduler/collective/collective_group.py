@@ -43,7 +43,6 @@ from ..worker import Worker, WorkerAddress
 from .async_work import AsyncFuncWork, AsyncWork
 from .tensor_compression import (
     CompressionLease,
-    TensorCodecPool,
     TensorCompressionOptions,
     TensorCompressionWireMetadata,
 )
@@ -263,8 +262,6 @@ class CollectiveGroup:
         )
         self._logger = logging.getLogger(cur_worker_address.get_name())
         self._lock = threading.Lock()
-        self._tensor_codec_pool: Optional[TensorCodecPool] = None
-        self._tensor_codec_pool_lock = threading.Lock()
         # Lazily populated sub-groups for the hybrid broadcast path.
         # IPC sub-groups: one per (src_rank, same_device_dst_rank) pair.
         self._ipc_sub_groups: dict[tuple[int, int], "CollectiveGroup"] = {}
@@ -1394,24 +1391,6 @@ class CollectiveGroup:
                 accel_tensors.append(t)
         return cpu_tensor_mask, cpu_tensors, accel_tensors
 
-    def _get_tensor_codec_pool(
-        self, options: TensorCompressionOptions
-    ) -> TensorCodecPool:
-        """Return this group's codec pool for its single codec configuration."""
-        with self._tensor_codec_pool_lock:
-            if self._tensor_codec_pool is None:
-                self._tensor_codec_pool = TensorCodecPool(options)
-            pool_options = self._tensor_codec_pool.options
-            if (
-                pool_options.codec,
-                pool_options.level,
-                pool_options.max_inflight,
-            ) != (options.codec, options.level, options.max_inflight):
-                raise ValueError(
-                    "A CollectiveGroup cannot use multiple tensor codec configurations."
-                )
-            return self._tensor_codec_pool
-
     def _compress_cpu_tensors(
         self,
         tensors: list[torch.Tensor],
@@ -1421,7 +1400,7 @@ class CollectiveGroup:
         Optional[TensorCompressionWireMetadata],
         Optional[CompressionLease],
     ]:
-        """Compress eligible CPU tensors into a non-blocking workspace lease.
+        """Compress eligible CPU tensors into non-blocking buffer leases.
 
         A missing compression option, no eligible tensor, or a saturated pool all
         preserve the original CPU tensors. The returned compressor remains owned
@@ -1440,33 +1419,60 @@ class CollectiveGroup:
         ):
             return cpu_tensors, None, None
 
-        compressor = self._get_tensor_codec_pool(
-            compression_options
-        ).try_acquire_compressor()
+        codec_pool = self._worker._get_tensor_codec_pool()
+        buffer_pool = self._worker._get_tensor_buffer_pool()
+        assert codec_pool is not None
+        assert buffer_pool is not None
+        compressor = codec_pool.try_acquire_compressor()
         if compressor is None:
             return cpu_tensors, None, None
 
         try:
             compressed_numel: list[Optional[int]] = [None] * len(tensors)
-            wire_cpu_tensors: list[torch.Tensor] = []
+            wire_cpu_tensors = list(cpu_tensors)
             has_compressed_tensor = False
+            compression_candidates = []
+            cpu_tensor_index = 0
             for tensor_index, tensor in enumerate(tensors):
                 if not tensor.is_cpu:
                     continue
-                wire_tensor = tensor
                 tensor_bytes = tensor.numel() * tensor.element_size()
                 if tensor_bytes >= compression_options.min_bytes:
-                    capacity = compressor.slot.codec.compress_bound(tensor_bytes)
+                    capacity = compressor.codec.compress_bound(tensor_bytes)
                     if capacity is not None:
-                        destination = compressor.slot.acquire_buffer(capacity)
-                        compressed_bytes = compressor.slot.codec.compress_into(
-                            tensor, destination
+                        compression_candidates.append(
+                            (
+                                capacity,
+                                tensor_index,
+                                cpu_tensor_index,
+                                tensor,
+                                tensor_bytes,
+                            )
                         )
-                        if compressed_bytes < tensor_bytes:
-                            wire_tensor = destination[:compressed_bytes]
-                            compressed_numel[tensor_index] = compressed_bytes
-                            has_compressed_tensor = True
-                wire_cpu_tensors.append(wire_tensor)
+                cpu_tensor_index += 1
+
+            for capacity, tensor_index, cpu_index, tensor, tensor_bytes in sorted(
+                compression_candidates,
+                key=lambda candidate: candidate[0],
+                reverse=True,
+            ):
+                buffer = buffer_pool.try_acquire(capacity)
+                if buffer is None:
+                    continue
+                try:
+                    compressed_bytes = compressor.codec.compress_into(
+                        tensor, buffer.tensor
+                    )
+                except BaseException:
+                    buffer.release(cache=False)
+                    raise
+                if compressed_bytes < tensor_bytes:
+                    wire_cpu_tensors[cpu_index] = buffer.tensor[:compressed_bytes]
+                    compressed_numel[tensor_index] = compressed_bytes
+                    has_compressed_tensor = True
+                    compressor.retain_buffer(buffer)
+                else:
+                    buffer.release(cache=False)
         except BaseException:
             compressor.release()
             raise
@@ -1501,9 +1507,12 @@ class CollectiveGroup:
             raise ValueError(
                 "Compressed tensor payloads require tensor compression options on recv."
             )
-        decompressor = self._get_tensor_codec_pool(
-            compression_options
-        ).acquire_decompressor(compression_metadata)
+        codec_pool = self._worker._get_tensor_codec_pool()
+        if codec_pool is None:
+            raise ValueError(
+                "Compressed tensor payloads require tensor compression on recv."
+            )
+        decompressor = codec_pool.acquire_decompressor(compression_metadata)
         try:
             for tensor, wire_numel in cpu_entries:
                 if wire_numel is None:
