@@ -1407,21 +1407,15 @@ class CollectiveGroup:
         compression completes; only the returned buffers span the wire transfer.
         """
         compression_options = self._tensor_compression
-        if (
-            compression_options is None
-            or not compression_options.enabled
-            or not any(
-                tensor.is_cpu
-                and tensor.numel() * tensor.element_size()
-                >= compression_options.min_bytes
-                for tensor in tensors
-            )
-        ):
+        if compression_options is None or not compression_options.enabled:
             return cpu_tensors, None, []
 
         codec_pool = self._worker._get_tensor_codec_pool()
-        buffer_pool = self._worker._get_tensor_buffer_pool()
         assert codec_pool is not None
+        if not any(compression_options.should_compress(tensor) for tensor in tensors):
+            return cpu_tensors, None, []
+
+        buffer_pool = self._worker._get_tensor_buffer_pool()
         assert buffer_pool is not None
         compressor = codec_pool.try_acquire_compressor()
         if compressor is None:
@@ -1437,8 +1431,8 @@ class CollectiveGroup:
             for tensor_index, tensor in enumerate(tensors):
                 if not tensor.is_cpu:
                     continue
-                tensor_bytes = tensor.numel() * tensor.element_size()
-                if tensor_bytes >= compression_options.min_bytes:
+                if compression_options.should_compress(tensor):
+                    tensor_bytes = tensor.numel() * tensor.element_size()
                     capacity = compressor.codec.compress_bound(tensor_bytes)
                     if capacity is not None:
                         compression_candidates.append(
@@ -1467,7 +1461,8 @@ class CollectiveGroup:
                 except BaseException:
                     buffer.release(cache=False)
                     raise
-                if compressed_bytes < tensor_bytes:
+                kept = compressed_bytes < tensor_bytes
+                if kept:
                     wire_cpu_tensors[cpu_index] = buffer.tensor[:compressed_bytes]
                     compressed_numel[tensor_index] = compressed_bytes
                     has_compressed_tensor = True
@@ -1487,7 +1482,6 @@ class CollectiveGroup:
             wire_cpu_tensors,
             TensorCompressionWireMetadata(
                 codec=compression_options.codec,
-                level=compression_options.level,
                 compressed_numel=tuple(compressed_numel),
             ),
             payload_buffers,

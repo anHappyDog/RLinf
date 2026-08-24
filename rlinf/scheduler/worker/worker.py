@@ -616,6 +616,9 @@ class Worker(metaclass=WorkerMeta):
         if options is None:
             return None
 
+        if self._tensor_buffer_pool is not None:
+            return self._tensor_buffer_pool
+
         with self._tensor_buffer_pool_lock:
             if self._tensor_buffer_pool is None:
                 from ..collective.tensor_buffer_pool import TensorBufferPool
@@ -628,6 +631,9 @@ class Worker(metaclass=WorkerMeta):
         options = self._tensor_compression
         if options is None or not options.enabled:
             return None
+
+        if self._tensor_codec_pool is not None:
+            return self._tensor_codec_pool
 
         with self._tensor_codec_pool_lock:
             if self._tensor_codec_pool is None:

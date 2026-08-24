@@ -999,9 +999,8 @@ def cluster():
                     "tensor_compression": {
                         "enabled": True,
                         "codec": "lz4",
-                        "level": 1,
                         "min_bytes": 1024,
-                        "max_inflight": 1,
+                        "params": {"acceleration": 1},
                     }
                 },
             }
