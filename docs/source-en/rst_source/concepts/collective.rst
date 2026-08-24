@@ -51,10 +51,61 @@ With the process groups in place, ``CollectiveGroup`` can perform communications
 Tensor Compression
 ---------------------------------
 
-For bandwidth-bound CPU tensor transfers, enable compression once in the job's
-``cluster`` configuration. The scheduler validates this configuration on the
-driver and propagates the same settings to every Worker, so ordinary
-``Worker.send``/``Worker.recv`` and channel transfers use it automatically.
+Enable lossless CPU tensor compression when network transfer time outweighs the
+extra CPU work. Compression is optional and job-wide: the driver validates one
+configuration and propagates it to every Worker.
+
+Scope
+~~~~~
+
+Compression applies to CPU tensors carried by the optimized generic
+``Worker.send``/``Worker.recv`` paths: a tensor, a tensor list or tuple, a
+tensor-valued dictionary, or tensor fields extracted from a dataclass. For a
+mixed CPU/accelerator container, only its CPU tensors are candidates. A Channel
+that communicates through Worker send/recv inherits the same behavior.
+
+Arbitrary pickled Python objects, accelerator tensors, ``broadcast``, and direct
+``send_tensor``/``recv_tensor`` calls are not compressed. Tensor-list elements
+also remain separate wire payloads; this feature reduces their byte counts but
+does not coalesce them.
+
+Choose a Codec
+~~~~~~~~~~~~~~
+
+Both codecs are lossless, operate on the raw bytes of a contiguous CPU tensor,
+and restore the original dtype and shape byte-for-byte. They write directly
+between tensors and preallocated ``torch.uint8`` buffers without creating an
+intermediate Python ``bytes`` object.
+
+.. list-table:: Codec trade-offs
+   :header-rows: 1
+   :widths: 14 30 24 32
+
+   * - Codec
+     - Characteristics
+     - ``level``
+     - Choose it when
+   * - ``lz4``
+     - Prioritizes compression and decompression speed with relatively low CPU
+       cost, usually at a lower compression ratio than Zstd.
+     - Passed as LZ4 ``acceleration``. Higher values favor speed and may reduce
+       the compression ratio.
+     - CPU time matters or the link is only moderately bandwidth-bound. This is
+       the default codec.
+   * - ``zstd``
+     - Usually reduces wire bytes more than LZ4, with higher compression and
+       decompression cost.
+     - Passed as the Zstandard compression level. Higher levels generally trade
+       more CPU time for a better compression ratio.
+     - The network is slow enough that reducing bytes dominates codec time.
+
+Measure with representative payloads before choosing. Already compressed or
+high-entropy tensors may not shrink, while dense tensors containing many zeros
+or repeated values can benefit substantially. LZ4 also has a per-tensor input
+limit; unsupported tensor sizes automatically follow the raw path.
+
+Configure Compression
+~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: yaml
 
@@ -69,47 +120,64 @@ driver and propagates the same settings to every Worker, so ordinary
          min_bytes: 65536
          max_inflight: 2
 
-``tensor_compression`` is disabled when this block is absent or when
-``enabled: false``. Its fields are:
+Omit ``tensor_compression`` or set ``enabled: false`` to use the original wire
+path. The compression options and defaults are:
 
-- ``codec``: ``lz4`` or ``zstd``.
-- ``level``: positive codec parameter. For ``lz4``, this is LZ4's
-  ``acceleration`` (higher values prioritize speed); for ``zstd``, it is the
-  Zstandard compression level.
-- ``min_bytes``: only CPU tensors at least this large are candidates.
-- ``max_inflight``: maximum encoder and decoder codec leases shared by all
-  ``CollectiveGroup`` instances in one Worker.
+.. list-table:: Compression options
+   :header-rows: 1
+   :widths: 20 16 64
 
-``tensor_buffer_pool`` is independent of compression. Its ``max_bytes`` field
-limits active plus cached CPU tensor buffers in one Worker and defaults to 2
-GiB. When compression is configured without this block, the default pool is
-created automatically.
+   * - Option
+     - Default
+     - Meaning
+   * - ``enabled``
+     - ``true``
+     - Enables compression when the ``tensor_compression`` block is present.
+   * - ``codec``
+     - ``lz4``
+     - Selects ``lz4`` or ``zstd``.
+   * - ``level``
+     - ``1``
+     - Sets the codec parameter described above; it must be positive.
+   * - ``min_bytes``
+     - ``65536``
+     - Skips tensors smaller than this raw byte count.
+   * - ``max_inflight``
+     - ``1``
+     - Creates this many encoder instances and this many decoder instances per
+       Worker.
 
-For each generic object transfer, a CPU tensor is compressed only when
-compression is enabled, it meets ``min_bytes``, and both a codec and buffer are
-immediately available. A saturated codec or buffer pool never queues or
-blocks the sender: that tensor proceeds uncompressed. A tensor also follows the
-original path when encoding does not reduce its wire size; the unused buffer
-is discarded instead of cached.
+``tensor_buffer_pool`` is independent of ``tensor_compression``. Its
+``max_bytes`` option limits the combined active and cached CPU buffer capacity
+per Worker and defaults to 2 GiB. Configuring compression without this block
+automatically supplies the default pool.
 
-Each Worker lazily owns independent ``TensorCodecPool`` and ``TensorBufferPool``
-instances shared by all of its ``CollectiveGroup`` instances. Compressed payload
-buffers remain leased until their synchronous sends finish, then return to the
-best-fit buffer cache. Idle buffers are evicted when a new shape needs room, so
-historical tensor shapes cannot grow the cache beyond ``max_bytes``. Received
-compressed payloads borrow a decoder only while restoring data.
+Runtime and Fallback
+~~~~~~~~~~~~~~~~~~~~
 
-Wire metadata identifies compressed tensors and validates that the codec matches
-the job-wide configuration on the receiving Worker. Compression currently
-applies only to CPU tensors in generic ``send``/``recv`` object, list,
-dictionary, and dataclass paths. GPU/NCCL transfers, broadcasts, and direct
-``send_tensor``/``recv_tensor`` calls remain uncompressed.
+Each Worker lazily creates one ``TensorCodecPool`` and one independent
+``TensorBufferPool`` shared by all of its ``CollectiveGroup`` instances. A send
+uses them as follows:
 
-YAML is the public control plane because it is versioned with the job and is
-propagated consistently across nodes. RLinf uses an internal environment
-variable to carry the validated setting to Worker processes; users should not
-set that variable directly. Individual Workers and individual transfers cannot
-override the job-wide setting.
+1. It tries to acquire one encoder without waiting. If all encoders are busy,
+   the transfer remains uncompressed.
+2. It orders eligible tensors by worst-case output capacity, largest first, and
+   tries to lease a buffer for each tensor. A tensor stays raw when its codec
+   bound is unsupported or no buffer fits within the budget.
+3. It keeps the compressed result only when it is smaller than the original.
+   Otherwise, the tensor stays raw and that buffer is discarded rather than
+   cached.
+4. It sends per-tensor compression sizes in the existing metadata. The receiver
+   restores compressed tensors directly into their preallocated destinations.
+5. It retains compressed payload buffers until their synchronous payload sends
+   finish, then returns them to the Worker buffer pool.
+
+The buffer pool indexes idle buffers by capacity and reuses the smallest size
+that fits. It maintains separate lists for repeated sizes and tracks active plus
+cached capacity against ``max_bytes``. When a new allocation needs room, it
+evicts buffers starting with the largest idle size bucket. Buffer acquisition
+never waits; an unavailable buffer therefore preserves baseline behavior for
+that tensor.
 
 The common dependency installation installs the LZ4 and Zstandard system
 libraries required by these codecs. Ensure the same RLinf version and its
