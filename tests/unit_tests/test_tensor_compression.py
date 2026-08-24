@@ -38,8 +38,8 @@ from rlinf.scheduler.worker.worker import Worker
 from rlinf.utils.tensor_codec import LZ4TensorCodec
 
 
-def test_codec_pool_prefers_a_reused_compressor_and_its_buffer():
-    """Released codecs and buffers are preferred over unused resources."""
+def test_codec_and_buffer_pools_reuse_resources_independently():
+    """Released codecs and buffers are independently preferred for reuse."""
     codec_pool = TensorCodecPool(TensorCompressionOptions(max_inflight=2))
     buffer_pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=512))
 
@@ -49,8 +49,8 @@ def test_codec_pool_prefers_a_reused_compressor_and_its_buffer():
     first_buffer_lease = buffer_pool.try_acquire(128)
     assert first_buffer_lease is not None
     first_buffer = first_buffer_lease.tensor
-    first_lease.retain_buffer(first_buffer_lease)
     first_lease.release()
+    first_buffer_lease.release()
 
     reused_lease = codec_pool.try_acquire_compressor()
     assert reused_lease is not None
@@ -58,8 +58,8 @@ def test_codec_pool_prefers_a_reused_compressor_and_its_buffer():
     reused_buffer = buffer_pool.try_acquire(64)
     assert reused_buffer is not None
     assert reused_buffer.tensor.data_ptr() == first_buffer.data_ptr()
-    reused_lease.retain_buffer(reused_buffer)
     reused_lease.release()
+    reused_buffer.release()
 
 
 def test_buffer_pool_uses_best_fit_buffers_independent_of_tensor_order():
@@ -193,13 +193,15 @@ def test_codec_pool_compresses_and_restores_a_tensor(codec):
     assert lease is not None
 
     source = torch.zeros(128 * 1024, dtype=torch.uint8)
+    compressor_codec = lease.codec
+    buffer = buffer_pool.try_acquire(compressor_codec.compress_bound(source.numel()))
+    assert buffer is not None
     try:
-        buffer = buffer_pool.try_acquire(lease.codec.compress_bound(source.numel()))
-        assert buffer is not None
-        compressed_numel = lease.codec.compress_into(source, buffer.tensor)
+        compressed_numel = compressor_codec.compress_into(source, buffer.tensor)
         assert compressed_numel < source.numel()
-        lease.retain_buffer(buffer)
-
+    finally:
+        lease.release()
+    try:
         restored = torch.empty_like(source)
         decompressor = codec_pool.acquire_decompressor(
             TensorCompressionWireMetadata(
@@ -209,7 +211,7 @@ def test_codec_pool_compresses_and_restores_a_tensor(codec):
             )
         )
         try:
-            assert decompressor.codec is not lease.codec
+            assert decompressor.codec is not compressor_codec
             decompressor.codec.decompress_into(
                 buffer.tensor[:compressed_numel], compressed_numel, restored
             )
@@ -217,7 +219,7 @@ def test_codec_pool_compresses_and_restores_a_tensor(codec):
             decompressor.release()
         assert torch.equal(restored, source)
     finally:
-        lease.release()
+        buffer.release()
 
 
 def test_codec_pool_rejects_mismatched_decompression_metadata():
@@ -248,14 +250,14 @@ def test_tensor_over_codec_bound_skips_compression(monkeypatch):
         "compress_bound",
         lambda _source_bytes: None,
     )
-    wire_tensors, metadata, lease = group._compress_cpu_tensors(
+    wire_tensors, metadata, buffers = group._compress_cpu_tensors(
         [tensor],
         [tensor],
     )
 
     assert wire_tensors[0] is tensor
     assert metadata is None
-    assert lease is None
+    assert buffers == []
 
 
 def test_buffer_budget_exhaustion_preserves_the_raw_tensor():
@@ -271,11 +273,11 @@ def test_buffer_budget_exhaustion_preserves_the_raw_tensor():
     group._tensor_compression = options
     tensor = torch.zeros(128, dtype=torch.uint8)
 
-    wire_tensors, metadata, lease = group._compress_cpu_tensors([tensor], [tensor])
+    wire_tensors, metadata, buffers = group._compress_cpu_tensors([tensor], [tensor])
 
     assert wire_tensors[0] is tensor
     assert metadata is None
-    assert lease is None
+    assert buffers == []
     assert buffer_pool.allocated_bytes == 0
 
 
@@ -295,15 +297,75 @@ def test_buffer_budget_can_compress_part_of_a_tensor_list():
         torch.zeros(128, dtype=torch.uint8),
     ]
 
-    wire_tensors, metadata, lease = group._compress_cpu_tensors(tensors, tensors)
+    wire_tensors, metadata, buffers = group._compress_cpu_tensors(tensors, tensors)
 
     assert metadata is not None
     assert metadata.compressed_numel[0] is not None
     assert metadata.compressed_numel[1] is None
     assert wire_tensors[0] is not tensors[0]
     assert wire_tensors[1] is tensors[1]
-    assert lease is not None
-    lease.release()
+    assert len(buffers) == 1
+    buffers[0].release()
+
+
+def test_compressor_is_released_before_payload_buffers():
+    """A slow wire transfer retains buffers without occupying a codec slot."""
+    options = TensorCompressionOptions(min_bytes=1, max_inflight=1)
+    codec_pool = TensorCodecPool(options)
+    buffer_pool = TensorBufferPool(TensorBufferPoolOptions())
+    group = object.__new__(CollectiveGroup)
+    group._worker = SimpleNamespace(
+        _get_tensor_codec_pool=lambda: codec_pool,
+        _get_tensor_buffer_pool=lambda: buffer_pool,
+    )
+    group._tensor_compression = options
+    tensor = torch.zeros(128, dtype=torch.uint8)
+
+    _, metadata, payload_buffers = group._compress_cpu_tensors([tensor], [tensor])
+
+    assert metadata is not None
+    assert payload_buffers
+    next_compressor = codec_pool.try_acquire_compressor()
+    assert next_compressor is not None
+    next_compressor.release()
+    for buffer in payload_buffers:
+        buffer.release()
+
+
+def test_decompressor_is_acquired_after_receiving_wire_payload():
+    """A slow GLOO receive does not occupy a Worker-wide decoder slot."""
+    events = []
+
+    class Decompressor:
+        codec = SimpleNamespace(
+            decompress_into=lambda *_args: events.append("decompress")
+        )
+
+        def release(self):
+            events.append("release")
+
+    codec_pool = SimpleNamespace(
+        acquire_decompressor=lambda _metadata: (
+            events.append("acquire") or Decompressor()
+        )
+    )
+    buffer_pool = TensorBufferPool(TensorBufferPoolOptions(max_bytes=128))
+    group = object.__new__(CollectiveGroup)
+    group._worker = SimpleNamespace(
+        _get_tensor_codec_pool=lambda: codec_pool,
+        _get_tensor_buffer_pool=lambda: buffer_pool,
+    )
+    group._tensor_compression = TensorCompressionOptions(min_bytes=1)
+    group._recv = lambda *_args, **_kwargs: events.append("recv")
+    metadata = TensorCompressionWireMetadata(
+        codec="lz4", level=1, compressed_numel=(32,)
+    )
+
+    group._recv_cpu_tensor_payloads(
+        [(torch.empty(128, dtype=torch.uint8), 32)], metadata, comm_id=0
+    )
+
+    assert events == ["recv", "acquire", "decompress", "release"]
 
 
 def test_unhelpful_compression_does_not_cache_its_buffer(monkeypatch):
@@ -321,11 +383,11 @@ def test_unhelpful_compression_does_not_cache_its_buffer(monkeypatch):
     codec = pool._fresh_compressors.queue[0]
     monkeypatch.setattr(codec, "compress_into", lambda source, destination: 128)
 
-    wire_tensors, metadata, lease = group._compress_cpu_tensors([tensor], [tensor])
+    wire_tensors, metadata, buffers = group._compress_cpu_tensors([tensor], [tensor])
 
     assert wire_tensors[0] is tensor
     assert metadata is None
-    assert lease is None
+    assert buffers == []
     assert buffer_pool.allocated_bytes == 0
 
 
@@ -412,14 +474,14 @@ def test_disabled_compression_preserves_the_original_cpu_tensors():
     group = object.__new__(CollectiveGroup)
     group._tensor_compression = TensorCompressionOptions(enabled=False, min_bytes=1)
     tensors = [torch.zeros(128 * 1024, dtype=torch.uint8)]
-    wire_tensors, metadata, lease = group._compress_cpu_tensors(
+    wire_tensors, metadata, buffers = group._compress_cpu_tensors(
         tensors,
         tensors,
     )
 
     assert wire_tensors is tensors
     assert metadata is None
-    assert lease is None
+    assert buffers == []
 
 
 def test_cluster_serializes_validated_tensor_pool_and_compression_config(monkeypatch):

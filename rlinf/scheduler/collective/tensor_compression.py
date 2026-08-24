@@ -20,8 +20,6 @@ from typing import Any, Literal, Optional
 
 from rlinf.utils.tensor_codec import TensorCodec, create_tensor_codec
 
-from .tensor_buffer_pool import BufferLease
-
 
 @dataclass(frozen=True)
 class TensorCompressionOptions:
@@ -79,13 +77,12 @@ class TensorCompressionWireMetadata:
 
 
 class CompressionLease:
-    """Own one encoder and the buffers backing its wire payloads."""
+    """Keep one compressor exclusively owned during compression."""
 
     def __init__(self, pool: "TensorCodecPool", codec: TensorCodec) -> None:
-        """Bind the encoder and future payload buffers to their pools."""
+        """Bind the borrowed compressor to its pool."""
         self._pool = pool
         self._codec: Optional[TensorCodec] = codec
-        self._buffers: list[BufferLease] = []
 
     @property
     def codec(self) -> TensorCodec:
@@ -94,21 +91,12 @@ class CompressionLease:
             raise RuntimeError("CompressionLease has already been released.")
         return self._codec
 
-    def retain_buffer(self, buffer: BufferLease) -> None:
-        """Keep a tensor buffer alive until the compressed transfer completes."""
-        if self._codec is None:
-            raise RuntimeError("CompressionLease has already been released.")
-        self._buffers.append(buffer)
-
     def release(self) -> None:
-        """Return the encoder and retained buffers exactly once."""
+        """Return the compressor to the pool exactly once."""
         if self._codec is None:
             return
         codec = self._codec
         self._codec = None
-        for buffer in self._buffers:
-            buffer.release()
-        self._buffers.clear()
         self._pool.release_compressor(codec)
 
 
