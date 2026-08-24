@@ -60,6 +60,8 @@ driver and propagates the same settings to every Worker, so ordinary
 
    cluster:
      collective:
+       tensor_buffer_pool:
+         max_bytes: 1073741824
        tensor_compression:
          enabled: true
          codec: lz4
@@ -75,26 +77,32 @@ driver and propagates the same settings to every Worker, so ordinary
   ``acceleration`` (higher values prioritize speed); for ``zstd``, it is the
   Zstandard compression level.
 - ``min_bytes``: only CPU tensors at least this large are candidates.
-- ``max_inflight``: maximum codec slots per direction in each
-  ``CollectiveGroup``: compression slots own reusable workspaces, while
-  decompression slots own only decoder codecs.
+- ``max_inflight``: maximum encoder and decoder codec leases shared by all
+  ``CollectiveGroup`` instances in one Worker.
+
+``tensor_buffer_pool`` is independent of compression. Its ``max_bytes`` field
+limits active plus cached CPU tensor buffers in one Worker and defaults to 1
+GiB. When compression is configured without this block, the default pool is
+created automatically.
 
 For each generic object transfer, a CPU tensor is compressed only when
-compression is enabled, it meets ``min_bytes``, and a workspace slot is
-immediately available. A saturated pool never queues or blocks the sender: the
-transfer proceeds uncompressed. A transfer also falls back to its original
-tensor when the encoded payload is not smaller. When a slot is released, it is
-prioritized over never-used slots, which greedily reuses its workspace buffers.
-The slot is released after its synchronous payload transfer finishes. Received
-compressed payloads borrow a decoder slot only while they are restored; decoder
-slots have no workspace buffers.
+compression is enabled, it meets ``min_bytes``, and both a codec and buffer are
+immediately available. A saturated codec or buffer pool never queues or
+blocks the sender: that tensor proceeds uncompressed. A tensor also follows the
+original path when encoding does not reduce its wire size; the unused buffer
+is discarded instead of cached.
 
-Each ``CollectiveGroup`` owns one ``TensorCodecPool`` and therefore uses one
-codec and parameter for the lifetime of the group. The wire metadata identifies
-the compressed payload and validates that its codec settings match the job-wide
-configuration propagated to the receiving Worker. Compression currently applies
-only to CPU tensors in generic ``send``/``recv`` object, list, dictionary, and
-dataclass paths. GPU/NCCL transfers, broadcasts, and direct
+Each Worker lazily owns independent ``TensorCodecPool`` and ``TensorBufferPool``
+instances shared by all of its ``CollectiveGroup`` instances. Compressed payload
+buffers remain leased until their synchronous sends finish, then return to the
+best-fit buffer cache. Idle buffers are evicted when a new shape needs room, so
+historical tensor shapes cannot grow the cache beyond ``max_bytes``. Received
+compressed payloads borrow a decoder only while restoring data.
+
+Wire metadata identifies compressed tensors and validates that the codec matches
+the job-wide configuration on the receiving Worker. Compression currently
+applies only to CPU tensors in generic ``send``/``recv`` object, list,
+dictionary, and dataclass paths. GPU/NCCL transfers, broadcasts, and direct
 ``send_tensor``/``recv_tensor`` calls remain uncompressed.
 
 YAML is the public control plane because it is versioned with the job and is

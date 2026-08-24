@@ -64,6 +64,8 @@ Tensor 压缩
 
    cluster:
      collective:
+       tensor_buffer_pool:
+         max_bytes: 1073741824
        tensor_compression:
          enabled: true
          codec: lz4
@@ -77,21 +79,27 @@ Tensor 压缩
 - ``level``：大于 0 的 codec 参数。对于 ``lz4``，它传给 LZ4 的
   ``acceleration``\ （值越大越优先速度）；对于 ``zstd``，它是 Zstandard 的压缩等级。
 - ``min_bytes``：只有不小于此大小的 CPU 张量才会成为压缩候选。
-- ``max_inflight``：每个 ``CollectiveGroup`` 两个方向的 codec slot 上限：压缩
-  slot 持有可复用 workspace，解压 slot 只持有 decoder codec。
+- ``max_inflight``：单个 Worker 内所有 ``CollectiveGroup`` 共享的 encoder 和
+  decoder codec lease 上限。
 
-每次通用对象传输中，只有压缩已开启、CPU 张量达到 ``min_bytes``，并且能立即获取到
-空闲 workspace slot 时，才会尝试压缩。pool 饱和时不会排队或阻塞发送端，而是直接
-原样发送；若编码结果并未变小，也会回退为原始张量。slot 释放后会优先于从未使用过的
-slot 被获取，从而贪心复用其中的 workspace buffer。payload 的同步传输完成后，slot 会
-立即释放。接收到压缩 payload 时，仅在恢复数据期间借用 decoder slot；decoder slot
-不持有 workspace buffer。
+``tensor_buffer_pool`` 独立于压缩配置。它的 ``max_bytes`` 限制单个 Worker 内 active
+与 cached CPU tensor buffer 的总字节数，默认值为 1 GiB。配置压缩但省略该段时，会自动
+使用默认 buffer pool。
 
-每个 ``CollectiveGroup`` 只持有一个 ``TensorCodecPool``，因此其整个生命周期只会使用
-一种 codec 及其参数。wire metadata 标记压缩 payload，并校验其 codec 设置与接收 Worker
-从作业级配置得到的设置一致。当前压缩仅适用于通用 ``send``/``recv`` 的对象、列表、
-字典和 dataclass 路径中的 CPU 张量；GPU/NCCL 传输、broadcast，以及直接调用
-``send_tensor``/``recv_tensor`` 的路径仍不会压缩。
+每次通用对象传输中，只有压缩已开启、CPU 张量达到 ``min_bytes``，并且能立即获取 codec
+和 buffer 时，才会尝试压缩。codec 或 buffer pool 饱和时不会排队或阻塞发送端，
+该张量会直接原样发送。若编码结果未减小 wire size，也会回退为原始张量，并且不会缓存
+此次未产生收益的 buffer。
+
+每个 Worker 延迟创建彼此独立的 ``TensorCodecPool`` 和 ``TensorBufferPool``，并由其
+所有 ``CollectiveGroup`` 共享。压缩 payload 使用的 buffer 会保持 lease，直到同步发送
+完成；随后它进入 best-fit buffer cache。当新 shape 需要空间时，pool 会淘汰 idle buffer，
+因此历史 tensor shape 不会让 cache 超过 ``max_bytes`` 预算。接收到压缩 payload 时，仅在
+恢复数据期间借用 decoder。
+
+wire metadata 标记压缩张量，并校验其 codec 设置与接收 Worker 的作业级配置一致。当前
+压缩仅适用于通用 ``send``/``recv`` 的对象、列表、字典和 dataclass 路径中的 CPU 张量；
+GPU/NCCL 传输、broadcast，以及直接调用 ``send_tensor``/``recv_tensor`` 的路径仍不会压缩。
 
 YAML 是公开的控制面：它会随作业一同版本化，并能保证跨节点下发一致。RLinf 仅使用
 内部环境变量把已校验的配置传递给 Worker 进程；用户不应直接设置该环境变量。单个 Worker
