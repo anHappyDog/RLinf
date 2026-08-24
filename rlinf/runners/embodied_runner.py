@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
-from rlinf.data.schema.embodied_channel import EmbodiedTrajectoryCollector
+from rlinf.data.schema.embodied_channel import select_trajectory_collector
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
@@ -98,7 +98,7 @@ class EmbodiedRunner:
         # nor the rollout worker has to hold partial trajectory state.
         self.actor_channel = Channel.create(
             "Actor",
-            collector=EmbodiedTrajectoryCollector,
+            collector=select_trajectory_collector(self.cfg),
             cfg=self.cfg,
             producers=[self.env, self.rollout],
             consumers=[self.actor],

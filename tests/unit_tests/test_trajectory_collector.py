@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.data.schema.embodied_channel import EmbodiedTrajectoryCollector
+from rlinf.data.schema.embodied_channel import (
+    OnlineLerobotTrajectoryCollector,
+    PipelineTrajectoryCollector,
+    RolloutGeometry,
+    RolloutTrajectoryCollector,
+    select_trajectory_collector,
+)
 from rlinf.data.schema.embodied_trajectory_builder import (
     EmbodiedLerobotTrajectoryBuilder,
 )
@@ -32,13 +38,6 @@ from rlinf.data.schema.embodied_types import (
 from rlinf.data.schema.trajectory_assembler import (
     AssembledChunk,
     TrajectoryEventAssembler,
-)
-from rlinf.data.schema.trajectory_collectors import (
-    CollectorOutput,
-    OnlineLerobotTrajectoryCollector,
-    PipelineTrajectoryCollector,
-    RolloutTrajectoryCollector,
-    create_trajectory_collector,
 )
 from rlinf.data.schema.trajectory_events import (
     DummyPolicyStep,
@@ -156,50 +155,59 @@ def _episode_data():
     }
 
 
-def _stub_collector(outputs=None, collect_error=None):
-    """An EmbodiedTrajectoryCollector with its assembly internals mocked out."""
-    collector = object.__new__(EmbodiedTrajectoryCollector)
+def _make(collector_cls, cfg=None, **geometry):
+    """Build a collector as a channel would, with the geometry supplied directly.
+
+    Deriving the geometry needs a live cluster, so tests pass it in instead.
+    """
+    shape = {
+        "source_count": 1,
+        "chunk_count": 1,
+        "shards_per_source": 1,
+        "actor_world_size": 1,
+    }
+    shape.update(geometry)
+    collector = collector_cls()
+    with patch.object(
+        RolloutGeometry, "from_cfg", return_value=RolloutGeometry(**shape)
+    ):
+        collector.setup(
+            ChannelContext(name="Actor", cfg=cfg if cfg is not None else _config())
+        )
+    return collector
+
+
+def _stub_collector(outputs=None, emit_error=None):
+    """A collector whose assembler and emit step are mocked out."""
+    collector = object.__new__(RolloutTrajectoryCollector)
     chunk = Mock()
     collector._assembler = Mock()
     collector._assembler.push.return_value = [chunk]
-    collector._collector = Mock()
-    if collect_error is not None:
-        collector._collector.collect.side_effect = collect_error
+    if emit_error is not None:
+        collector.emit = Mock(side_effect=emit_error)
     else:
-        collector._collector.collect.return_value = outputs or []
+        collector.emit = Mock(return_value=iter(outputs or []))
     return collector, chunk
 
 
-def test_collector_keys_pipeline_outputs_by_actor_rank():
-    collector, chunk = _stub_collector(
-        [CollectorOutput(queue_key="actor:2", data="batch")]
-    )
+def test_collect_assembles_an_event_then_emits_what_it_completed():
+    collector, chunk = _stub_collector([("actor:2", "batch")])
     event = object()
 
     assert list(collector.collect(event, DEFAULT_KEY)) == [("actor:2", "batch")]
     collector._assembler.push.assert_called_once_with(event)
-    collector._collector.collect.assert_called_once_with(chunk)
+    collector.emit.assert_called_once_with(chunk)
     collector._assembler.acknowledge.assert_called_once_with(chunk.key)
 
 
-def test_collector_maps_shared_outputs_onto_the_channel_default_key():
-    collector, _ = _stub_collector(
-        [CollectorOutput(queue_key="default", data="trajectory")]
-    )
-
-    assert list(collector.collect(object(), DEFAULT_KEY)) == [
-        (DEFAULT_KEY, "trajectory")
-    ]
-
-
-def test_collector_emits_nothing_until_a_chunk_completes():
+def test_collect_emits_nothing_until_a_chunk_completes():
     collector, _ = _stub_collector([])
 
     assert list(collector.collect(object(), DEFAULT_KEY)) == []
 
 
-def test_collector_keeps_the_assembled_chunk_when_collection_fails():
-    collector, _ = _stub_collector(collect_error=ValueError("invalid collection"))
+def test_collect_keeps_the_assembled_chunk_when_emitting_fails():
+    collector, _ = _stub_collector(emit_error=ValueError("invalid collection"))
 
     with pytest.raises(ValueError, match="invalid collection"):
         list(collector.collect(object(), DEFAULT_KEY))
@@ -207,11 +215,31 @@ def test_collector_keeps_the_assembled_chunk_when_collection_fails():
     collector._assembler.acknowledge.assert_not_called()
 
 
-def test_collector_setup_requires_the_run_config():
-    collector = EmbodiedTrajectoryCollector()
-
+@pytest.mark.parametrize(
+    "collector_cls",
+    [
+        RolloutTrajectoryCollector,
+        PipelineTrajectoryCollector,
+        OnlineLerobotTrajectoryCollector,
+    ],
+)
+def test_setup_requires_the_run_config(collector_cls):
     with pytest.raises(ValueError, match="needs the run config"):
-        collector.setup(ChannelContext(name="Actor", cfg=None))
+        collector_cls().setup(ChannelContext(name="Actor", cfg=None))
+
+
+def test_selection_matches_the_mode_the_config_asks_for():
+    assert select_trajectory_collector(_config()) is RolloutTrajectoryCollector
+    assert (
+        select_trajectory_collector(_config(runner={"use_training_pipeline": True}))
+        is PipelineTrajectoryCollector
+    )
+    assert (
+        select_trajectory_collector(
+            _config(algorithm={"dagger": {"online_lerobot": {"enabled": True}}})
+        )
+        is OnlineLerobotTrajectoryCollector
+    )
 
 
 def test_assembler_joins_out_of_order_source_fragments():
@@ -287,21 +315,29 @@ def test_trajectory_start_completes_waiting_chunk():
 
 
 def test_rollout_collector_bootstraps_reward_and_emits_trajectory():
-    collector = RolloutTrajectoryCollector(
-        _config(), source_count=1, chunk_count=1, shards_per_source=1
+    collector = _make(
+        RolloutTrajectoryCollector,
+        _config(),
+        source_count=1,
+        chunk_count=1,
+        shards_per_source=1,
     )
     key = TrajectoryKey(3, 0, 0, 0, 0)
 
-    outputs = collector.collect(_chunk(key, initial_env_result=EnvResult()))
+    outputs = list(collector.emit(_chunk(key, initial_env_result=EnvResult())))
 
     assert len(outputs) == 1
-    assert outputs[0].queue_key == "default"
-    assert torch.equal(outputs[0].data.rewards, torch.tensor([[[3.0]]]))
+    assert outputs[0][0] == DEFAULT_KEY
+    assert torch.equal(outputs[0][1].rewards, torch.tensor([[[3.0]]]))
 
 
 def test_rollout_collector_preserves_scope_when_conversion_fails():
-    collector = RolloutTrajectoryCollector(
-        _config(), source_count=1, chunk_count=1, shards_per_source=1
+    collector = _make(
+        RolloutTrajectoryCollector,
+        _config(),
+        source_count=1,
+        chunk_count=1,
+        shards_per_source=1,
     )
     key = TrajectoryKey(3, 0, 0, 0, 0)
     builder = Mock()
@@ -309,7 +345,7 @@ def test_rollout_collector_preserves_scope_when_conversion_fails():
     collector._builders = {3: {(0, 0): builder}}
 
     with pytest.raises(RuntimeError, match="invalid trajectory"):
-        collector.collect(_chunk(key))
+        list(collector.emit(_chunk(key)))
 
     assert collector._builders == {3: {(0, 0): builder}}
     assert collector._completed_keys == {key}
@@ -317,22 +353,30 @@ def test_rollout_collector_preserves_scope_when_conversion_fails():
 
 def test_rollout_collector_rejects_duplicate_completed_key():
     cfg = _config(env={"train": {"rollout_epoch": 2}})
-    collector = RolloutTrajectoryCollector(
-        cfg, source_count=1, chunk_count=1, shards_per_source=1
+    collector = _make(
+        RolloutTrajectoryCollector,
+        cfg,
+        source_count=1,
+        chunk_count=1,
+        shards_per_source=1,
     )
     key = TrajectoryKey(3, 0, 0, 0, 0)
-    collector.collect(_chunk(key))
+    list(collector.emit(_chunk(key)))
 
     with pytest.raises(ValueError, match="duplicate trajectory event"):
-        collector.collect(_chunk(key))
+        list(collector.emit(_chunk(key)))
 
 
 def test_online_lerobot_collector_accepts_dummy_step_and_emits_shards():
     cfg = _config(
         algorithm={"dagger": {"online_lerobot": {"enabled": True}}},
     )
-    collector = OnlineLerobotTrajectoryCollector(
-        cfg, source_count=1, chunk_count=1, shards_per_source=2
+    collector = _make(
+        OnlineLerobotTrajectoryCollector,
+        cfg,
+        source_count=1,
+        chunk_count=1,
+        shards_per_source=2,
     )
     key = TrajectoryKey(3, 0, 0, 0, 0)
     dummy = DummyPolicyStep(
@@ -342,25 +386,29 @@ def test_online_lerobot_collector_accepts_dummy_step_and_emits_shards():
     )
     env = _env_step(key, episode_data=_episode_data())
 
-    outputs = collector.collect(_chunk(key, policy=dummy, env=env))
+    outputs = list(collector.emit(_chunk(key, policy=dummy, env=env)))
 
     assert len(outputs) == 2
-    assert all(output.queue_key == "default" for output in outputs)
+    assert all(key == DEFAULT_KEY for key, _ in outputs)
 
 
 def test_pipeline_collector_routes_completed_epoch_to_actor():
     cfg = _config(runner={"use_training_pipeline": True})
-    collector = PipelineTrajectoryCollector(
-        cfg, source_count=1, chunk_count=1, actor_world_size=1
+    collector = _make(
+        PipelineTrajectoryCollector,
+        cfg,
+        source_count=1,
+        chunk_count=1,
+        actor_world_size=1,
     )
     collector._prepare_pipeline_batch = lambda trajectory: {"value": trajectory}
     collector._pipeline_micro_batches = lambda batch, actor_rank: [batch]
     key = TrajectoryKey(2, 1, 0, 0, 0)
 
-    outputs = collector.collect(_chunk(key, initial_env_result=EnvResult()))
+    outputs = list(collector.emit(_chunk(key, initial_env_result=EnvResult())))
 
     assert len(outputs) == 1
-    assert outputs[0].queue_key == "actor:0"
+    assert outputs[0][0] == "actor:0"
     assert (2, 1) not in collector._builders
 
 
@@ -379,15 +427,7 @@ def test_pipeline_collector_routes_completed_epoch_to_actor():
     ],
 )
 def test_collector_factory_selects_configured_strategy(overrides, expected_type):
-    collector = create_trajectory_collector(
-        _config(**overrides),
-        source_count=1,
-        chunk_count=1,
-        shards_per_source=1,
-        actor_world_size=1,
-    )
-
-    assert isinstance(collector, expected_type)
+    assert select_trajectory_collector(_config(**overrides)) is expected_type
 
 
 def test_collector_factory_rejects_pipeline_with_online_lerobot():
@@ -397,13 +437,7 @@ def test_collector_factory_rejects_pipeline_with_online_lerobot():
     )
 
     with pytest.raises(ValueError, match="does not support online LeRobot"):
-        create_trajectory_collector(
-            cfg,
-            source_count=1,
-            chunk_count=1,
-            shards_per_source=1,
-            actor_world_size=1,
-        )
+        select_trajectory_collector(cfg)
 
 
 def test_online_lerobot_dummy_step_records_intervened_action():
