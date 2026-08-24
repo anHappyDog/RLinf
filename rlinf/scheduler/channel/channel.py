@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import ray
 import ray.actor
 
-from ..cluster import Cluster
+from ..cluster import Cluster, resolve_group_names, resolve_worker_names
 from ..collective import (
     AsyncChannelCommWork,
     AsyncChannelWork,
@@ -27,85 +27,13 @@ from ..collective import (
     AsyncWork,
 )
 from ..placement import NodePlacementStrategy
-from ..worker import Worker, WorkerAddress, WorkerGroup
+from ..worker import Worker, WorkerGroup
 from .hooks import ChannelContext
 
 if TYPE_CHECKING:
     from .channel_worker import ChannelWorker, LocalChannel
 
 DEFAULT_KEY = "default_queue"
-
-#: What ``Channel.create`` accepts for ``producers`` and ``consumers``: a worker
-#: group, a group name, or any iterable mixing the two.
-WorkerGroupSpec = "WorkerGroup | str | Iterable[WorkerGroup | str]"
-
-
-def _group_names(spec: Any) -> list[str]:
-    """Normalize a worker group spec into a list of group names."""
-    if spec is None:
-        return []
-    if isinstance(spec, (str, WorkerGroup)):
-        spec = [spec]
-    names = []
-    for group in spec:
-        if isinstance(group, WorkerGroup):
-            names.append(group.worker_group_name)
-        elif isinstance(group, str):
-            names.append(group)
-        else:
-            raise TypeError(
-                f"Expected a WorkerGroup or a group name, got {type(group)}."
-            )
-    return names
-
-
-def _group_world_size(group_name: str) -> int:
-    """Ask the worker manager how many workers a launched group has."""
-    from ..manager import WorkerManager
-
-    worker_info = WorkerManager.get_proxy().get_worker_info(
-        WorkerAddress(root_group_name=group_name, ranks=0)
-    )
-    if worker_info is None:
-        raise ValueError(
-            f"Worker group '{group_name}' is not registered. Pass the worker "
-            f"group itself, or launch it before naming it as a channel "
-            f"producer or consumer."
-        )
-    return worker_info.group_world_size
-
-
-def _group_sizes(spec: Any) -> list[tuple[str, int]]:
-    """Normalize a worker group spec into ``(group name, world size)`` pairs.
-
-    A worker group reports its own size, which is known as soon as it is
-    launched. A bare group name is resolved through the worker manager, which
-    requires that group to have finished registering.
-    """
-    if spec is None:
-        return []
-    if isinstance(spec, (str, WorkerGroup)):
-        spec = [spec]
-    sizes = []
-    for group in spec:
-        if isinstance(group, WorkerGroup):
-            sizes.append((group.worker_group_name, len(group.worker_info_list)))
-        elif isinstance(group, str):
-            sizes.append((group, _group_world_size(group)))
-        else:
-            raise TypeError(
-                f"Expected a WorkerGroup or a group name, got {type(group)}."
-            )
-    return sizes
-
-
-def _consumer_ids(spec: Any) -> list[str]:
-    """Expand a worker group spec into one consumer id per worker rank."""
-    return [
-        WorkerAddress(root_group_name=name, ranks=rank).get_name()
-        for name, world_size in _group_sizes(spec)
-        for rank in range(world_size)
-    ]
 
 
 class Channel:
@@ -279,8 +207,8 @@ class Channel:
         context = ChannelContext(
             name=name,
             cfg=cfg,
-            producers=tuple(_group_names(producers)),
-            consumers=tuple(_consumer_ids(consumers)),
+            producers=tuple(resolve_group_names(producers)),
+            consumers=tuple(resolve_worker_names(consumers)),
             options=dict(hook_options or {}),
         )
         try:

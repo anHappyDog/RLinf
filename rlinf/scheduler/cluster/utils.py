@@ -614,3 +614,117 @@ def unpack_dataclass_tensors(skeleton: Any, tensors: list[torch.Tensor]) -> Any:
         return value
 
     return unpack(skeleton)
+
+
+#: What worker-group arguments accept: a worker group, a group name, or any
+#: iterable mixing the two.
+WorkerGroupSpec = "WorkerGroup | str | Iterable[WorkerGroup | str]"
+
+
+def get_group_world_size(group_name: str) -> int:
+    """Ask the worker manager how many workers a launched group has.
+
+    Args:
+        group_name: Name of a launched worker group.
+
+    Returns:
+        The number of workers in the group.
+
+    Raises:
+        ValueError: If no group of that name has registered with the manager.
+    """
+    from ..manager import WorkerAddress, WorkerManager
+
+    worker_info = WorkerManager.get_proxy().get_worker_info(
+        WorkerAddress(root_group_name=group_name, ranks=0)
+    )
+    if worker_info is None:
+        raise ValueError(
+            f"Worker group '{group_name}' is not registered. Pass the worker "
+            f"group itself, or launch it before naming it."
+        )
+    return worker_info.group_world_size
+
+
+def resolve_group_sizes(spec: Any) -> list[tuple[str, int]]:
+    """Normalize a worker group spec into ``(group name, world size)`` pairs.
+
+    A worker group reports its own size, which is known as soon as it is
+    launched. A bare group name is resolved through the worker manager, which
+    requires that group to have finished registering.
+
+    Args:
+        spec: A worker group, a group name, an iterable mixing the two, or None.
+
+    Returns:
+        One ``(group name, world size)`` pair per group, in the given order.
+
+    Raises:
+        TypeError: If an entry is neither a worker group nor a group name.
+    """
+    from ..worker import WorkerGroup
+
+    if spec is None:
+        return []
+    if isinstance(spec, (str, WorkerGroup)):
+        spec = [spec]
+    sizes = []
+    for group in spec:
+        if isinstance(group, WorkerGroup):
+            sizes.append((group.worker_group_name, len(group.worker_info_list)))
+        elif isinstance(group, str):
+            sizes.append((group, get_group_world_size(group)))
+        else:
+            raise TypeError(
+                f"Expected a WorkerGroup or a group name, got {type(group)}."
+            )
+    return sizes
+
+
+def resolve_group_names(spec: Any) -> list[str]:
+    """Normalize a worker group spec into a list of group names.
+
+    Args:
+        spec: A worker group, a group name, an iterable mixing the two, or None.
+
+    Returns:
+        The group names, in the given order.
+    """
+    from ..worker import WorkerGroup
+
+    if spec is None:
+        return []
+    if isinstance(spec, (str, WorkerGroup)):
+        spec = [spec]
+    names = []
+    for group in spec:
+        if isinstance(group, WorkerGroup):
+            names.append(group.worker_group_name)
+        elif isinstance(group, str):
+            names.append(group)
+        else:
+            raise TypeError(
+                f"Expected a WorkerGroup or a group name, got {type(group)}."
+            )
+    return names
+
+
+def resolve_worker_names(spec: Any) -> list[str]:
+    """Expand a worker group spec into one worker name per rank.
+
+    Names are built with :meth:`WorkerAddress.get_name`, so they match the
+    names workers report for themselves.
+
+    Args:
+        spec: A worker group, a group name, an iterable mixing the two, or None.
+
+    Returns:
+        One ``"<group>:<rank>"`` name per worker, in group and rank order.
+    """
+    from ..manager import WorkerAddress
+
+    return [
+        WorkerAddress(root_group_name=name, ranks=rank).get_name()
+        for name, world_size in resolve_group_sizes(spec)
+        for rank in range(world_size)
+    ]

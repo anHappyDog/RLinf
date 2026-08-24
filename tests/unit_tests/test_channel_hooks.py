@@ -20,13 +20,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from rlinf.scheduler.channel.channel import (
-    DEFAULT_KEY,
-    _consumer_ids,
-    _group_names,
-    _group_sizes,
-    _group_world_size,
-)
+from rlinf.scheduler.channel.channel import DEFAULT_KEY
 from rlinf.scheduler.channel.channel_worker import ChannelWorker, PeekQueue
 from rlinf.scheduler.channel.hooks import (
     COLLECTOR_REGISTRY,
@@ -43,6 +37,12 @@ from rlinf.scheduler.channel.hooks import (
     register_dispatcher,
     resolve_collector,
     resolve_dispatcher,
+)
+from rlinf.scheduler.cluster import (
+    get_group_world_size,
+    resolve_group_names,
+    resolve_group_sizes,
+    resolve_worker_names,
 )
 from rlinf.scheduler.worker import WorkerAddress, WorkerGroup
 
@@ -397,15 +397,15 @@ def test_group_specs_accept_worker_groups_names_and_mixtures():
     group = object.__new__(WorkerGroup)
     group._worker_group_name = "ActorGroup"
 
-    assert _group_names(None) == []
-    assert _group_names("EnvGroup") == ["EnvGroup"]
-    assert _group_names(group) == ["ActorGroup"]
-    assert _group_names([group, "EnvGroup"]) == ["ActorGroup", "EnvGroup"]
+    assert resolve_group_names(None) == []
+    assert resolve_group_names("EnvGroup") == ["EnvGroup"]
+    assert resolve_group_names(group) == ["ActorGroup"]
+    assert resolve_group_names([group, "EnvGroup"]) == ["ActorGroup", "EnvGroup"]
 
 
 def test_a_group_spec_of_the_wrong_type_is_rejected():
     with pytest.raises(TypeError, match="WorkerGroup or a group name"):
-        _group_names([object()])
+        resolve_group_names([object()])
 
 
 def test_consumers_expand_to_one_id_per_rank_of_a_worker_group():
@@ -413,8 +413,12 @@ def test_consumers_expand_to_one_id_per_rank_of_a_worker_group():
     group._worker_group_name = "ActorGroup"
     group._workers = [Mock(rank=rank) for rank in range(3)]
 
-    assert _consumer_ids(group) == ["ActorGroup:0", "ActorGroup:1", "ActorGroup:2"]
-    assert _consumer_ids(None) == []
+    assert resolve_worker_names(group) == [
+        "ActorGroup:0",
+        "ActorGroup:1",
+        "ActorGroup:2",
+    ]
+    assert resolve_worker_names(None) == []
 
 
 def test_a_bare_group_name_gets_its_size_from_the_worker_manager(monkeypatch):
@@ -424,7 +428,7 @@ def test_a_bare_group_name_gets_its_size_from_the_worker_manager(monkeypatch):
         "rlinf.scheduler.manager.WorkerManager.get_proxy", lambda: proxy
     )
 
-    assert _consumer_ids("ActorGroup") == ["ActorGroup:0", "ActorGroup:1"]
+    assert resolve_worker_names("ActorGroup") == ["ActorGroup:0", "ActorGroup:1"]
     proxy.get_worker_info.assert_called_once()
 
 
@@ -438,7 +442,10 @@ def test_group_sizes_mixes_groups_and_names(monkeypatch):
         "rlinf.scheduler.manager.WorkerManager.get_proxy", lambda: proxy
     )
 
-    assert _group_sizes([group, "EnvGroup"]) == [("ActorGroup", 1), ("EnvGroup", 4)]
+    assert resolve_group_sizes([group, "EnvGroup"]) == [
+        ("ActorGroup", 1),
+        ("EnvGroup", 4),
+    ]
 
 
 def test_naming_an_unlaunched_group_says_what_to_do_about_it(monkeypatch):
@@ -449,7 +456,7 @@ def test_naming_an_unlaunched_group_says_what_to_do_about_it(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="launch it before"):
-        _group_world_size("NeverLaunched")
+        get_group_world_size("NeverLaunched")
 
 
 def test_consumer_ids_match_the_ids_the_worker_get_path_reports():
