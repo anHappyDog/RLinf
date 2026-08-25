@@ -101,9 +101,9 @@ class Collector:
             item: The item as it was put into the channel.
             key: The key it was put under.
 
-        Returns:
-            An iterable of ``(key, item)`` pairs to enqueue. May be empty to
-            drop the item, or yield several pairs to fan it out.
+        Yields:
+            ``(key, item)`` pairs to enqueue. May yield nothing to drop the
+            input, or several pairs to fan it out.
         """
         yield key, item
 
