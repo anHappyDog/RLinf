@@ -40,6 +40,7 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.utils.obs_compression import decompress_obs, infer_obs_batch_size
 from rlinf.utils.placement import HybridComponentPlacement
 
 
@@ -120,6 +121,7 @@ class MultiStepRolloutWorker(Worker):
                 // self.model_cfg.num_action_chunks
             )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
+        self.collect_final_values = self.cfg.rollout.get("collect_final_values", True)
         self.version = 0
         self.global_step = 0
         self.finished_episodes = None
@@ -663,6 +665,22 @@ class MultiStepRolloutWorker(Worker):
         """Infer the batch size of a routed policy input."""
         return cls._infer_env_batch_size(policy_input.obs)
 
+    @staticmethod
+    def _decompress_policy_input(policy_input: PolicyInput) -> PolicyInput:
+        """Restore compressed current and transition observations in place."""
+        policy_input.obs = decompress_obs(policy_input.obs)
+        for env_part in policy_input.env_parts:
+            if env_part is not None:
+                env_part.next_obs = decompress_obs(env_part.next_obs)
+        return policy_input
+
+    @classmethod
+    def _merge_policy_inputs(cls, policy_inputs: list[PolicyInput]) -> PolicyInput:
+        """Decompress routed requests before merging their tensor batches."""
+        return PolicyInput.merge(
+            [cls._decompress_policy_input(item) for item in policy_inputs]
+        )
+
     async def _receive_policy_input(
         self,
         channel: Channel,
@@ -678,7 +696,7 @@ class MultiStepRolloutWorker(Worker):
                 channel=channel,
                 tag=tag,
                 batch_size=self.train_batch_size,
-                merge_fn=PolicyInput.merge,
+                merge_fn=self._merge_policy_inputs,
                 infer_batch_size_fn=self._infer_policy_input_batch_size,
                 timeout_time=0.02,
                 recv_queue_size=self.rollout_queue_size,
@@ -691,7 +709,7 @@ class MultiStepRolloutWorker(Worker):
             route_key=stage_id,
             async_op=True,
             batch_size=self.train_batch_size,
-            merge_fn=PolicyInput.merge,
+            merge_fn=self._merge_policy_inputs,
             infer_batch_size_fn=self._infer_policy_input_batch_size,
         ).async_wait()
         return policy_input, None
@@ -943,14 +961,9 @@ class MultiStepRolloutWorker(Worker):
 
     @staticmethod
     def _infer_env_batch_size(obs_batch: dict[str, Any]) -> int:
-        obs = obs_batch["obs"] if "obs" in obs_batch else obs_batch
-        for key in ("states", "main_images", "task_descriptions"):
-            value = obs.get(key)
-            if isinstance(value, torch.Tensor):
-                return value.shape[0]
-            if isinstance(value, list):
-                return len(value)
-        raise ValueError("Cannot infer batch size from env obs.")
+        # Delegates to the shared helper, which also understands compressed
+        # image markers (inference runs before decompression on the recv path).
+        return infer_obs_batch_size(obs_batch)
 
     def _merge_optional_flag_tensors(
         self,
@@ -973,6 +986,9 @@ class MultiStepRolloutWorker(Worker):
     def _merge_obs_batches(self, obs_batches: list[dict[str, Any]]) -> dict[str, Any]:
         if not obs_batches:
             return {}
+        # Reconstruct any image tensors compressed by the env workers. This is a
+        # no-op when `env.obs_compression` is disabled (no compression markers).
+        obs_batches = [decompress_obs(obs_batch) for obs_batch in obs_batches]
         obs_dicts = [
             obs_batch["obs"] if "obs" in obs_batch else obs_batch
             for obs_batch in obs_batches

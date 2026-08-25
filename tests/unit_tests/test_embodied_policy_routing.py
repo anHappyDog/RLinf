@@ -21,6 +21,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+import rlinf.utils.obs_compression as obs_compression
 from rlinf.data.schema import (
     EnvOutput,
     EnvPart,
@@ -32,9 +33,10 @@ from rlinf.data.schema import (
     TrajectorySource,
 )
 from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
+from rlinf.utils.env_helpers import SmoothInterveneController
+from rlinf.utils.obs_compression import is_compressed_image
 from rlinf.workers.env.async_env_worker import AsyncEnvWorker
 from rlinf.workers.env.env_worker import EnvWorker
-from rlinf.workers.env.smooth_intervene import SmoothInterveneController
 from rlinf.workers.rollout.hf.async_huggingface_worker import (
     AsyncMultiStepRolloutWorker,
 )
@@ -44,6 +46,51 @@ from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 def _policy_input() -> PolicyInput:
     return PolicyInput(
         obs={"states": torch.zeros(16, 4)},
+    )
+
+
+def test_policy_input_compression_preserves_attached_env_parts(monkeypatch):
+    """Trajectory requests remain lossless across split/compress/merge routing."""
+    monkeypatch.setattr(
+        obs_compression,
+        "_get_backend",
+        lambda _codec: (
+            lambda raw, _level: raw,
+            lambda raw: raw,
+        ),
+    )
+    key = TrajectoryKey(0, 0, 0, 0, 0)
+    source = TrajectorySource(key=key, size=4)
+    current_images = torch.randint(0, 256, (4, 8, 8, 3), dtype=torch.uint8)
+    next_images = torch.randint(0, 256, (4, 8, 8, 3), dtype=torch.uint8)
+    policy_input = PolicyInput(
+        obs={"main_images": current_images},
+        sources=[source],
+        env_parts=[
+            EnvPart(
+                sources=[source],
+                transition=EnvTransition(rewards=torch.ones(4, 2)),
+                next_obs={"main_images": next_images},
+            )
+        ],
+    )
+    env_worker = object.__new__(EnvWorker)
+    env_worker.obs_compression_cfg = {
+        "enable": True,
+        "codec": "lz4",
+        "level": 1,
+        "xor_delta": True,
+    }
+
+    shards = env_worker._split_and_compress_policy_input(policy_input, [1, 3])
+
+    assert is_compressed_image(shards[0].obs["main_images"])
+    assert is_compressed_image(shards[0].env_parts[0].next_obs["main_images"])
+    merged = MultiStepRolloutWorker._merge_policy_inputs(shards)
+    assert torch.equal(merged.obs["main_images"], current_images)
+    assert torch.equal(
+        torch.cat([part.next_obs["main_images"] for part in merged.env_parts], dim=0),
+        next_images,
     )
 
 
@@ -136,7 +183,7 @@ def test_decoupled_policy_route_round_trip():
         channel=None,
         tag="policy",
         batch_size=32,
-        merge_fn=PolicyInput.merge,
+        merge_fn=rollout._merge_policy_inputs,
         infer_batch_size_fn=rollout._infer_policy_input_batch_size,
         timeout_time=0.02,
         recv_queue_size=0,

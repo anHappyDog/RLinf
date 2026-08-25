@@ -33,17 +33,26 @@ from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import InsertDelay, RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.utils.env_helpers import HistoryManager, SmoothInterveneController
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
     update_nested_cfg,
 )
+from rlinf.utils.obs_compression import compress_obs, is_compression_enabled
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.workers.env.history_manager import HistoryManager
-from rlinf.workers.env.smooth_intervene import SmoothInterveneController
 
 
 class EnvWorker(Worker):
+    # Class-level default so the observation send path is safe even when the
+    # instance is built without running ``__init__`` (e.g. ``object.__new__`` in
+    # unit tests). ``None`` means "use the scheduler's default split"; when
+    # ``env.obs_compression`` is enabled, ``__init__`` installs the compressing
+    # ``split_fn`` (see ``_split_and_compress_obs``).
+    _obs_split_fn = None
+    _policy_input_split_fn = None
+    collect_final_values = True
+
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
 
@@ -63,11 +72,24 @@ class EnvWorker(Worker):
 
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
+        self.collect_final_values = self.cfg.rollout.get("collect_final_values", True)
         self.stage_num = self.cfg.rollout.pipeline_stage_num
         self.enable_rlt = OmegaConf.select(
             self.cfg, "algorithm.loss_type", default=""
         ) in {"rlt_ac", "rlt_td3"}
         self.use_training_pipeline = self.cfg.runner.get("use_training_pipeline", False)
+        # Optional lossless compression of image observations before they are
+        # sent to rollout workers. Splitting happens before compression so
+        # routing still sees ordinary batched tensors.
+        self.obs_compression_cfg = OmegaConf.select(
+            self.cfg, "env.obs_compression", default=None
+        )
+        if is_compression_enabled(self.obs_compression_cfg):
+            self._obs_split_fn = self._split_and_compress_obs
+            self._policy_input_split_fn = self._split_and_compress_policy_input
+        else:
+            self._obs_split_fn = None
+            self._policy_input_split_fn = PolicyInput.split
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -839,7 +861,7 @@ class EnvWorker(Worker):
             tag="policy_final" if policy_input.is_last else "policy",
             route_key=stage_id if not self.env_decoupled_mode else None,
             batch_size=self.train_batch_size,
-            split_fn=PolicyInput.split,
+            split_fn=self._policy_input_split_fn or PolicyInput.split,
             decoupled_mode=self.env_decoupled_mode,
         )
 
@@ -865,8 +887,10 @@ class EnvWorker(Worker):
             env_output.dones.any()
         )
         # A terminal forward pass supplies value/transition data, not actions.
-        needs_terminal = not self.enable_online_lerobot and (
-            is_last or has_terminal_state
+        needs_terminal = (
+            self.collect_final_values
+            and not self.enable_online_lerobot
+            and (is_last or has_terminal_state)
         )
 
         next_obs = env_output.obs
@@ -919,6 +943,39 @@ class EnvWorker(Worker):
             next_key,
         )
         return None
+
+    def _split_and_compress_obs(
+        self, data: dict[str, Any], split_sizes: list[int]
+    ) -> list[dict[str, Any]]:
+        """Split a rollout-input payload by batch, then compress each shard.
+
+        Used as the ``split_fn`` for observation ``send_to`` calls when
+        ``env.obs_compression`` is enabled. Splitting first keeps the
+        scheduler's ``infer_batch_size`` / ``split_batch`` operating on plain
+        tensors; compression is applied per shard so the rollout worker can
+        reconstruct it after receiving. When compression is disabled this
+        function is not installed and the default ``split_batch`` is used.
+        """
+        from rlinf.scheduler.worker.routing import split_batch
+
+        return [
+            compress_obs(shard, self.obs_compression_cfg)
+            for shard in split_batch(data, split_sizes)
+        ]
+
+    def _split_and_compress_policy_input(
+        self, policy_input: PolicyInput, split_sizes: list[int]
+    ) -> list[PolicyInput]:
+        """Split a policy request, then compress its observation payloads."""
+        shards = policy_input.split(split_sizes)
+        for shard in shards:
+            shard.obs = compress_obs(shard.obs, self.obs_compression_cfg)
+            for env_part in shard.env_parts:
+                if env_part is not None:
+                    env_part.next_obs = compress_obs(
+                        env_part.next_obs, self.obs_compression_cfg
+                    )
+        return shards
 
     def _send_train_bootstrap(
         self,
@@ -1170,6 +1227,7 @@ class EnvWorker(Worker):
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
                         data=self._build_rollout_input_data(env_batch),
+                        split_fn=self._obs_split_fn,
                         mode="eval",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
@@ -1219,6 +1277,7 @@ class EnvWorker(Worker):
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
                         data=self._build_rollout_input_data(env_batch),
+                        split_fn=self._obs_split_fn,
                         mode="eval",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
