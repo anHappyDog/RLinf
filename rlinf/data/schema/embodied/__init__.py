@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,18 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unified entrypoints for embodied and agentic data schemas."""
+"""Embodied rollout schemas and trajectory collection APIs."""
 
-from rlinf.data.schema.agentic import (
-    DynamicRolloutResult,
-    FinishReasonEnum,
-    RolloutRequest,
-    RolloutResult,
-    SeqGroupInfo,
-    get_batch_size,
-    get_seq_length,
+from rlinf.data.schema.embodied.trajectory import (
+    TrajectoryCollector,
+    TrajectoryMode,
+    TrajectoryPlan,
+    select_trajectory_collector,
+    select_trajectory_dispatcher,
 )
-from rlinf.data.schema.embodied import (
+from rlinf.data.schema.embodied.types import (
     EnvOutput,
     EnvPart,
     EnvTransition,
@@ -36,30 +34,14 @@ from rlinf.data.schema.embodied import (
     RTCActionResponse,
     RTCRequest,
     Trajectory,
-    TrajectoryCollector,
     TrajectoryKey,
-    TrajectoryMode,
     TrajectoryPart,
-    TrajectoryPlan,
     TrajectorySource,
     TrajectoryStep,
     get_model_weights_id,
 )
 
-from . import agentic, embodied
-
 __all__ = [
-    "agentic",
-    "embodied",
-    # Agentic compatibility exports.
-    "DynamicRolloutResult",
-    "FinishReasonEnum",
-    "RolloutRequest",
-    "RolloutResult",
-    "SeqGroupInfo",
-    "get_batch_size",
-    "get_seq_length",
-    # Embodied compatibility exports.
     "EnvOutput",
     "EnvPart",
     "EnvTransition",
@@ -80,4 +62,6 @@ __all__ = [
     "TrajectorySource",
     "TrajectoryStep",
     "get_model_weights_id",
+    "select_trajectory_collector",
+    "select_trajectory_dispatcher",
 ]

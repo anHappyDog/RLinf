@@ -25,7 +25,7 @@ from rlinf.data.datasets.dagger import (
     RollingLeRobotDataset,
     build_dataloader_from_dataset,
 )
-from rlinf.data.schema.embodied_types import Trajectory
+from rlinf.data.schema.embodied.types import Trajectory
 from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Channel, Worker

@@ -18,7 +18,7 @@ Bypasses policy inference across action-chunk boundaries while human teleop
 continues. Requires ``algorithm.loss_type=embodied_dagger`` with online LeRobot
 collection enabled, a ``realworld`` env, and PICO teleop
 (``env.train.use_pico=True``); SpaceMouse is not supported. The env only
-supplies hold actions; this module owns dummy-request construction and the
+supplies hold actions; this module owns external-action request construction and the
 per-stage continue/skip state.
 """
 
@@ -27,7 +27,7 @@ from __future__ import annotations
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from rlinf.data.schema.embodied_types import DummyPolicyInput
+from rlinf.data.schema.embodied.types import PolicyInput
 from rlinf.envs.utils import get_env_attr
 
 
@@ -126,7 +126,7 @@ class SmoothInterveneController:
         """Record the chunk a stage just executed.
 
         Its last step seeds ``get_hold_actions``, so intervention wrappers that
-        hold at the previously commanded pose keep doing so across a dummy chunk
+        hold at the previously commanded pose keep doing so across an external chunk
         instead of snapping back to their own default.
         """
         if not self.enabled or actions is None:
@@ -147,13 +147,13 @@ class SmoothInterveneController:
             )
         return actions[:, -1, :].float().cpu().numpy()
 
-    def build_dummy_policy_input(
+    def build_external_policy_input(
         self,
         stage_id: int,
         *,
         env,
         obs: dict,
-    ) -> DummyPolicyInput:
+    ) -> PolicyInput:
         """Build a self-contained request for a chunk without model inference."""
         get_hold_actions = get_env_attr(env, "get_hold_actions")
         if not callable(get_hold_actions):
@@ -170,7 +170,7 @@ class SmoothInterveneController:
                 f"expected {expected_shape} for stage {stage_id}"
             )
         actions = hold_actions.unsqueeze(1).expand(-1, self.num_action_chunks, -1)
-        return DummyPolicyInput(obs=obs, actions=actions.contiguous())
+        return PolicyInput(obs=obs, external_actions=actions.contiguous())
 
     def on_chunk_done(
         self,

@@ -12,17 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Collect trajectory parts and emit actor-ready outputs.
+"""Assemble rollout trajectory parts into actor-facing channel outputs.
 
-Rollout workers publish policy-owned and environment-owned parts. The one
-public :class:`TrajectoryCollector` restores routing fragments, joins both
-parts, accumulates chunks, and delegates final formatting to a private output
-strategy selected by :class:`TrajectoryPlan`.
+This module registers the public :class:`TrajectoryCollector`, restores routed
+policy and environment fragments, and joins matching chunks. It then applies
+the rollout, pipeline, or online LeRobot output strategy selected by
+:class:`TrajectoryPlan`. Collector-local accumulators live at the end of this
+file so the complete assembly path is readable in one place without expanding
+the public schema API.
 """
+
+from __future__ import annotations
 
 from abc import abstractmethod
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Iterator, TypeAlias
 
@@ -30,25 +34,18 @@ import torch
 from omegaconf import DictConfig
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
-from rlinf.data.schema.embodied_types import (
-    ChunkStepResult,
-    EmbodiedRolloutResult,
+from rlinf.data.schema.embodied.types import (
     EnvPart,
-    EnvResult,
+    EnvTransition,
+    LeRobotChunk,
+    LeRobotFrame,
+    LeRobotStep,
+    PolicyOutput,
     PolicyPart,
+    Trajectory,
     TrajectoryKey,
     TrajectoryPart,
-    TrajectorySource,
-    convert_trajectories_to_batch,
-    merge_batch_values,
-    merge_episode_data,
-    split_batch_value,
-    split_env_result,
-    split_episode_data,
-)
-from rlinf.data.schema.trajectory_accumulator import (
-    LerobotEpisodeAccumulator,
-    TrajectoryAccumulator,
+    TrajectoryStep,
 )
 from rlinf.scheduler.channel import (
     ChannelContext,
@@ -73,19 +70,193 @@ CollectionScope: TypeAlias = int | tuple[int, ...]
 CollectedItem: TypeAlias = tuple[str, Any]
 
 
-@dataclass(kw_only=True)
-class JoinedChunk:
-    """Policy and environment data joined for one action chunk.
+# Public configuration and collector API.
 
-    ``source`` identifies the environment rank and pipeline stage. Only chunk
-    zero carries ``initial_env_result``.
+
+class TrajectoryMode(str, Enum):
+    """Actor-facing output mode for collected trajectory chunks."""
+
+    ROLLOUT = "rollout"
+    PIPELINE = "pipeline"
+    LEROBOT = "lerobot"
+
+
+@dataclass(frozen=True)
+class RolloutGeometry:
+    """How one training step's rollout data is shaped and routed.
+
+    Attributes:
+        source_count: Number of logical rollout sources (env ranks x stages).
+        chunk_count: Action chunks each source produces per rollout epoch.
+        shards_per_source: Consumable items each source is split into.
+        actor_world_size: Number of actor workers consuming the channel.
     """
 
+    source_count: int
+    chunk_count: int
+    shards_per_source: int
+    actor_world_size: int
+
+    @classmethod
+    def from_cfg(cls, cfg: DictConfig) -> "RolloutGeometry":
+        """Derive the geometry a run configuration implies.
+
+        Args:
+            cfg: The run configuration.
+
+        Returns:
+            The rollout geometry.
+
+        Raises:
+            ValueError: If sources cannot be split evenly across actors.
+        """
+        from rlinf.scheduler.cluster import Cluster
+        from rlinf.utils.metric_utils import compute_split_num
+        from rlinf.utils.placement import HybridComponentPlacement
+
+        placement = HybridComponentPlacement(cfg, Cluster())
+        actor_world_size = placement.get_world_size("actor")
+        source_count = placement.get_world_size("env") * cfg.rollout.pipeline_stage_num
+        output_count = compute_split_num(source_count, actor_world_size) * (
+            actor_world_size
+        )
+        if output_count % source_count:
+            raise ValueError(
+                "Trajectory routing requires each rollout source to have an "
+                "equal number of actor shards."
+            )
+        return cls(
+            source_count=source_count,
+            chunk_count=(
+                cfg.env.train.max_steps_per_rollout_epoch
+                // cfg.actor.model.num_action_chunks
+            ),
+            shards_per_source=output_count // source_count,
+            actor_world_size=actor_world_size,
+        )
+
+
+@dataclass(frozen=True)
+class TrajectoryPlan:
+    """Validated trajectory mode and routing geometry for one run."""
+
+    mode: TrajectoryMode
+    geometry: RolloutGeometry
+
+    @classmethod
+    def from_cfg(cls, cfg: DictConfig) -> "TrajectoryPlan":
+        """Build the single source of truth for trajectory collection."""
+        return cls(mode=cls.mode_from_cfg(cfg), geometry=RolloutGeometry.from_cfg(cfg))
+
+    @staticmethod
+    def mode_from_cfg(cfg: DictConfig) -> TrajectoryMode:
+        """Validate mode combinations and return the configured output mode."""
+        use_pipeline = cfg.runner.get("use_training_pipeline", False)
+        use_lerobot = bool(
+            cfg.algorithm.get("dagger", {})
+            .get("online_lerobot", {})
+            .get("enabled", False)
+        )
+        if use_pipeline and use_lerobot:
+            raise ValueError(
+                "Training pipeline does not support online LeRobot trajectory data."
+            )
+        if use_pipeline and cfg.runner.get("enable_decoupled_mode", False):
+            raise ValueError(
+                "Training pipeline does not support decoupled environment mode."
+            )
+        if use_pipeline and cfg.algorithm.get("adv_type") == "opd":
+            raise ValueError(
+                "Training pipeline does not support OPD because teacher log-probabilities "
+                "are computed on actor workers after rollout."
+            )
+        if use_lerobot:
+            return TrajectoryMode.LEROBOT
+        if use_pipeline:
+            return TrajectoryMode.PIPELINE
+        return TrajectoryMode.ROLLOUT
+
+    @property
+    def dispatcher(self) -> str | None:
+        """Return the channel dispatcher compatible with the output routing."""
+        return None if self.mode is TrajectoryMode.PIPELINE else "least_loaded"
+
+
+@register_collector("embodied_trajectory")
+class TrajectoryCollector(Collector):
+    """Join trajectory parts and emit outputs selected by one validated plan."""
+
+    def setup(self, ctx: ChannelContext) -> None:
+        """Initialize the join state and private output strategy."""
+        if ctx.cfg is None:
+            raise ValueError(
+                "TrajectoryCollector needs the run config. Pass cfg= when "
+                "creating the channel."
+            )
+        self.plan = TrajectoryPlan.from_cfg(ctx.cfg)
+        source_batch_size = (
+            ctx.cfg.env.train.total_num_envs // self.plan.geometry.source_count
+        )
+        self._joiner = ChunkJoiner(source_batch_size=source_batch_size)
+        # One collector owns joining; only final materialization varies by mode.
+        output_types: dict[TrajectoryMode, type[TrajectoryOutput]] = {
+            TrajectoryMode.ROLLOUT: RolloutOutput,
+            TrajectoryMode.PIPELINE: PipelineOutput,
+            TrajectoryMode.LEROBOT: LerobotOutput,
+        }
+        self._output = output_types[self.plan.mode](ctx.cfg, self.plan.geometry)
+
+    def collect(self, item: Any, key: str) -> Iterable[CollectedItem]:
+        """Accept one part and yield any actor outputs it completes."""
+        del key
+        for chunk in self._joiner.push(item):
+            # Commit join state only after accumulation/materialization succeeds.
+            outputs = list(self._output.emit(chunk))
+            self._joiner.acknowledge(chunk.key)
+            yield from outputs
+
+
+def select_trajectory_collector(cfg: DictConfig) -> type[TrajectoryCollector]:
+    """Validate the configured mode and return the one public collector."""
+    TrajectoryPlan.mode_from_cfg(cfg)
+    return TrajectoryCollector
+
+
+def select_trajectory_dispatcher(cfg: DictConfig) -> str | None:
+    """Return the dispatcher used for actor-facing trajectory output.
+
+    Whole trajectories and LeRobot episode shards share one queue key. Dealing
+    them evenly at enqueue time prevents an asynchronous ``get_nowait`` loop on
+    one actor from draining work intended for its peers. Pipeline output is
+    already routed by its canonical ``<rank>_<rank>_pipeline_actor`` key and
+    must stay on shared key queues, because applying a second dispatcher could
+    send an actor-specific key to a different consumer.
+
+    Args:
+        cfg: The run configuration.
+
+    Returns:
+        The registered dispatcher name, or ``None`` for pipeline output.
+    """
+    mode = TrajectoryPlan.mode_from_cfg(cfg)
+    return None if mode is TrajectoryMode.PIPELINE else "least_loaded"
+
+
+# Chunk reconstruction and policy/environment joining.
+
+
+@dataclass(kw_only=True)
+class JoinedChunk:
+    """Collector-local pairing of policy and environment data for one key."""
+
+    # Logical identity shared by both halves.
     key: TrajectoryKey
-    source: tuple[int, int]
+    # Environment-rank and pipeline-stage accumulator key.
+    source: SourceID
+    # Model-owned chunk data.
     policy: PolicyPart
+    # Environment-owned chunk data completed by Rollout.
     env: EnvPart
-    initial_env_result: EnvResult | None = None
 
 
 class ChunkJoiner:
@@ -147,74 +318,20 @@ class ChunkJoiner:
         env = self._env_parts.get(key)
         if policy is None or env is None:
             return None
-        if key.chunk_id == 0 and env.initial_result is None:
+        if key.chunk_id == 0 and env.initial_transition is None:
             raise ValueError(f"Chunk zero is missing its initial state: {key}.")
-        if key.chunk_id != 0 and env.initial_result is not None:
+        if key.chunk_id != 0 and env.initial_transition is not None:
             raise ValueError(f"Only chunk zero may carry initial state: {key}.")
         return JoinedChunk(
             key=key,
             source=(key.env_rank, key.stage_id),
             policy=policy,
             env=env,
-            initial_env_result=env.initial_result,
         )
 
     def _split_part(self, part: TrajectoryPart):
         """Split a routed multi-source part into single-source fragments."""
-        sizes = [source.size for source in part.sources]
-        if isinstance(part, PolicyPart):
-            observations = split_batch_value(part.obs, sizes)
-            if part.rollout_result is None:
-                actions = split_batch_value(part.external_actions, sizes)
-                for index, source in enumerate(part.sources):
-                    yield PolicyPart(
-                        sources=[source],
-                        obs=observations[index],
-                        external_actions=actions[index],
-                    )
-                return
-            fields = {
-                name: split_batch_value(getattr(part.rollout_result, name), sizes)
-                for name in part.rollout_result.__dataclass_fields__
-            }
-            for index, source in enumerate(part.sources):
-                yield PolicyPart(
-                    sources=[source],
-                    obs=observations[index],
-                    rollout_result=EmbodiedRolloutResult(
-                        **{name: values[index] for name, values in fields.items()}
-                    ),
-                )
-            return
-
-        fields = {
-            name: split_batch_value(getattr(part.result, name), sizes)
-            for name in part.result.__dataclass_fields__
-            if name != "episode_data"
-        }
-        episodes = split_episode_data(part.result.episode_data, sizes)
-        next_observations = split_batch_value(part.next_obs, sizes)
-        forward_inputs = split_batch_value(part.forward_inputs, sizes)
-        bootstrap_values = split_batch_value(part.bootstrap_values, sizes)
-        final_prev_values = split_batch_value(part.final_prev_values, sizes)
-        initial_results = (
-            split_env_result(part.initial_result, sizes)
-            if part.initial_result is not None
-            else [None] * len(sizes)
-        )
-        for index, source in enumerate(part.sources):
-            yield EnvPart(
-                sources=[source],
-                result=EnvResult(
-                    **{name: values[index] for name, values in fields.items()},
-                    episode_data=episodes[index],
-                ),
-                next_obs=next_observations[index],
-                forward_inputs=forward_inputs[index],
-                bootstrap_values=bootstrap_values[index],
-                final_prev_values=final_prev_values[index],
-                initial_result=initial_results[index],
-            )
+        yield from part.split()
 
     def _merge_fragments(self, part: TrajectoryPart):
         """Reassemble one source batch after all of its fragments arrive."""
@@ -238,189 +355,12 @@ class ChunkJoiner:
             raise ValueError(f"Non-contiguous trajectory fragments: {offsets}.")
 
         del self._fragments[key]
-        full_source = TrajectorySource(source.key, self._source_batch_size)
         if isinstance(part, PolicyPart):
-            if part.rollout_result is None:
-                return PolicyPart(
-                    sources=[full_source],
-                    obs=merge_batch_values([item.obs for item in fragments]),
-                    external_actions=merge_batch_values(
-                        [item.external_actions for item in fragments]
-                    ),
-                )
-            return PolicyPart(
-                sources=[full_source],
-                obs=merge_batch_values([item.obs for item in fragments]),
-                rollout_result=EmbodiedRolloutResult(
-                    **{
-                        name: merge_batch_values(
-                            [getattr(item.rollout_result, name) for item in fragments]
-                        )
-                        for name in part.rollout_result.__dataclass_fields__
-                    }
-                ),
-            )
-
-        initial_results = [item.initial_result for item in fragments]
-        has_initial = [result is not None for result in initial_results]
-        if any(has_initial) and not all(has_initial):
-            raise ValueError(f"Incomplete initial-state fragments for {source.key}.")
-        return EnvPart(
-            sources=[full_source],
-            result=EnvResult(
-                **{
-                    name: merge_batch_values(
-                        [getattr(item.result, name) for item in fragments]
-                    )
-                    for name in part.result.__dataclass_fields__
-                    if name != "episode_data"
-                },
-                episode_data=(
-                    merge_episode_data([item.result.episode_data for item in fragments])
-                    if part.result.episode_data is not None
-                    else None
-                ),
-            ),
-            next_obs=merge_batch_values([item.next_obs for item in fragments]),
-            forward_inputs=merge_batch_values(
-                [item.forward_inputs for item in fragments]
-            ),
-            bootstrap_values=merge_batch_values(
-                [item.bootstrap_values for item in fragments]
-            ),
-            final_prev_values=merge_batch_values(
-                [item.final_prev_values for item in fragments]
-            ),
-            initial_result=(
-                EnvResult(
-                    **{
-                        name: merge_batch_values(
-                            [getattr(item, name) for item in initial_results]
-                        )
-                        for name in initial_results[0].__dataclass_fields__
-                        if name != "episode_data"
-                    },
-                    episode_data=(
-                        merge_episode_data(
-                            [item.episode_data for item in initial_results]
-                        )
-                        if initial_results[0].episode_data is not None
-                        else None
-                    ),
-                )
-                if all(has_initial)
-                else None
-            ),
-        )
+            return PolicyPart.merge(fragments)
+        return EnvPart.merge(fragments)
 
 
-@dataclass(frozen=True)
-class RolloutGeometry:
-    """How one training step's rollout data is shaped and routed.
-
-    Attributes:
-        source_count: Number of logical rollout sources (env ranks x stages).
-        chunk_count: Action chunks each source produces per rollout epoch.
-        shards_per_source: Consumable items each source is split into.
-        actor_world_size: Number of actor workers consuming the channel.
-    """
-
-    source_count: int
-    chunk_count: int
-    shards_per_source: int
-    actor_world_size: int
-
-    @classmethod
-    def from_cfg(cls, cfg: DictConfig) -> "RolloutGeometry":
-        """Derive the geometry a run configuration implies.
-
-        Args:
-            cfg: The run configuration.
-
-        Returns:
-            The rollout geometry.
-
-        Raises:
-            ValueError: If sources cannot be split evenly across actors.
-        """
-        from rlinf.scheduler.cluster import Cluster
-        from rlinf.utils.metric_utils import compute_split_num
-        from rlinf.utils.placement import HybridComponentPlacement
-
-        placement = HybridComponentPlacement(cfg, Cluster())
-        actor_world_size = placement.get_world_size("actor")
-        source_count = placement.get_world_size("env") * cfg.rollout.pipeline_stage_num
-        output_count = compute_split_num(source_count, actor_world_size) * (
-            actor_world_size
-        )
-        if output_count % source_count:
-            raise ValueError(
-                "Trajectory routing requires each rollout source to have an "
-                "equal number of actor shards."
-            )
-        return cls(
-            source_count=source_count,
-            chunk_count=(
-                cfg.env.train.max_steps_per_rollout_epoch
-                // cfg.actor.model.num_action_chunks
-            ),
-            shards_per_source=output_count // source_count,
-            actor_world_size=actor_world_size,
-        )
-
-
-class TrajectoryMode(str, Enum):
-    """Actor-facing output mode for collected trajectory chunks."""
-
-    ROLLOUT = "rollout"
-    PIPELINE = "pipeline"
-    LEROBOT = "lerobot"
-
-
-@dataclass(frozen=True)
-class TrajectoryPlan:
-    """Validated trajectory mode and routing geometry for one run."""
-
-    mode: TrajectoryMode
-    geometry: RolloutGeometry
-
-    @classmethod
-    def from_cfg(cls, cfg: DictConfig) -> "TrajectoryPlan":
-        """Build the single source of truth for trajectory collection."""
-        return cls(mode=cls.mode_from_cfg(cfg), geometry=RolloutGeometry.from_cfg(cfg))
-
-    @staticmethod
-    def mode_from_cfg(cfg: DictConfig) -> TrajectoryMode:
-        """Validate mode combinations and return the configured output mode."""
-        use_pipeline = cfg.runner.get("use_training_pipeline", False)
-        use_lerobot = bool(
-            cfg.algorithm.get("dagger", {})
-            .get("online_lerobot", {})
-            .get("enabled", False)
-        )
-        if use_pipeline and use_lerobot:
-            raise ValueError(
-                "Training pipeline does not support online LeRobot trajectory data."
-            )
-        if use_pipeline and cfg.runner.get("enable_decoupled_mode", False):
-            raise ValueError(
-                "Training pipeline does not support decoupled environment mode."
-            )
-        if use_pipeline and cfg.algorithm.get("adv_type") == "opd":
-            raise ValueError(
-                "Training pipeline does not support OPD because teacher log-probabilities "
-                "are computed on actor workers after rollout."
-            )
-        if use_lerobot:
-            return TrajectoryMode.LEROBOT
-        if use_pipeline:
-            return TrajectoryMode.PIPELINE
-        return TrajectoryMode.ROLLOUT
-
-    @property
-    def dispatcher(self) -> str | None:
-        """Return the channel dispatcher compatible with the output routing."""
-        return None if self.mode is TrajectoryMode.PIPELINE else "least_loaded"
+# Actor-facing output strategies.
 
 
 class TrajectoryOutput:
@@ -474,8 +414,6 @@ class AccumulatorOutput(TrajectoryOutput):
             ),
         )
         self._append_chunk(accumulator, chunk)
-        if chunk.key.chunk_id == self._chunk_count - 1 and self._collect_prev_infos:
-            accumulator.append_final_value(chunk.env.final_prev_values)
         self._completed_keys.add(chunk.key)
 
         if self._scope_key_count(scope) != self._expected_key_count:
@@ -496,99 +434,28 @@ class AccumulatorOutput(TrajectoryOutput):
     def _append_chunk(
         self, accumulator: TrajectoryAccumulator, chunk: JoinedChunk
     ) -> None:
-        """Append model, environment, reward, and optional transition data."""
-        policy = chunk.policy
-        result = policy.rollout_result
-        assert result is not None
-        env_result = chunk.env.result
-        result.bootstrap_values = chunk.env.bootstrap_values
-
-        if chunk.initial_env_result is not None:
-            accumulator.append_initial_state(
-                dones=chunk.initial_env_result.dones,
-                truncations=chunk.initial_env_result.truncations,
-                terminations=chunk.initial_env_result.terminations,
-            )
-        accumulator.append_step_result(
-            ChunkStepResult(
-                actions=result.forward_inputs.get("action"),
-                prev_logprobs=(
-                    result.prev_logprobs if self._collect_prev_infos else None
-                ),
-                prev_values=(result.prev_values if self._collect_prev_infos else None),
-                forward_inputs=result.forward_inputs,
-                versions=result.versions,
-                dones=env_result.dones,
-                truncations=env_result.truncations,
-                terminations=env_result.terminations,
-                rewards=self._rewards(chunk),
-            )
+        """Resolve and retain one joined chunk without inspecting its fields."""
+        rewards = chunk.env.compute_rewards(
+            env_reward_weight=self._env_reward_weight,
+            reward_weight=self._reward_weight,
+            auto_reset=self._cfg.env.train.auto_reset,
+            bootstrap_type=self._cfg.algorithm.get("bootstrap_type", "standard"),
+            gamma=self._cfg.algorithm.get("gamma", 1.0),
         )
-        if env_result.reward_assign_lengths is not None:
-            # History rewards are assigned backwards to the requested chunks.
-            rewards = accumulator.rewards
-            reward = self._reward_weight * env_result.reward_model_output
-            for env_id, length in enumerate(env_result.reward_assign_lengths):
-                for offset in range(2, min(length, len(rewards)) + 1):
-                    rewards[-offset][env_id] += reward[env_id].to(
-                        rewards[-offset].dtype
-                    )
-        if env_result.intervene_actions is not None:
-            accumulator.update_last_actions(
-                env_result.intervene_actions, env_result.intervene_flags
-            )
-        if result.intervene_flags is not None:
-            accumulator.mark_last_step_with_intervene_flags(result.intervene_flags)
-        if self._enable_rlt:
-            from rlinf.algorithms.rlt.transition import (
-                apply_rlt_interventions,
-                extract_rlt_obs_from_forward_inputs,
-            )
-
-            current_obs = extract_rlt_obs_from_forward_inputs(result.forward_inputs)
-            apply_rlt_interventions(
-                current_obs,
-                env_result.intervene_actions,
-                env_result.intervene_flags,
-            )
-            accumulator.append_transitions(
-                current_obs,
-                extract_rlt_obs_from_forward_inputs(
-                    chunk.env.forward_inputs, transition=True
-                ),
-            )
-        elif self._collect_transitions:
-            accumulator.append_transitions(policy.obs, chunk.env.next_obs)
-
-    def _rewards(self, chunk: JoinedChunk) -> torch.Tensor | None:
-        """Combine reward sources and apply terminal-value bootstrapping."""
-        env_result = chunk.env.result
-        rewards = env_result.rewards
-        if rewards is None:
-            return None
-        if env_result.reward_model_output is not None:
-            rewards = (
-                self._env_reward_weight * rewards
-                + self._reward_weight * env_result.reward_model_output.to(rewards.dtype)
-            )
-        values = chunk.env.bootstrap_values
-        if (
-            values is None
-            or not self._cfg.env.train.auto_reset
-            or env_result.dones is None
-        ):
-            return rewards
-        truncations = env_result.truncations
-        if self._cfg.algorithm.get("bootstrap_type", "standard") != "standard":
-            truncations = env_result.dones
-        if truncations is None or not truncations[:, -1].any():
-            return rewards
-        rewards = rewards.clone()
-        mask = truncations[:, -1]
-        rewards[mask, -1] += self._cfg.algorithm.get("gamma", 1.0) * values[
-            mask
-        ].reshape(-1).to(rewards.dtype)
-        return rewards
+        step = TrajectoryStep.from_parts(
+            chunk.policy,
+            chunk.env,
+            rewards=rewards,
+            collect_prev_infos=self._collect_prev_infos,
+            collect_transitions=self._collect_transitions,
+            enable_rlt=self._enable_rlt,
+            include_final_value=chunk.key.chunk_id == self._chunk_count - 1,
+        )
+        accumulator.append(step)
+        accumulator.assign_history_rewards(
+            chunk.env.transition,
+            reward_weight=self._reward_weight,
+        )
 
     @property
     @abstractmethod
@@ -627,9 +494,7 @@ class RolloutOutput(AccumulatorOutput):
         """Split each source's trajectory into its shards."""
         # Stable source ordering makes output independent of arrival timing.
         for _, accumulator in sorted(accumulators.items()):
-            shards = accumulator.to_splited_trajectories(
-                self._geometry.shards_per_source
-            )
+            shards = accumulator.to_trajectory().split(self._geometry.shards_per_source)
             for trajectory in shards:
                 yield DEFAULT_KEY, trajectory
 
@@ -678,7 +543,7 @@ class PipelineOutput(AccumulatorOutput):
                 dst_world_size=self._actor_world_size,
                 src_rank=logical_rank,
             )
-            trajectories = accumulator.to_splited_trajectories_by_sizes(
+            trajectories = accumulator.to_trajectory().split(
                 [size for _, size in actor_splits]
             )
             for (actor_rank, _), trajectory in zip(actor_splits, trajectories):
@@ -708,10 +573,12 @@ class PipelineOutput(AccumulatorOutput):
                         micro_batch,
                     )
 
-    def _prepare_pipeline_batch(self, trajectory) -> dict[str, torch.Tensor]:
+    def _prepare_pipeline_batch(
+        self, trajectory: Trajectory
+    ) -> dict[str, torch.Tensor]:
         """Preprocess one actor shard and compute training targets."""
         batch = preprocess_embodied_batch(
-            convert_trajectories_to_batch([trajectory]),
+            Trajectory.to_batch([trajectory]),
             rollout_epoch=1,
             auto_reset=self._cfg.env.train.auto_reset,
             ignore_terminations=self._cfg.env.train.ignore_terminations,
@@ -788,7 +655,7 @@ class LerobotOutput(TrajectoryOutput):
     def __init__(self, cfg: DictConfig, geometry: RolloutGeometry) -> None:
         """Initialize persistent per-source episode accumulators."""
         super().__init__(cfg, geometry)
-        self._accumulators: dict[SourceID, LerobotEpisodeAccumulator] = {}
+        self._accumulators: dict[SourceID, LeRobotEpisodeAccumulator] = {}
         online_cfg = self._cfg.algorithm.dagger.online_lerobot
         self._only_success = bool(online_cfg.get("only_success", False))
 
@@ -796,21 +663,20 @@ class LerobotOutput(TrajectoryOutput):
         """Append episode data and drain completed episodes at step boundaries."""
         if chunk.key in self._completed_keys:
             raise ValueError(f"Received duplicate trajectory event for {chunk.key}.")
-        episode_data = chunk.env.result.episode_data
+        episode_data = chunk.env.transition.episode_data
         if episode_data is None:
             raise ValueError("Online LeRobot segment is missing episode data.")
 
         accumulator = self._accumulators.setdefault(
             chunk.source,
-            LerobotEpisodeAccumulator(
-                max_episode_length=self._cfg.env.train.max_episode_steps,
+            LeRobotEpisodeAccumulator(
                 num_envs=self._cfg.env.train.total_num_envs // self._source_count,
                 only_success=self._only_success,
                 num_action_chunks=self._cfg.actor.model.num_action_chunks,
                 action_dim=self._cfg.actor.model.action_dim,
             ),
         )
-        policy_output = chunk.policy.rollout_result
+        policy_output = chunk.policy.output
         accumulator.append_chunk_episode_data(
             policy_output=policy_output, **episode_data
         )
@@ -841,61 +707,241 @@ class LerobotOutput(TrajectoryOutput):
         return (key.step_id, key.env_rank, key.stage_id)
 
 
-@register_collector("embodied_trajectory")
-class TrajectoryCollector(Collector):
-    """Join trajectory parts and emit outputs selected by one validated plan."""
+# The remaining classes retain collector-local state. Keeping them beside the
+# collector makes the complete data path visible without exposing another API.
 
-    def setup(self, ctx: ChannelContext) -> None:
-        """Initialize the join state and private output strategy."""
-        if ctx.cfg is None:
-            raise ValueError(
-                "TrajectoryCollector needs the run config. Pass cfg= when "
-                "creating the channel."
-            )
-        self.plan = TrajectoryPlan.from_cfg(ctx.cfg)
-        source_batch_size = (
-            ctx.cfg.env.train.total_num_envs // self.plan.geometry.source_count
+
+@dataclass(kw_only=True)
+class TrajectoryAccumulator:
+    """Retain complete chunk steps until one collection scope can flush."""
+
+    max_episode_length: int = 0
+    steps: list[TrajectoryStep] = field(default_factory=list, repr=False)
+
+    def append(self, step: TrajectoryStep) -> None:
+        """Append one already-resolved trajectory step."""
+        self.steps.append(step)
+
+    def assign_history_rewards(
+        self,
+        env_transition: EnvTransition,
+        *,
+        reward_weight: float,
+    ) -> None:
+        """Delegate delayed reward assignment to the environment result."""
+        env_transition.assign_history_rewards(self.steps, reward_weight=reward_weight)
+
+    def to_trajectory(self) -> Trajectory:
+        """Materialize retained steps through the trajectory data type."""
+        return Trajectory.from_steps(
+            self.steps,
+            max_episode_length=self.max_episode_length,
         )
-        self._joiner = ChunkJoiner(source_batch_size=source_batch_size)
-        # One collector owns joining; only final materialization varies by mode.
-        output_types: dict[TrajectoryMode, type[TrajectoryOutput]] = {
-            TrajectoryMode.ROLLOUT: RolloutOutput,
-            TrajectoryMode.PIPELINE: PipelineOutput,
-            TrajectoryMode.LEROBOT: LerobotOutput,
-        }
-        self._output = output_types[self.plan.mode](ctx.cfg, self.plan.geometry)
 
-    def collect(self, item: Any, key: str) -> Iterable[CollectedItem]:
-        """Accept one part and yield any actor outputs it completes."""
-        del key
-        for chunk in self._joiner.push(item):
-            # Commit join state only after accumulation/materialization succeeds.
-            outputs = list(self._output.emit(chunk))
-            self._joiner.acknowledge(chunk.key)
-            yield from outputs
+    def clear(self) -> None:
+        """Discard retained steps while preserving configuration."""
+        self.steps.clear()
 
 
-def select_trajectory_collector(cfg: DictConfig) -> type[TrajectoryCollector]:
-    """Validate the configured mode and return the one public collector."""
-    TrajectoryPlan.mode_from_cfg(cfg)
-    return TrajectoryCollector
+class LeRobotFrameConverter:
+    """Expand canonical chunks and construct frames without retaining state."""
+
+    @staticmethod
+    def convert(chunk: LeRobotChunk) -> Iterator[LeRobotStep]:
+        """Yield steps in low-level time order, then environment order."""
+        for step_index in range(chunk.step_count):
+            for env_index in range(chunk.num_envs):
+                yield chunk.step(step_index, env_index)
+
+    @staticmethod
+    def to_frame(
+        step: LeRobotStep,
+        *,
+        observation: Any,
+        info: Any,
+        segment_id: int,
+        action_dim: int,
+    ) -> LeRobotFrame | None:
+        """Convert one decoded step to the canonical LeRobot frame type."""
+        return LeRobotFrame.from_step(
+            observation=observation,
+            action=step.action,
+            info=info,
+            segment_id=segment_id,
+            action_dim=action_dim,
+        )
 
 
-def select_trajectory_dispatcher(cfg: DictConfig) -> str | None:
-    """Return the dispatcher used for actor-facing trajectory output.
+@dataclass
+class LeRobotEpisodeState:
+    """Mutable state for one independently progressing environment."""
 
-    Whole trajectories and LeRobot episode shards share one queue key. Dealing
-    them evenly at enqueue time prevents an asynchronous ``get_nowait`` loop on
-    one actor from draining work intended for its peers. Pipeline output is
-    already routed by its canonical ``<rank>_<rank>_pipeline_actor`` key and
-    must stay on shared key queues, because applying a second dispatcher could
-    send an actor-specific key to a different consumer.
+    # Frames retained until this environment terminates or truncates.
+    frames: list[LeRobotFrame] = field(default_factory=list)
+    # Auto-reset observation paired with the next executed action.
+    pending_observation: Any | None = None
+    # Metadata paired with pending_observation.
+    pending_info: Any | None = None
+    # Whether any retained frame reported success.
+    success: bool = False
+    # Real-world recording segment local to this episode.
+    segment_id: int = 0
 
-    Args:
-        cfg: The run configuration.
+    def restart_recording(self, observation: Any, info: Any) -> None:
+        """Start a fresh recording with the current observation as its seed."""
+        self.frames.clear()
+        self.success = False
+        self.segment_id = 0
+        self.pending_observation = observation
+        self.pending_info = info if isinstance(info, dict) else {}
 
-    Returns:
-        The registered dispatcher name, or ``None`` for pipeline output.
-    """
-    mode = TrajectoryPlan.mode_from_cfg(cfg)
-    return None if mode is TrajectoryMode.PIPELINE else "least_loaded"
+    def take_observation(self, observation: Any, info: Any) -> tuple[Any, Any]:
+        """Use a pending auto-reset seed before the current step observation."""
+        if self.pending_observation is None:
+            return observation, info
+        observation = self.pending_observation
+        info = self.pending_info if self.pending_info is not None else {}
+        self.pending_observation = None
+        self.pending_info = None
+        return observation, info
+
+    def retain_reset(self, observation: Any, info: Any) -> None:
+        """Retain an auto-reset seed for the next action."""
+        if observation is None:
+            return
+        self.pending_observation = observation
+        self.pending_info = info
+
+    def append(self, frame: LeRobotFrame) -> None:
+        """Append a frame and update episode-level success."""
+        self.frames.append(frame)
+        if frame.step_success is not None:
+            self.success = self.success or frame.step_success
+
+    def finish(self) -> list[dict[str, Any]]:
+        """Materialize retained frames with episode-level terminal fields."""
+        last_index = len(self.frames) - 1
+        return [
+            frame.to_dict(
+                episode_success=self.success,
+                done=index == last_index,
+            )
+            for index, frame in enumerate(self.frames)
+        ]
+
+    def reset_episode(self) -> None:
+        """Clear the completed episode while retaining an auto-reset seed."""
+        self.frames.clear()
+        self.success = False
+        self.segment_id = 0
+
+
+@dataclass(kw_only=True)
+class LeRobotEpisodeAccumulator:
+    """Retain per-environment frames and emit completed LeRobot episodes."""
+
+    # Number of independently progressing environments in this source batch.
+    num_envs: int = 1
+    # Export only successful natural terminations when enabled.
+    only_success: bool = False
+    # Action chunk width C from actor.model.num_action_chunks.
+    num_action_chunks: int = 1
+    # Single-action width A from actor.model.action_dim.
+    action_dim: int = 7
+    _converter: LeRobotFrameConverter = field(
+        default_factory=LeRobotFrameConverter,
+        init=False,
+        repr=False,
+    )
+    _states: list[LeRobotEpisodeState] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
+    _episodes: list[list[dict[str, Any]]] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        """Validate the source geometry and allocate per-environment state."""
+        if self.num_envs <= 0:
+            raise ValueError("num_envs must be positive.")
+        if self.num_action_chunks <= 0:
+            raise ValueError("num_action_chunks must be positive.")
+        if self.action_dim <= 0:
+            raise ValueError("action_dim must be positive.")
+        self._states = [LeRobotEpisodeState() for _ in range(self.num_envs)]
+
+    def append_chunk_episode_data(
+        self,
+        *,
+        policy_output: PolicyOutput | None,
+        chunk_actions: Any,
+        obs_list: Any,
+        terminations: Any,
+        truncations: Any,
+        infos_list: Any,
+    ) -> None:
+        """Normalize and append one vectorized action chunk."""
+        chunk = LeRobotChunk.from_data(
+            policy_output=policy_output,
+            chunk_actions=chunk_actions,
+            obs_list=obs_list,
+            terminations=terminations,
+            truncations=truncations,
+            infos_list=infos_list,
+            num_envs=self.num_envs,
+            num_action_chunks=self.num_action_chunks,
+            action_dim=self.action_dim,
+        )
+        for step in self._converter.convert(chunk):
+            self._append_step(step)
+
+    def drain_episodes(self) -> list[list[dict[str, Any]]]:
+        """Return completed episodes and clear only the output queue."""
+        episodes = self._episodes
+        self._episodes = []
+        return episodes
+
+    def clear(self) -> None:
+        """Discard in-progress frames, pending reset data, and completed output."""
+        self._states = [LeRobotEpisodeState() for _ in range(self.num_envs)]
+        self._episodes = []
+
+    def _append_step(self, step: LeRobotStep) -> None:
+        """Apply recording controls and advance one environment state."""
+        state = self._states[step.env_index]
+
+        if step.info_flag("record_reset"):
+            state.restart_recording(step.observation, step.info)
+            return
+        if step.info_flag("pre_record"):
+            state.retain_reset(step.reset_observation, step.reset_info)
+            return
+        if step.info_flag("segment_advance"):
+            state.segment_id += 1
+
+        observation, info = state.take_observation(step.observation, step.info)
+        state.retain_reset(step.reset_observation, step.reset_info)
+        frame = self._converter.to_frame(
+            step,
+            observation=observation,
+            info=info,
+            segment_id=state.segment_id,
+            action_dim=self.action_dim,
+        )
+        if frame is None:
+            return
+
+        state.append(frame)
+        if not step.done:
+            return
+
+        should_emit = not self.only_success or (state.success and step.terminated)
+        if should_emit:
+            episode = state.finish()
+            if episode:
+                self._episodes.append(episode)
+        state.reset_episode()

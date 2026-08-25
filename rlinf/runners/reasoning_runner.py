@@ -24,7 +24,7 @@ from torch.utils.data import Dataset, RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from rlinf.data.schema.reasoning_requests import build_rollout_requests_from_batch
+from rlinf.data.schema.agentic.requests import build_rollout_requests_from_batch
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer

@@ -20,10 +20,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from rlinf.data.schema.embodied_types import (
-    ChunkStepResult,
+from rlinf.data.schema.embodied.trajectory import TrajectoryAccumulator
+from rlinf.data.schema.embodied.types import (
+    TrajectoryStep,
 )
-from rlinf.data.schema.trajectory_accumulator import TrajectoryAccumulator
 from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.envs.realworld.realworld_env import RealWorldEnv
 from rlinf.scheduler import Cluster, ComponentPlacement, Worker
@@ -152,7 +152,7 @@ class DataCollector(Worker):
             action_tensor = torch.as_tensor(action, dtype=torch.float32)
             reward_tensor = reward.float().unsqueeze(1)
 
-            step_result = ChunkStepResult(
+            step_result = TrajectoryStep(
                 actions=action_tensor,
                 rewards=reward_tensor,
                 dones=done_tensor,

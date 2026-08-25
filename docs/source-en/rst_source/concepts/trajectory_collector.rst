@@ -47,10 +47,10 @@ The Actor Channel sees this flow:
                          v
    EnvPart --------------+----> accumulate ----> flush ----> Actor output
 
-The Environment does not write the Actor Channel directly. It sends the
-completed transition back to Rollout inside ``PolicyCompletion``. Rollout then
-publishes ``EnvPart`` so the Actor Channel has one producer and one ordering
-boundary.
+The Environment does not write the Actor Channel directly. It attaches an
+``EnvPart`` to the next ``PolicyInput``. Rollout adds optional terminal
+inference data and publishes that same ``EnvPart`` so the Actor Channel has one
+producer and one ordering boundary.
 
 Complete One Action Chunk
 -------------------------
@@ -59,15 +59,15 @@ Follow one normal inferred chunk:
 
 1. Env sends ``PolicyInput`` with the current observation and a new
    ``TrajectoryKey``.
-2. Rollout runs policy inference, returns ``PolicyOutput(actions)`` to Env, and
-   immediately publishes ``PolicyPart`` to the Actor Channel.
+2. Rollout runs policy inference, returns the action tensor to Env, and
+   immediately publishes a ``PolicyPart`` containing the full ``PolicyOutput``
+   to the Actor Channel.
 3. Env executes the action chunk and records rewards, boundary flags, the next
    observation, and intervention data.
-4. Env places that result in ``PolicyCompletion``. Chunk zero also carries
-   ``initial_result``, the boundary before its first action.
-5. Rollout converts the completion into ``EnvPart``. When the algorithm needs a
-   terminal value or terminal transition feature, Rollout first runs inference
-   on the terminal observation.
+4. Env stores that ``EnvTransition`` in ``EnvPart``. Chunk zero also carries
+   ``initial_transition``, the boundary before its first action.
+5. Rollout completes the ``EnvPart``. When requested, it first runs inference
+   on the terminal observation and adds the final value or transition features.
 6. ``ChunkJoiner`` matches both parts by key. Arrival order does not matter.
 7. ``TrajectoryCollector`` passes the joined chunk to the output strategy
    selected by ``TrajectoryPlan``.
@@ -76,13 +76,13 @@ The temporal meaning is:
 
 .. code-block:: text
 
-   initial_result                   EnvPart.result
+   initial_transition             EnvPart.transition
          |                                |
          v                                v
       state_t ---- PolicyPart.action ----> state_t+1
 
-Only chunk zero owns ``initial_result``. This keeps boundary sequences aligned
-without a separate start event.
+Only chunk zero owns ``initial_transition``. This keeps boundary sequences
+aligned without a separate start event.
 
 From Chunks to Actor Output
 ---------------------------
@@ -99,7 +99,12 @@ one source id, one ``PolicyPart``, and one ``EnvPart``.
 Accumulate
 ~~~~~~~~~~
 
-``TrajectoryAccumulator`` appends joined chunks in rollout order. Action-owned
+``TrajectoryStep.from_parts`` converts each joined pair into one complete
+training step. The embodied data types own reward composition, intervention
+updates, transition extraction, and CPU conversion. ``TrajectoryAccumulator``
+only retains these complete steps in rollout order.
+
+``Trajectory.from_steps`` later materializes the temporal layout. Action-owned
 fields normally have one entry per chunk. Boundary fields include the state
 before the first action, and value fields may include the final bootstrap value:
 
@@ -110,9 +115,9 @@ before the first action, and value fields may include the final bootstrap value:
    dones:        [d_before, d0, d1, ...]
    prev_values:  [V(s0), V(s1), ..., V(s_final)]
 
-During accumulation the Collector also applies reward-model weights, terminal
-bootstrapping, delayed history rewards, executed interventions, and optional
-transition observations.
+This separation keeps field-specific behavior next to ``EnvTransition``,
+``TrajectoryStep``, and ``Trajectory`` instead of embedding it in Collector or
+accumulator control flow.
 
 Flush
 ~~~~~
@@ -158,36 +163,38 @@ path.
 
    * - Algorithm Need
      - Produce It In
-     - Collector Responsibility
+     - Data-Type Path
    * - Policy statistic such as log-probability or value
-     - ``EmbodiedRolloutResult`` in Rollout
-     - Copy it from ``PolicyPart`` into ``ChunkStepResult`` and materialize it in
-       ``Trajectory``.
+     - ``PolicyOutput`` in Rollout
+     - Resolve it in ``TrajectoryStep.from_parts`` and materialize it with
+       ``Trajectory.from_steps``.
    * - Environment or reward-model signal
-     - ``EnvResult`` in Env
-     - Combine reward sources and append the result to the same chunk.
+     - ``EnvTransition`` in Env
+     - Combine sources in ``EnvTransition.compute_rewards``.
    * - Current and next observation
      - ``PolicyPart.obs`` and ``EnvPart.next_obs``
-     - Append transitions when ``rollout.collect_transitions`` is enabled.
+     - Resolve them in ``TrajectoryStep.set_transition_observations`` when
+       ``rollout.collect_transitions`` is enabled.
    * - Executed intervention action
-     - ``EnvResult.intervene_actions`` and ``intervene_flags``
-     - Replace the stored policy action and preserve the intervention mask.
+     - ``EnvTransition.intervene_actions`` and ``intervene_flags``
+     - Apply it through ``TrajectoryStep.apply_interventions``.
    * - RLT transition feature
      - Retained ``forward_inputs`` on both sides
-     - Extract ``z_rl``, ``proprio``, and ``ref_chunk`` and apply executed
-       interventions before storing the transition.
+     - Extract it while constructing ``TrajectoryStep`` and apply executed
+       interventions before retaining the transition.
    * - Pipeline training target
      - Algorithm advantage/loss configuration
      - Compute advantages and returns before Actor-specific micro-batch packing.
 
 For a new algorithm, check these five points:
 
-1. Add the field to ``EmbodiedRolloutResult`` or ``EnvResult`` according to who
+1. Add the field to ``PolicyOutput`` or ``EnvTransition`` according to who
    owns it.
-2. Populate it in Rollout or Env and preserve CPU transport plus routed
-   split/merge behavior.
-3. Append it in the Collector's joined-chunk path.
-4. Materialize it in ``Trajectory`` or the mode-specific Actor output.
+2. Populate it in Rollout or Env and update that type's ``split``/``merge``
+   methods when the field follows the batch dimension.
+3. Resolve cross-part semantics in ``TrajectoryStep.from_parts``.
+4. Materialize temporal fields in ``Trajectory.from_steps`` or the
+   mode-specific Actor output.
 5. Keep pipeline preprocessing aligned with the non-pipeline Actor path.
 
 Most algorithms do not need to change ``TrajectoryKey``, ``TrajectorySource``,
@@ -202,11 +209,11 @@ With one Env source, one chunk, one rollout epoch, and one Actor:
 
 1. Bootstrap produces the pre-action observation and boundary state.
 2. Rollout publishes one ``PolicyPart`` and sends its action to Env.
-3. Env executes the action and returns one ``PolicyCompletion``.
-4. Rollout publishes one ``EnvPart`` with the same key.
+3. Env executes the action and attaches one ``EnvPart`` to the next request.
+4. Rollout completes and publishes that ``EnvPart`` with the same key.
 5. The Joiner creates one complete chunk.
-6. The Accumulator appends the initial boundary, action data, environment data,
-   and final value.
+6. ``TrajectoryStep`` resolves the pair; the Accumulator retains that complete
+   step without inspecting its fields.
 7. The rollout scope is complete, so the Collector emits one ``Trajectory`` on
    the default queue key.
 8. Actor converts the received trajectory into a training batch, then computes
@@ -222,5 +229,5 @@ Read the Interfaces
 
 Use :doc:`channel` to understand Collector and Dispatcher execution. Use
 :doc:`../reference/api/embodied_data` for exact data-class and Collector APIs.
-The implementation lives in ``rlinf/data/schema/trajectory_collector.py`` and
-``rlinf/data/schema/trajectory_accumulator.py``.
+The complete collector and accumulation implementation lives in
+``rlinf/data/schema/embodied/trajectory.py``.

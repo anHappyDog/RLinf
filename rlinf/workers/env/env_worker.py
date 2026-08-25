@@ -20,15 +20,13 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from rlinf.data.schema.embodied_types import (
+from rlinf.data.schema.embodied.types import (
     EnvOutput,
-    EnvResult,
-    PolicyCompletion,
+    EnvPart,
+    EnvTransition,
     PolicyInput,
-    PolicyOutput,
     TrajectoryKey,
     TrajectorySource,
-    split_policy_input,
 )
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
@@ -445,14 +443,16 @@ class EnvWorker(Worker):
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
-            rewards=chunk_rewards,
             env_infos=infos if isinstance(infos, dict) else None,
-            dones=chunk_dones,
-            terminations=chunk_terminations,
-            truncations=chunk_truncations,
-            intervene_actions=intervene_actions,
-            intervene_flags=intervene_flags,
-            rlt_switch_flags=rlt_switch_flags,
+            transition=EnvTransition(
+                rewards=chunk_rewards,
+                dones=chunk_dones,
+                terminations=chunk_terminations,
+                truncations=chunk_truncations,
+                intervene_actions=intervene_actions,
+                intervene_flags=intervene_flags,
+                rlt_switch_flags=rlt_switch_flags,
+            ),
         )
         chunk_step_payload = {
             "chunk_actions": exec_actions,
@@ -524,7 +524,7 @@ class EnvWorker(Worker):
             obs=extracted_obs,
             final_obs=final_obs,
             env_infos=infos if isinstance(infos, dict) else None,
-            rlt_switch_flags=rlt_switch_flags,
+            transition=EnvTransition(rlt_switch_flags=rlt_switch_flags),
         )
         return env_output, env_info
 
@@ -594,77 +594,13 @@ class EnvWorker(Worker):
 
     @staticmethod
     def _infer_rollout_batch_size(data: Any) -> int:
-        """Infer batch dim for routed shards; supports PolicyOutput and plain tensor payloads.
-
-        When the channel carries a non-``PolicyOutput`` shard (e.g. reward tensor or eval
-        actions) into a rollout recv, avoid assuming dataclass fields and delegate or use
-        the leading dimension of dense arrays.
-        """
+        """Infer the leading batch dimension of rollout or reward payloads."""
 
         if isinstance(data, torch.Tensor) or isinstance(data, np.ndarray):
             return int(data.shape[0])
-        if isinstance(data, PolicyOutput):
-            for field_name in (
-                "actions",
-                "prev_logprobs",
-                "prev_values",
-                "bootstrap_values",
-                "versions",
-            ):
-                value = getattr(data, field_name, None)
-                if isinstance(value, torch.Tensor):
-                    return int(value.shape[0])
-            forward_inputs = getattr(data, "forward_inputs", None)
-            if forward_inputs:
-                first_tensor = next(iter(forward_inputs.values()))
-                if isinstance(first_tensor, torch.Tensor):
-                    return int(first_tensor.shape[0])
-            raise ValueError("Cannot infer batch size from rollout result.")
         from rlinf.scheduler import infer_batch_size
 
         return infer_batch_size(data)
-
-    @Worker.timer("compute_bootstrap_rewards")
-    def compute_bootstrap_rewards(
-        self,
-        env_output: EnvOutput,
-        bootstrap_values: torch.Tensor | None,
-        reward_model_output: torch.Tensor | None,
-    ) -> torch.Tensor | None:
-        rewards = env_output.rewards
-        if rewards is None:
-            return None
-
-        if reward_model_output is not None:
-            reward_model_output = reward_model_output.to(rewards.dtype)
-            rewards = (
-                self.env_reward_weight * rewards
-                + self.reward_weight * reward_model_output
-            )
-
-        adjusted_rewards = rewards.clone()
-        if (
-            bootstrap_values is None
-            or not self.cfg.env.train.auto_reset
-            or env_output.dones is None
-        ):
-            return adjusted_rewards
-
-        bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
-        if bootstrap_type == "standard":
-            last_step_truncations = env_output.truncations[:, -1]
-        else:
-            last_step_truncations = env_output.dones[:, -1]
-
-        if not last_step_truncations.any():
-            return adjusted_rewards
-
-        final_values = torch.zeros_like(adjusted_rewards[:, -1], dtype=torch.float32)
-        final_values[last_step_truncations] = (
-            bootstrap_values[last_step_truncations].reshape(-1).to(torch.float32)
-        )
-        adjusted_rewards[:, -1] += self.cfg.algorithm.gamma * final_values
-        return adjusted_rewards
 
     def finish_rollout(self, mode="train"):
         # reset
@@ -801,17 +737,17 @@ class EnvWorker(Worker):
 
                 env_output = EnvOutput(
                     obs=extracted_obs,
-                    dones=dones,
-                    terminations=terminations,
-                    truncations=truncations,
+                    transition=EnvTransition(
+                        dones=dones,
+                        terminations=terminations,
+                        truncations=truncations,
+                    ),
                     final_obs=(
                         infos["final_observation"]
                         if "final_observation" in infos
                         else None
                     ),
                     env_infos=infos if isinstance(infos, dict) else None,
-                    intervene_actions=None,
-                    intervene_flags=None,
                 )
                 env_outputs.append(env_output)
         else:
@@ -822,12 +758,13 @@ class EnvWorker(Worker):
             for stage_id in range(self.stage_num):
                 env_output = EnvOutput(
                     obs=self.last_obs_list[stage_id],
-                    rewards=None,
-                    dones=dones,
-                    terminations=terminations,
-                    truncations=truncations,
-                    intervene_actions=self.last_intervened_info_list[stage_id][0],
-                    intervene_flags=self.last_intervened_info_list[stage_id][1],
+                    transition=EnvTransition(
+                        dones=dones,
+                        terminations=terminations,
+                        truncations=truncations,
+                        intervene_actions=self.last_intervened_info_list[stage_id][0],
+                        intervene_flags=self.last_intervened_info_list[stage_id][1],
+                    ),
                 )
                 env_outputs.append(env_output)
 
@@ -843,32 +780,34 @@ class EnvWorker(Worker):
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
         return data
 
-    def _build_env_result(
+    def _build_env_transition(
         self,
         env_output: EnvOutput,
         *,
         stage_id: int | None = None,
         reward_model_output: torch.Tensor | None = None,
         chunk_step_data: dict[str, Any] | None = None,
-    ) -> EnvResult:
-        """Convert one environment step into its trajectory result."""
-        env_result = EnvResult.from_env_output(env_output, reward_model_output)
+    ) -> EnvTransition:
+        """Attach collector metadata to one environment transition."""
+        reward_assign_lengths = None
         if (
             stage_id is not None
             and reward_model_output is not None
             and self.reward_mode == "history_buffer"
             and self.history_reward_assign
         ):
-            env_result.reward_assign_lengths = [
+            reward_assign_lengths = [
                 min(
                     lengths[env_id]
                     for lengths in self.history_lengths[stage_id].values()
                 )
                 for env_id in range(self.train_num_envs_per_stage)
             ]
-        if self.enable_online_lerobot:
-            env_result.episode_data = chunk_step_data
-        return env_result
+        return env_output.transition.with_trajectory_data(
+            reward_model_output=reward_model_output,
+            reward_assign_lengths=reward_assign_lengths,
+            episode_data=chunk_step_data if self.enable_online_lerobot else None,
+        )
 
     def _build_policy_input(
         self,
@@ -900,7 +839,7 @@ class EnvWorker(Worker):
             tag="policy_final" if policy_input.is_last else "policy",
             route_key=stage_id if not self.env_decoupled_mode else None,
             batch_size=self.train_batch_size,
-            split_fn=split_policy_input,
+            split_fn=PolicyInput.split,
             decoupled_mode=self.env_decoupled_mode,
         )
 
@@ -908,13 +847,13 @@ class EnvWorker(Worker):
         self,
         rollout_channel: Channel,
         env_output: EnvOutput,
-        initial_result: EnvResult,
+        initial_transition: EnvTransition,
         reward_model_output: torch.Tensor | None,
         chunk_step_data: dict[str, Any] | None,
         epoch_id: int,
         chunk_id: int,
         stage_id: int,
-    ) -> PolicyCompletion | None:
+    ) -> EnvPart | None:
         """Publish one environment outcome and schedule its next model input."""
         # The policy and environment halves of a chunk share this identity.
         key = TrajectoryKey(
@@ -947,7 +886,7 @@ class EnvWorker(Worker):
             stage_id, env_output.intervene_flags, env_output.dones
         )
         if continue_smooth and not is_last:
-            policy_input = self.smooth_intervene.build_dummy_policy_input(
+            policy_input = self.smooth_intervene.build_external_policy_input(
                 stage_id,
                 env=self.env_list[stage_id],
                 obs=env_output.prepare_observations(env_output.obs),
@@ -956,9 +895,9 @@ class EnvWorker(Worker):
             policy_input = self._build_policy_input(env_output)
         # Piggyback the completed transition on the next policy request so
         # Rollout remains the Actor channel's only producer.
-        completion = PolicyCompletion(
+        env_part = EnvPart(
             sources=[source],
-            env_result=self._build_env_result(
+            transition=self._build_env_transition(
                 env_output,
                 stage_id=stage_id,
                 reward_model_output=reward_model_output,
@@ -967,12 +906,12 @@ class EnvWorker(Worker):
             next_obs=env_output.prepare_observations(next_obs),
             requires_inference=needs_terminal,
             # Only chunk zero owns the boundary before the first action.
-            initial_result=initial_result if chunk_id == 0 else None,
+            initial_transition=initial_transition if chunk_id == 0 else None,
         )
-        policy_input.completions = [completion]
+        policy_input.env_parts = [env_part]
         policy_input.is_last = is_last
         if is_last and self.env_decoupled_mode:
-            return completion
+            return env_part
         self._send_policy_input(
             rollout_channel,
             policy_input,
@@ -987,13 +926,13 @@ class EnvWorker(Worker):
         env_outputs: list[EnvOutput],
         step_id: int,
         epoch_id: int,
-        completions: dict[int, PolicyCompletion] | None = None,
+        previous_env_parts: dict[int, EnvPart] | None = None,
     ) -> None:
         for stage_id in range(self.stage_num):
             # Bootstrap starts chunk zero; no earlier transition exists yet.
             key = TrajectoryKey(step_id, epoch_id, self._rank, stage_id, 0)
             if self.smooth_intervene.is_active(stage_id):
-                policy_input = self.smooth_intervene.build_dummy_policy_input(
+                policy_input = self.smooth_intervene.build_external_policy_input(
                     stage_id,
                     env=self.env_list[stage_id],
                     obs=env_outputs[stage_id].prepare_observations(
@@ -1002,8 +941,10 @@ class EnvWorker(Worker):
                 )
             else:
                 policy_input = self._build_policy_input(env_outputs[stage_id])
-            policy_input.completions = [
-                completions.get(stage_id) if completions is not None else None
+            policy_input.env_parts = [
+                previous_env_parts.get(stage_id)
+                if previous_env_parts is not None
+                else None
             ]
             self._send_policy_input(
                 rollout_channel,
@@ -1017,7 +958,7 @@ class EnvWorker(Worker):
         rollout_channel: Channel,
         step_id: int,
         epoch_id: int,
-        completions: dict[int, PolicyCompletion] | None = None,
+        previous_env_parts: dict[int, EnvPart] | None = None,
     ) -> list[EnvOutput]:
         env_outputs = self.bootstrap_step()
         self._send_train_bootstrap(
@@ -1025,7 +966,7 @@ class EnvWorker(Worker):
             env_outputs,
             step_id,
             epoch_id,
-            completions,
+            previous_env_parts,
         )
         return env_outputs
 
@@ -1061,13 +1002,11 @@ class EnvWorker(Worker):
         ]
 
     @staticmethod
-    def _infer_policy_output_batch_size(policy_output: PolicyOutput) -> int:
+    def _infer_action_batch_size(actions: torch.Tensor) -> int:
         """Infer the batch dimension of a policy response."""
-        return int(policy_output.actions.shape[0])
+        return int(actions.shape[0])
 
-    def _recv_policy_output(
-        self, input_channel: Channel, stage_id: int
-    ) -> PolicyOutput:
+    def _recv_actions(self, input_channel: Channel, stage_id: int) -> torch.Tensor:
         """Receive actions using the route paired with the policy request."""
         return self.recv_from(
             group_name=self.cfg.rollout.group_name,
@@ -1075,7 +1014,7 @@ class EnvWorker(Worker):
             tag="train_policy" if self.env_decoupled_mode else "policy",
             route_key=stage_id if not self.env_decoupled_mode else None,
             batch_size=self.train_batch_size,
-            infer_batch_size_fn=self._infer_policy_output_batch_size,
+            infer_batch_size_fn=self._infer_action_batch_size,
             decoupled_mode=self.env_decoupled_mode,
         )
 
@@ -1089,7 +1028,7 @@ class EnvWorker(Worker):
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
         env_metrics = defaultdict(list)
-        final_completions: dict[int, PolicyCompletion] = {}
+        final_env_parts: dict[int, EnvPart] = {}
 
         for epoch in range(self.rollout_epoch):
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
@@ -1100,12 +1039,12 @@ class EnvWorker(Worker):
                     rollout_channel,
                     self._trajectory_step,
                     epoch,
-                    final_completions,
+                    final_env_parts,
                 )
-            final_completions = {}
+            final_env_parts = {}
             # Preserve the pre-action boundary until chunk zero completes.
-            initial_results = [
-                self._build_env_result(env_output) for env_output in env_outputs
+            initial_transitions = [
+                self._build_env_transition(env_output) for env_output in env_outputs
             ]
 
             for stage_id in range(self.stage_num):
@@ -1116,13 +1055,11 @@ class EnvWorker(Worker):
                     if cooperative_yield:
                         await asyncio.sleep(0)
 
-                    policy_output = self._recv_policy_output(input_channel, stage_id)
-                    self.smooth_intervene.remember_actions(
-                        stage_id, policy_output.actions
-                    )
+                    actions = self._recv_actions(input_channel, stage_id)
+                    self.smooth_intervene.remember_actions(stage_id, actions)
 
                     env_output, env_info, chunk_step_data = self.env_interact_step(
-                        policy_output.actions, stage_id
+                        actions, stage_id
                     )
                     # Delay the next observation without blocking other worker tasks.
                     await self._maybe_wait_env_delay(stage_id)
@@ -1144,18 +1081,18 @@ class EnvWorker(Worker):
                                 reward_model_output.detach().float().reshape(-1).cpu()
                             )
 
-                    completion = self._publish_step(
+                    env_part = self._publish_step(
                         rollout_channel,
                         env_output,
-                        initial_results[stage_id],
+                        initial_transitions[stage_id],
                         reward_model_output,
                         chunk_step_data,
                         epoch,
                         chunk_step_idx,
                         stage_id,
                     )
-                    if completion is not None:
-                        final_completions[stage_id] = completion
+                    if env_part is not None:
+                        final_env_parts[stage_id] = env_part
                     if (
                         get_env_attr(self.env_list[stage_id], "insert_delay_metrics")
                         is not None
@@ -1180,7 +1117,7 @@ class EnvWorker(Worker):
                 rollout_channel,
                 self._trajectory_step,
                 0,
-                final_completions,
+                final_env_parts,
             )
 
         for key, value in env_metrics.items():

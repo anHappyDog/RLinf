@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reasoning rollout result structures and post-processing helpers."""
+"""Agentic rollout result structures and post-processing helpers."""
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -33,12 +33,12 @@ if TYPE_CHECKING:
     from vllm.outputs import CompletionOutput
     from vllm.outputs import RequestOutput as VllmRequestOutput
 
-from rlinf.data.schema.reasoning_requests import SeqGroupInfo, get_batch_size
+from rlinf.data.schema.agentic.requests import SeqGroupInfo, get_batch_size
 
 
 @dataclass(kw_only=True)
 class RolloutResult:
-    """Container for reasoning rollout sequences and training metadata."""
+    """Container for agentic rollout sequences and training metadata."""
 
     num_sequence: int
     group_size: int
@@ -1590,3 +1590,10 @@ class BatchResizingIterator:
             )
 
             return self._get_next_micro_batch()
+
+
+__all__ = [
+    "BatchResizingIterator",
+    "DynamicRolloutResult",
+    "RolloutResult",
+]

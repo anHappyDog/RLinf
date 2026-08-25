@@ -5,37 +5,52 @@ Embodied Data 接口
 
 .. code-block:: text
 
-   EnvOutput
-       -> PolicyInput (+ previous PolicyCompletion)
-       -> PolicyOutput(actions)
+   EnvOutput(obs, EnvTransition)
+       -> PolicyInput (+ previous EnvPart)
+       -> actions tensor
 
-   PolicyPart + EnvPart
+   PolicyPart + completed EnvPart
        -> TrajectoryCollector
        -> Trajectory / episode shard / pipeline micro-batch
 
 完整生命周期、数据所有权和执行模式语义参见
 :doc:`../../concepts/trajectory_collector`。
 
+Shape 记号
+----------
+
+类字段注释使用以下符号：
+
+* ``B`` 是 routed environment batch。Decoupled merge 前通常为
+  ``env.train.total_num_envs / env_world_size /
+  rollout.pipeline_stage_num``。
+* ``C`` 是 ``actor.model.num_action_chunks``；only-eval 模式改用 Rollout model
+  config。
+* ``A`` 是 ``actor.model.action_dim``，``D = C * A``。令
+  ``E = env.train.rollout_epoch``，完整 trajectory 通常包含
+  ``T = E * env.train.max_steps_per_rollout_epoch / C`` 个 chunk。
+
 环境与策略消息
 --------------
 
-``EnvOutput`` 是环境 reset 或执行 action 后的本地结果。``PolicyInput`` 将
-observation 发送给 Rollout，并可携带上一个 action 的 ``PolicyCompletion``。
-``PolicyOutput`` 是返回 Env 的纯 action 响应。
+``EnvOutput`` 组合 observation 和一个 ``EnvTransition``，不再重复 reward 和
+boundary 字段。``PolicyInput`` 携带 observation，并可附带前一个 ``EnvPart``。
+Rollout 只将 action tensor 返回 Env；完整 ``PolicyOutput`` 留在 trajectory 路径，
+因为它还包含 log-probability、value、version 和 training input。
 
-.. autoclass:: rlinf.data.schema.embodied_types.EnvOutput
+.. autoclass:: rlinf.data.schema.embodied.types.EnvOutput
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.PolicyInput
+.. autoclass:: rlinf.data.schema.embodied.types.EnvTransition
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.PolicyCompletion
+.. autoclass:: rlinf.data.schema.embodied.types.PolicyInput
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.PolicyOutput
+.. autoclass:: rlinf.data.schema.embodied.types.PolicyOutput
    :members:
    :member-order: bysource
 
@@ -44,21 +59,22 @@ Trajectory Part
 
 ``PolicyPart`` 和 ``EnvPart`` 是 Actor channel 仅有的两种输入，并通过
 ``TrajectoryKey`` 配对。Channel routing 拆分 batch 时，``TrajectorySource``
-保留 source size 和 offset。
+保留 source size 和 offset。Env 在 step 后创建未完成的 ``EnvPart``；Rollout 补充
+可选 terminal inference 数据后发布同一个类型。
 
-.. autoclass:: rlinf.data.schema.embodied_types.TrajectoryKey
+.. autoclass:: rlinf.data.schema.embodied.types.TrajectoryKey
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.TrajectorySource
+.. autoclass:: rlinf.data.schema.embodied.types.TrajectorySource
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.PolicyPart
+.. autoclass:: rlinf.data.schema.embodied.types.PolicyPart
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.EnvPart
+.. autoclass:: rlinf.data.schema.embodied.types.EnvPart
    :members:
    :member-order: bysource
 
@@ -68,30 +84,29 @@ Trajectory Part
 ``TrajectoryPlan`` 校验输出模式并推导 rollout geometry。所有具身模式都使用同一个
 公共 ``TrajectoryCollector``。
 
-.. autoclass:: rlinf.data.schema.trajectory_collector.TrajectoryMode
+.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryMode
    :members:
 
-.. autoclass:: rlinf.data.schema.trajectory_collector.TrajectoryPlan
+.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryPlan
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.trajectory_collector.TrajectoryCollector
+.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryCollector
    :members:
    :member-order: bysource
 
 Actor 输出
 ----------
 
-``Trajectory`` 保存非 pipeline Actor worker 使用的训练 tensor，典型布局为
-``[T, B, ...]``。Boundary 和 bootstrap 字段可能包含 ``T + 1`` 个元素。
+``TrajectoryStep`` 解析一对已配对的 policy/environment 数据，包括 reward、
+intervention 和 transition 语义。``Trajectory`` 再将 step 堆叠成
+``[T, B, ...]`` Actor tensor。Boundary 和 final-value 序列可能包含
+``T + E`` 个元素。
 
-``ChunkStepResult`` 描述一个已配对 action chunk 所保留的数据。跨 chunk 的时序累积
-属于 collector 的私有实现细节。
-
-.. autoclass:: rlinf.data.schema.embodied_types.Trajectory
+.. autoclass:: rlinf.data.schema.embodied.types.TrajectoryStep
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.ChunkStepResult
+.. autoclass:: rlinf.data.schema.embodied.types.Trajectory
    :members:
    :member-order: bysource

@@ -23,7 +23,7 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
 from rlinf.config import SupportedModel
-from rlinf.data.schema.embodied_types import Trajectory
+from rlinf.data.schema.embodied.types import Trajectory
 from rlinf.data.storage.replay import (
     PreloadReplayBufferDataset,
     ReplayBufferDataset,

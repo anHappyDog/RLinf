@@ -30,8 +30,8 @@ from rlinf.algorithms.utils import (
     kl_penalty,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
-from rlinf.data.schema.embodied_types import Trajectory, convert_trajectories_to_batch
-from rlinf.data.schema.reasoning_results import BatchResizingIterator, RolloutResult
+from rlinf.data.schema.agentic.types import BatchResizingIterator, RolloutResult
+from rlinf.data.schema.embodied.types import Trajectory
 from rlinf.data.storage.lerobot import resolve_lerobot_repo_id
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
 from rlinf.hybrid_engines.fsdp.utils import (
@@ -1214,7 +1214,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
 
-        self.rollout_batch = convert_trajectories_to_batch(recv_list)
+        self.rollout_batch = Trajectory.to_batch(recv_list)
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
 

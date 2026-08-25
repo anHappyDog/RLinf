@@ -32,7 +32,7 @@ except (ImportError, ModuleNotFoundError):
 from omegaconf import DictConfig
 
 from rlinf.config import SupportedModel
-from rlinf.data.schema.reasoning_requests import get_seq_length
+from rlinf.data.schema.agentic.requests import get_seq_length
 from rlinf.hybrid_engines.megatron.megatron_model_manager import MegatronModelManager
 from rlinf.scheduler import Cluster, Worker
 from rlinf.utils.data_iter_utils import get_iterator_k_split

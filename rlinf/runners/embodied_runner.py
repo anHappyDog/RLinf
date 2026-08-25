@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
-from rlinf.data.schema.trajectory_collector import (
+from rlinf.data.schema.embodied.trajectory import (
     select_trajectory_collector,
     select_trajectory_dispatcher,
 )

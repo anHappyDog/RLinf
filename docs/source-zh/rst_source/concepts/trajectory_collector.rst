@@ -46,9 +46,9 @@ Actor Channel 看到的数据流如下：
                          v
    EnvPart --------------+----> 累积 ----> flush ----> Actor 输出
 
-Environment 不直接写 Actor Channel。它通过 ``PolicyCompletion`` 将已完成 transition
-返回 Rollout，再由 Rollout 发布 ``EnvPart``。因此 Actor Channel 只有一个 producer
-和一个确定的顺序边界。
+Environment 不直接写 Actor Channel。它将 ``EnvPart`` 附在下一个
+``PolicyInput`` 上返回 Rollout。Rollout 补充可选 terminal inference 数据后发布同一个
+``EnvPart``。因此 Actor Channel 只有一个 producer 和一个确定的顺序边界。
 
 闭合一个 Action Chunk
 ---------------------
@@ -56,14 +56,14 @@ Environment 不直接写 Actor Channel。它通过 ``PolicyCompletion`` 将已�
 跟踪一个普通 inference chunk：
 
 1. Env 使用当前 observation 和新的 ``TrajectoryKey`` 发送 ``PolicyInput``。
-2. Rollout 执行 policy inference，将 ``PolicyOutput(actions)`` 返回 Env，并立即向
-   Actor Channel 发布 ``PolicyPart``。
+2. Rollout 执行 policy inference，将 action tensor 返回 Env，并立即向 Actor Channel
+   发布包含完整 ``PolicyOutput`` 的 ``PolicyPart``。
 3. Env 执行 action chunk，记录 rewards、boundary flags、next observation 和
    intervention data。
-4. Env 将结果放进 ``PolicyCompletion``。Chunk zero 还携带 ``initial_result``，即
-   第一个 action 之前的边界。
-5. Rollout 将 completion 转为 ``EnvPart``。如果算法需要 terminal value 或 terminal
-   transition feature，Rollout 会先对 terminal observation 执行 inference。
+4. Env 将 ``EnvTransition`` 放进 ``EnvPart``。Chunk zero 还携带
+   ``initial_transition``，即第一个 action 之前的边界。
+5. Rollout 完成这个 ``EnvPart``。需要时，它先对 terminal observation 执行
+   inference，再补充 final value 或 transition feature。
 6. ``ChunkJoiner`` 按 key 配对两个 part，抵达顺序不影响结果。
 7. ``TrajectoryCollector`` 将完整 chunk 交给 ``TrajectoryPlan`` 选择的 output
    strategy。
@@ -72,13 +72,13 @@ Environment 不直接写 Actor Channel。它通过 ``PolicyCompletion`` 将已�
 
 .. code-block:: text
 
-   initial_result                   EnvPart.result
+   initial_transition             EnvPart.transition
          |                                |
          v                                v
       state_t ---- PolicyPart.action ----> state_t+1
 
-只有 chunk zero 保存 ``initial_result``。这样无需单独的 start event，也能对齐边界
-序列。
+只有 chunk zero 保存 ``initial_transition``。这样无需单独的 start event，也能对齐
+边界序列。
 
 从 Chunk 到 Actor 输出
 ----------------------
@@ -95,9 +95,13 @@ Collector 执行三个核心操作。
 累积
 ~~~~
 
-``TrajectoryAccumulator`` 按 rollout 顺序追加完整 chunk。Action 字段通常每个 chunk
-有一个元素；boundary 字段包含第一个 action 之前的状态，value 字段还可能包含最终
-bootstrap value：
+``TrajectoryStep.from_parts`` 将每个已配对的数据转换为完整 training step。
+Reward 合成、intervention 更新、transition 提取和 CPU 转换由 embodied 数据类型
+负责；``TrajectoryAccumulator`` 只按 rollout 顺序保存这些完整 step。
+
+随后，``Trajectory.from_steps`` 负责物化时序布局。Action 字段通常每个 chunk 有一个
+元素；boundary 字段包含第一个 action 之前的状态，value 字段还可能包含最终 bootstrap
+value：
 
 .. code-block:: text
 
@@ -106,8 +110,8 @@ bootstrap value：
    dones:        [d_before, d0, d1, ...]
    prev_values:  [V(s0), V(s1), ..., V(s_final)]
 
-累积过程中，Collector 还会处理 reward-model weight、terminal bootstrap、延迟
-history reward、实际执行的 intervention，以及可选 transition observation。
+这样，字段相关行为保留在 ``EnvTransition``、``TrajectoryStep`` 和 ``Trajectory`` 中，
+而不会混入 Collector 或 accumulator 的控制流程。
 
 Flush
 ~~~~~
@@ -149,33 +153,36 @@ service loop 不同，但 chunk 数据契约不变。
 
    * - 算法需求
      - 产生位置
-     - Collector 职责
+     - 数据类型处理路径
    * - Log-probability 或 value 等 policy statistic
-     - Rollout 中的 ``EmbodiedRolloutResult``
-     - 从 ``PolicyPart`` 复制到 ``ChunkStepResult``，并物化到 ``Trajectory``。
+     - Rollout 中的 ``PolicyOutput``
+     - 在 ``TrajectoryStep.from_parts`` 中解析，并通过
+       ``Trajectory.from_steps`` 物化。
    * - Environment 或 reward-model signal
-     - Env 中的 ``EnvResult``
-     - 合并 reward source，并追加到同一个 chunk。
+     - Env 中的 ``EnvTransition``
+     - 在 ``EnvTransition.compute_rewards`` 中合并 reward source。
    * - Current 和 next observation
      - ``PolicyPart.obs`` 和 ``EnvPart.next_obs``
-     - 启用 ``rollout.collect_transitions`` 时追加 transition。
+     - 启用 ``rollout.collect_transitions`` 时，在
+       ``TrajectoryStep.set_transition_observations`` 中解析。
    * - 实际执行的 intervention action
-     - ``EnvResult.intervene_actions`` 和 ``intervene_flags``
-     - 替换已保存的 policy action，并保留 intervention mask。
+     - ``EnvTransition.intervene_actions`` 和 ``intervene_flags``
+     - 通过 ``TrajectoryStep.apply_interventions`` 应用。
    * - RLT transition feature
      - 两侧保留的 ``forward_inputs``
-     - 提取 ``z_rl``、``proprio`` 和 ``ref_chunk``，应用实际 intervention 后保存
-       transition。
+     - 构造 ``TrajectoryStep`` 时提取，并在保存 transition 前应用实际
+       intervention。
    * - Pipeline training target
      - Algorithm advantage/loss configuration
      - 在按 Actor 打包 micro-batch 之前计算 advantages 和 returns。
 
 新增算法时检查以下五点：
 
-1. 根据数据所有者，将字段添加到 ``EmbodiedRolloutResult`` 或 ``EnvResult``。
-2. 在 Rollout 或 Env 中赋值，并保持 CPU transport 和 routed split/merge 行为。
-3. 在 Collector 的 joined-chunk 路径中追加字段。
-4. 将字段物化到 ``Trajectory`` 或对应模式的 Actor 输出。
+1. 根据数据所有者，将字段添加到 ``PolicyOutput`` 或 ``EnvTransition``。
+2. 在 Rollout 或 Env 中赋值；如果字段随 batch dimension 变化，则更新所属类型的
+   ``split``/``merge`` 方法。
+3. 在 ``TrajectoryStep.from_parts`` 中解析跨 part 语义。
+4. 在 ``Trajectory.from_steps`` 或对应模式的 Actor 输出中物化时序字段。
 5. 保持 pipeline preprocessing 与非 pipeline Actor 路径一致。
 
 大多数算法无需修改 ``TrajectoryKey``、``TrajectorySource``、fragment restoration、
@@ -189,10 +196,10 @@ dispatcher selection 或 completion scope。只有算法改变数据所有权或
 
 1. Bootstrap 产生 action 前的 observation 和 boundary state。
 2. Rollout 发布一个 ``PolicyPart``，并将 action 发给 Env。
-3. Env 执行 action，返回一个 ``PolicyCompletion``。
-4. Rollout 使用同一个 key 发布一个 ``EnvPart``。
+3. Env 执行 action，并将一个 ``EnvPart`` 附在下一个请求上。
+4. Rollout 完成并使用同一个 key 发布这个 ``EnvPart``。
 5. Joiner 创建一个完整 chunk。
-6. Accumulator 追加 initial boundary、action data、environment data 和 final value。
+6. ``TrajectoryStep`` 解析两个 part；Accumulator 不检查字段，只保存这个完整 step。
 7. Rollout scope 完成，Collector 在默认 queue key 上输出一个 ``Trajectory``。
 8. Actor 将收到的 trajectory 转为 training batch，然后在非 pipeline 路径中计算
    advantages 和 returns。
@@ -205,6 +212,5 @@ source，因为 routing 和可选 advantage normalization 作用于 Actor-specif
 --------
 
 阅读 :doc:`channel` 了解 Collector 和 Dispatcher 的执行方式。阅读
-:doc:`../reference/api/embodied_data` 查看准确的数据类和 Collector API。实现位于
-``rlinf/data/schema/trajectory_collector.py`` 和
-``rlinf/data/schema/trajectory_accumulator.py``。
+:doc:`../reference/api/embodied_data` 查看准确的数据类和 Collector API。完整的
+Collector 与累计逻辑位于 ``rlinf/data/schema/embodied/trajectory.py``\ 。

@@ -22,19 +22,15 @@ import torch
 from omegaconf import OmegaConf
 
 from rlinf.data.schema import (
-    DummyPolicyInput,
     EnvOutput,
     EnvPart,
-    EnvResult,
-    PolicyCompletion,
+    EnvTransition,
     PolicyInput,
     PolicyOutput,
     PolicyPart,
     TrajectoryKey,
     TrajectorySource,
-    merge_policy_inputs,
 )
-from rlinf.data.schema.embodied_types import EmbodiedRolloutResult
 from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
 from rlinf.workers.env.async_env_worker import AsyncEnvWorker
 from rlinf.workers.env.env_worker import EnvWorker
@@ -131,8 +127,8 @@ def test_decoupled_policy_route_round_trip():
     policy_input, split_sizes = asyncio.run(
         rollout._receive_policy_input(None, "policy", 0)
     )
-    output = PolicyOutput(actions=torch.zeros(16, 4))
-    rollout._send_policy_output(None, output, 0, split_sizes)
+    output = torch.zeros(16, 4)
+    rollout._send_actions(None, output, 0, split_sizes)
 
     assert policy_input.obs["states"].shape == (16, 4)
     rollout.recv_from_and_record_batch_routes_with_timeout.assert_awaited_once_with(
@@ -140,7 +136,7 @@ def test_decoupled_policy_route_round_trip():
         channel=None,
         tag="policy",
         batch_size=32,
-        merge_fn=merge_policy_inputs,
+        merge_fn=PolicyInput.merge,
         infer_batch_size_fn=rollout._infer_policy_input_batch_size,
         timeout_time=0.02,
         recv_queue_size=0,
@@ -150,7 +146,7 @@ def test_decoupled_policy_route_round_trip():
         channel=None,
         data=output,
         tag="policy",
-        split_fn=rollout._split_policy_output,
+        split_fn=rollout._split_actions,
         split_sizes=[8, 8],
     )
 
@@ -160,9 +156,9 @@ def test_env_uses_mode_qualified_decoupled_response_tag():
     env.cfg = SimpleNamespace(rollout=SimpleNamespace(group_name="RolloutGroup"))
     env.env_decoupled_mode = True
     env.train_batch_size = 32
-    env.recv_from = Mock(return_value=PolicyOutput(actions=torch.zeros(8, 4)))
+    env.recv_from = Mock(return_value=torch.zeros(8, 4))
 
-    env._recv_policy_output(None, stage_id=0)
+    env._recv_actions(None, stage_id=0)
 
     env.recv_from.assert_called_once_with(
         group_name="RolloutGroup",
@@ -170,12 +166,12 @@ def test_env_uses_mode_qualified_decoupled_response_tag():
         tag="train_policy",
         route_key=None,
         batch_size=32,
-        infer_batch_size_fn=env._infer_policy_output_batch_size,
+        infer_batch_size_fn=env._infer_action_batch_size,
         decoupled_mode=True,
     )
 
 
-def test_smooth_intervention_builds_dummy_input_without_policy_history():
+def test_smooth_intervention_builds_external_input_without_policy_history():
     controller = SmoothInterveneController(
         stage_num=1,
         num_envs_per_stage=1,
@@ -185,13 +181,14 @@ def test_smooth_intervention_builds_dummy_input_without_policy_history():
     )
     env = SimpleNamespace(get_hold_actions=lambda fallback=None: [[1.0, 2.0, 3.0]])
 
-    policy_input = controller.build_dummy_policy_input(
+    policy_input = controller.build_external_policy_input(
         0, env=env, obs={"states": torch.zeros(1, 4)}
     )
 
-    assert isinstance(policy_input, DummyPolicyInput)
+    assert isinstance(policy_input, PolicyInput)
+    assert not policy_input.requires_inference
     assert torch.equal(
-        policy_input.actions,
+        policy_input.external_actions,
         torch.tensor([[[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]]]),
     )
 
@@ -224,7 +221,7 @@ def test_smooth_intervention_requires_online_lerobot_dagger():
         )
 
 
-def test_env_sends_dummy_request_after_intervention_continues():
+def test_env_sends_external_request_after_intervention_continues():
     env = object.__new__(EnvWorker)
     env._trajectory_step = 0
     env._rank = 0
@@ -236,20 +233,25 @@ def test_env_sends_dummy_request_after_intervention_continues():
         SimpleNamespace(get_hold_actions=lambda fallback=None: [[1.0, 2.0]])
     ]
     env.smooth_intervene = SmoothInterveneController(1, 1, 2, 2, enabled=True)
-    env._build_env_result = Mock(return_value=EnvResult())
+    env._build_env_transition = Mock(return_value=EnvTransition())
     env._send_policy_input = Mock()
     env_output = EnvOutput(
         obs={"states": torch.zeros(1, 4)},
-        dones=torch.tensor([[False, False]]),
-        intervene_flags=torch.tensor([[False, True]]),
+        transition=EnvTransition(
+            dones=torch.tensor([[False, False]]),
+            intervene_flags=torch.tensor([[False, True]]),
+        ),
     )
 
-    env._publish_step(Mock(), env_output, EnvResult(), None, {}, 0, 0, 0)
+    env._publish_step(Mock(), env_output, EnvTransition(), None, {}, 0, 0, 0)
 
     policy_input = env._send_policy_input.call_args.args[1]
-    assert isinstance(policy_input, DummyPolicyInput)
-    assert policy_input.completions[0] is not None
-    assert torch.equal(policy_input.actions, torch.tensor([[[1.0, 2.0], [1.0, 2.0]]]))
+    assert not policy_input.requires_inference
+    assert policy_input.env_parts[0] is not None
+    assert torch.equal(
+        policy_input.external_actions,
+        torch.tensor([[[1.0, 2.0], [1.0, 2.0]]]),
+    )
 
 
 def test_rollout_completes_each_epoch_through_policy_inputs():
@@ -260,14 +262,14 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
     rollout.enable_rlt = False
     rollout.hf_model = SimpleNamespace(value_head=object())
     rollout.update_dagger_beta = Mock()
-    rollout._send_policy_output = Mock()
-    rollout._build_rollout_result = Mock(
+    rollout._send_actions = Mock()
+    rollout._build_policy_output = Mock(
         side_effect=[
-            EmbodiedRolloutResult(
+            PolicyOutput(
                 actions=torch.zeros(1, 1),
                 forward_inputs={"states": torch.tensor([[1]])},
             ),
-            EmbodiedRolloutResult(
+            PolicyOutput(
                 actions=torch.zeros(1, 1),
                 forward_inputs={"states": torch.tensor([[2]])},
             ),
@@ -275,16 +277,16 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
     )
     key0 = TrajectoryKey(0, 0, 0, 0, 0)
     key1 = TrajectoryKey(0, 0, 0, 0, 1)
-    completion0 = PolicyCompletion(
+    completion0 = EnvPart(
         sources=[TrajectorySource(key0, 1)],
-        env_result=EnvResult(),
+        transition=EnvTransition(),
         next_obs={"states": torch.tensor([[2]])},
         requires_inference=False,
-        initial_result=EnvResult(dones=torch.zeros(1, 1, dtype=torch.bool)),
+        initial_transition=EnvTransition(dones=torch.zeros(1, 1, dtype=torch.bool)),
     )
-    completion1 = PolicyCompletion(
+    completion1 = EnvPart(
         sources=[TrajectorySource(key1, 1)],
-        env_result=EnvResult(),
+        transition=EnvTransition(),
         next_obs={"states": torch.tensor([[3]])},
         requires_inference=True,
     )
@@ -294,7 +296,7 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
                 PolicyInput(
                     obs={"states": torch.tensor([[1]])},
                     sources=[TrajectorySource(key0, 1)],
-                    completions=[None],
+                    env_parts=[None],
                     request_sizes=[1],
                 ),
                 None,
@@ -303,7 +305,7 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
                 PolicyInput(
                     obs={"states": torch.tensor([[2]])},
                     sources=[TrajectorySource(key1, 1)],
-                    completions=[completion0],
+                    env_parts=[completion0],
                     request_sizes=[1],
                 ),
                 None,
@@ -311,7 +313,7 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
             (
                 PolicyInput(
                     obs={"states": torch.tensor([[3]])},
-                    completions=[completion1],
+                    env_parts=[completion1],
                     request_sizes=[1],
                     is_last=True,
                 ),
@@ -350,14 +352,14 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
     assert sum(isinstance(part, PolicyPart) for part in parts) == 2
     env_parts = [part for part in parts if isinstance(part, EnvPart)]
     assert len(env_parts) == 2
-    assert env_parts[0].initial_result is completion0.initial_result
+    assert env_parts[0].initial_transition is completion0.initial_transition
     assert torch.equal(env_parts[0].forward_inputs["states"], torch.tensor([[2]]))
     assert torch.equal(env_parts[1].bootstrap_values, torch.tensor([[4.0]]))
     assert torch.equal(env_parts[1].final_prev_values, torch.tensor([[4.0, 5.0]]))
     assert rollout._predict_rollout_actions.call_count == 3
 
 
-def test_rollout_routes_dummy_input_without_model_inference():
+def test_rollout_routes_external_input_without_model_inference():
     rollout = object.__new__(MultiStepRolloutWorker)
     rollout.n_train_chunk_steps = 2
     rollout.num_pipeline_stages = 1
@@ -365,24 +367,24 @@ def test_rollout_routes_dummy_input_without_model_inference():
     rollout.enable_rlt = False
     rollout.hf_model = SimpleNamespace(value_head=object())
     rollout.update_dagger_beta = Mock()
-    rollout._send_policy_output = Mock()
-    rollout._build_rollout_result = Mock(
-        return_value=EmbodiedRolloutResult(
+    rollout._send_actions = Mock()
+    rollout._build_policy_output = Mock(
+        return_value=PolicyOutput(
             actions=torch.ones(1, 2, 3),
             forward_inputs={"action": torch.ones(1, 6)},
         )
     )
     key0 = TrajectoryKey(0, 0, 0, 0, 0)
     key1 = TrajectoryKey(0, 0, 0, 0, 1)
-    completion0 = PolicyCompletion(
+    completion0 = EnvPart(
         sources=[TrajectorySource(key0, 1)],
-        env_result=EnvResult(),
+        transition=EnvTransition(),
         next_obs={"states": torch.ones(1, 4)},
         requires_inference=False,
     )
-    completion1 = PolicyCompletion(
+    completion1 = EnvPart(
         sources=[TrajectorySource(key1, 1)],
-        env_result=EnvResult(),
+        transition=EnvTransition(),
         next_obs={"states": torch.ones(1, 4)},
         requires_inference=False,
     )
@@ -393,17 +395,7 @@ def test_rollout_routes_dummy_input_without_model_inference():
                 PolicyInput(
                     obs={"states": torch.zeros(1, 4)},
                     sources=[TrajectorySource(key0, 1)],
-                    completions=[None],
-                    request_sizes=[1],
-                ),
-                None,
-            ),
-            (
-                DummyPolicyInput(
-                    obs={"states": torch.ones(1, 4)},
-                    actions=dummy_actions,
-                    sources=[TrajectorySource(key1, 1)],
-                    completions=[completion0],
+                    env_parts=[None],
                     request_sizes=[1],
                 ),
                 None,
@@ -411,7 +403,17 @@ def test_rollout_routes_dummy_input_without_model_inference():
             (
                 PolicyInput(
                     obs={"states": torch.ones(1, 4)},
-                    completions=[completion1],
+                    external_actions=dummy_actions,
+                    sources=[TrajectorySource(key1, 1)],
+                    env_parts=[completion0],
+                    request_sizes=[1],
+                ),
+                None,
+            ),
+            (
+                PolicyInput(
+                    obs={"states": torch.ones(1, 4)},
+                    env_parts=[completion1],
                     request_sizes=[1],
                     is_last=True,
                 ),
@@ -442,9 +444,7 @@ def test_rollout_routes_dummy_input_without_model_inference():
     )
     assert torch.equal(external_part.external_actions, dummy_actions)
     assert rollout._predict_rollout_actions.call_count == 1
-    assert torch.equal(
-        rollout._send_policy_output.call_args_list[1].args[1].actions, dummy_actions
-    )
+    assert torch.equal(rollout._send_actions.call_args_list[1].args[1], dummy_actions)
 
 
 def test_decoupled_final_completion_uses_next_bootstrap():
@@ -457,14 +457,14 @@ def test_decoupled_final_completion_uses_next_bootstrap():
     env.enable_online_lerobot = False
     env.env_decoupled_mode = True
     env.smooth_intervene = SmoothInterveneController(1, 1, 1, 4)
-    env._build_env_result = Mock(return_value=EnvResult())
+    env._build_env_transition = Mock(return_value=EnvTransition())
     env._send_policy_input = Mock()
     env_output = EnvOutput(obs={"states": torch.zeros(1, 4)})
 
     completion = env._publish_step(
         rollout_channel=Mock(),
         env_output=env_output,
-        initial_result=EnvResult(),
+        initial_transition=EnvTransition(),
         reward_model_output=None,
         chunk_step_data=None,
         epoch_id=0,
@@ -473,7 +473,7 @@ def test_decoupled_final_completion_uses_next_bootstrap():
     )
 
     assert completion is not None
-    assert completion.initial_result is not None
+    assert completion.initial_transition is not None
     env._send_policy_input.assert_not_called()
 
     env._send_train_bootstrap(
@@ -481,11 +481,11 @@ def test_decoupled_final_completion_uses_next_bootstrap():
         env_outputs=[env_output],
         step_id=1,
         epoch_id=0,
-        completions={0: completion},
+        previous_env_parts={0: completion},
     )
 
     policy_input = env._send_policy_input.call_args.args[1]
-    assert policy_input.completions == [completion]
+    assert policy_input.env_parts == [completion]
 
 
 def test_env_closes_reward_stream_with_final_chunk():
@@ -509,13 +509,13 @@ def test_env_closes_reward_stream_with_final_chunk():
         return_value=[EnvOutput(obs={"states": torch.zeros(1, 4)})]
     )
     env._maybe_wait_env_delay = AsyncMock()
-    env._recv_policy_output = Mock(return_value=PolicyOutput(actions=torch.zeros(1, 4)))
+    env._recv_actions = Mock(return_value=torch.zeros(1, 4))
     env.smooth_intervene = SmoothInterveneController(1, 1, 2, 4)
     env.env_interact_step = Mock(
         return_value=(
             EnvOutput(
                 obs={"states": torch.zeros(1, 4)},
-                rewards=torch.zeros(1, 1),
+                transition=EnvTransition(rewards=torch.zeros(1, 1)),
             ),
             {},
             {},
@@ -559,7 +559,9 @@ def test_smooth_intervention_holds_at_the_last_commanded_step():
     env = SimpleNamespace(get_hold_actions=get_hold_actions)
     controller.remember_actions(0, torch.tensor([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]))
 
-    controller.build_dummy_policy_input(0, env=env, obs={"states": torch.zeros(1, 4)})
+    controller.build_external_policy_input(
+        0, env=env, obs={"states": torch.zeros(1, 4)}
+    )
 
     # The wrapper receives the final step of the chunk that was just executed,
     # so it can hold that pose instead of snapping back to its own default.
@@ -567,25 +569,32 @@ def test_smooth_intervention_holds_at_the_last_commanded_step():
     assert seen[0].tolist() == [[4.0, 5.0, 6.0]]
 
 
-def test_rollout_skips_terminal_inference_without_a_value_head():
+def test_rollout_runs_requested_terminal_inference_without_a_value_head():
     rollout = object.__new__(MultiStepRolloutWorker)
-    rollout.enable_rlt = False
-    rollout.hf_model = SimpleNamespace()
-    rollout._predict_rollout_actions = Mock()
+    rollout._predict_rollout_actions = Mock(
+        return_value=(
+            torch.zeros(1, 1),
+            {
+                "prev_values": torch.zeros(1, 1),
+                "forward_inputs": {"states": torch.ones(1, 1)},
+            },
+        )
+    )
     actor_channel = Mock()
-    completion = PolicyCompletion(
+    completion = EnvPart(
         sources=[TrajectorySource(TrajectoryKey(0, 0, 0, 0, 0), 1)],
-        env_result=EnvResult(),
+        transition=EnvTransition(),
         next_obs={"states": torch.zeros(1, 4)},
         requires_inference=True,
     )
 
-    rollout._publish_completion(completion, None, actor_channel)
+    rollout._publish_env_part(completion, None, actor_channel)
 
-    rollout._predict_rollout_actions.assert_not_called()
+    rollout._predict_rollout_actions.assert_called_once_with(completion.next_obs)
     part = actor_channel.put.call_args.args[0]
-    assert part.bootstrap_values is None
-    assert part.final_prev_values is None
+    assert torch.equal(part.bootstrap_values, torch.zeros(1, 1))
+    assert torch.equal(part.final_prev_values, torch.zeros(1, 1))
+    assert torch.equal(part.forward_inputs["states"], torch.ones(1, 1))
 
 
 def test_rollout_runs_terminal_inference_for_rlt_without_a_value_head():
@@ -599,14 +608,14 @@ def test_rollout_runs_terminal_inference_for_rlt_without_a_value_head():
         )
     )
     actor_channel = Mock()
-    completion = PolicyCompletion(
+    completion = EnvPart(
         sources=[TrajectorySource(TrajectoryKey(0, 0, 0, 0, 0), 1)],
-        env_result=EnvResult(),
+        transition=EnvTransition(),
         next_obs={"states": torch.zeros(1, 4)},
         requires_inference=True,
     )
 
-    rollout._publish_completion(completion, None, actor_channel)
+    rollout._publish_env_part(completion, None, actor_channel)
 
     rollout._predict_rollout_actions.assert_called_once()
     part = actor_channel.put.call_args.args[0]

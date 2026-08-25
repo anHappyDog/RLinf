@@ -12,28 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import replace
-
 import numpy as np
 import pytest
 import torch
 
-from rlinf.data.schema.embodied_types import (
-    DummyPolicyInput,
-    EmbodiedRolloutResult,
-    EnvResult,
-    PolicyCompletion,
+from rlinf.data.schema.embodied.types import (
+    EnvOutput,
+    EnvPart,
+    EnvTransition,
     PolicyInput,
     PolicyOutput,
     PolicyPart,
+    Trajectory,
     TrajectoryKey,
     TrajectorySource,
+    TrajectoryStep,
     merge_batch_values,
     merge_episode_data,
-    merge_policy_inputs,
     split_batch_value,
     split_episode_data,
-    split_policy_input,
 )
 from rlinf.scheduler.cluster.utils import (
     TensorPlaceholder,
@@ -42,30 +39,72 @@ from rlinf.scheduler.cluster.utils import (
 )
 
 
-def test_policy_output_supports_tensor_transport_skeleton():
-    output = PolicyOutput(actions=torch.ones(2, 3))
+def test_env_output_composes_one_transition_object():
+    transition = EnvTransition(
+        rewards=torch.ones(2, 1),
+        dones=torch.zeros(2, 1, dtype=torch.bool),
+    )
+    output = EnvOutput(obs={"states": torch.zeros(2, 3)}, transition=transition)
 
-    skeleton = replace(output, actions=None)
-    restored = replace(skeleton, actions=output.actions)
+    assert output.transition is transition
+    assert output.rewards is transition.rewards
+    assert output.dones is transition.dones
+    assert set(output.__dataclass_fields__) == {
+        "obs",
+        "transition",
+        "final_obs",
+        "env_infos",
+    }
 
-    assert skeleton.actions is None
-    assert torch.equal(restored.actions, output.actions)
+
+def test_removed_duplicate_types_are_not_schema_api():
+    import rlinf.data.schema as schema
+
+    for name in (
+        "ChunkStepResult",
+        "DummyPolicyInput",
+        "EmbodiedRolloutResult",
+        "EnvResult",
+        "PolicyCompletion",
+    ):
+        assert not hasattr(schema, name)
+
+
+def test_env_part_completion_reuses_the_environment_payload():
+    key = TrajectoryKey(0, 0, 0, 0, 0)
+    transition = EnvTransition(rewards=torch.ones(2, 1))
+    part = EnvPart(
+        sources=[TrajectorySource(key, 2)],
+        transition=transition,
+        next_obs={"states": torch.zeros(2, 3)},
+        requires_inference=True,
+    )
+
+    completed = part.complete(
+        forward_inputs={"states": torch.ones(2, 3)},
+        final_prev_values=torch.tensor([[2.0], [3.0]]),
+    )
+
+    assert completed.transition is transition
+    assert not completed.requires_inference
+    assert torch.equal(completed.bootstrap_values, torch.tensor([[2.0], [3.0]]))
+    assert torch.equal(completed.final_prev_values, completed.bootstrap_values)
 
 
 def test_transport_results_store_contiguous_cpu_tensors():
     non_contiguous = torch.arange(12).reshape(3, 4).T
 
-    env_result = EnvResult(rewards=non_contiguous)
-    rollout_result = EmbodiedRolloutResult(
+    env_transition = EnvTransition(rewards=non_contiguous)
+    policy_output = PolicyOutput(
         actions=non_contiguous,
         forward_inputs={"states": non_contiguous},
     )
 
-    assert env_result.rewards.device.type == "cpu"
-    assert env_result.rewards.is_contiguous()
-    assert rollout_result.actions.device.type == "cpu"
-    assert rollout_result.actions.is_contiguous()
-    assert rollout_result.forward_inputs["states"].device.type == "cpu"
+    assert env_transition.rewards.device.type == "cpu"
+    assert env_transition.rewards.is_contiguous()
+    assert policy_output.actions.device.type == "cpu"
+    assert policy_output.actions.is_contiguous()
+    assert policy_output.forward_inputs["states"].device.type == "cpu"
 
 
 def test_nested_dataclass_transport_separates_tensors_from_skeleton():
@@ -74,7 +113,7 @@ def test_nested_dataclass_transport_separates_tensors_from_skeleton():
     event = PolicyPart(
         sources=[TrajectorySource(key, 2)],
         obs={"states": shared, "task_descriptions": ["a", "b"]},
-        rollout_result=EmbodiedRolloutResult(
+        output=PolicyOutput(
             actions=shared,
             forward_inputs={"nested": {"states": shared}},
             prev_values=torch.ones(2, 1),
@@ -85,14 +124,14 @@ def test_nested_dataclass_transport_separates_tensors_from_skeleton():
     restored = unpack_dataclass_tensors(skeleton, tensors)
 
     assert isinstance(skeleton.obs["states"], TensorPlaceholder)
-    assert isinstance(skeleton.rollout_result.actions, TensorPlaceholder)
+    assert isinstance(skeleton.output.actions, TensorPlaceholder)
     assert isinstance(
-        skeleton.rollout_result.forward_inputs["nested"]["states"],
+        skeleton.output.forward_inputs["nested"]["states"],
         TensorPlaceholder,
     )
     assert len(tensors) == 2
-    assert restored.obs["states"] is restored.rollout_result.actions
-    assert torch.equal(restored.rollout_result.prev_values, torch.ones(2, 1))
+    assert restored.obs["states"] is restored.output.actions
+    assert torch.equal(restored.output.prev_values, torch.ones(2, 1))
 
 
 def test_policy_input_split_merge_preserves_sources_and_nested_payloads():
@@ -106,8 +145,8 @@ def test_policy_input_split_merge_preserves_sources_and_nested_payloads():
         sources=[TrajectorySource(key, 2) for key in keys],
     )
 
-    shards = split_policy_input(policy_input, [1, 3])
-    merged = merge_policy_inputs(shards)
+    shards = policy_input.split([1, 3])
+    merged = PolicyInput.merge(shards)
 
     assert shards[0].sources == [TrajectorySource(keys[0], 1)]
     assert shards[1].sources == [
@@ -120,20 +159,20 @@ def test_policy_input_split_merge_preserves_sources_and_nested_payloads():
     assert torch.equal(merged.rlt_switch_flags, policy_input.rlt_switch_flags)
 
 
-def test_dummy_policy_input_split_merge_preserves_actions_and_type():
+def test_external_policy_input_split_merge_preserves_actions():
     key = TrajectoryKey(0, 0, 0, 0, 1)
-    policy_input = DummyPolicyInput(
+    policy_input = PolicyInput(
         obs={"states": torch.arange(12).reshape(4, 3)},
-        actions=torch.arange(24).reshape(4, 2, 3),
+        external_actions=torch.arange(24).reshape(4, 2, 3),
         sources=[TrajectorySource(key, 4)],
     )
 
-    shards = split_policy_input(policy_input, [1, 3])
-    merged = merge_policy_inputs(shards)
+    shards = policy_input.split([1, 3])
+    merged = PolicyInput.merge(shards)
 
-    assert all(isinstance(shard, DummyPolicyInput) for shard in shards)
-    assert isinstance(merged, DummyPolicyInput)
-    assert torch.equal(merged.actions, policy_input.actions)
+    assert all(not shard.requires_inference for shard in shards)
+    assert not merged.requires_inference
+    assert torch.equal(merged.external_actions, policy_input.external_actions)
     assert merged.sources == policy_input.sources
 
 
@@ -166,37 +205,39 @@ def test_online_lerobot_payload_survives_source_routing():
     )
 
 
-def test_policy_completion_split_merge_preserves_offsets():
+def test_env_part_split_merge_preserves_offsets():
     current_key = TrajectoryKey(1, 2, 3, 0, 4)
     previous_key = TrajectoryKey(1, 2, 3, 0, 3)
     policy_input = PolicyInput(
         obs={"states": torch.arange(12).reshape(4, 3)},
         sources=[TrajectorySource(current_key, 4)],
-        completions=[
-            PolicyCompletion(
+        env_parts=[
+            EnvPart(
                 sources=[TrajectorySource(previous_key, 4)],
-                env_result=EnvResult(rewards=torch.arange(4).reshape(4, 1)),
+                transition=EnvTransition(rewards=torch.arange(4).reshape(4, 1)),
                 next_obs={"states": torch.arange(12).reshape(4, 3)},
                 requires_inference=False,
-                initial_result=EnvResult(dones=torch.zeros(4, 1, dtype=torch.bool)),
+                initial_transition=EnvTransition(
+                    dones=torch.zeros(4, 1, dtype=torch.bool)
+                ),
             )
         ],
     )
 
-    shards = split_policy_input(policy_input, [1, 3])
-    merged = merge_policy_inputs(shards)
+    shards = policy_input.split([1, 3])
+    merged = PolicyInput.merge(shards)
 
     assert shards[1].sources == [TrajectorySource(current_key, 3, offset=1)]
-    assert shards[1].completions[0].sources == [
+    assert shards[1].env_parts[0].sources == [
         TrajectorySource(previous_key, 3, offset=1)
     ]
     assert merged.request_sizes == [1, 3]
     assert torch.equal(
-        shards[1].completions[0].initial_result.dones,
+        shards[1].env_parts[0].initial_transition.dones,
         torch.zeros(3, 1, dtype=torch.bool),
     )
     assert torch.equal(
-        merged.completions[1].next_obs["states"],
+        merged.env_parts[1].next_obs["states"],
         torch.arange(12).reshape(4, 3)[1:],
     )
 
@@ -239,3 +280,112 @@ def test_episode_data_round_trip_keeps_scalar_info_flags_intact():
     assert merged["infos_list"][0]["record_reset"] is True
     assert merged["infos_list"][0]["segment_advance"] is False
     assert torch.equal(merged["chunk_actions"], episode_data["chunk_actions"])
+
+
+def test_policy_part_owns_routed_fragment_split_and_merge():
+    key = TrajectoryKey(1, 0, 0, 0, 2)
+    actions = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    part = PolicyPart(
+        sources=[TrajectorySource(key, 1), TrajectorySource(key, 3, offset=1)],
+        obs={"states": torch.arange(12).reshape(4, 3)},
+        output=PolicyOutput(
+            actions=actions,
+            forward_inputs={"action": actions},
+            prev_values=torch.arange(4).reshape(4, 1),
+        ),
+    )
+
+    fragments = part.split()
+    merged = PolicyPart.merge(fragments)
+
+    assert len(fragments) == 2
+    assert fragments[1].sources == [TrajectorySource(key, 3, offset=1)]
+    assert torch.equal(fragments[0].output.actions, actions[:1])
+    assert torch.equal(merged.obs["states"], part.obs["states"])
+
+
+def test_trajectory_step_owns_intervention_and_transition_conversion():
+    key = TrajectoryKey(1, 0, 0, 0, 2)
+    model_actions = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    policy = PolicyPart(
+        sources=[TrajectorySource(key, 1)],
+        obs={"states": torch.zeros(1, 2), "task_descriptions": ["pick"]},
+        output=PolicyOutput(
+            actions=model_actions,
+            forward_inputs={"action": model_actions, "model_action": model_actions},
+            prev_values=torch.ones(1, 1),
+        ),
+    )
+    env = EnvPart(
+        sources=[TrajectorySource(key, 1)],
+        transition=EnvTransition(
+            rewards=torch.ones(1, 1),
+            intervene_actions=torch.tensor([[9.0, 8.0, 7.0, 6.0]]),
+            intervene_flags=torch.tensor([[False, True]]),
+        ),
+        next_obs={"states": torch.ones(1, 2), "task_descriptions": ["pick"]},
+        forward_inputs=None,
+        bootstrap_values=None,
+        final_prev_values=torch.full((1, 1), 5.0),
+        initial_transition=EnvTransition(dones=torch.zeros(1, 1, dtype=torch.bool)),
+    )
+
+    step = TrajectoryStep.from_parts(
+        policy,
+        env,
+        rewards=env.transition.rewards,
+        collect_prev_infos=True,
+        collect_transitions=True,
+        enable_rlt=False,
+        include_final_value=True,
+    )
+
+    assert torch.equal(step.actions, torch.tensor([[1.0, 2.0, 7.0, 6.0]]))
+    assert torch.equal(step.forward_inputs["action"], step.actions)
+    assert "model_action" not in step.forward_inputs
+    assert "task_descriptions" not in step.curr_obs
+    assert "task_descriptions" not in step.next_obs
+    assert torch.equal(step.final_prev_values, torch.full((1, 1), 5.0))
+
+
+def test_trajectory_owns_step_materialization_splitting_and_batching():
+    steps = [
+        TrajectoryStep(
+            actions=torch.tensor([[1.0], [2.0]]),
+            rewards=torch.ones(2, 1),
+            dones=torch.zeros(2, 1, dtype=torch.bool),
+            initial_dones=torch.zeros(2, 1, dtype=torch.bool),
+            forward_inputs={"action": torch.tensor([[1.0], [2.0]])},
+            versions=torch.ones(2, 1),
+        ),
+        TrajectoryStep(
+            actions=torch.tensor([[3.0], [4.0]]),
+            rewards=torch.ones(2, 1),
+            dones=torch.ones(2, 1, dtype=torch.bool),
+            final_prev_values=torch.zeros(2, 1),
+            forward_inputs={"action": torch.tensor([[3.0], [4.0]])},
+            versions=torch.ones(2, 1),
+        ),
+    ]
+
+    trajectory = Trajectory.from_steps(steps, max_episode_length=8)
+    shards = trajectory.split(2)
+    batch = Trajectory.to_batch(shards)
+
+    assert trajectory.actions.shape == (2, 2, 1)
+    assert trajectory.dones.shape == (3, 2, 1)
+    assert [shard.actions.shape for shard in shards] == [(2, 1, 1)] * 2
+    assert torch.equal(batch["actions"], trajectory.actions)
+    assert torch.equal(batch["forward_inputs"]["action"], trajectory.actions)
+
+
+def test_policy_input_methods_replace_legacy_routing_helpers():
+    policy_input = PolicyInput(
+        obs={"states": torch.arange(8).reshape(4, 2)},
+        sources=[TrajectorySource(TrajectoryKey(1, 0, 0, 0, 0), 4)],
+    )
+
+    shards = policy_input.split([1, 3])
+    merged = PolicyInput.merge(shards)
+
+    assert torch.equal(merged.obs["states"], policy_input.obs["states"])

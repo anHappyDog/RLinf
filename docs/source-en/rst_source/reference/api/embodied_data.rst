@@ -6,38 +6,53 @@ training data:
 
 .. code-block:: text
 
-   EnvOutput
-       -> PolicyInput (+ previous PolicyCompletion)
-       -> PolicyOutput(actions)
+   EnvOutput(obs, EnvTransition)
+       -> PolicyInput (+ previous EnvPart)
+       -> actions tensor
 
-   PolicyPart + EnvPart
+   PolicyPart + completed EnvPart
        -> TrajectoryCollector
        -> Trajectory / episode shard / pipeline micro-batch
 
 See :doc:`../../concepts/trajectory_collector` for the lifecycle, data
 ownership, and execution-mode semantics.
 
+Shape notation
+--------------
+
+The class field comments use the following symbols:
+
+* ``B`` is the routed environment batch. Before decoupled merging, it is
+  normally ``env.train.total_num_envs / env_world_size /
+  rollout.pipeline_stage_num``.
+* ``C`` is ``actor.model.num_action_chunks``; eval-only runs use the Rollout
+  model config instead.
+* ``A`` is ``actor.model.action_dim`` and ``D = C * A``. With
+  ``E = env.train.rollout_epoch``, a full trajectory normally has
+  ``T = E * env.train.max_steps_per_rollout_epoch / C`` chunks.
+
 Environment and policy messages
 -------------------------------
 
-``EnvOutput`` is the local result of environment reset or action execution.
-``PolicyInput`` transports observations to Rollout and may carry the previous
-action's ``PolicyCompletion``. ``PolicyOutput`` is the action-only response sent
-back to Env.
+``EnvOutput`` composes observations with one ``EnvTransition``; it does not
+duplicate reward and boundary fields. ``PolicyInput`` carries observations and
+may piggyback the preceding ``EnvPart``. Rollout sends only the action tensor
+back to Env. The full ``PolicyOutput`` stays on the trajectory path because it
+also contains log-probabilities, values, versions, and training inputs.
 
-.. autoclass:: rlinf.data.schema.embodied_types.EnvOutput
+.. autoclass:: rlinf.data.schema.embodied.types.EnvOutput
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.PolicyInput
+.. autoclass:: rlinf.data.schema.embodied.types.EnvTransition
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.PolicyCompletion
+.. autoclass:: rlinf.data.schema.embodied.types.PolicyInput
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.PolicyOutput
+.. autoclass:: rlinf.data.schema.embodied.types.PolicyOutput
    :members:
    :member-order: bysource
 
@@ -46,21 +61,23 @@ Trajectory parts
 
 ``PolicyPart`` and ``EnvPart`` are the only Actor channel input types. They are
 matched by ``TrajectoryKey``. ``TrajectorySource`` preserves source size and
-offset when channel routing splits a batch.
+offset when channel routing splits a batch. Env creates an incomplete
+``EnvPart`` after stepping; Rollout adds optional terminal inference data and
+publishes the same type.
 
-.. autoclass:: rlinf.data.schema.embodied_types.TrajectoryKey
+.. autoclass:: rlinf.data.schema.embodied.types.TrajectoryKey
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.TrajectorySource
+.. autoclass:: rlinf.data.schema.embodied.types.TrajectorySource
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.PolicyPart
+.. autoclass:: rlinf.data.schema.embodied.types.PolicyPart
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.EnvPart
+.. autoclass:: rlinf.data.schema.embodied.types.EnvPart
    :members:
    :member-order: bysource
 
@@ -71,31 +88,29 @@ Collection
 geometry. ``TrajectoryCollector`` is the one public channel collector for every
 embodied mode.
 
-.. autoclass:: rlinf.data.schema.trajectory_collector.TrajectoryMode
+.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryMode
    :members:
 
-.. autoclass:: rlinf.data.schema.trajectory_collector.TrajectoryPlan
+.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryPlan
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.trajectory_collector.TrajectoryCollector
+.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryCollector
    :members:
    :member-order: bysource
 
 Actor output
 ------------
 
-``Trajectory`` contains the tensors used by non-pipeline Actor workers. Its
-typical layout is ``[T, B, ...]``. Boundary and bootstrap fields may have
-``T + 1`` entries.
+``TrajectoryStep`` resolves one joined policy/environment pair, including
+reward, intervention, and transition semantics. ``Trajectory`` then stacks
+steps into ``[T, B, ...]`` Actor tensors. Boundary and final-value sequences may
+have ``T + E`` entries.
 
-``ChunkStepResult`` describes the data retained for one joined action chunk.
-Sequence accumulation is a private collector implementation detail.
-
-.. autoclass:: rlinf.data.schema.embodied_types.Trajectory
+.. autoclass:: rlinf.data.schema.embodied.types.TrajectoryStep
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied_types.ChunkStepResult
+.. autoclass:: rlinf.data.schema.embodied.types.Trajectory
    :members:
    :member-order: bysource

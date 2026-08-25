@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.data.schema.embodied_types import EnvOutput
+from rlinf.data.schema.embodied.types import EnvOutput, EnvTransition
 
 # Mock gymnasium and rlinf.envs.wrappers before importing EnvWorker
 # to avoid ModuleNotFoundError when gymnasium is not installed.
@@ -149,9 +149,11 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
             return_value=(
                 EnvOutput(
                     obs={"main_images": torch.zeros(2, 3, 224, 224)},
-                    dones=torch.zeros(2, 4, dtype=torch.bool),
-                    truncations=torch.zeros(2, 4, dtype=torch.bool),
-                    terminations=torch.zeros(2, 4, dtype=torch.bool),
+                    transition=EnvTransition(
+                        dones=torch.zeros(2, 4, dtype=torch.bool),
+                        truncations=torch.zeros(2, 4, dtype=torch.bool),
+                        terminations=torch.zeros(2, 4, dtype=torch.bool),
+                    ),
                 ),
                 {},
                 {},
@@ -160,15 +162,15 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
         self.worker.send_env_batch = MagicMock()
         self.worker.store_last_obs_and_intervened_info = MagicMock()
         self.worker.finish_rollout = MagicMock()
-        self.worker.compute_bootstrap_rewards = MagicMock(
-            return_value=torch.zeros(2, 4)
-        )
         self.worker.record_env_metrics = MagicMock()
 
         # 1. Prefetch
         # We need to mock _bootstrap_and_send_train as it's called by prefetch_train_bootstrap
         dummy_bootstrap = [
-            EnvOutput(obs={"m": torch.zeros(1)}, dones=torch.zeros(1, 4))
+            EnvOutput(
+                obs={"m": torch.zeros(1)},
+                transition=EnvTransition(dones=torch.zeros(1, 4)),
+            )
         ]
         self.worker._bootstrap_and_send_train = MagicMock(return_value=dummy_bootstrap)
 
@@ -258,9 +260,11 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
             return_value=(
                 EnvOutput(
                     obs={"main_images": torch.zeros(2, 3, 224, 224)},
-                    dones=torch.zeros(2, 4, dtype=torch.bool),
-                    truncations=torch.zeros(2, 4, dtype=torch.bool),
-                    terminations=torch.zeros(2, 4, dtype=torch.bool),
+                    transition=EnvTransition(
+                        dones=torch.zeros(2, 4, dtype=torch.bool),
+                        truncations=torch.zeros(2, 4, dtype=torch.bool),
+                        terminations=torch.zeros(2, 4, dtype=torch.bool),
+                    ),
                 ),
                 {"episode_len": torch.tensor([1, 2])},
                 {},
@@ -269,11 +273,13 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
         self.worker.send_env_batch = MagicMock()
         self.worker.store_last_obs_and_intervened_info = MagicMock()
         self.worker.finish_rollout = MagicMock()
-        self.worker.compute_bootstrap_rewards = MagicMock(
-            return_value=torch.zeros(2, 4)
-        )
         self.worker._bootstrap_and_send_train = MagicMock(
-            return_value=[EnvOutput(obs={"m": torch.zeros(1)}, dones=torch.zeros(1, 4))]
+            return_value=[
+                EnvOutput(
+                    obs={"m": torch.zeros(1)},
+                    transition=EnvTransition(dones=torch.zeros(1, 4)),
+                )
+            ]
         )
         self.worker.send_rollout_trajectories = MagicMock(
             return_value=MagicMock(wait=MagicMock(return_value=None))

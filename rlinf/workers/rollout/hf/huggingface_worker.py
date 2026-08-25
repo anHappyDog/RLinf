@@ -29,15 +29,11 @@ from rlinf.algorithms.rlt import (
     predict_rlt_actions,
 )
 from rlinf.config import SupportedModel
-from rlinf.data.schema.embodied_types import (
-    DummyPolicyInput,
-    EmbodiedRolloutResult,
+from rlinf.data.schema.embodied.types import (
     EnvPart,
-    PolicyCompletion,
     PolicyInput,
     PolicyOutput,
     PolicyPart,
-    merge_policy_inputs,
     split_batch_value,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
@@ -588,9 +584,9 @@ class MultiStepRolloutWorker(Worker):
             )
         return self.predict(env_obs, mode=mode)
 
-    def _build_rollout_result(
+    def _build_policy_output(
         self, actions: torch.Tensor, result: dict[str, Any]
-    ) -> EmbodiedRolloutResult:
+    ) -> PolicyOutput:
         """Keep inference metadata locally until its environment result arrives."""
         intervene_flags = result.get("intervene_flags")
         if (
@@ -603,7 +599,7 @@ class MultiStepRolloutWorker(Worker):
                 dtype=torch.bool,
                 device=actions.device,
             )
-        return EmbodiedRolloutResult(
+        return PolicyOutput(
             actions=actions,
             prev_logprobs=result["prev_logprobs"] if self.collect_prev_infos else None,
             prev_values=result["prev_values"] if self.collect_prev_infos else None,
@@ -682,7 +678,7 @@ class MultiStepRolloutWorker(Worker):
                 channel=channel,
                 tag=tag,
                 batch_size=self.train_batch_size,
-                merge_fn=merge_policy_inputs,
+                merge_fn=PolicyInput.merge,
                 infer_batch_size_fn=self._infer_policy_input_batch_size,
                 timeout_time=0.02,
                 recv_queue_size=self.rollout_queue_size,
@@ -695,59 +691,38 @@ class MultiStepRolloutWorker(Worker):
             route_key=stage_id,
             async_op=True,
             batch_size=self.train_batch_size,
-            merge_fn=merge_policy_inputs,
+            merge_fn=PolicyInput.merge,
             infer_batch_size_fn=self._infer_policy_input_batch_size,
         ).async_wait()
         return policy_input, None
 
-    def _terminal_inference_is_useful(self) -> bool:
-        """Return whether terminal-observation inference produces consumed data.
-
-        The extra forward pass is only worth its cost when the model can emit a
-        bootstrap value, or when RLT needs the terminal transition observation
-        from ``forward_inputs``. Without either, the trajectory worker discards
-        everything this pass would produce.
-        """
-        return (
-            hasattr(self.hf_model, "value_head")
-            or hasattr(self.hf_model, "q_head")
-            or self.enable_rlt
-        )
-
-    def _publish_completion(
+    def _publish_env_part(
         self,
-        completion: PolicyCompletion,
+        env_part: EnvPart,
         forward_inputs: dict[str, Any] | None,
         actor_channel: Channel,
     ) -> None:
-        bootstrap_values = None
         final_prev_values = None
         # Terminal inference contributes values or transition features only.
-        if completion.requires_inference and self._terminal_inference_is_useful():
-            _, result = self._predict_rollout_actions(completion.next_obs)
+        if env_part.requires_inference:
+            _, result = self._predict_rollout_actions(env_part.next_obs)
             values = result.get("prev_values")
             if values is not None:
                 final_prev_values = values.cpu().contiguous()
-                bootstrap_values = final_prev_values[:, :1]
             forward_inputs = result.get("forward_inputs")
         # Republish environment-owned data here to keep one Actor-channel writer.
         actor_channel.put(
-            EnvPart(
-                sources=completion.sources,
-                result=completion.env_result,
-                next_obs=completion.next_obs,
+            env_part.complete(
                 forward_inputs=forward_inputs,
-                bootstrap_values=bootstrap_values,
                 final_prev_values=final_prev_values,
-                initial_result=completion.initial_result,
             ),
             async_op=True,
         )
 
-    def _send_policy_output(
+    def _send_actions(
         self,
         channel: Channel,
-        output: PolicyOutput,
+        actions: torch.Tensor,
         stage_id: int,
         split_sizes: list[int] | None,
     ) -> None:
@@ -757,21 +732,21 @@ class MultiStepRolloutWorker(Worker):
             self.send_to_recorded_batch_routes(
                 group_name=self.cfg.env.group_name,
                 channel=channel,
-                data=output,
+                data=actions,
                 tag="policy",
-                split_fn=self._split_policy_output,
+                split_fn=self._split_actions,
                 split_sizes=split_sizes,
             )
             return
         self.send_to(
             group_name=self.cfg.env.group_name,
             channel=channel,
-            data=output,
+            data=actions,
             tag="policy",
             route_key=stage_id,
             async_op=True,
             batch_size=self.train_batch_size,
-            split_fn=self._split_policy_output,
+            split_fn=self._split_actions,
         )
 
     @Worker.timer("generate_one_epoch")
@@ -789,9 +764,10 @@ class MultiStepRolloutWorker(Worker):
                 )
                 if policy_input.is_last:
                     raise ValueError("Received a final input in the policy stream.")
-                if isinstance(policy_input, DummyPolicyInput):
-                    actions = policy_input.actions
+                if not policy_input.requires_inference:
+                    actions = policy_input.external_actions
                     forward_inputs = [None] * len(policy_input.request_sizes)
+                    policy_output = None
                 else:
                     actions, result = self._predict_rollout_actions(
                         policy_input.obs,
@@ -801,13 +777,14 @@ class MultiStepRolloutWorker(Worker):
                     forward_inputs = split_batch_value(
                         result.get("forward_inputs"), policy_input.request_sizes
                     )
-                self._send_policy_output(
+                    policy_output = self._build_policy_output(actions, result)
+                self._send_actions(
                     output_channel,
-                    PolicyOutput(actions=actions.contiguous()),
+                    actions.contiguous(),
                     stage_id,
                     split_sizes,
                 )
-                if isinstance(policy_input, DummyPolicyInput):
+                if not policy_input.requires_inference:
                     trajectory_part = PolicyPart(
                         sources=policy_input.sources,
                         obs=policy_input.obs,
@@ -817,17 +794,17 @@ class MultiStepRolloutWorker(Worker):
                     trajectory_part = PolicyPart(
                         sources=policy_input.sources,
                         obs=policy_input.obs,
-                        rollout_result=self._build_rollout_result(actions, result),
+                        output=policy_output,
                     )
                 # Publish model-owned data immediately; its environment half
-                # arrives later through a PolicyCompletion with the same key.
+                # arrives later through an EnvPart with the same key.
                 actor_channel.put(trajectory_part, async_op=True)
-                for completion, next_inputs in zip(
-                    policy_input.completions, forward_inputs
+                for env_part, next_inputs in zip(
+                    policy_input.env_parts, forward_inputs
                 ):
-                    if completion is not None:
-                        # This completion closes a previously executed chunk.
-                        self._publish_completion(completion, next_inputs, actor_channel)
+                    if env_part is not None:
+                        # This part closes a previously executed chunk.
+                        self._publish_env_part(env_part, next_inputs, actor_channel)
 
         if self.env_decoupled_mode:
             return
@@ -838,11 +815,11 @@ class MultiStepRolloutWorker(Worker):
             )
             if not policy_input.is_last:
                 raise ValueError("Expected a final policy input at epoch end.")
-            for completion in policy_input.completions:
-                if completion is not None:
+            for env_part in policy_input.env_parts:
+                if env_part is not None:
                     # The final message carries the last chunk without requesting
                     # another action from the policy.
-                    self._publish_completion(completion, None, actor_channel)
+                    self._publish_env_part(env_part, None, actor_channel)
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -1046,14 +1023,9 @@ class MultiStepRolloutWorker(Worker):
         }
 
     @staticmethod
-    def _split_policy_output(
-        policy_output: PolicyOutput, sizes: list[int]
-    ) -> list[PolicyOutput]:
+    def _split_actions(actions: torch.Tensor, sizes: list[int]) -> list[torch.Tensor]:
         """Split policy actions for the environment workers that requested them."""
-        return [
-            PolicyOutput(actions=actions.contiguous())
-            for actions in torch.split(policy_output.actions, sizes, dim=0)
-        ]
+        return [shard.contiguous() for shard in torch.split(actions, sizes, dim=0)]
 
     def set_global_step(self, global_step: int):
         self.global_step = global_step

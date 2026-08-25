@@ -300,7 +300,7 @@ Core Components
 1. Initialise ``RealWorldEnv`` and ``TrajectoryReplayBuffer``.
 2. Loop over steps, reading the SpaceMouse intervention action from
    ``info["intervene_action"]``.
-3. Construct a ``ChunkStepResult`` and append it to the script's internal
+3. Construct a ``TrajectoryStep`` and append it to the script's internal
    trajectory accumulator.
 4. When an episode ends (``done=True``) with reward ``>= 0.5``, count it as a
    success and write the trajectory to the buffer.

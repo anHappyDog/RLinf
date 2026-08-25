@@ -18,16 +18,8 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.data.schema.embodied_types import (
-    EmbodiedRolloutResult,
-    EnvPart,
-    EnvResult,
-    PolicyPart,
-    TrajectoryKey,
-    TrajectorySource,
-)
-from rlinf.data.schema.trajectory_accumulator import LerobotEpisodeAccumulator
-from rlinf.data.schema.trajectory_collector import (
+from rlinf.data.schema.embodied.trajectory import (
+    LeRobotEpisodeAccumulator,
     RolloutGeometry,
     TrajectoryCollector,
     TrajectoryMode,
@@ -35,6 +27,16 @@ from rlinf.data.schema.trajectory_collector import (
     select_trajectory_collector,
     select_trajectory_dispatcher,
 )
+from rlinf.data.schema.embodied.types import (
+    EnvPart,
+    EnvTransition,
+    LeRobotFrame,
+    PolicyOutput,
+    PolicyPart,
+    TrajectoryKey,
+    TrajectorySource,
+)
+from rlinf.envs.wrappers.collect_episode import CollectEpisode
 from rlinf.scheduler.channel.channel import DEFAULT_KEY
 from rlinf.scheduler.channel.hooks import ChannelContext
 
@@ -108,7 +110,7 @@ def _policy(
         {"external_actions": value_tensor.unsqueeze(1)}
         if external
         else {
-            "rollout_result": EmbodiedRolloutResult(
+            "output": PolicyOutput(
                 actions=value_tensor,
                 forward_inputs={"action": value_tensor},
                 prev_logprobs=torch.zeros(1, 1),
@@ -128,14 +130,14 @@ def _env_part(
     key: TrajectoryKey,
     *,
     episode_data=None,
-    initial_result=None,
+    initial_transition=None,
     value: float = 2.0,
     **source_kwargs,
 ):
     value_tensor = torch.tensor([[value]])
     return EnvPart(
         sources=[_source(key, **source_kwargs)],
-        result=EnvResult(
+        transition=EnvTransition(
             rewards=torch.ones(1, 1),
             dones=torch.ones(1, 1, dtype=torch.bool),
             truncations=torch.ones(1, 1, dtype=torch.bool),
@@ -146,7 +148,7 @@ def _env_part(
         forward_inputs={"states": value_tensor},
         bootstrap_values=torch.tensor([[4.0]]),
         final_prev_values=torch.tensor([[5.0]]),
-        initial_result=initial_result,
+        initial_transition=initial_transition,
     )
 
 
@@ -195,9 +197,7 @@ def test_policy_part_requires_exactly_one_policy_payload():
     with pytest.raises(ValueError, match="exactly one"):
         PolicyPart(
             **common,
-            rollout_result=EmbodiedRolloutResult(
-                actions=torch.zeros(1, 1), forward_inputs={}
-            ),
+            output=PolicyOutput(actions=torch.zeros(1, 1), forward_inputs={}),
             external_actions=torch.zeros(1, 1),
         )
 
@@ -289,14 +289,14 @@ def test_rollout_output_matches_main_fields_for_sync_and_decoupled(
     cfg = _config(runner={"enable_decoupled_mode": decoupled})
     collector = _make(cfg)
     key = TrajectoryKey(3, 0, 0, 0, 0)
-    initial = EnvResult(
+    initial = EnvTransition(
         dones=torch.zeros(1, 1, dtype=torch.bool),
         truncations=torch.zeros(1, 1, dtype=torch.bool),
         terminations=torch.zeros(1, 1, dtype=torch.bool),
     )
     parts = {
         "policy": _policy(key),
-        "env": _env_part(key, initial_result=initial),
+        "env": _env_part(key, initial_transition=initial),
     }
 
     [(_, trajectory)] = _collect(collector, *(parts[name] for name in part_order))
@@ -322,7 +322,7 @@ def test_rollout_sources_flush_independently_like_main_env_workers(decoupled):
         runner={"enable_decoupled_mode": decoupled},
     )
     collector = _make(cfg, source_count=2)
-    initial = EnvResult(
+    initial = EnvTransition(
         dones=torch.zeros(1, 1, dtype=torch.bool),
         truncations=torch.zeros(1, 1, dtype=torch.bool),
         terminations=torch.zeros(1, 1, dtype=torch.bool),
@@ -332,14 +332,14 @@ def test_rollout_sources_flush_independently_like_main_env_workers(decoupled):
     first_outputs = _collect(
         collector,
         _policy(first_key),
-        _env_part(first_key, initial_result=initial),
+        _env_part(first_key, initial_transition=initial),
     )
     assert len(first_outputs) == 1
 
     second_key = TrajectoryKey(4, 0, 1, 0, 0)
     second_outputs = _collect(
         collector,
-        _env_part(second_key, initial_result=initial),
+        _env_part(second_key, initial_transition=initial),
         _policy(second_key),
     )
     assert len(second_outputs) == 1
@@ -349,12 +349,12 @@ def test_collector_joins_out_of_order_routed_fragments_and_initial_state():
     collector = _make(source_count=1, chunk_count=1, shards_per_source=1)
     collector._joiner._source_batch_size = 2
     key = TrajectoryKey(0, 0, 0, 0, 0)
-    initial = EnvResult(dones=torch.zeros(2, 1, dtype=torch.bool))
+    initial = EnvTransition(dones=torch.zeros(2, 1, dtype=torch.bool))
     policy_tail = _policy(key, 11.0, size=1, offset=1)
     policy_head = _policy(key, 10.0, size=1, offset=0)
     env = EnvPart(
         sources=[_source(key, size=2)],
-        result=EnvResult(
+        transition=EnvTransition(
             rewards=torch.ones(2, 1),
             dones=torch.ones(2, 1, dtype=torch.bool),
             truncations=torch.zeros(2, 1, dtype=torch.bool),
@@ -363,7 +363,7 @@ def test_collector_joins_out_of_order_routed_fragments_and_initial_state():
         forward_inputs=None,
         bootstrap_values=None,
         final_prev_values=None,
-        initial_result=initial,
+        initial_transition=initial,
     )
 
     assert _collect(collector, policy_tail, policy_head) == []
@@ -379,7 +379,7 @@ def test_collector_rejects_initial_state_after_chunk_zero():
 
     _collect(collector, _policy(key))
     with pytest.raises(ValueError, match="Only chunk zero"):
-        _collect(collector, _env_part(key, initial_result=EnvResult()))
+        _collect(collector, _env_part(key, initial_transition=EnvTransition()))
 
 
 def test_collector_requires_initial_state_for_chunk_zero():
@@ -395,7 +395,7 @@ def test_collector_keeps_joined_parts_when_output_materialization_fails():
     collector = _make()
     key = TrajectoryKey(0, 0, 0, 0, 0)
     policy = _policy(key)
-    env = _env_part(key, initial_result=EnvResult())
+    env = _env_part(key, initial_transition=EnvTransition())
     original_emit = collector._output.emit
     collector._output.emit = Mock(side_effect=RuntimeError("invalid output"))
 
@@ -413,11 +413,67 @@ def test_rollout_collector_rejects_duplicate_completed_key():
     key = TrajectoryKey(3, 0, 0, 0, 0)
 
     assert (
-        _collect(collector, _policy(key), _env_part(key, initial_result=EnvResult()))
+        _collect(
+            collector,
+            _policy(key),
+            _env_part(key, initial_transition=EnvTransition()),
+        )
         == []
     )
     with pytest.raises(ValueError, match="duplicate trajectory event"):
-        _collect(collector, _policy(key), _env_part(key, initial_result=EnvResult()))
+        _collect(
+            collector,
+            _policy(key),
+            _env_part(key, initial_transition=EnvTransition()),
+        )
+
+
+def test_rollout_materializes_each_epoch_boundary_and_final_value_in_order():
+    collector = _make(_config(env={"train": {"rollout_epoch": 2}}))
+    initial = EnvTransition(
+        dones=torch.zeros(1, 1, dtype=torch.bool),
+        truncations=torch.zeros(1, 1, dtype=torch.bool),
+        terminations=torch.zeros(1, 1, dtype=torch.bool),
+    )
+    first_key = TrajectoryKey(3, 0, 0, 0, 0)
+    second_key = TrajectoryKey(3, 1, 0, 0, 0)
+
+    assert (
+        _collect(
+            collector,
+            _policy(first_key),
+            _env_part(first_key, initial_transition=initial),
+        )
+        == []
+    )
+    [(_, trajectory)] = _collect(
+        collector,
+        _env_part(second_key, initial_transition=initial),
+        _policy(second_key),
+    )
+
+    assert torch.equal(
+        trajectory.dones,
+        torch.tensor([[[False]], [[True]], [[False]], [[True]]]),
+    )
+    assert torch.equal(
+        trajectory.prev_values,
+        torch.tensor([[[0.0]], [[5.0]], [[0.0]], [[5.0]]]),
+    )
+
+
+def test_rollout_omits_policy_statistics_when_collection_is_disabled():
+    collector = _make(_config(rollout={"collect_prev_infos": False}))
+    key = TrajectoryKey(3, 0, 0, 0, 0)
+
+    [(_, trajectory)] = _collect(
+        collector,
+        _policy(key),
+        _env_part(key, initial_transition=EnvTransition()),
+    )
+
+    assert trajectory.prev_logprobs is None
+    assert trajectory.prev_values is None
 
 
 def test_history_reward_assignment_matches_main_across_chunks():
@@ -436,19 +492,19 @@ def test_history_reward_assignment_matches_main_across_chunks():
         },
     )
     collector = _make(cfg, chunk_count=2)
-    initial = EnvResult(
+    initial = EnvTransition(
         dones=torch.zeros(1, 1, dtype=torch.bool),
         truncations=torch.zeros(1, 1, dtype=torch.bool),
         terminations=torch.zeros(1, 1, dtype=torch.bool),
     )
     first_key = TrajectoryKey(3, 0, 0, 0, 0)
     second_key = TrajectoryKey(3, 0, 0, 0, 1)
-    first_env = _env_part(first_key, initial_result=initial)
-    first_env.result.dones = torch.zeros(1, 1, dtype=torch.bool)
-    first_env.result.truncations = torch.zeros(1, 1, dtype=torch.bool)
+    first_env = _env_part(first_key, initial_transition=initial)
+    first_env.transition.dones = torch.zeros(1, 1, dtype=torch.bool)
+    first_env.transition.truncations = torch.zeros(1, 1, dtype=torch.bool)
     second_env = _env_part(second_key)
-    second_env.result.reward_model_output = torch.tensor([[3.0]])
-    second_env.result.reward_assign_lengths = [2]
+    second_env.transition.reward_model_output = torch.tensor([[3.0]])
+    second_env.transition.reward_assign_lengths = [2]
 
     assert _collect(collector, _policy(first_key), first_env) == []
     [(_, trajectory)] = _collect(
@@ -470,7 +526,7 @@ def test_rlt_output_matches_main_transition_and_intervention_behavior(loss_type)
     policy = PolicyPart(
         sources=[_source(key)],
         obs={"states": torch.zeros(1, 1)},
-        rollout_result=EmbodiedRolloutResult(
+        output=PolicyOutput(
             actions=current_ref_chunk,
             forward_inputs={
                 "action": current_ref_chunk,
@@ -484,7 +540,7 @@ def test_rlt_output_matches_main_transition_and_intervention_behavior(loss_type)
     )
     env = EnvPart(
         sources=[_source(key)],
-        result=EnvResult(
+        transition=EnvTransition(
             rewards=torch.ones(1, 1),
             dones=torch.zeros(1, 1, dtype=torch.bool),
             truncations=torch.zeros(1, 1, dtype=torch.bool),
@@ -499,7 +555,7 @@ def test_rlt_output_matches_main_transition_and_intervention_behavior(loss_type)
         },
         bootstrap_values=None,
         final_prev_values=None,
-        initial_result=EnvResult(),
+        initial_transition=EnvTransition(),
     )
 
     [(_, trajectory)] = _collect(collector, env, policy)
@@ -518,7 +574,7 @@ def test_pipeline_output_contains_main_actor_training_fields():
         actor_world_size=1,
     )
     key = TrajectoryKey(2, 0, 0, 0, 0)
-    initial = EnvResult(
+    initial = EnvTransition(
         dones=torch.zeros(1, 1, dtype=torch.bool),
         truncations=torch.zeros(1, 1, dtype=torch.bool),
         terminations=torch.zeros(1, 1, dtype=torch.bool),
@@ -527,7 +583,7 @@ def test_pipeline_output_contains_main_actor_training_fields():
     [(queue_key, batch)] = _collect(
         collector,
         _policy(key),
-        _env_part(key, initial_result=initial),
+        _env_part(key, initial_transition=initial),
     )
 
     assert queue_key == "0_0_pipeline_actor"
@@ -554,7 +610,7 @@ def test_pipeline_waits_for_all_sources_and_routes_each_actor_like_main():
         source_count=2,
         actor_world_size=2,
     )
-    initial = EnvResult(
+    initial = EnvTransition(
         dones=torch.zeros(1, 1, dtype=torch.bool),
         truncations=torch.zeros(1, 1, dtype=torch.bool),
         terminations=torch.zeros(1, 1, dtype=torch.bool),
@@ -566,13 +622,13 @@ def test_pipeline_waits_for_all_sources_and_routes_each_actor_like_main():
         _collect(
             collector,
             _policy(first_key),
-            _env_part(first_key, initial_result=initial),
+            _env_part(first_key, initial_transition=initial),
         )
         == []
     )
     outputs = _collect(
         collector,
-        _env_part(second_key, initial_result=initial),
+        _env_part(second_key, initial_transition=initial),
         _policy(second_key),
     )
 
@@ -595,7 +651,7 @@ def test_pipeline_flushes_each_epoch_to_the_actor_specific_key():
         key = TrajectoryKey(2, epoch_id, 0, 0, 0)
         outputs = _collect(
             collector,
-            _env_part(key, initial_result=EnvResult()),
+            _env_part(key, initial_transition=EnvTransition()),
             _policy(key),
         )
         assert outputs[0][0] == "0_0_pipeline_actor"
@@ -612,7 +668,11 @@ def test_online_lerobot_accepts_external_policy_actions_and_emits_shards():
     outputs = _collect(
         collector,
         _policy(key, external=True),
-        _env_part(key, episode_data=_episode_data(), initial_result=EnvResult()),
+        _env_part(
+            key,
+            episode_data=_episode_data(),
+            initial_transition=EnvTransition(),
+        ),
     )
 
     assert len(outputs) == 2
@@ -620,8 +680,7 @@ def test_online_lerobot_accepts_external_policy_actions_and_emits_shards():
 
 
 def test_online_lerobot_accumulator_records_external_intervened_action():
-    accumulator = LerobotEpisodeAccumulator(
-        max_episode_length=4,
+    accumulator = LeRobotEpisodeAccumulator(
         num_envs=1,
         num_action_chunks=1,
         action_dim=2,
@@ -650,3 +709,205 @@ def test_online_lerobot_accumulator_records_external_intervened_action():
     assert torch.equal(
         torch.from_numpy(episode[0]["actions"]), torch.tensor([9.0, 8.0])
     )
+
+
+def test_online_lerobot_accumulator_preserves_auto_reset_observation():
+    accumulator = LeRobotEpisodeAccumulator(
+        num_envs=1,
+        num_action_chunks=1,
+        action_dim=1,
+    )
+
+    accumulator.append_chunk_episode_data(
+        policy_output=None,
+        chunk_actions=torch.tensor([[[1.0]]]),
+        obs_list=[{"states": torch.tensor([[100.0]])}],
+        terminations=torch.tensor([[True]]),
+        truncations=torch.tensor([[False]]),
+        infos_list=[
+            {
+                "final_observation": {"states": torch.tensor([[10.0]])},
+                "final_info": {"success_once": torch.tensor([True])},
+            }
+        ],
+    )
+    accumulator.append_chunk_episode_data(
+        policy_output=None,
+        chunk_actions=torch.tensor([[[2.0]]]),
+        obs_list=[{"states": torch.tensor([[20.0]])}],
+        terminations=torch.tensor([[True]]),
+        truncations=torch.tensor([[False]]),
+        infos_list=[{}],
+    )
+
+    first, second = accumulator.drain_episodes()
+    assert first[0]["state"].item() == 10.0
+    assert first[0]["is_success"].item()
+    assert second[0]["state"].item() == 100.0
+
+
+def test_online_lerobot_accumulator_filters_unsuccessful_episodes():
+    accumulator = LeRobotEpisodeAccumulator(
+        num_envs=1,
+        only_success=True,
+        num_action_chunks=1,
+        action_dim=1,
+    )
+
+    for terminated, truncated, success in (
+        (True, False, False),
+        (False, True, True),
+        (True, False, True),
+    ):
+        accumulator.append_chunk_episode_data(
+            policy_output=None,
+            chunk_actions=torch.tensor([[[1.0]]]),
+            obs_list=[{"states": torch.tensor([[1.0]])}],
+            terminations=torch.tensor([[terminated]]),
+            truncations=torch.tensor([[truncated]]),
+            infos_list=[{"success_once": torch.tensor([success])}],
+        )
+
+    [episode] = accumulator.drain_episodes()
+    assert episode[-1]["is_success"].item()
+    assert episode[-1]["done"].item()
+
+
+def test_online_lerobot_accumulator_expands_vectorized_action_chunks():
+    accumulator = LeRobotEpisodeAccumulator(
+        num_envs=2,
+        num_action_chunks=2,
+        action_dim=1,
+    )
+
+    accumulator.append_chunk_episode_data(
+        policy_output=None,
+        chunk_actions=torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]]),
+        obs_list=[
+            {"states": torch.tensor([[10.0], [30.0]])},
+            {"states": torch.tensor([[20.0], [40.0]])},
+        ],
+        terminations=torch.tensor([[False, True], [False, True]]),
+        truncations=torch.zeros(2, 2, dtype=torch.bool),
+        infos_list=[{}, {}],
+    )
+
+    episodes = accumulator.drain_episodes()
+    assert len(episodes) == 2
+    assert [frame["actions"].item() for frame in episodes[0]] == [1.0, 2.0]
+    assert [frame["actions"].item() for frame in episodes[1]] == [3.0, 4.0]
+
+
+def test_online_lerobot_accumulator_uses_policy_intervention_metadata():
+    accumulator = LeRobotEpisodeAccumulator(
+        num_envs=1,
+        num_action_chunks=2,
+        action_dim=1,
+    )
+    policy_output = PolicyOutput(
+        actions=torch.tensor([[[1.0], [2.0]]]),
+        forward_inputs={"action": torch.tensor([[[9.0], [8.0]]])},
+        intervene_flags=torch.tensor([[False, True]]),
+    )
+
+    accumulator.append_chunk_episode_data(
+        policy_output=policy_output,
+        chunk_actions=policy_output.actions,
+        obs_list=[
+            {"states": torch.tensor([[10.0]])},
+            {"states": torch.tensor([[20.0]])},
+        ],
+        terminations=torch.tensor([[False, True]]),
+        truncations=torch.zeros(1, 2, dtype=torch.bool),
+        infos_list=[{}, {}],
+    )
+
+    [episode] = accumulator.drain_episodes()
+    assert [frame["actions"].item() for frame in episode] == [1.0, 8.0]
+    assert [frame["intervene_flag"].item() for frame in episode] == [False, True]
+
+
+def test_online_lerobot_accumulator_applies_recording_controls():
+    accumulator = LeRobotEpisodeAccumulator(
+        num_envs=1,
+        num_action_chunks=1,
+        action_dim=1,
+    )
+
+    for state, action, info, terminated in (
+        (10.0, 1.0, {"record_reset": True}, False),
+        (20.0, 2.0, {"pre_record": True}, False),
+        (30.0, 3.0, {"segment_advance": True}, True),
+    ):
+        accumulator.append_chunk_episode_data(
+            policy_output=None,
+            chunk_actions=torch.tensor([[[action]]]),
+            obs_list=[{"states": torch.tensor([[state]])}],
+            terminations=torch.tensor([[terminated]]),
+            truncations=torch.tensor([[False]]),
+            infos_list=[info],
+        )
+
+    [episode] = accumulator.drain_episodes()
+    assert len(episode) == 1
+    assert episode[0]["state"].item() == 10.0
+    assert episode[0]["actions"].item() == 3.0
+    assert episode[0]["segment_id"].item() == 1
+
+
+def test_lerobot_frame_owns_observation_and_image_conversion():
+    frame = LeRobotFrame.from_step(
+        observation={
+            "main_images": torch.full((2, 2, 3), 0.5),
+            "wrist_images": torch.zeros(2, 2, 2, 3),
+            "states": torch.tensor([1.0, 2.0]),
+            "task_descriptions": ["pick"],
+        },
+        action=torch.tensor([1.0, 2.0]).numpy(),
+        info={
+            "intervene_action": torch.tensor([9.0, 8.0]),
+            "intervene_flag": torch.tensor(True),
+            "success_once": torch.tensor(True),
+        },
+        segment_id=3,
+        action_dim=2,
+    )
+
+    assert frame is not None
+    output = frame.to_dict(episode_success=True, done=True)
+    assert output["actions"].tolist() == [9.0, 8.0]
+    assert output["image"].dtype.name == "uint8"
+    assert {"wrist_image-0", "wrist_image-1"} <= output.keys()
+    assert output["task"] == "pick"
+    assert output["segment_id"].item() == 3
+
+
+def test_offline_lerobot_export_reuses_canonical_frame_conversion():
+    collector = object.__new__(CollectEpisode)
+    collector.num_envs = 1
+    buffer = {
+        "observations": [
+            {
+                "main_images": torch.full((2, 2, 3), 0.5),
+                "states": torch.tensor([1.0, 2.0]),
+                "task_descriptions": ["pick"],
+            }
+        ],
+        "actions": [torch.tensor([1.0, 2.0])],
+        "terminated": [True],
+        "infos": [
+            {},
+            {
+                "intervene_action": torch.tensor([9.0, 8.0]),
+                "intervene_flag": torch.tensor([True]),
+            },
+        ],
+        "segment_ids": [4],
+    }
+
+    [frame] = collector._buffer_to_lerobot_ep(buffer, env_idx=0, is_success=True)
+    assert frame["actions"].tolist() == [9.0, 8.0]
+    assert frame["image"].dtype.name == "uint8"
+    assert frame["task"] == "pick"
+    assert frame["segment_id"].item() == 4
+    assert frame["done"].item()
