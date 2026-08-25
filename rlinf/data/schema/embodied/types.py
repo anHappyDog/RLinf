@@ -811,35 +811,23 @@ class TrajectoryStep:
 
 @dataclass
 class Trajectory:
-    """Actor-facing tensors collected from one logical rollout source."""
+    """
+    trajectory contains multiple episodes.
+    """
 
-    # Environment horizon from ``env.train.max_episode_steps``.
     max_episode_length: int = 0
-    # UUID derived from ``versions`` for behavior-policy identity checks.
     model_weights_id: str = ""
-    # Executed actions, float [T, B, C, A] or flattened [T, B, D].
     actions: torch.Tensor | None = None
-    # Expanded intervention mask with the same shape as ``actions``.
     intervene_flags: torch.Tensor | None = None
-    # Training rewards, float [T, B, C].
     rewards: torch.Tensor | None = None
-    # Termination boundaries, bool [T + rollout_epoch, B, C].
     terminations: torch.Tensor | None = None
-    # Truncation boundaries, bool [T + rollout_epoch, B, C].
     truncations: torch.Tensor | None = None
-    # Combined done boundaries, bool [T + rollout_epoch, B, C].
     dones: torch.Tensor | None = None
-    # Behavior-policy log probabilities, float [T, B, ...], model/loss specific.
     prev_logprobs: torch.Tensor | None = None
-    # Values including final epoch boundaries, usually [T + E, B, 1 or C].
     prev_values: torch.Tensor | None = None
-    # Actor weight versions, float [T, B, ...], matching ``prev_logprobs``.
     versions: torch.Tensor | None = None
-    # Stacked model training inputs; tensor leaves start with [T, B, ...].
     forward_inputs: dict[str, Any] = field(default_factory=dict)
-    # Stacked current transition observations; leaves [T, B, ...].
     curr_obs: dict[str, Any] = field(default_factory=dict)
-    # Stacked next transition observations; leaves [T, B, ...].
     next_obs: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -998,7 +986,6 @@ class Trajectory:
         return batch
 
     def extract_intervene_traj(self, mode="any"):
-        """Return per-environment trajectories containing intervened actions."""
         if self.intervene_flags is None or (~self.intervene_flags).all():
             return None
         if mode == "any":
@@ -1077,7 +1064,9 @@ class Trajectory:
     def _generate_field_mask(
         ref_tensor: torch.Tensor, mask: torch.Tensor, traj_len: int
     ) -> torch.Tensor:
-        """Align an action mask with boundary fields that include epoch starts."""
+        """
+        Generate a mask for terminations/truncations/dones based on their original shape.
+        """
         assert mask.dim() == 1, f"Expected 1D mask, got {mask.shape=}"
         if ref_tensor.shape[0] == traj_len:
             return mask
@@ -1094,7 +1083,6 @@ class Trajectory:
             original_indices = torch.arange(ref_tensor.shape[0], device=mask.device)
             epoch_idx = original_indices // (epoch_len + 1)
             step_idx = original_indices % (epoch_len + 1)
-            # Every epoch-start boundary is retained even though it has no action.
             field_mask[step_idx == 0] = True
             valid_mask = step_idx >= 1
             mask_idx = epoch_idx[valid_mask] * epoch_len + (step_idx[valid_mask] - 1)
@@ -1798,15 +1786,10 @@ class PolicyInput:
 class RTCRequest:
     """Real-time correction request sent from the env worker to rollout."""
 
-    # Current observations; nested tensors/arrays start with [B, ...].
     obs: dict[str, Any]
-    # RTC protocol branch, currently ``bootstrap`` or ``correction``.
     request_type: str = "bootstrap"
-    # Number of low-level actions already executed from the current chunk.
     executed_horizon: int = 0
-    # Predicted control delay in low-level environment steps.
     predicted_delay_steps: int = 0
-    # Monotonic RTC request id local to this env/rollout stream.
     chunk_id: int = 0
 
     def __post_init__(self):
@@ -1819,13 +1802,9 @@ class RTCRequest:
 class RTCActionResponse:
     """RTC response carrying a fresh action chunk."""
 
-    # Executable action chunk, float tensor [B, C, A] or flattened [B, D].
     actions: torch.Tensor | None = None
-    # Unguided model chunk with the same shape as ``actions`` for overlap reuse.
     model_actions: torch.Tensor | None = None
-    # Request id copied from :class:`RTCRequest`.
     chunk_id: int = 0
-    # Whether delay-aware guidance changed ``actions``.
     guidance_applied: bool = False
 
     def __post_init__(self):

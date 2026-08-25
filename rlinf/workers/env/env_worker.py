@@ -79,8 +79,11 @@ class EnvWorker(Worker):
         ) in {"rlt_ac", "rlt_td3"}
         self.use_training_pipeline = self.cfg.runner.get("use_training_pipeline", False)
         # Optional lossless compression of image observations before they are
-        # sent to rollout workers. Splitting happens before compression so
-        # routing still sees ordinary batched tensors.
+        # sent to the rollout workers. Disabled unless `env.obs_compression`
+        # is present and `enable: true`. Compression runs inside a custom
+        # `split_fn` (see `_split_and_compress_obs`) so it happens *after* the
+        # channel splits the batch across ranks, keeping the scheduler's
+        # batch-size inference and splitting operating on plain tensors.
         self.obs_compression_cfg = OmegaConf.select(
             self.cfg, "env.obs_compression", default=None
         )
