@@ -313,9 +313,6 @@ def _publish_step_env(**overrides):
     env.enable_online_lerobot = False
     env.env_decoupled_mode = False
     env.collect_final_values = True
-    env.enable_rlt = False
-    env.train_auto_reset = True
-    env.bootstrap_type = "standard"
     env.smooth_intervene = SmoothInterveneController(1, 1, 1, 4)
     env._build_env_transition = Mock(return_value=EnvTransition())
     env._send_policy_input = Mock()
@@ -340,7 +337,6 @@ def test_env_sends_terminal_observation_only_as_a_boundary_override():
     env_output = _terminal_env_output(
         reset_obs,
         terminal_obs,
-        truncations=torch.ones(1, 1, dtype=torch.bool),
     )
 
     env._publish_step(Mock(), env_output, EnvTransition(), None, None, 0, 0, 0)
@@ -348,57 +344,7 @@ def test_env_sends_terminal_observation_only_as_a_boundary_override():
     policy_input = env._send_policy_input.call_args.args[1]
     assert torch.equal(policy_input.obs["states"], reset_obs)
     assert torch.equal(policy_input.env_parts[0].next_obs["states"], terminal_obs)
-    # Truncation bootstrapping requires the terminal value.
     assert policy_input.env_parts[0].requires_inference
-
-
-def test_env_skips_terminal_inference_when_no_bootstrap_consumes_it():
-    """Skip terminal inference when a natural termination is not bootstrapped."""
-    env = _publish_step_env()
-    reset_obs = torch.zeros(1, 4)
-    terminal_obs = torch.ones(1, 4)
-    env_output = _terminal_env_output(
-        reset_obs,
-        terminal_obs,
-        terminations=torch.ones(1, 1, dtype=torch.bool),
-        truncations=torch.zeros(1, 1, dtype=torch.bool),
-    )
-
-    env._publish_step(Mock(), env_output, EnvTransition(), None, None, 0, 0, 0)
-
-    env_part = env._send_policy_input.call_args.args[1].env_parts[0]
-    assert not env_part.requires_inference
-    # Preserve the transition boundary even when inference is skipped.
-    assert torch.equal(env_part.next_obs["states"], terminal_obs)
-
-
-def test_env_still_infers_on_any_terminal_for_rlt_next_state_features():
-    """Preserve terminal inference for RLT next-state features."""
-    env = _publish_step_env(enable_rlt=True)
-    env_output = _terminal_env_output(
-        torch.zeros(1, 4),
-        torch.ones(1, 4),
-        terminations=torch.ones(1, 1, dtype=torch.bool),
-        truncations=torch.zeros(1, 1, dtype=torch.bool),
-    )
-
-    env._publish_step(Mock(), env_output, EnvTransition(), None, None, 0, 0, 0)
-
-    assert env._send_policy_input.call_args.args[1].env_parts[0].requires_inference
-
-
-def test_env_skips_terminal_inference_without_auto_reset():
-    """Skip terminal inference when auto-reset is disabled."""
-    env = _publish_step_env(train_auto_reset=False)
-    env_output = _terminal_env_output(
-        torch.zeros(1, 4),
-        torch.ones(1, 4),
-        truncations=torch.ones(1, 1, dtype=torch.bool),
-    )
-
-    env._publish_step(Mock(), env_output, EnvTransition(), None, None, 0, 0, 0)
-
-    assert not env._send_policy_input.call_args.args[1].env_parts[0].requires_inference
 
 
 def test_rollout_completes_each_epoch_through_policy_inputs():

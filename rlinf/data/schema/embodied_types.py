@@ -244,27 +244,6 @@ class EnvTransition:
             ),
         )
 
-    def bootstrap_mask(
-        self, *, auto_reset: bool, bootstrap_type: str
-    ) -> torch.Tensor | None:
-        """Return rows whose final action requires terminal bootstrapping.
-
-        Args:
-            auto_reset: Whether finished environments reset automatically.
-            bootstrap_type: ``"standard"`` selects truncations; other values
-                select all terminal rows.
-
-        Returns:
-            A batch mask, or ``None`` when no row requires bootstrapping.
-        """
-        if not auto_reset or self.dones is None:
-            return None
-        terminal = self.dones if bootstrap_type != "standard" else self.truncations
-        if terminal is None:
-            return None
-        mask = terminal[:, -1]
-        return mask if mask.any() else None
-
     def compute_rewards(
         self,
         *,
@@ -292,12 +271,14 @@ class EnvTransition:
             )
         else:
             rewards = rewards.clone()
-        if bootstrap_values is None:
-            return rewards
-        mask = self.bootstrap_mask(auto_reset=auto_reset, bootstrap_type=bootstrap_type)
-        if mask is None:
+        if bootstrap_values is None or not auto_reset or self.dones is None:
             return rewards
 
+        terminal = self.truncations if bootstrap_type == "standard" else self.dones
+        if terminal is None or not terminal[:, -1].any():
+            return rewards
+
+        mask = terminal[:, -1]
         rewards[mask, -1] += gamma * bootstrap_values[mask].reshape(-1).to(
             rewards.dtype
         )
