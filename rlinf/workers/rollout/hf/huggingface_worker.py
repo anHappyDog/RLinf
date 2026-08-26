@@ -148,6 +148,11 @@ class MultiStepRolloutWorker(Worker):
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
 
+    @property
+    def collect_raw_transition_obs(self) -> bool:
+        """Return whether Actor training requires raw transition observations."""
+        return self.collect_transitions and not self.enable_rlt
+
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
         with open_dict(rollout_model_config):
@@ -740,11 +745,7 @@ class MultiStepRolloutWorker(Worker):
         # Republish environment-owned data here to keep one Actor-channel writer.
         actor_channel.put(
             env_part.complete(
-                next_obs=(
-                    next_obs
-                    if self.collect_transitions and not self.enable_rlt
-                    else None
-                ),
+                next_obs=(next_obs if self.collect_raw_transition_obs else None),
                 next_rlt_obs=next_rlt_obs if self.enable_rlt else None,
                 final_prev_values=final_prev_values,
             ),
@@ -777,7 +778,7 @@ class MultiStepRolloutWorker(Worker):
         needs_policy_obs = any(
             part is not None
             and (
-                (self.collect_transitions and not self.enable_rlt)
+                self.collect_raw_transition_obs
                 or (part.requires_inference and part.next_obs is None)
             )
             for part in policy_input.env_parts
@@ -863,16 +864,20 @@ class MultiStepRolloutWorker(Worker):
                     stage_id,
                     split_sizes,
                 )
+                # Omit raw observations when the collector does not consume them.
+                transition_obs = (
+                    policy_input.obs if self.collect_raw_transition_obs else {}
+                )
                 if not policy_input.requires_inference:
                     trajectory_part = PolicyPart(
                         sources=policy_input.sources,
-                        obs=policy_input.obs,
+                        obs=transition_obs,
                         external_actions=actions,
                     )
                 else:
                     trajectory_part = PolicyPart(
                         sources=policy_input.sources,
-                        obs=policy_input.obs,
+                        obs=transition_obs,
                         output=policy_output,
                     )
                 # Publish model-owned data immediately; its environment half

@@ -52,6 +52,10 @@ class EnvWorker(Worker):
     _obs_split_fn = None
     _policy_input_split_fn = None
     collect_final_values = True
+    enable_rlt = False
+    # Defaults support lightweight test instances; __init__ applies run config.
+    train_auto_reset = True
+    bootstrap_type = "standard"
 
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -78,6 +82,7 @@ class EnvWorker(Worker):
             self.cfg, "algorithm.loss_type", default=""
         ) in {"rlt_ac", "rlt_td3"}
         self.use_training_pipeline = self.cfg.runner.get("use_training_pipeline", False)
+        self.bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
         # Optional lossless compression of image observations before they are
         # sent to the rollout workers. Disabled unless `env.obs_compression`
         # is present and `enable: true`. Compression runs inside a custom
@@ -125,6 +130,9 @@ class EnvWorker(Worker):
         )
         self.rollout_epoch = (
             train_env_cfg.rollout_epoch if train_env_cfg is not None else 1
+        )
+        self.train_auto_reset = (
+            train_env_cfg.auto_reset if train_env_cfg is not None else True
         )
         self.eval_rollout_epoch = eval_env_cfg.rollout_epoch if self.enable_eval else 1
 
@@ -890,10 +898,18 @@ class EnvWorker(Worker):
             env_output.dones.any()
         )
         # A terminal forward pass supplies value/transition data, not actions.
+        # Infer only at rollout end or when bootstrap/RLT consumes terminal data.
+        needs_bootstrap = (
+            env_output.transition.bootstrap_mask(
+                auto_reset=self.train_auto_reset,
+                bootstrap_type=self.bootstrap_type,
+            )
+            is not None
+        )
         needs_terminal = (
             self.collect_final_values
             and not self.enable_online_lerobot
-            and (is_last or has_terminal_state)
+            and (is_last or needs_bootstrap or (self.enable_rlt and has_terminal_state))
         )
 
         next_obs_override = None

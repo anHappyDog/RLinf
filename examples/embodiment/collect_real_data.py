@@ -107,6 +107,11 @@ class DataCollector(Worker):
                 ret_obs[key] = val.clone()
         return ret_obs
 
+    @staticmethod
+    def _drop_task_descriptions(obs: dict) -> dict:
+        """Remove task metadata before stacking trajectory observations."""
+        return {key: value for key, value in obs.items() if key != "task_descriptions"}
+
     def run(self):
         obs, _ = self.env.reset()
         # Seed from preexisting episodes so resume bar + stop target line up.
@@ -159,6 +164,8 @@ class DataCollector(Worker):
                 terminations=terminated_tensor,
                 truncations=truncated_tensor,
                 forward_inputs={"action": action_tensor},
+                curr_obs=self._drop_task_descriptions(current_obs_processed),
+                next_obs=self._drop_task_descriptions(next_obs_processed),
             )
 
             # Rebuild rollout on rec-start or abort; ``restart`` kept for older wrappers.
@@ -167,10 +174,7 @@ class DataCollector(Worker):
                     max_episode_length=self.cfg.env.eval.max_episode_steps,
                 )
             if kb_phase in (None, "rec"):
-                current_rollout.append_step_result(step_result)
-                current_rollout.append_transitions(
-                    curr_obs=current_obs_processed, next_obs=next_obs_processed
-                )
+                current_rollout.append(step_result)
 
             obs = next_obs
             current_obs_processed = next_obs_processed

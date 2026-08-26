@@ -306,9 +306,18 @@ class ChannelWorker(Worker):
         else:
             await queue.put(weighted_item)
 
+    def _unrouted_queue(self, key: Any) -> PeekQueue | None:
+        """Return the shared queue populated before consumer discovery."""
+        queue = self._queue_map.get(key)
+        return queue if queue is not None and not queue.empty() else None
+
     async def _take(self, key: Any, consumer: str, nowait: bool) -> WeightedItem:
         """Take one item for ``consumer``, stealing from a peer if allowed."""
         queue = self._queue_for_get(key, consumer)
+        if self._deals and queue.empty():
+            unrouted = self._unrouted_queue(key)
+            if unrouted is not None:
+                return unrouted.get_nowait()
         if nowait:
             return queue.get_nowait()
         if self._deals and queue.empty():

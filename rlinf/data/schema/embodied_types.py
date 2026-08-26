@@ -244,6 +244,27 @@ class EnvTransition:
             ),
         )
 
+    def bootstrap_mask(
+        self, *, auto_reset: bool, bootstrap_type: str
+    ) -> torch.Tensor | None:
+        """Return rows whose final action requires terminal bootstrapping.
+
+        Args:
+            auto_reset: Whether finished environments reset automatically.
+            bootstrap_type: ``"standard"`` selects truncations; other values
+                select all terminal rows.
+
+        Returns:
+            A batch mask, or ``None`` when no row requires bootstrapping.
+        """
+        if not auto_reset or self.dones is None:
+            return None
+        terminal = self.dones if bootstrap_type != "standard" else self.truncations
+        if terminal is None:
+            return None
+        mask = terminal[:, -1]
+        return mask if mask.any() else None
+
     def compute_rewards(
         self,
         *,
@@ -258,6 +279,8 @@ class EnvTransition:
 
         Reward-model scores are weighted into environment rewards first.
         Auto-reset truncations then receive the configured bootstrap value.
+
+        The result has independent storage for later in-place reward updates.
         """
         rewards = self.rewards
         if rewards is None:
@@ -267,17 +290,14 @@ class EnvTransition:
                 env_reward_weight * rewards
                 + reward_weight * self.reward_model_output.to(rewards.dtype)
             )
-        if bootstrap_values is None or not auto_reset or self.dones is None:
+        else:
+            rewards = rewards.clone()
+        if bootstrap_values is None:
+            return rewards
+        mask = self.bootstrap_mask(auto_reset=auto_reset, bootstrap_type=bootstrap_type)
+        if mask is None:
             return rewards
 
-        truncations = self.truncations
-        if bootstrap_type != "standard":
-            truncations = self.dones
-        if truncations is None or not truncations[:, -1].any():
-            return rewards
-
-        rewards = rewards.clone()
-        mask = truncations[:, -1]
         rewards[mask, -1] += gamma * bootstrap_values[mask].reshape(-1).to(
             rewards.dtype
         )
