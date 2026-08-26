@@ -174,7 +174,8 @@ def test_decoupled_policy_route_round_trip():
     policy_input, split_sizes = asyncio.run(
         rollout._receive_policy_input(None, "policy", 0)
     )
-    output = torch.zeros(16, 4)
+    source = torch.zeros(16, 4, requires_grad=True)
+    output = source * 2
     rollout._send_actions(None, output, 0, split_sizes)
 
     assert policy_input.obs["states"].shape == (16, 4)
@@ -188,10 +189,14 @@ def test_decoupled_policy_route_round_trip():
         timeout_time=0.02,
         recv_queue_size=0,
     )
+    sent_output = rollout.send_to_recorded_batch_routes.call_args.kwargs["data"]
+    assert torch.equal(sent_output, output)
+    assert not sent_output.requires_grad
+    assert sent_output.grad_fn is None
     rollout.send_to_recorded_batch_routes.assert_called_once_with(
         group_name="EnvGroup",
         channel=None,
-        data=output,
+        data=sent_output,
         tag="policy",
         split_fn=rollout._split_actions,
         split_sizes=[8, 8],

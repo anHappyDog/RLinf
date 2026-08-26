@@ -323,7 +323,11 @@ class PolicyOutput:
 
     def __post_init__(self) -> None:
         """Move inference outputs to contiguous CPU storage for transport."""
-        self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
+        self.forward_inputs = put_tensor_device(
+            self.forward_inputs,
+            "cpu",
+            detach=True,
+        )
         for field_name in (
             "prev_logprobs",
             "prev_values",
@@ -332,7 +336,7 @@ class PolicyOutput:
         ):
             value = getattr(self, field_name)
             if value is not None:
-                setattr(self, field_name, value.cpu().contiguous())
+                setattr(self, field_name, value.detach().cpu().contiguous())
 
     def split(self, split_sizes: list[int]) -> list["PolicyOutput"]:
         """Split model outputs on their leading batch dimension."""

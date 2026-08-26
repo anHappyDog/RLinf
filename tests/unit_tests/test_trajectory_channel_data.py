@@ -107,6 +107,34 @@ def test_transport_results_store_contiguous_cpu_tensors():
     assert policy_output.forward_inputs["states"].is_contiguous()
 
 
+def test_policy_output_detaches_nested_model_tensors_for_transport():
+    source = torch.arange(12.0, requires_grad=True)
+    model_output = (source * 2).reshape(3, 4).T
+    policy_output = PolicyOutput(
+        forward_inputs={
+            "nested": {
+                "states": model_output,
+                "features": [model_output[:, :2]],
+            }
+        },
+        prev_logprobs=model_output,
+        prev_values=model_output[:, :1],
+        versions=model_output,
+    )
+    part = PolicyPart(
+        sources=[TrajectorySource(TrajectoryKey(0, 0, 0, 0, 0), 4)],
+        obs={},
+        output=policy_output,
+    )
+
+    _, tensors = pack_dataclass_tensors(part)
+    assert tensors
+    assert all(tensor.device.type == "cpu" for tensor in tensors)
+    assert all(tensor.is_contiguous() for tensor in tensors)
+    assert all(not tensor.requires_grad for tensor in tensors)
+    assert all(tensor.grad_fn is None for tensor in tensors)
+
+
 def test_nested_dataclass_transport_separates_tensors_from_skeleton():
     key = TrajectoryKey(0, 0, 0, 0, 0)
     shared = torch.arange(4).reshape(2, 2)

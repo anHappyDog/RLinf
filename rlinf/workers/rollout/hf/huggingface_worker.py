@@ -808,6 +808,10 @@ class MultiStepRolloutWorker(Worker):
         stage_id: int,
         split_sizes: list[int] | None,
     ) -> None:
+        # Environment actions are transport data, not part of the rollout graph.
+        if actions.requires_grad:
+            actions = actions.detach()
+        actions = actions.contiguous()
         if self.env_decoupled_mode:
             if split_sizes is None:
                 raise ValueError("Decoupled policy output requires recorded routes.")
