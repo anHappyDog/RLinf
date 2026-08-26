@@ -295,10 +295,40 @@ def test_env_sends_external_request_after_intervention_continues():
     policy_input = env._send_policy_input.call_args.args[1]
     assert not policy_input.requires_inference
     assert policy_input.env_parts[0] is not None
+    assert policy_input.env_parts[0].next_obs is None
+    assert torch.equal(policy_input.obs["states"], env_output.obs["states"])
     assert torch.equal(
         policy_input.external_actions,
         torch.tensor([[[1.0, 2.0], [1.0, 2.0]]]),
     )
+
+
+def test_env_sends_terminal_observation_only_as_a_boundary_override():
+    env = object.__new__(EnvWorker)
+    env._trajectory_step = 0
+    env._rank = 0
+    env.train_num_envs_per_stage = 1
+    env.n_train_chunk_steps = 2
+    env.enable_online_lerobot = False
+    env.env_decoupled_mode = False
+    env.collect_final_values = True
+    env.smooth_intervene = SmoothInterveneController(1, 1, 1, 4)
+    env._build_env_transition = Mock(return_value=EnvTransition())
+    env._send_policy_input = Mock()
+    reset_obs = torch.zeros(1, 4)
+    terminal_obs = torch.ones(1, 4)
+    env_output = EnvOutput(
+        obs={"states": reset_obs},
+        final_obs={"states": terminal_obs},
+        transition=EnvTransition(dones=torch.ones(1, 1, dtype=torch.bool)),
+    )
+
+    env._publish_step(Mock(), env_output, EnvTransition(), None, None, 0, 0, 0)
+
+    policy_input = env._send_policy_input.call_args.args[1]
+    assert torch.equal(policy_input.obs["states"], reset_obs)
+    assert torch.equal(policy_input.env_parts[0].next_obs["states"], terminal_obs)
+    assert policy_input.env_parts[0].requires_inference
 
 
 def test_rollout_completes_each_epoch_through_policy_inputs():
@@ -307,17 +337,16 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
     rollout.num_pipeline_stages = 1
     rollout.env_decoupled_mode = False
     rollout.enable_rlt = False
+    rollout.collect_transitions = False
     rollout.hf_model = SimpleNamespace(value_head=object())
     rollout.update_dagger_beta = Mock()
     rollout._send_actions = Mock()
     rollout._build_policy_output = Mock(
         side_effect=[
             PolicyOutput(
-                actions=torch.zeros(1, 1),
                 forward_inputs={"states": torch.tensor([[1]])},
             ),
             PolicyOutput(
-                actions=torch.zeros(1, 1),
                 forward_inputs={"states": torch.tensor([[2]])},
             ),
         ]
@@ -400,7 +429,8 @@ def test_rollout_completes_each_epoch_through_policy_inputs():
     env_parts = [part for part in parts if isinstance(part, EnvPart)]
     assert len(env_parts) == 2
     assert env_parts[0].initial_transition is completion0.initial_transition
-    assert torch.equal(env_parts[0].forward_inputs["states"], torch.tensor([[2]]))
+    assert env_parts[0].next_rlt_obs is None
+    assert env_parts[0].next_obs is None
     assert torch.equal(env_parts[1].bootstrap_values, torch.tensor([[4.0]]))
     assert torch.equal(env_parts[1].final_prev_values, torch.tensor([[4.0, 5.0]]))
     assert rollout._predict_rollout_actions.call_count == 3
@@ -412,12 +442,12 @@ def test_rollout_routes_external_input_without_model_inference():
     rollout.num_pipeline_stages = 1
     rollout.env_decoupled_mode = False
     rollout.enable_rlt = False
+    rollout.collect_transitions = False
     rollout.hf_model = SimpleNamespace(value_head=object())
     rollout.update_dagger_beta = Mock()
     rollout._send_actions = Mock()
     rollout._build_policy_output = Mock(
         return_value=PolicyOutput(
-            actions=torch.ones(1, 2, 3),
             forward_inputs={"action": torch.ones(1, 6)},
         )
     )
@@ -521,6 +551,7 @@ def test_decoupled_final_completion_uses_next_bootstrap():
 
     assert completion is not None
     assert completion.initial_transition is not None
+    assert torch.equal(completion.next_obs["states"], env_output.obs["states"])
     env._send_policy_input.assert_not_called()
 
     env._send_train_bootstrap(
@@ -618,6 +649,8 @@ def test_smooth_intervention_holds_at_the_last_commanded_step():
 
 def test_rollout_runs_requested_terminal_inference_without_a_value_head():
     rollout = object.__new__(MultiStepRolloutWorker)
+    rollout.enable_rlt = False
+    rollout.collect_transitions = False
     rollout._predict_rollout_actions = Mock(
         return_value=(
             torch.zeros(1, 1),
@@ -635,23 +668,54 @@ def test_rollout_runs_requested_terminal_inference_without_a_value_head():
         requires_inference=True,
     )
 
-    rollout._publish_env_part(completion, None, actor_channel)
+    rollout._publish_env_part(completion, None, None, actor_channel)
 
     rollout._predict_rollout_actions.assert_called_once_with(completion.next_obs)
     part = actor_channel.put.call_args.args[0]
     assert torch.equal(part.bootstrap_values, torch.zeros(1, 1))
     assert torch.equal(part.final_prev_values, torch.zeros(1, 1))
-    assert torch.equal(part.forward_inputs["states"], torch.ones(1, 1))
+    assert part.next_rlt_obs is None
+    assert part.next_obs is None
+
+
+def test_rollout_reuses_policy_obs_for_transition_next_obs():
+    rollout = object.__new__(MultiStepRolloutWorker)
+    rollout.enable_rlt = False
+    rollout.collect_transitions = True
+    actor_channel = Mock()
+    policy_obs = {"states": torch.ones(1, 4)}
+    completion = EnvPart(
+        sources=[TrajectorySource(TrajectoryKey(0, 0, 0, 0, 0), 1)],
+        transition=EnvTransition(),
+    )
+
+    rollout._publish_env_part(
+        completion,
+        policy_obs,
+        {"unused": torch.ones(1, 1)},
+        actor_channel,
+    )
+
+    part = actor_channel.put.call_args.args[0]
+    assert part.next_obs is policy_obs
+    assert part.next_rlt_obs is None
 
 
 def test_rollout_runs_terminal_inference_for_rlt_without_a_value_head():
     rollout = object.__new__(MultiStepRolloutWorker)
     rollout.enable_rlt = True
+    rollout.collect_transitions = True
     rollout.hf_model = SimpleNamespace()
     rollout._predict_rollout_actions = Mock(
         return_value=(
             torch.zeros(1, 1),
-            {"forward_inputs": {"states": torch.ones(1, 1)}},
+            {
+                "forward_inputs": {
+                    "rlt_transition_z_rl": torch.ones(1, 2),
+                    "rlt_transition_proprio": torch.ones(1, 3),
+                    "rlt_transition_ref_chunk": torch.ones(1, 4),
+                }
+            },
         )
     )
     actor_channel = Mock()
@@ -662,8 +726,42 @@ def test_rollout_runs_terminal_inference_for_rlt_without_a_value_head():
         requires_inference=True,
     )
 
-    rollout._publish_env_part(completion, None, actor_channel)
+    rollout._publish_env_part(completion, None, None, actor_channel)
 
     rollout._predict_rollout_actions.assert_called_once()
     part = actor_channel.put.call_args.args[0]
-    assert torch.equal(part.forward_inputs["states"], torch.ones(1, 1))
+    assert torch.equal(part.next_rlt_obs["z_rl"], torch.ones(1, 2))
+
+
+def test_rollout_keeps_next_forward_inputs_only_for_rlt():
+    rollout = object.__new__(MultiStepRolloutWorker)
+    rollout.enable_rlt = True
+    rollout.collect_transitions = True
+    actor_channel = Mock()
+    key = TrajectoryKey(0, 0, 0, 0, 0)
+    policy_input = PolicyInput(
+        obs={"states": torch.zeros(1, 4)},
+        env_parts=[
+            EnvPart(
+                sources=[TrajectorySource(key, 1)],
+                transition=EnvTransition(),
+            )
+        ],
+        request_sizes=[1],
+    )
+    forward_inputs = {
+        "rlt_transition_z_rl": torch.ones(1, 2),
+        "rlt_transition_proprio": torch.ones(1, 3),
+        "rlt_transition_ref_chunk": torch.ones(1, 4),
+        "unrelated": torch.ones(1, 8),
+    }
+
+    rollout._publish_env_parts(policy_input, forward_inputs, actor_channel)
+
+    part = actor_channel.put.call_args.args[0]
+    assert part.next_obs is None
+    assert torch.equal(
+        part.next_rlt_obs["z_rl"],
+        forward_inputs["rlt_transition_z_rl"],
+    )
+    assert set(part.next_rlt_obs) == {"z_rl", "proprio", "ref_chunk"}

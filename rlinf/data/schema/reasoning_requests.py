@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Agentic rollout request and sequence-group structures."""
+"""Reasoning request and sequence-group structures."""
 
 import uuid
 from dataclasses import dataclass, field

@@ -18,7 +18,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.data.schema.embodied.trajectory import (
+from rlinf.data.schema.embodied_trajectory import (
     LeRobotEpisodeAccumulator,
     RolloutGeometry,
     TrajectoryCollector,
@@ -27,7 +27,7 @@ from rlinf.data.schema.embodied.trajectory import (
     select_trajectory_collector,
     select_trajectory_dispatcher,
 )
-from rlinf.data.schema.embodied.types import (
+from rlinf.data.schema.embodied_types import (
     EnvPart,
     EnvTransition,
     LeRobotFrame,
@@ -111,7 +111,6 @@ def _policy(
         if external
         else {
             "output": PolicyOutput(
-                actions=value_tensor,
                 forward_inputs={"action": value_tensor},
                 prev_logprobs=torch.zeros(1, 1),
                 prev_values=torch.zeros(1, 1),
@@ -145,7 +144,7 @@ def _env_part(
             episode_data=episode_data,
         ),
         next_obs={"states": value_tensor},
-        forward_inputs={"states": value_tensor},
+        next_rlt_obs={"states": value_tensor},
         bootstrap_values=torch.tensor([[4.0]]),
         final_prev_values=torch.tensor([[5.0]]),
         initial_transition=initial_transition,
@@ -197,7 +196,7 @@ def test_policy_part_requires_exactly_one_policy_payload():
     with pytest.raises(ValueError, match="exactly one"):
         PolicyPart(
             **common,
-            output=PolicyOutput(actions=torch.zeros(1, 1), forward_inputs={}),
+            output=PolicyOutput(forward_inputs={}),
             external_actions=torch.zeros(1, 1),
         )
 
@@ -360,7 +359,7 @@ def test_collector_joins_out_of_order_routed_fragments_and_initial_state():
             truncations=torch.zeros(2, 1, dtype=torch.bool),
         ),
         next_obs={"states": torch.tensor([[20], [21]])},
-        forward_inputs=None,
+        next_rlt_obs=None,
         bootstrap_values=None,
         final_prev_values=None,
         initial_transition=initial,
@@ -527,7 +526,6 @@ def test_rlt_output_matches_main_transition_and_intervention_behavior(loss_type)
         sources=[_source(key)],
         obs={"states": torch.zeros(1, 1)},
         output=PolicyOutput(
-            actions=current_ref_chunk,
             forward_inputs={
                 "action": current_ref_chunk,
                 "z_rl": torch.tensor([[3.0, 4.0]]),
@@ -548,10 +546,10 @@ def test_rlt_output_matches_main_transition_and_intervention_behavior(loss_type)
             intervene_flags=torch.ones(1, 1, dtype=torch.bool),
         ),
         next_obs={"states": torch.ones(1, 1)},
-        forward_inputs={
-            "rlt_transition_z_rl": torch.tensor([[13.0, 14.0]]),
-            "rlt_transition_proprio": torch.tensor([[15.0, 16.0, 17.0]]),
-            "rlt_transition_ref_chunk": torch.tensor([[11.0, 12.0]]),
+        next_rlt_obs={
+            "z_rl": torch.tensor([[13.0, 14.0]]),
+            "proprio": torch.tensor([[15.0, 16.0, 17.0]]),
+            "ref_chunk": torch.tensor([[11.0, 12.0]]),
         },
         bootstrap_values=None,
         final_prev_values=None,
@@ -805,14 +803,14 @@ def test_online_lerobot_accumulator_uses_policy_intervention_metadata():
         action_dim=1,
     )
     policy_output = PolicyOutput(
-        actions=torch.tensor([[[1.0], [2.0]]]),
         forward_inputs={"action": torch.tensor([[[9.0], [8.0]]])},
         intervene_flags=torch.tensor([[False, True]]),
     )
+    chunk_actions = torch.tensor([[[1.0], [2.0]]])
 
     accumulator.append_chunk_episode_data(
         policy_output=policy_output,
-        chunk_actions=policy_output.actions,
+        chunk_actions=chunk_actions,
         obs_list=[
             {"states": torch.tensor([[10.0]])},
             {"states": torch.tensor([[20.0]])},

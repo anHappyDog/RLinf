@@ -23,8 +23,8 @@ One action chunk is split into two independently produced parts:
        forward inputs.
    * - ``EnvPart``
      - Environment interaction
-     - Reward, termination state, next observation, intervention result, and
-       optional terminal inference data.
+     - Reward, termination state, intervention result, and optional boundary
+       observation or compact RLT features.
 
 Both parts carry the same ``TrajectoryKey``:
 
@@ -62,12 +62,16 @@ Follow one normal inferred chunk:
 2. Rollout runs policy inference, returns the action tensor to Env, and
    immediately publishes a ``PolicyPart`` containing the full ``PolicyOutput``
    to the Actor Channel.
-3. Env executes the action chunk and records rewards, boundary flags, the next
-   observation, and intervention data.
-4. Env stores that ``EnvTransition`` in ``EnvPart``. Chunk zero also carries
-   ``initial_transition``, the boundary before its first action.
-5. Rollout completes the ``EnvPart``. When requested, it first runs inference
-   on the terminal observation and adds the final value or transition features.
+3. Env executes the action chunk and records rewards, boundary flags, the
+   post-action observation, and intervention data.
+4. Env stores that ``EnvTransition`` in ``EnvPart``. The accompanying
+   ``PolicyInput.obs`` normally carries the same post-action observation, so
+   ``EnvPart.next_obs`` is set only when a terminal or decoupled boundary needs
+   an explicit override. Chunk zero also carries ``initial_transition``.
+5. Rollout resolves the effective next observation from the request or its
+   override and completes the ``EnvPart``. When requested, it runs terminal
+   inference and adds the final value. RLT keeps only the next-state features
+   required by the algorithm, not the complete next forward-input dictionary.
 6. ``ChunkJoiner`` matches both parts by key. Arrival order does not matter.
 7. ``TrajectoryCollector`` passes the joined chunk to the output strategy
    selected by ``TrajectoryPlan``.
@@ -172,16 +176,18 @@ path.
      - ``EnvTransition`` in Env
      - Combine sources in ``EnvTransition.compute_rewards``.
    * - Current and next observation
-     - ``PolicyPart.obs`` and ``EnvPart.next_obs``
-     - Resolve them in ``TrajectoryStep.set_transition_observations`` when
-       ``rollout.collect_transitions`` is enabled.
+     - ``PolicyPart.obs`` and the next ``PolicyInput.obs`` or boundary override
+     - Rollout resolves the effective next observation before publishing
+       ``EnvPart``. Retain it only when ``rollout.collect_transitions`` is
+       enabled.
    * - Executed intervention action
      - ``EnvTransition.intervene_actions`` and ``intervene_flags``
      - Apply it through ``TrajectoryStep.apply_interventions``.
    * - RLT transition feature
-     - Retained ``forward_inputs`` on both sides
-     - Extract it while constructing ``TrajectoryStep`` and apply executed
-       interventions before retaining the transition.
+     - ``PolicyOutput.forward_inputs`` and compact ``EnvPart.next_rlt_obs``
+     - Rollout extracts only ``z_rl``, ``proprio``, and ``ref_chunk`` for the
+       next state. ``TrajectoryStep`` applies executed interventions before
+       retaining the transition.
    * - Pipeline training target
      - Algorithm advantage/loss configuration
      - Compute advantages and returns before Actor-specific micro-batch packing.
@@ -230,4 +236,4 @@ Read the Interfaces
 Use :doc:`channel` to understand Collector and Dispatcher execution. Use
 :doc:`../reference/api/embodied_data` for exact data-class and Collector APIs.
 The complete collector and accumulation implementation lives in
-``rlinf/data/schema/embodied/trajectory.py``.
+``rlinf/data/schema/embodied_trajectory.py``.

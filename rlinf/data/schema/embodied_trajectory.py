@@ -34,7 +34,7 @@ import torch
 from omegaconf import DictConfig
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
-from rlinf.data.schema.embodied.types import (
+from rlinf.data.schema.embodied_types import (
     EnvPart,
     EnvTransition,
     LeRobotChunk,

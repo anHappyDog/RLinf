@@ -27,7 +27,7 @@ from rlinf.algorithms.utils import (
     kl_penalty,
 )
 from rlinf.config import torch_dtype_from_precision
-from rlinf.data.schema.agentic.types import BatchResizingIterator, RolloutResult
+from rlinf.data.schema.reasoning_results import BatchResizingIterator, RolloutResult
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
 from rlinf.hybrid_engines.fsdp.utils import (
     pack_fsdp_input,

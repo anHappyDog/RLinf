@@ -306,8 +306,6 @@ class EnvTransition:
 class PolicyOutput:
     """Policy inference output retained until its environment transition arrives."""
 
-    # Executable actions, usually float [B, C, A] or flattened [B, D].
-    actions: torch.Tensor
     # Model-ready training inputs; batched leaves are [B, ...], and ``action``
     # is normally flattened [B, D] where D = num_action_chunks * action_dim.
     forward_inputs: dict[str, Any]
@@ -324,7 +322,6 @@ class PolicyOutput:
 
     def __post_init__(self) -> None:
         """Move inference outputs to contiguous CPU storage for transport."""
-        self.actions = self.actions.cpu().contiguous()
         self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         for field_name in (
             "prev_logprobs",
@@ -459,12 +456,13 @@ class EnvPart:
     sources: list[TrajectorySource]
     # Outcome of the executed actions; tensors are normally [B, C, ...].
     transition: EnvTransition
-    # Post-action observation used by transition-based losses; leaves [B, ...].
-    next_obs: dict[str, Any]
-    # Whether Rollout must infer on ``next_obs`` for terminal features/values.
+    # Post-action observation override; leaves [B, ...]. Env sends it only when
+    # the accompanying PolicyInput.obs cannot represent this boundary.
+    next_obs: dict[str, Any] | None = None
+    # Whether Rollout must infer on the effective post-action observation.
     requires_inference: bool = False
-    # Training inputs for ``next_obs``; leaves [B, ...], populated by Rollout.
-    forward_inputs: dict[str, Any] | None = None
+    # RLT features for the next state (z_rl, proprio, ref_chunk); leaves [B, ...].
+    next_rlt_obs: dict[str, Any] | None = None
     # Value used for truncation bootstrap, float [B, 1], derived from final values.
     bootstrap_values: torch.Tensor | None = None
     # Full terminal value output, usually float [B, 1], appended at epoch end.
@@ -474,9 +472,10 @@ class EnvPart:
 
     def __post_init__(self) -> None:
         """Move model-derived fields to CPU for transport."""
-        self.next_obs = put_tensor_device(self.next_obs, "cpu")
-        if self.forward_inputs is not None:
-            self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
+        if self.next_obs is not None:
+            self.next_obs = put_tensor_device(self.next_obs, "cpu")
+        if self.next_rlt_obs is not None:
+            self.next_rlt_obs = put_tensor_device(self.next_rlt_obs, "cpu")
         if self.bootstrap_values is not None:
             self.bootstrap_values = self.bootstrap_values.cpu().contiguous()
         if self.final_prev_values is not None:
@@ -485,10 +484,11 @@ class EnvPart:
     def complete(
         self,
         *,
-        forward_inputs: dict[str, Any] | None,
+        next_obs: dict[str, Any] | None,
+        next_rlt_obs: dict[str, Any] | None,
         final_prev_values: torch.Tensor | None = None,
     ) -> "EnvPart":
-        """Return the Actor-ready part after optional terminal inference."""
+        """Return the Actor-ready part after resolving rollout-owned fields."""
         final_prev_values = (
             final_prev_values.cpu().contiguous()
             if final_prev_values is not None
@@ -497,7 +497,8 @@ class EnvPart:
         return replace(
             self,
             requires_inference=False,
-            forward_inputs=forward_inputs,
+            next_obs=next_obs,
+            next_rlt_obs=next_rlt_obs,
             bootstrap_values=(
                 final_prev_values[:, :1] if final_prev_values is not None else None
             ),
@@ -510,7 +511,7 @@ class EnvPart:
         source_shards = TrajectorySource.split(self.sources, split_sizes)
         transitions = self.transition.split(split_sizes)
         next_observations = split_batch_value(self.next_obs, split_sizes)
-        forward_inputs = split_batch_value(self.forward_inputs, split_sizes)
+        next_rlt_observations = split_batch_value(self.next_rlt_obs, split_sizes)
         bootstrap_values = split_batch_value(self.bootstrap_values, split_sizes)
         final_prev_values = split_batch_value(self.final_prev_values, split_sizes)
         initial_transitions = (
@@ -524,7 +525,7 @@ class EnvPart:
                 transition=transitions[index],
                 next_obs=next_observations[index],
                 requires_inference=self.requires_inference,
-                forward_inputs=forward_inputs[index],
+                next_rlt_obs=next_rlt_observations[index],
                 bootstrap_values=bootstrap_values[index],
                 final_prev_values=final_prev_values[index],
                 initial_transition=initial_transitions[index],
@@ -557,8 +558,8 @@ class EnvPart:
             ),
             next_obs=merge_batch_values([fragment.next_obs for fragment in fragments]),
             requires_inference=fragments[0].requires_inference,
-            forward_inputs=merge_batch_values(
-                [fragment.forward_inputs for fragment in fragments]
+            next_rlt_obs=merge_batch_values(
+                [fragment.next_rlt_obs for fragment in fragments]
             ),
             bootstrap_values=merge_batch_values(
                 [fragment.bootstrap_values for fragment in fragments]
@@ -777,16 +778,18 @@ class TrajectoryStep:
                 extract_rlt_obs_from_forward_inputs,
             )
 
+            if env.next_rlt_obs is None:
+                raise ValueError("RLT transitions require next-state features.")
             current_obs = extract_rlt_obs_from_forward_inputs(self.forward_inputs)
             apply_rlt_interventions(
                 current_obs,
                 env.transition.intervene_actions,
                 env.transition.intervene_flags,
             )
-            next_obs = extract_rlt_obs_from_forward_inputs(
-                env.forward_inputs, transition=True
-            )
+            next_obs = env.next_rlt_obs
         elif collect_transitions:
+            if env.next_obs is None:
+                raise ValueError("Raw transitions require a next observation.")
             current_obs = policy.obs
             next_obs = env.next_obs
         else:

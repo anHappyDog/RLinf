@@ -1,22 +1,24 @@
-Agentic Data Interface
+Data Interface
 ======================
 
-This section provides the key agentic **data structures** used for data transmission between different workers
-under the **Megatron + SGLang backend** combination in RLinf.
-It includes two fundamental structures: ``RolloutRequest`` and ``RolloutResult``.
+This section provides the key **data structures** used for data transmission between different workers  
+under the **Megatron + SGLang backend** combination in RLinf.  
+It includes two fundamental structures: `RolloutRequest` and `RolloutResult`.
 
 
 RolloutRequest
 ---------------
 
-.. autoclass:: rlinf.data.schema.agentic.requests.RolloutRequest
+.. autoclass:: rlinf.data.schema.reasoning_requests.RolloutRequest
    :members: 
    :member-order: bysource
 
 RolloutResult
 -----------------------
 
-.. autoclass:: rlinf.data.schema.agentic.types.RolloutResult
+.. autoclass:: rlinf.data.schema.reasoning_results.RolloutResult
    :members: 
    :member-order: bysource
    
+
+

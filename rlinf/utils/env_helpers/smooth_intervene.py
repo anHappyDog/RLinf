@@ -27,7 +27,7 @@ from __future__ import annotations
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from rlinf.data.schema.embodied.types import PolicyInput
+from rlinf.data.schema.embodied_types import PolicyInput
 from rlinf.envs.utils import get_env_attr
 
 

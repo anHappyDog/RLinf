@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 import torch
 
-from rlinf.data.schema.embodied.types import (
+from rlinf.data.schema.embodied_types import (
     EnvOutput,
     EnvPart,
     EnvTransition,
@@ -81,7 +81,8 @@ def test_env_part_completion_reuses_the_environment_payload():
     )
 
     completed = part.complete(
-        forward_inputs={"states": torch.ones(2, 3)},
+        next_obs=part.next_obs,
+        next_rlt_obs={"states": torch.ones(2, 3)},
         final_prev_values=torch.tensor([[2.0], [3.0]]),
     )
 
@@ -96,15 +97,14 @@ def test_transport_results_store_contiguous_cpu_tensors():
 
     env_transition = EnvTransition(rewards=non_contiguous)
     policy_output = PolicyOutput(
-        actions=non_contiguous,
         forward_inputs={"states": non_contiguous},
     )
 
     assert env_transition.rewards.device.type == "cpu"
     assert env_transition.rewards.is_contiguous()
-    assert policy_output.actions.device.type == "cpu"
-    assert policy_output.actions.is_contiguous()
+    assert not hasattr(policy_output, "actions")
     assert policy_output.forward_inputs["states"].device.type == "cpu"
+    assert policy_output.forward_inputs["states"].is_contiguous()
 
 
 def test_nested_dataclass_transport_separates_tensors_from_skeleton():
@@ -114,7 +114,6 @@ def test_nested_dataclass_transport_separates_tensors_from_skeleton():
         sources=[TrajectorySource(key, 2)],
         obs={"states": shared, "task_descriptions": ["a", "b"]},
         output=PolicyOutput(
-            actions=shared,
             forward_inputs={"nested": {"states": shared}},
             prev_values=torch.ones(2, 1),
         ),
@@ -124,13 +123,12 @@ def test_nested_dataclass_transport_separates_tensors_from_skeleton():
     restored = unpack_dataclass_tensors(skeleton, tensors)
 
     assert isinstance(skeleton.obs["states"], TensorPlaceholder)
-    assert isinstance(skeleton.output.actions, TensorPlaceholder)
     assert isinstance(
         skeleton.output.forward_inputs["nested"]["states"],
         TensorPlaceholder,
     )
     assert len(tensors) == 2
-    assert restored.obs["states"] is restored.output.actions
+    assert restored.obs["states"] is restored.output.forward_inputs["nested"]["states"]
     assert torch.equal(restored.output.prev_values, torch.ones(2, 1))
 
 
@@ -289,7 +287,6 @@ def test_policy_part_owns_routed_fragment_split_and_merge():
         sources=[TrajectorySource(key, 1), TrajectorySource(key, 3, offset=1)],
         obs={"states": torch.arange(12).reshape(4, 3)},
         output=PolicyOutput(
-            actions=actions,
             forward_inputs={"action": actions},
             prev_values=torch.arange(4).reshape(4, 1),
         ),
@@ -300,7 +297,7 @@ def test_policy_part_owns_routed_fragment_split_and_merge():
 
     assert len(fragments) == 2
     assert fragments[1].sources == [TrajectorySource(key, 3, offset=1)]
-    assert torch.equal(fragments[0].output.actions, actions[:1])
+    assert torch.equal(fragments[0].output.forward_inputs["action"], actions[:1])
     assert torch.equal(merged.obs["states"], part.obs["states"])
 
 
@@ -311,7 +308,6 @@ def test_trajectory_step_owns_intervention_and_transition_conversion():
         sources=[TrajectorySource(key, 1)],
         obs={"states": torch.zeros(1, 2), "task_descriptions": ["pick"]},
         output=PolicyOutput(
-            actions=model_actions,
             forward_inputs={"action": model_actions, "model_action": model_actions},
             prev_values=torch.ones(1, 1),
         ),
@@ -324,7 +320,7 @@ def test_trajectory_step_owns_intervention_and_transition_conversion():
             intervene_flags=torch.tensor([[False, True]]),
         ),
         next_obs={"states": torch.ones(1, 2), "task_descriptions": ["pick"]},
-        forward_inputs=None,
+        next_rlt_obs=None,
         bootstrap_values=None,
         final_prev_values=torch.full((1, 1), 5.0),
         initial_transition=EnvTransition(dones=torch.zeros(1, 1, dtype=torch.bool)),

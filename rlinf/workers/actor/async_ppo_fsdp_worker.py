@@ -24,7 +24,7 @@ import torch
 
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.config import SupportedModel
-from rlinf.data.schema.embodied.types import Trajectory
+from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.data.storage.replay import PriorityStore
 from rlinf.scheduler import Worker
 from rlinf.utils.distributed import all_reduce_dict, masked_normalization

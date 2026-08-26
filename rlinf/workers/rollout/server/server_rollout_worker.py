@@ -25,7 +25,7 @@ from fastapi import FastAPI, Request, Response
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
 
-from rlinf.data.schema.agentic.types import RolloutResult
+from rlinf.data.schema.reasoning_results import RolloutResult
 from rlinf.scheduler import Channel, Worker
 
 

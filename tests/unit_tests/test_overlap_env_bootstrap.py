@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.data.schema.embodied.types import EnvOutput, EnvTransition
+from rlinf.data.schema.embodied_types import EnvOutput, EnvTransition
 
 # Mock gymnasium and rlinf.envs.wrappers before importing EnvWorker
 # to avoid ModuleNotFoundError when gymnasium is not installed.

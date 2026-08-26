@@ -20,8 +20,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from rlinf.data.schema.embodied.trajectory import TrajectoryAccumulator
-from rlinf.data.schema.embodied.types import (
+from rlinf.data.schema.embodied_trajectory import TrajectoryAccumulator
+from rlinf.data.schema.embodied_types import (
     TrajectoryStep,
 )
 from rlinf.data.storage.replay import TrajectoryReplayBuffer

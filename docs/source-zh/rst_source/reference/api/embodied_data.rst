@@ -38,19 +38,19 @@ boundary 字段。``PolicyInput`` 携带 observation，并可附带前一个 ``E
 Rollout 只将 action tensor 返回 Env；完整 ``PolicyOutput`` 留在 trajectory 路径，
 因为它还包含 log-probability、value、version 和 training input。
 
-.. autoclass:: rlinf.data.schema.embodied.types.EnvOutput
+.. autoclass:: rlinf.data.schema.embodied_types.EnvOutput
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.EnvTransition
+.. autoclass:: rlinf.data.schema.embodied_types.EnvTransition
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.PolicyInput
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyInput
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.PolicyOutput
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyOutput
    :members:
    :member-order: bysource
 
@@ -62,19 +62,19 @@ Trajectory Part
 保留 source size 和 offset。Env 在 step 后创建未完成的 ``EnvPart``；Rollout 补充
 可选 terminal inference 数据后发布同一个类型。
 
-.. autoclass:: rlinf.data.schema.embodied.types.TrajectoryKey
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectoryKey
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.TrajectorySource
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectorySource
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.PolicyPart
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyPart
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.EnvPart
+.. autoclass:: rlinf.data.schema.embodied_types.EnvPart
    :members:
    :member-order: bysource
 
@@ -84,14 +84,14 @@ Trajectory Part
 ``TrajectoryPlan`` 校验输出模式并推导 rollout geometry。所有具身模式都使用同一个
 公共 ``TrajectoryCollector``。
 
-.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryMode
+.. autoclass:: rlinf.data.schema.embodied_trajectory.TrajectoryMode
    :members:
 
-.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryPlan
+.. autoclass:: rlinf.data.schema.embodied_trajectory.TrajectoryPlan
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryCollector
+.. autoclass:: rlinf.data.schema.embodied_trajectory.TrajectoryCollector
    :members:
    :member-order: bysource
 
@@ -103,10 +103,10 @@ intervention 和 transition 语义。``Trajectory`` 再将 step 堆叠成
 ``[T, B, ...]`` Actor tensor。Boundary 和 final-value 序列可能包含
 ``T + E`` 个元素。
 
-.. autoclass:: rlinf.data.schema.embodied.types.TrajectoryStep
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectoryStep
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.Trajectory
+.. autoclass:: rlinf.data.schema.embodied_types.Trajectory
    :members:
    :member-order: bysource

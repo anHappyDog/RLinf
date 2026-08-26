@@ -118,7 +118,7 @@ channel collector 以 LeRobot 格式收集完整 episode，经内存发送给 ac
 
 1. **混合 rollout 与专家重标注** — 与经典 DAgger 相同的 ``beta`` 调度与专家重标注。
 2. **Episode 收集** — 当 ``algorithm.dagger.online_lerobot.enabled`` 为 ``True`` 时，
-   :class:`~rlinf.data.schema.embodied.trajectory.TrajectoryCollector` 累积各 env
+   :class:`~rlinf.data.schema.embodied_trajectory.TrajectoryCollector` 累积各 env
    的帧并导出完整 episode。
 3. **Actor 接收** — 完成的 episode 经 ``recv_lerobot_rollout_trajectories`` 写入 rolling dataset。
 4. **滑动窗口训练** — actor 从 ``RollingLeRobotDataset`` 采样（可选 decoded cache），

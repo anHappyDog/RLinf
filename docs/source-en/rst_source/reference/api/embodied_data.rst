@@ -40,19 +40,19 @@ may piggyback the preceding ``EnvPart``. Rollout sends only the action tensor
 back to Env. The full ``PolicyOutput`` stays on the trajectory path because it
 also contains log-probabilities, values, versions, and training inputs.
 
-.. autoclass:: rlinf.data.schema.embodied.types.EnvOutput
+.. autoclass:: rlinf.data.schema.embodied_types.EnvOutput
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.EnvTransition
+.. autoclass:: rlinf.data.schema.embodied_types.EnvTransition
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.PolicyInput
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyInput
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.PolicyOutput
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyOutput
    :members:
    :member-order: bysource
 
@@ -65,19 +65,19 @@ offset when channel routing splits a batch. Env creates an incomplete
 ``EnvPart`` after stepping; Rollout adds optional terminal inference data and
 publishes the same type.
 
-.. autoclass:: rlinf.data.schema.embodied.types.TrajectoryKey
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectoryKey
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.TrajectorySource
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectorySource
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.PolicyPart
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyPart
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.EnvPart
+.. autoclass:: rlinf.data.schema.embodied_types.EnvPart
    :members:
    :member-order: bysource
 
@@ -88,14 +88,14 @@ Collection
 geometry. ``TrajectoryCollector`` is the one public channel collector for every
 embodied mode.
 
-.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryMode
+.. autoclass:: rlinf.data.schema.embodied_trajectory.TrajectoryMode
    :members:
 
-.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryPlan
+.. autoclass:: rlinf.data.schema.embodied_trajectory.TrajectoryPlan
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.trajectory.TrajectoryCollector
+.. autoclass:: rlinf.data.schema.embodied_trajectory.TrajectoryCollector
    :members:
    :member-order: bysource
 
@@ -107,10 +107,10 @@ reward, intervention, and transition semantics. ``Trajectory`` then stacks
 steps into ``[T, B, ...]`` Actor tensors. Boundary and final-value sequences may
 have ``T + E`` entries.
 
-.. autoclass:: rlinf.data.schema.embodied.types.TrajectoryStep
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectoryStep
    :members:
    :member-order: bysource
 
-.. autoclass:: rlinf.data.schema.embodied.types.Trajectory
+.. autoclass:: rlinf.data.schema.embodied_types.Trajectory
    :members:
    :member-order: bysource

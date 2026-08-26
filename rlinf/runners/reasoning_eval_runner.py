@@ -22,7 +22,7 @@ from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from rlinf.data.schema.agentic.requests import build_rollout_requests_from_batch
+from rlinf.data.schema.reasoning_requests import build_rollout_requests_from_batch
 from rlinf.scheduler import Channel
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.metric_logger import MetricLogger

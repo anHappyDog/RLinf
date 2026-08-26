@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from rlinf.data.schema.embodied.types import (
+from rlinf.data.schema.embodied_types import (
     EnvOutput,
     EnvPart,
     EnvTransition,
@@ -896,9 +896,12 @@ class EnvWorker(Worker):
             and (is_last or has_terminal_state)
         )
 
-        next_obs = env_output.obs
-        if needs_terminal and has_terminal_state and env_output.final_obs is not None:
-            next_obs = env_output.final_obs
+        next_obs_override = None
+        if has_terminal_state and env_output.final_obs is not None:
+            next_obs_override = env_output.final_obs
+        elif is_last and self.env_decoupled_mode:
+            # The next decoupled request may contain a reset observation.
+            next_obs_override = env_output.obs
 
         next_key = None
         if not is_last:
@@ -930,7 +933,11 @@ class EnvWorker(Worker):
                 reward_model_output=reward_model_output,
                 chunk_step_data=chunk_step_data,
             ),
-            next_obs=env_output.prepare_observations(next_obs),
+            next_obs=(
+                env_output.prepare_observations(next_obs_override)
+                if next_obs_override is not None
+                else None
+            ),
             requires_inference=needs_terminal,
             # Only chunk zero owns the boundary before the first action.
             initial_transition=initial_transition if chunk_id == 0 else None,
@@ -974,7 +981,7 @@ class EnvWorker(Worker):
         for shard in shards:
             shard.obs = compress_obs(shard.obs, self.obs_compression_cfg)
             for env_part in shard.env_parts:
-                if env_part is not None:
+                if env_part is not None and env_part.next_obs is not None:
                     env_part.next_obs = compress_obs(
                         env_part.next_obs, self.obs_compression_cfg
                     )

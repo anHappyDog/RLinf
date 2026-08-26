@@ -22,8 +22,8 @@
        forward inputs。
    * - ``EnvPart``
      - Environment interaction
-     - Reward、termination state、next observation、intervention result 和可选的
-       terminal inference data。
+     - Reward、termination state、intervention result，以及可选的边界
+       observation 或精简 RLT feature。
 
 两个 part 携带相同的 ``TrajectoryKey``：
 
@@ -58,12 +58,14 @@ Environment 不直接写 Actor Channel。它将 ``EnvPart`` 附在下一个
 1. Env 使用当前 observation 和新的 ``TrajectoryKey`` 发送 ``PolicyInput``。
 2. Rollout 执行 policy inference，将 action tensor 返回 Env，并立即向 Actor Channel
    发布包含完整 ``PolicyOutput`` 的 ``PolicyPart``。
-3. Env 执行 action chunk，记录 rewards、boundary flags、next observation 和
-   intervention data。
-4. Env 将 ``EnvTransition`` 放进 ``EnvPart``。Chunk zero 还携带
-   ``initial_transition``，即第一个 action 之前的边界。
-5. Rollout 完成这个 ``EnvPart``。需要时，它先对 terminal observation 执行
-   inference，再补充 final value 或 transition feature。
+3. Env 执行 action chunk，记录 rewards、boundary flags、action 后的 observation
+   和 intervention data。
+4. Env 将 ``EnvTransition`` 放进 ``EnvPart``。随附的 ``PolicyInput.obs`` 通常已经
+   携带相同的 action 后 observation，因此只有 terminal 或 decoupled 边界需要显式
+   覆盖时才设置 ``EnvPart.next_obs``。Chunk zero 还携带 ``initial_transition``。
+5. Rollout 从请求或其覆盖值解析实际 next observation，并完成 ``EnvPart``。需要时，
+   它执行 terminal inference 并补充 final value。RLT 只保留算法所需的 next-state
+   feature，不保留完整的 next forward-input dictionary。
 6. ``ChunkJoiner`` 按 key 配对两个 part，抵达顺序不影响结果。
 7. ``TrajectoryCollector`` 将完整 chunk 交给 ``TrajectoryPlan`` 选择的 output
    strategy。
@@ -162,16 +164,16 @@ service loop 不同，但 chunk 数据契约不变。
      - Env 中的 ``EnvTransition``
      - 在 ``EnvTransition.compute_rewards`` 中合并 reward source。
    * - Current 和 next observation
-     - ``PolicyPart.obs`` 和 ``EnvPart.next_obs``
-     - 启用 ``rollout.collect_transitions`` 时，在
-       ``TrajectoryStep.set_transition_observations`` 中解析。
+     - ``PolicyPart.obs`` 和下一个 ``PolicyInput.obs`` 或边界覆盖值
+     - Rollout 在发布 ``EnvPart`` 前解析实际 next observation；仅在启用
+       ``rollout.collect_transitions`` 时保留它。
    * - 实际执行的 intervention action
      - ``EnvTransition.intervene_actions`` 和 ``intervene_flags``
      - 通过 ``TrajectoryStep.apply_interventions`` 应用。
    * - RLT transition feature
-     - 两侧保留的 ``forward_inputs``
-     - 构造 ``TrajectoryStep`` 时提取，并在保存 transition 前应用实际
-       intervention。
+     - ``PolicyOutput.forward_inputs`` 和精简的 ``EnvPart.next_rlt_obs``
+     - Rollout 只为 next state 提取 ``z_rl``、``proprio`` 和 ``ref_chunk``；
+       ``TrajectoryStep`` 在保存 transition 前应用实际 intervention。
    * - Pipeline training target
      - Algorithm advantage/loss configuration
      - 在按 Actor 打包 micro-batch 之前计算 advantages 和 returns。
@@ -213,4 +215,4 @@ source，因为 routing 和可选 advantage normalization 作用于 Actor-specif
 
 阅读 :doc:`channel` 了解 Collector 和 Dispatcher 的执行方式。阅读
 :doc:`../reference/api/embodied_data` 查看准确的数据类和 Collector API。完整的
-Collector 与累计逻辑位于 ``rlinf/data/schema/embodied/trajectory.py``\ 。
+Collector 与累计逻辑位于 ``rlinf/data/schema/embodied_trajectory.py``\ 。

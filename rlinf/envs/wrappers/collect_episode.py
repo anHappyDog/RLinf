@@ -28,7 +28,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from rlinf.data.schema.embodied.types import LeRobotFrame
+from rlinf.data.schema.embodied_types import LeRobotFrame
 from rlinf.utils.logging import get_logger
 
 _VALID_FORMATS = ("pickle", "lerobot")

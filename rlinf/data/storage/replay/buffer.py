@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from sortedcontainers import SortedList
 
-from rlinf.data.schema.embodied.types import Trajectory
+from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.utils.logging import get_logger
 
 

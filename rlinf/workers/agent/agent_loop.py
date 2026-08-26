@@ -29,8 +29,8 @@ from rlinf.agents.tool_call.schema import (
     ToolResponse,
 )
 from rlinf.algorithms.registry import get_toolcall_parser
-from rlinf.data.schema.agentic.requests import RolloutRequest
-from rlinf.data.schema.agentic.types import DynamicRolloutResult, RolloutResult
+from rlinf.data.schema.reasoning_requests import RolloutRequest
+from rlinf.data.schema.reasoning_results import DynamicRolloutResult, RolloutResult
 from rlinf.scheduler import Channel, Worker
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.agent.tool_worker import ToolChannelInfo

@@ -12,18 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unified entrypoints for embodied and agentic data schemas."""
+"""Schema-layer entrypoints for data module."""
 
-from rlinf.data.schema.agentic import (
-    DynamicRolloutResult,
-    FinishReasonEnum,
-    RolloutRequest,
-    RolloutResult,
-    SeqGroupInfo,
-    get_batch_size,
-    get_seq_length,
+from rlinf.data.schema.embodied_trajectory import (
+    TrajectoryCollector,
+    TrajectoryMode,
+    TrajectoryPlan,
 )
-from rlinf.data.schema.embodied import (
+from rlinf.data.schema.embodied_types import (
     EnvOutput,
     EnvPart,
     EnvTransition,
@@ -36,22 +32,25 @@ from rlinf.data.schema.embodied import (
     RTCActionResponse,
     RTCRequest,
     Trajectory,
-    TrajectoryCollector,
     TrajectoryKey,
-    TrajectoryMode,
     TrajectoryPart,
-    TrajectoryPlan,
     TrajectorySource,
     TrajectoryStep,
     get_model_weights_id,
 )
-
-from . import agentic, embodied
+from rlinf.data.schema.reasoning_requests import (
+    FinishReasonEnum,
+    RolloutRequest,
+    SeqGroupInfo,
+    get_batch_size,
+    get_seq_length,
+)
+from rlinf.data.schema.reasoning_results import (
+    DynamicRolloutResult,
+    RolloutResult,
+)
 
 __all__ = [
-    "agentic",
-    "embodied",
-    # Agentic compatibility exports.
     "DynamicRolloutResult",
     "FinishReasonEnum",
     "RolloutRequest",
@@ -59,7 +58,6 @@ __all__ = [
     "SeqGroupInfo",
     "get_batch_size",
     "get_seq_length",
-    # Embodied compatibility exports.
     "EnvOutput",
     "EnvPart",
     "EnvTransition",
