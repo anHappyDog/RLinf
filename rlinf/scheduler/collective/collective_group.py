@@ -1410,11 +1410,11 @@ class CollectiveGroup:
         if compression_options is None or not compression_options.enabled:
             return cpu_tensors, None, []
 
-        codec_pool = self._worker._get_tensor_codec_pool()
-        assert codec_pool is not None
         if not any(compression_options.should_compress(tensor) for tensor in tensors):
             return cpu_tensors, None, []
 
+        codec_pool = self._worker._get_tensor_codec_pool()
+        assert codec_pool is not None
         buffer_pool = self._worker._get_tensor_buffer_pool()
         assert buffer_pool is not None
         compressor = codec_pool.try_acquire_compressor()

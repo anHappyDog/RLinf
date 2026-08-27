@@ -554,6 +554,33 @@ def test_worker_does_not_create_a_codec_pool_when_compression_is_disabled():
     assert worker._tensor_codec_pool is None
 
 
+@pytest.mark.parametrize(
+    "tensor",
+    [
+        pytest.param(torch.zeros(1, dtype=torch.uint8), id="below-min-bytes"),
+        pytest.param(
+            torch.zeros(16 * 1024 // 4, dtype=torch.float32),
+            id="excluded-dtype",
+        ),
+    ],
+)
+def test_ineligible_tensors_do_not_initialize_the_codec_pool(tensor):
+    """Raw CPU transfers do not require the configured codec library."""
+    group = object.__new__(CollectiveGroup)
+    group._tensor_compression = TensorCompressionOptions()
+    group._worker = SimpleNamespace(
+        _get_tensor_codec_pool=lambda: pytest.fail(
+            "ineligible tensors initialized the codec pool"
+        )
+    )
+
+    wire_tensors, metadata, buffers = group._compress_cpu_tensors([tensor], [tensor])
+
+    assert wire_tensors[0] is tensor
+    assert metadata is None
+    assert buffers == []
+
+
 def test_lz4_compress_bound_returns_none_for_an_unsupported_input_size():
     """An input-size limit is a normal no-compression outcome."""
     codec = LZ4TensorCodec()
