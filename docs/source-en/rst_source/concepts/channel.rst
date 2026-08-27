@@ -1,9 +1,79 @@
-Customize Data Flow with Channel Hooks
-======================================
+Use Channel for Communication
+=============================
 
-Use a ``Channel`` to move items between WorkerGroups. Add a ``Collector`` when
-items must be transformed before enqueueing, and add a ``Dispatcher`` when each
-output must be assigned to a specific consumer.
+The Channel module provides a distributed producer-consumer queue for moving
+data between workers. One or more producers can ``put`` items into a named
+``Channel``, while one or more consumers ``get`` those items independently of
+the producers' execution schedule.
+
+The default shared queue supports synchronous and asynchronous operations,
+logical queues selected by key, bounded capacity, and weighted batches. Most
+applications can use that behavior directly. Add a ``Collector`` only when data
+must be transformed before enqueueing, and a ``Dispatcher`` only when outputs
+must be assigned to specific consumers.
+
+Create and Share a Channel
+--------------------------
+
+Create a channel outside the workers, then pass it to WorkerGroup methods that
+produce or consume data:
+
+.. code-block:: python
+
+   from rlinf.scheduler import Channel
+
+   sample_channel = Channel.create(name="Samples", maxsize=64)
+   producer_group.produce(sample_channel)
+   consumer_group.consume(sample_channel)
+
+``produce`` and ``consume`` are application-defined worker methods in this
+example. Passing the channel into a worker binds communication to that worker.
+Code already running inside a worker may instead call
+``self.create_channel(...)`` or ``self.connect_channel("Samples")``.
+
+Put, Get, and Batch Items
+-------------------------
+
+``put`` sends one serializable item. ``get`` removes the next item from the
+same logical queue:
+
+.. code-block:: python
+
+   sample_channel.put(sample, key="train", weight=num_tokens)
+   sample = sample_channel.get(key="train")
+
+Each key identifies an independent FIFO queue. The optional weight records an
+item's cost or size; it does not change queue order. Use ``get_batch`` to remove
+as many leading items as fit within a target total weight:
+
+.. code-block:: python
+
+   batch = sample_channel.get_batch(
+       target_weight=global_batch_size,
+       key="train",
+   )
+
+This is useful when samples have different lengths or processing costs. For
+ordinary single-item consumption, leave the weight at its default value.
+
+Use Asynchronous Operations and Backpressure
+--------------------------------------------
+
+``put`` and ``get`` block by default. Set ``async_op=True`` to receive a work
+handle and overlap communication with other work:
+
+.. code-block:: python
+
+   put_work = sample_channel.put(sample, async_op=True)
+   # Do independent work here.
+   put_work.wait()
+
+   get_work = sample_channel.get(async_op=True)
+   sample = get_work.wait()
+
+In an asyncio function, use ``await work.async_wait()`` instead. A positive
+``maxsize`` applies backpressure by blocking ``put`` while its destination queue
+is full. ``put_nowait`` and ``get_nowait`` provide non-blocking queue semantics.
 
 Hook Execution Model
 --------------------
@@ -187,16 +257,13 @@ A Dispatcher that returns ``None`` leaves an item in the shared queue. Returning
 a consumer id assigns the item before any consumer calls ``get``. Override
 ``rebalance()`` only when a blocking consumer may steal from a peer.
 
-Use Channel Keys and Weights
-----------------------------
+Combine Hooks with Keys and Weights
+-----------------------------------
 
-``put(item, key=...)`` and ``get(key=...)`` select an independent logical queue.
-A Collector may change the key it received. A Dispatcher routes independently
-within each output key.
-
-Set ``weight`` on ``put`` and call ``get_batch(target_weight=...)`` when items
-have different costs and consumers need approximately weighted batches. Hook
-routing happens before weighted items enter their queues.
+The core key and weight behavior remains unchanged when hooks are enabled. A
+Collector may change the input key, and a Dispatcher routes independently
+within each output key. Routing happens before weighted items enter the shared
+or private queue used by ``get`` and ``get_batch``.
 
 For exact method signatures, see :doc:`../reference/api/channel`. For a
 production Collector that joins embodied rollout data, continue with

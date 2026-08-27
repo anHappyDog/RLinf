@@ -1,8 +1,72 @@
-使用 Channel Hook 定制数据流
-============================
+使用 Channel 进行通信
+=====================
 
-使用 ``Channel`` 在 WorkerGroup 之间传输数据。当数据入队前需要转换时添加
-``Collector``；当每个输出需要分配给指定消费者时添加 ``Dispatcher``。
+Channel 模块提供分布式生产者—消费者队列，用于在 Worker 之间传输数据。一个或多个
+生产者可以向命名 ``Channel`` 中 ``put`` 数据项，一个或多个消费者则可以独立于
+生产者的执行进度，通过 ``get`` 获取数据。
+
+默认共享队列支持同步与异步操作、按 key 划分逻辑队列、容量限制和加权 batch。大多数
+应用可以直接使用这些默认行为。只有在数据入队前需要转换时才添加 ``Collector``，
+只有在输出必须分配给指定消费者时才添加 ``Dispatcher``。
+
+创建并共享 Channel
+-------------------
+
+在 Worker 外创建 channel，然后将其传给负责生产或消费数据的 WorkerGroup 方法：
+
+.. code-block:: python
+
+   from rlinf.scheduler import Channel
+
+   sample_channel = Channel.create(name="Samples", maxsize=64)
+   producer_group.produce(sample_channel)
+   consumer_group.consume(sample_channel)
+
+本例中的 ``produce`` 和 ``consume`` 是应用自定义的 Worker 方法。将 channel 传入
+Worker 后，通信会自动绑定到该 Worker。已经在 Worker 内运行的代码也可以调用
+``self.create_channel(...)`` 或 ``self.connect_channel("Samples")``。
+
+放入、获取和批量获取数据
+--------------------------
+
+``put`` 发送一个可序列化的数据项，``get`` 从同一逻辑队列中移除下一个数据项：
+
+.. code-block:: python
+
+   sample_channel.put(sample, key="train", weight=num_tokens)
+   sample = sample_channel.get(key="train")
+
+每个 key 对应一个独立的 FIFO 队列。可选的 weight 表示数据项的开销或大小，但不会
+改变队列顺序。使用 ``get_batch`` 可以取出队首连续数据项，使其总 weight 不超过
+目标值：
+
+.. code-block:: python
+
+   batch = sample_channel.get_batch(
+       target_weight=global_batch_size,
+       key="train",
+   )
+
+该功能适合长度或处理开销不同的 sample。普通的单项消费可以保留默认 weight。
+
+使用异步操作和背压
+--------------------
+
+``put`` 和 ``get`` 默认阻塞。设置 ``async_op=True`` 会返回 work handle，从而将通信
+与其他工作重叠：
+
+.. code-block:: python
+
+   put_work = sample_channel.put(sample, async_op=True)
+   # Do independent work here.
+   put_work.wait()
+
+   get_work = sample_channel.get(async_op=True)
+   sample = get_work.wait()
+
+在 asyncio 函数中，应使用 ``await work.async_wait()``。正数 ``maxsize`` 会在目标
+队列已满时阻塞 ``put``，从而施加背压。``put_nowait`` 和 ``get_nowait`` 提供非阻塞
+队列语义。
 
 Hook 执行模型
 -------------
@@ -180,15 +244,12 @@ Dispatcher 返回 ``None`` 时，数据项留在共享队列；返回消费者 i
 任何消费者调用 ``get`` 之前完成分配。只有阻塞消费者允许从 peer 取任务时才需要
 重写 ``rebalance()``。
 
-使用 Channel Key 和 Weight
----------------------------
+组合使用 Hook、Key 和 Weight
+----------------------------
 
-``put(item, key=...)`` 和 ``get(key=...)`` 选择相互独立的逻辑队列。Collector 可以
-修改收到的 key，Dispatcher 则在每个输出 key 内独立路由。
-
-当数据项开销不同时，在 ``put`` 时设置 ``weight``，并调用
-``get_batch(target_weight=...)`` 形成近似等权 batch。Hook 路由在加权数据项进入
-队列之前完成。
+启用 hook 后，Channel 的 key 和 weight 行为保持不变。Collector 可以修改输入 key，
+Dispatcher 则在每个输出 key 内独立路由。加权数据项进入 ``get`` 和 ``get_batch``
+使用的共享或私有队列之前，会先完成路由。
 
 完整方法签名参见 :doc:`../reference/api/channel`。要了解一个用于拼接具身 rollout
 数据的生产级 Collector，请继续阅读 :doc:`trajectory_collector`。
