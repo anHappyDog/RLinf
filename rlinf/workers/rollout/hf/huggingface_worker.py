@@ -808,10 +808,9 @@ class MultiStepRolloutWorker(Worker):
         stage_id: int,
         split_sizes: list[int] | None,
     ) -> None:
-        # Environment actions are transport data, not part of the rollout graph.
-        if actions.requires_grad:
-            actions = actions.detach()
-        actions = actions.contiguous()
+        # Send by value on CPU: a device-resident tensor reaches a same-device env
+        # as a CUDA IPC handle aliasing the buffer the next forward pass reuses.
+        actions = actions.detach().cpu().contiguous()
         if self.env_decoupled_mode:
             if split_sizes is None:
                 raise ValueError("Decoupled policy output requires recorded routes.")
