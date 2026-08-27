@@ -30,6 +30,8 @@ class TensorBufferPoolOptions:
 
     def __post_init__(self) -> None:
         """Validate the buffer budget."""
+        if type(self.max_bytes) is not int:
+            raise ValueError("Maximum tensor buffer pool size must be an integer.")
         if self.max_bytes < 1:
             raise ValueError(
                 f"Maximum tensor buffer pool size must be >= 1, got {self.max_bytes}."

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 import os
 import threading
@@ -594,6 +595,27 @@ def test_collective_group_options_exclude_tensor_compression():
         CollectiveGroupOptions(tensor_compression=TensorCompressionOptions())
 
 
+def test_tensor_container_helpers_keep_async_send_without_unused_options():
+    """Private send helpers retain their baseline async contract only."""
+    send_helpers = [
+        CollectiveGroup._send_tensor_list,
+        CollectiveGroup._send_tensor_dict,
+        CollectiveGroup._send_tensor_dataclass,
+    ]
+    recv_helpers = [
+        CollectiveGroup._recv_tensor_list,
+        CollectiveGroup._recv_tensor_dict,
+        CollectiveGroup._recv_tensor_dataclass,
+    ]
+
+    for helper in send_helpers:
+        parameters = inspect.signature(helper).parameters
+        assert "async_op" in parameters
+        assert "options" not in parameters
+    for helper in recv_helpers:
+        assert "options" not in inspect.signature(helper).parameters
+
+
 @pytest.mark.parametrize(
     ("config", "message"),
     [
@@ -611,6 +633,14 @@ def test_collective_group_options_exclude_tensor_compression():
         ({"codec": "lz4", "params": {"max_inflight": 4}}, "LZ4"),
         ({"codec": "zstd", "params": {"acceleration": 1}}, "Zstd"),
         ({"codec": "lz4", "params": 1}, "mapping"),
+        ({"min_bytes": 1.5}, "integer"),
+        ({"min_bytes": True}, "integer"),
+        ({"codec": "lz4", "params": {"acceleration": 1.5}}, "integer"),
+        ({"codec": "lz4", "params": {"acceleration": True}}, "integer"),
+        ({"codec": "zstd", "params": {"level": 1.5}}, "integer"),
+        ({"codec": "zstd", "params": {"level": True}}, "integer"),
+        ({"codec": "zstd", "params": {"max_inflight": 4.0}}, "integer"),
+        ({"codec": "zstd", "params": {"max_inflight": True}}, "integer"),
     ],
 )
 def test_compression_options_validate_provider_params(config, message):
@@ -630,6 +660,8 @@ def test_compression_options_reject_unknown_cluster_yaml_key():
     [
         ({"max_bytes": 0}, "buffer pool"),
         ({"max_byte": 1024}, "Unsupported"),
+        ({"max_bytes": 1.5}, "integer"),
+        ({"max_bytes": True}, "integer"),
     ],
 )
 def test_tensor_buffer_pool_options_validate_public_config(config, message):
@@ -691,6 +723,14 @@ def test_cluster_serializes_validated_tensor_pool_and_compression_config(monkeyp
     }
 
 
+def test_cluster_rejects_unknown_collective_config_keys():
+    """A typo cannot silently disable the requested collective feature."""
+    with pytest.raises(ValueError, match="Unsupported cluster.collective"):
+        Cluster._configure_collective_tensor_envs(
+            {"collective": {"tensor_compresssion": {"enabled": True}}}
+        )
+
+
 def test_compression_uses_the_default_tensor_buffer_pool_config(monkeypatch):
     """Compression gets a bounded buffer pool without extra YAML."""
     buffer_pool_env = Cluster.get_full_env_var_name(
@@ -742,6 +782,76 @@ def test_worker_loads_the_job_wide_tensor_compression_config(monkeypatch):
         min_bytes=1024,
         provider=ZstdCodecProviderOptions(level=3),
     )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "expected_probes"),
+    [(True, ["zstd"]), (False, [])],
+)
+def test_worker_probes_only_enabled_compression_libraries(
+    monkeypatch, enabled, expected_probes
+):
+    """Every Worker checks its configured system library during startup."""
+    worker = object.__new__(Worker)
+    env_var_name = Cluster.get_full_env_var_name(
+        ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
+    )
+    monkeypatch.setenv(
+        env_var_name,
+        json.dumps({"enabled": enabled, "codec": "zstd"}),
+    )
+    probes = []
+    monkeypatch.setattr(
+        "rlinf.utils.tensor_codec.probe_tensor_codec_library",
+        probes.append,
+    )
+
+    worker._load_tensor_compression_options()
+
+    assert probes == expected_probes
+
+
+def test_net_emulation_uses_the_compressed_wire_size():
+    """Compression finishes before a point-to-point bandwidth reservation."""
+    group = object.__new__(CollectiveGroup)
+    tensor = torch.zeros(1024, dtype=torch.uint8)
+    wire_tensor = torch.zeros(64, dtype=torch.uint8)
+    tensor_data = SimpleNamespace(
+        cpu_tensors=[tensor],
+        tensors_list=None,
+    )
+    metadata = TensorCompressionWireMetadata(codec="lz4", compressed_numel=(64,))
+    events = []
+
+    group._init_process_group = lambda **_kwargs: None
+    group._compress_cpu_tensors = lambda *_args: (
+        events.append("compress") or [wire_tensor],
+        metadata,
+        [],
+    )
+    group._wait_for_net_emulation_size = lambda size: events.append(("reserve", size))
+    group._send = lambda *_args, **_kwargs: None
+    group._send_tensor_list = lambda *_args, **_kwargs: events.append("send")
+    group._cur_worker_address = SimpleNamespace(get_name=lambda: "Src:0")
+    group._group_info = SimpleNamespace(group_name="test")
+    group._logger = SimpleNamespace(debug=lambda *_args: None)
+    group._net_emu_manager = object()
+
+    group._atomic_send(
+        work=None,
+        object=tensor,
+        comm_id=0,
+        object_type=CollectiveGroup.TENSOR,
+        tensor_data=tensor_data,
+    )
+
+    raw_size = group._estimate_payload_size((tensor, None))
+    metadata_size = group._estimate_payload_size((metadata,))
+    assert events == [
+        "compress",
+        ("reserve", raw_size - tensor.numel() + wire_tensor.numel() + metadata_size),
+        "send",
+    ]
 
 
 def test_worker_loads_the_job_wide_tensor_buffer_pool_config(monkeypatch):

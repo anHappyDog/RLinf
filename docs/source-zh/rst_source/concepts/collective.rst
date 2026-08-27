@@ -213,10 +213,12 @@ Worker 内 active 与 cached CPU buffer 的总容量，默认值为 2 GiB。配�
 运行与回退
 ~~~~~~~~~~
 
-每个 Worker 延迟创建一个 ``TensorCodecPool`` 和一个独立的 ``TensorBufferPool``，并由其
-所有 ``CollectiveGroup`` 共享。codec pool 根据 provider 选择 acquisition policy：LZ4
-无锁、无 slot 限制地共享一个无状态 codec；Zstd 则从有界 encoder/decoder pool 中独占
-native context。发送流程如下：
+每个 Worker 在加载作业级配置时会 probe 已配置的系统 codec library，因此缺少依赖会在
+Worker 启动期间失败。native codec context 和 buffer 仍然延迟创建：每个 Worker 在首次使用
+时创建一个 ``TensorCodecPool`` 和一个独立的 ``TensorBufferPool``，并由其所有
+``CollectiveGroup`` 共享。codec pool 根据 provider 选择 acquisition policy：LZ4 无锁、
+无 slot 限制地共享一个无状态 codec；Zstd 则从有界 encoder/decoder pool 中独占 native
+context。发送流程如下：
 
 1. 获取 provider 的 encoder。LZ4 不会耗尽；Zstd encoder pool 饱和时不会等待，本次传输
    保持 raw。
@@ -230,6 +232,9 @@ native context。发送流程如下：
 5. 压缩结束后立即释放 codec。仅保持压缩 payload 的 buffer lease，直到同步 payload send
    完成，再将 buffer 返回 Worker buffer pool。接收端在 compressed wire payload 到达后才
    获取 decoder，并在解压完成后立即释放。
+
+同时启用 ``cluster.net_emulation`` 时，bandwidth 按实际压缩后的 CPU tensor bytes 计费，
+并保留原 payload 的 metadata 估算；raw 或不符合压缩条件的 tensor 仍使用原计费方式。
 
 buffer pool 按 capacity 索引 idle buffer，并复用能够容纳请求的最小 size。相同 size 使用
 独立 list，active 与 cached 容量共同受 ``max_bytes`` 限制。当新分配需要空间时，pool 会

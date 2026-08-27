@@ -233,12 +233,14 @@ automatically supplies the default pool.
 Runtime and Fallback
 ~~~~~~~~~~~~~~~~~~~~
 
-Each Worker lazily creates one ``TensorCodecPool`` and one independent
-``TensorBufferPool`` shared by all of its ``CollectiveGroup`` instances. The
-codec pool selects an acquisition policy for the configured provider: LZ4
-shares one stateless codec without a lock or slot limit, while Zstd leases
-exclusive native contexts from bounded encoder and decoder pools. A send uses
-them as follows:
+Each Worker probes the configured system codec library while loading its
+job-wide configuration, so a missing dependency fails during Worker startup.
+Native codec contexts and buffers remain lazy: each Worker creates one
+``TensorCodecPool`` and one independent ``TensorBufferPool`` on first use and
+shares them across all of its ``CollectiveGroup`` instances. The codec pool
+selects an acquisition policy for the configured provider: LZ4 shares one
+stateless codec without a lock or slot limit, while Zstd leases exclusive native
+contexts from bounded encoder and decoder pools. A send uses them as follows:
 
 1. It obtains the provider's encoder. LZ4 access cannot be saturated. Zstd does
    not wait for a busy encoder pool; a saturated pool keeps the transfer raw.
@@ -255,6 +257,10 @@ them as follows:
    buffers remain leased until their synchronous payload sends finish, then
    return to the Worker buffer pool. The receiver acquires a decoder only after
    the compressed wire payload has arrived and releases it after decompression.
+
+When ``cluster.net_emulation`` is also enabled, bandwidth is charged against the
+actual compressed CPU tensor bytes while preserving the original payload's
+metadata estimate. Raw and ineligible tensors keep their original accounting.
 
 The buffer pool indexes idle buffers by capacity and reuses the smallest size
 that fits. It maintains separate lists for repeated sizes and tracks active plus

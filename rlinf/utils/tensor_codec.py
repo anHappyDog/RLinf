@@ -131,6 +131,8 @@ class ZstdTensorCodec(TensorCodec):
     """
 
     def __init__(self, level: int = 1) -> None:
+        if type(level) is not int or level < 1:
+            raise ValueError("Zstd compression level must be a positive integer.")
         self.level = level
         self._library = _load_library("zstd")
         self._library.ZSTD_compressBound.argtypes = [ctypes.c_size_t]
@@ -233,6 +235,13 @@ def create_tensor_codec(name: str, *, level: int = 1) -> TensorCodec:
     if name == "zstd":
         return ZstdTensorCodec(level=level)
     raise ValueError(f"Unsupported tensor codec: {name!r}.")
+
+
+def probe_tensor_codec_library(name: str) -> None:
+    """Check that a configured system codec library can be loaded."""
+    if name not in {"lz4", "zstd"}:
+        raise ValueError(f"Unsupported tensor codec: {name!r}.")
+    _load_library(name)
 
 
 def _load_library(name: str) -> ctypes.CDLL:

@@ -568,6 +568,16 @@ class Cluster:
         if not isinstance(collective_cfg, (dict, DictConfig)):
             raise ValueError("cluster.collective must be a mapping.")
 
+        unknown_keys = set(collective_cfg) - {
+            "tensor_compression",
+            "tensor_buffer_pool",
+        }
+        if unknown_keys:
+            raise ValueError(
+                "Unsupported cluster.collective options: "
+                + ", ".join(sorted(unknown_keys))
+            )
+
         compression_cfg = collective_cfg.get("tensor_compression", None)
         buffer_pool_cfg = collective_cfg.get("tensor_buffer_pool", None)
         if compression_cfg is None and buffer_pool_cfg is None:

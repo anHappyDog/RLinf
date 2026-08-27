@@ -31,6 +31,8 @@ class LZ4CodecProviderOptions:
 
     def __post_init__(self) -> None:
         """Validate LZ4 provider parameters."""
+        if type(self.acceleration) is not int:
+            raise ValueError("LZ4 acceleration must be an integer.")
         if self.acceleration < 1:
             raise ValueError(f"LZ4 acceleration must be >= 1, got {self.acceleration}.")
 
@@ -59,8 +61,12 @@ class ZstdCodecProviderOptions:
 
     def __post_init__(self) -> None:
         """Validate Zstd provider parameters."""
+        if type(self.level) is not int:
+            raise ValueError("Zstd level must be an integer.")
         if self.level < 1:
             raise ValueError(f"Zstd level must be >= 1, got {self.level}.")
+        if type(self.max_inflight) is not int:
+            raise ValueError("Zstd maximum inflight contexts must be an integer.")
         if self.max_inflight < 1:
             raise ValueError(
                 f"Zstd maximum inflight contexts must be >= 1, got {self.max_inflight}."
@@ -106,12 +112,18 @@ class TensorCompressionOptions:
         """Validate compression settings."""
         if not isinstance(self.enabled, bool):
             raise ValueError("Compression enabled must be a boolean.")
+        if type(self.min_bytes) is not int:
+            raise ValueError("Minimum compression size must be an integer.")
         if self.min_bytes < 1:
             raise ValueError(
                 f"Minimum compression size must be >= 1, got {self.min_bytes}."
             )
         if not isinstance(self.excluded_dtypes, (list, tuple)):
             raise ValueError("Excluded tensor dtypes must be a list.")
+        if not isinstance(
+            self.provider, (LZ4CodecProviderOptions, ZstdCodecProviderOptions)
+        ):
+            raise ValueError("Compression provider options have an unsupported type.")
 
         dtype_names = tuple(self.excluded_dtypes)
         if len(set(dtype_names)) != len(dtype_names):
@@ -242,17 +254,14 @@ class _ZstdCodecAcquisition:
     """Bound concurrent access to reusable Zstd compression contexts."""
 
     def __init__(self, options: ZstdCodecProviderOptions) -> None:
-        self._fresh_compressors: LifoQueue[TensorCodec] = LifoQueue(
-            maxsize=options.max_inflight
-        )
-        self._reused_compressors: LifoQueue[TensorCodec] = LifoQueue(
+        self._compressors: LifoQueue[TensorCodec] = LifoQueue(
             maxsize=options.max_inflight
         )
         self._decompressors: LifoQueue[TensorCodec] = LifoQueue(
             maxsize=options.max_inflight
         )
         for _ in range(options.max_inflight):
-            self._fresh_compressors.put_nowait(
+            self._compressors.put_nowait(
                 create_tensor_codec(name="zstd", level=options.level)
             )
             self._decompressors.put_nowait(
@@ -261,13 +270,10 @@ class _ZstdCodecAcquisition:
 
     def try_acquire_compressor(self) -> Optional[_PooledCodecLease]:
         try:
-            codec = self._reused_compressors.get_nowait()
+            codec = self._compressors.get_nowait()
         except Empty:
-            try:
-                codec = self._fresh_compressors.get_nowait()
-            except Empty:
-                return None
-        return _PooledCodecLease(codec, self._reused_compressors)
+            return None
+        return _PooledCodecLease(codec, self._compressors)
 
     def acquire_decompressor(self) -> _PooledCodecLease:
         return _PooledCodecLease(self._decompressors.get(), self._decompressors)

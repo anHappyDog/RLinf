@@ -584,9 +584,13 @@ class Worker(metaclass=WorkerMeta):
                 "Collective tensor compression configuration must be a mapping."
             )
 
+        from ...utils.tensor_codec import probe_tensor_codec_library
         from ..collective.tensor_compression import TensorCompressionOptions
 
-        return TensorCompressionOptions.from_dict(config)
+        options = TensorCompressionOptions.from_dict(config)
+        if options.enabled:
+            probe_tensor_codec_library(options.codec)
+        return options
 
     def _load_tensor_buffer_pool_options(self):
         """Load the job-wide tensor-buffer configuration propagated by Cluster."""
