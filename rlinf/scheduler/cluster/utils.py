@@ -696,22 +696,18 @@ def resolve_colocation_node_rank(*specs: Any) -> Optional[int]:
         The node rank to place on, or None if no spec names a launched group.
     """
     from ..manager import WorkerAddress, WorkerManager
-    from ..worker import WorkerGroup
 
     for spec in specs:
         if spec is None:
             continue
-        groups = spec if isinstance(spec, (list, tuple, set)) else [spec]
-        for group in groups:
-            if isinstance(group, WorkerGroup):
-                if group.worker_info_list:
-                    return group.worker_info_list[0].cluster_node_rank
-            elif isinstance(group, str):
-                info = WorkerManager.get_proxy().get_worker_info(
-                    WorkerAddress(root_group_name=group, ranks=0)
-                )
-                if info is not None:
-                    return info.cluster_node_rank
+        # Groups are looked up by name whether they arrive as objects or strings:
+        # a group's own worker list holds ranks and actor handles, not placements.
+        for group_name in resolve_group_names(spec):
+            worker_info = WorkerManager.get_proxy().get_worker_info(
+                WorkerAddress(root_group_name=group_name, ranks=0)
+            )
+            if worker_info is not None:
+                return worker_info.cluster_node_rank
     return None
 
 
