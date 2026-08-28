@@ -574,9 +574,7 @@ class Cluster:
             normalized[name] = option_types[name].from_dict(value).to_dict()
 
         env_name = self.get_full_env_var_name(ClusterEnvVar.COLLECTIVE_CONFIG)
-        self._collective_env_vars = {
-            env_name: json.dumps(normalized, sort_keys=True)
-        }
+        self._collective_env_vars = {env_name: json.dumps(normalized, sort_keys=True)}
 
     def _set_scheduler_env_vars(self):
         """Set default environment variables for the system."""

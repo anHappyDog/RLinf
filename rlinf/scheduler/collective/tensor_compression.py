@@ -14,11 +14,10 @@
 
 """Codec-specific acquisition policies for collective tensor compression."""
 
-from typing import TypeAlias
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from queue import Empty, LifoQueue
-from typing import Any, ClassVar, Literal, Optional
+from typing import Any, ClassVar, Literal, Optional, TypeAlias
 
 import torch
 
@@ -92,7 +91,7 @@ class ZstdCodecProviderOptions:
         return {"level": self.level, "max_inflight": self.max_inflight}
 
 
-CodecProviderOptions : TypeAlias = LZ4CodecProviderOptions | ZstdCodecProviderOptions
+CodecProviderOptions: TypeAlias = LZ4CodecProviderOptions | ZstdCodecProviderOptions
 
 
 @dataclass(frozen=True)
