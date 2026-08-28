@@ -14,19 +14,22 @@
 
 """Codec-specific acquisition policies for collective tensor compression."""
 
+from typing import TypeAlias
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from queue import Empty, LifoQueue
-from typing import Any, Literal, Optional
+from typing import Any, ClassVar, Literal, Optional
 
 import torch
 
-from rlinf.utils.tensor_codec import TensorCodec, create_tensor_codec
+from rlinf.utils.tensor_codec import LZ4TensorCodec, TensorCodec, ZstdTensorCodec
 
 
 @dataclass(frozen=True)
 class LZ4CodecProviderOptions:
     """Configure the stateless Worker-wide LZ4 provider."""
 
+    codec_name: ClassVar[Literal["lz4"]] = "lz4"
     acceleration: int = 1
 
     def __post_init__(self) -> None:
@@ -54,8 +57,9 @@ class LZ4CodecProviderOptions:
 
 @dataclass(frozen=True)
 class ZstdCodecProviderOptions:
-    """Configure bounded Worker-wide Zstd context pools."""
+    """Configure the bounded Worker-wide Zstd context pool."""
 
+    codec_name: ClassVar[Literal["zstd"]] = "zstd"
     level: int = 1
     max_inflight: int = 4
 
@@ -88,7 +92,7 @@ class ZstdCodecProviderOptions:
         return {"level": self.level, "max_inflight": self.max_inflight}
 
 
-CodecProviderOptions = LZ4CodecProviderOptions | ZstdCodecProviderOptions
+CodecProviderOptions : TypeAlias = LZ4CodecProviderOptions | ZstdCodecProviderOptions
 
 
 @dataclass(frozen=True)
@@ -106,7 +110,7 @@ class TensorCompressionOptions:
     @property
     def codec(self) -> Literal["lz4", "zstd"]:
         """Return the selected provider name."""
-        return "lz4" if isinstance(self.provider, LZ4CodecProviderOptions) else "zstd"
+        return self.provider.codec_name
 
     def __post_init__(self) -> None:
         """Validate compression settings."""
@@ -173,7 +177,8 @@ class TensorCompressionOptions:
     def should_compress(self, tensor: torch.Tensor) -> bool:
         """Return whether a CPU tensor is eligible for a codec attempt."""
         return (
-            tensor.is_cpu
+            self.enabled
+            and tensor.is_cpu
             and tensor.dtype not in self._excluded_dtype_values
             and tensor.numel() * tensor.element_size() >= self.min_bytes
         )
@@ -197,111 +202,79 @@ class TensorCompressionWireMetadata:
     compressed_numel: tuple[Optional[int], ...]
 
 
-class _SharedCodecLease:
-    """Expose a thread-safe codec through the common lease interface."""
+class TensorCodecProvider(ABC):
+    """Own codec resources and their concurrent acquisition policy."""
 
-    def __init__(self, codec: TensorCodec) -> None:
-        self.codec = codec
+    codec_name: str
 
-    def release(self) -> None:
-        """Keep the shared codec available to all callers."""
+    @abstractmethod
+    def try_acquire_compressor(self) -> Optional[TensorCodec]:
+        """Return an available compressor without blocking."""
 
+    @abstractmethod
+    def acquire_decompressor(self) -> TensorCodec:
+        """Return a decompressor, waiting for one when required."""
 
-class _PooledCodecLease:
-    """Keep one stateful codec context exclusively owned during a call."""
-
-    def __init__(
-        self, codec: TensorCodec, release_queue: LifoQueue[TensorCodec]
-    ) -> None:
-        self._release_queue = release_queue
-        self._codec: Optional[TensorCodec] = codec
-
-    @property
-    def codec(self) -> TensorCodec:
-        """Return the exclusively owned codec context."""
-        if self._codec is None:
-            raise RuntimeError("Codec lease has already been released.")
-        return self._codec
-
-    def release(self) -> None:
-        """Return the codec context to its pool exactly once."""
-        if self._codec is None:
-            return
-        codec = self._codec
-        self._codec = None
-        self._release_queue.put_nowait(codec)
+    @abstractmethod
+    def release(self, codec: TensorCodec) -> None:
+        """Release a previously acquired codec."""
 
 
-CodecLease = _SharedCodecLease | _PooledCodecLease
+class LZ4CodecProvider(TensorCodecProvider):
+    """Share one stateless LZ4 codec across Worker threads."""
 
-
-class _LZ4CodecAcquisition:
-    """Share one stateless LZ4 codec without acquisition locks or limits."""
+    codec_name = LZ4CodecProviderOptions.codec_name
 
     def __init__(self, options: LZ4CodecProviderOptions) -> None:
-        self._lease = _SharedCodecLease(
-            create_tensor_codec(name="lz4", level=options.acceleration)
-        )
+        """Create the shared LZ4 codec."""
+        self._codec = LZ4TensorCodec(acceleration=options.acceleration)
 
-    def try_acquire_compressor(self) -> _SharedCodecLease:
-        return self._lease
+    def try_acquire_compressor(self) -> TensorCodec:
+        """Return the shared codec without blocking."""
+        return self._codec
 
-    def acquire_decompressor(self) -> _SharedCodecLease:
-        return self._lease
+    def acquire_decompressor(self) -> TensorCodec:
+        """Return the shared codec without blocking."""
+        return self._codec
+
+    def release(self, codec: TensorCodec) -> None:
+        """Leave the shared codec available to all callers."""
+        pass
 
 
-class _ZstdCodecAcquisition:
-    """Bound concurrent access to reusable Zstd compression contexts."""
+class ZstdCodecProvider(TensorCodecProvider):
+    """Bound concurrent use of reusable Zstd codec contexts."""
+
+    codec_name = ZstdCodecProviderOptions.codec_name
 
     def __init__(self, options: ZstdCodecProviderOptions) -> None:
-        self._compressors: LifoQueue[TensorCodec] = LifoQueue(
-            maxsize=options.max_inflight
-        )
-        self._decompressors: LifoQueue[TensorCodec] = LifoQueue(
-            maxsize=options.max_inflight
-        )
+        """Create the bounded Zstd codec queue."""
+        self._codecs: LifoQueue[TensorCodec] = LifoQueue(maxsize=options.max_inflight)
         for _ in range(options.max_inflight):
-            self._compressors.put_nowait(
-                create_tensor_codec(name="zstd", level=options.level)
-            )
-            self._decompressors.put_nowait(
-                create_tensor_codec(name="zstd", level=options.level)
-            )
+            self._codecs.put_nowait(ZstdTensorCodec(level=options.level))
 
-    def try_acquire_compressor(self) -> Optional[_PooledCodecLease]:
+    def try_acquire_compressor(self) -> Optional[TensorCodec]:
+        """Return an available codec without blocking."""
         try:
-            codec = self._compressors.get_nowait()
+            return self._codecs.get_nowait()
         except Empty:
             return None
-        return _PooledCodecLease(codec, self._compressors)
 
-    def acquire_decompressor(self) -> _PooledCodecLease:
-        return _PooledCodecLease(self._decompressors.get(), self._decompressors)
+    def acquire_decompressor(self) -> TensorCodec:
+        """Wait for and return an available codec."""
+        return self._codecs.get()
+
+    def release(self, codec: TensorCodec) -> None:
+        """Return the codec to the queue."""
+        self._codecs.put_nowait(codec)
 
 
-class TensorCodecPool:
-    """Own the Worker-wide codec-specific acquisition policy."""
-
-    def __init__(self, options: TensorCompressionOptions) -> None:
-        """Create shared LZ4 access or bounded Zstd context pools."""
-        self.options = options
-        provider = options.provider
-        self._acquisition = (
-            _LZ4CodecAcquisition(provider)
-            if isinstance(provider, LZ4CodecProviderOptions)
-            else _ZstdCodecAcquisition(provider)
-        )
-
-    def try_acquire_compressor(self) -> Optional[CodecLease]:
-        """Return a codec according to its compression acquisition policy."""
-        return self._acquisition.try_acquire_compressor()
-
-    def acquire_decompressor(
-        self, metadata: TensorCompressionWireMetadata
-    ) -> CodecLease:
-        """Return a codec according to its decompression acquisition policy."""
-        if metadata.codec != self.options.codec:
-            raise ValueError(
-                "Compression metadata does not match this collective's codec settings."
-            )
-        return self._acquisition.acquire_decompressor()
+def create_tensor_codec_provider(
+    options: CodecProviderOptions,
+) -> TensorCodecProvider:
+    """Create the runtime provider for validated codec options."""
+    if isinstance(options, LZ4CodecProviderOptions):
+        return LZ4CodecProvider(options)
+    if isinstance(options, ZstdCodecProviderOptions):
+        return ZstdCodecProvider(options)
+    raise ValueError(f"Unsupported tensor codec provider options: {options!r}.")

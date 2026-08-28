@@ -108,11 +108,8 @@ class ClusterEnvVar(str, Enum):
     Set explicitly when workers do not share a filesystem with the launch node.
     """
 
-    COLLECTIVE_TENSOR_COMPRESSION = "COLLECTIVE_TENSOR_COMPRESSION"
-    """Serialized ``cluster.collective.tensor_compression`` configuration."""
-
-    COLLECTIVE_TENSOR_BUFFER_POOL = "COLLECTIVE_TENSOR_BUFFER_POOL"
-    """Serialized ``cluster.collective.tensor_buffer_pool`` configuration."""
+    COLLECTIVE_CONFIG = "COLLECTIVE_CONFIG"
+    """Serialized job-wide collective configuration."""
 
 
 class PathEnvMergeMode(str, Enum):
@@ -143,8 +140,7 @@ class Cluster:
         ClusterEnvVar.NET_EMULATION: "0",
         ClusterEnvVar.PATH_ENV_MERGE_MODE: PathEnvMergeMode.APPEND.value,
         ClusterEnvVar.CODE_WORKING_DIR: "0",
-        ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION: None,
-        ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL: None,
+        ClusterEnvVar.COLLECTIVE_CONFIG: "{}",
     }
     PATH_LIKE_ENV_VARS = {
         "PYTHONPATH",
@@ -154,10 +150,6 @@ class Cluster:
         "CMAKE_PREFIX_PATH",
         "PKG_CONFIG_PATH",
         "CPATH",
-    }
-    SCHEDULER_OWNED_ENV_VARS = {
-        ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION,
-        ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL,
     }
 
     class NamespaceConflictError(Exception):
@@ -328,6 +320,7 @@ class Cluster:
         self._cluster_cfg = (
             ClusterConfig.from_dict_cfg(cluster_cfg) if cluster_cfg else None
         )
+        self._set_collective_env_vars(cluster_cfg)
         if (
             self._cluster_cfg is not None
             and num_nodes is not None
@@ -419,8 +412,6 @@ class Cluster:
             os.environ[Cluster.get_full_env_var_name(ClusterEnvVar.NET_EMULATION)] = "1"
         else:
             net_emu_cfg = None
-
-        self._configure_collective_tensor_envs(cluster_cfg)
 
         # Set environment variables
         self._set_scheduler_env_vars()
@@ -548,70 +539,44 @@ class Cluster:
         """Get the full environment variable name with system prefix."""
         return f"{Cluster.SYS_NAME.upper()}_{var.value}"
 
-    @classmethod
-    def _configure_collective_tensor_envs(
-        cls, cluster_cfg: Optional[DictConfig]
-    ) -> None:
-        """Validate and serialize collective tensor settings for Workers."""
-        compression_env = cls.get_full_env_var_name(
-            ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
-        )
-        buffer_pool_env = cls.get_full_env_var_name(
-            ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL
-        )
-        os.environ.pop(compression_env, None)
-        os.environ.pop(buffer_pool_env, None)
-
-        collective_cfg = cluster_cfg.get("collective", None) if cluster_cfg else None
-        if collective_cfg is None:
-            return
-        if not isinstance(collective_cfg, (dict, DictConfig)):
-            raise ValueError("cluster.collective must be a mapping.")
-
-        unknown_keys = set(collective_cfg) - {
-            "tensor_compression",
-            "tensor_buffer_pool",
-        }
-        if unknown_keys:
-            raise ValueError(
-                "Unsupported cluster.collective options: "
-                + ", ".join(sorted(unknown_keys))
-            )
-
-        compression_cfg = collective_cfg.get("tensor_compression", None)
-        buffer_pool_cfg = collective_cfg.get("tensor_buffer_pool", None)
-        if compression_cfg is None and buffer_pool_cfg is None:
-            return
-
+    def _set_collective_env_vars(self, cluster_cfg: Optional[DictConfig]) -> None:
+        """Validate and serialize the job-wide collective configuration."""
         from ..collective.tensor_buffer_pool import TensorBufferPoolOptions
         from ..collective.tensor_compression import TensorCompressionOptions
 
-        if buffer_pool_cfg is None:
-            buffer_pool_options = TensorBufferPoolOptions()
-        else:
-            if isinstance(buffer_pool_cfg, DictConfig):
-                buffer_pool_cfg = OmegaConf.to_container(buffer_pool_cfg, resolve=True)
-            if not isinstance(buffer_pool_cfg, dict):
-                raise ValueError(
-                    "cluster.collective.tensor_buffer_pool must be a mapping."
-                )
-            buffer_pool_options = TensorBufferPoolOptions.from_dict(buffer_pool_cfg)
-        os.environ[buffer_pool_env] = json.dumps(
-            buffer_pool_options.to_dict(), sort_keys=True
+        option_types = {
+            "tensor_compression": TensorCompressionOptions,
+            "tensor_buffer_pool": TensorBufferPoolOptions,
+        }
+        collective_cfg = (
+            OmegaConf.select(cluster_cfg, "collective")
+            if cluster_cfg is not None
+            else None
         )
+        collective = (
+            OmegaConf.to_container(collective_cfg, resolve=True)
+            if collective_cfg is not None
+            else {}
+        )
+        if not isinstance(collective, dict):
+            raise ValueError("cluster.collective must be a mapping.")
 
-        if compression_cfg is not None:
-            if isinstance(compression_cfg, DictConfig):
-                compression_cfg = OmegaConf.to_container(compression_cfg, resolve=True)
-            if not isinstance(compression_cfg, dict):
-                raise ValueError(
-                    "cluster.collective.tensor_compression must be a mapping."
-                )
-            compression_options = TensorCompressionOptions.from_dict(compression_cfg)
-            os.environ[compression_env] = json.dumps(
-                compression_options.to_dict(),
-                sort_keys=True,
+        unknown = collective.keys() - option_types.keys()
+        if unknown:
+            raise ValueError(
+                f"Unsupported cluster.collective options: {sorted(unknown)}"
             )
+
+        normalized = {}
+        for name, value in collective.items():
+            if not isinstance(value, dict):
+                raise ValueError(f"cluster.collective.{name} must be a mapping.")
+            normalized[name] = option_types[name].from_dict(value).to_dict()
+
+        env_name = self.get_full_env_var_name(ClusterEnvVar.COLLECTIVE_CONFIG)
+        self._collective_env_vars = {
+            env_name: json.dumps(normalized, sort_keys=True)
+        }
 
     def _set_scheduler_env_vars(self):
         """Set default environment variables for the system."""
@@ -619,12 +584,6 @@ class Cluster:
         for node in self._nodes:
             for env_var in env_var_list:
                 env_var_name = Cluster.get_full_env_var_name(env_var)
-                if env_var in Cluster.SCHEDULER_OWNED_ENV_VARS:
-                    if env_var_name in os.environ:
-                        node.env_vars[env_var_name] = os.environ[env_var_name]
-                    else:
-                        node.env_vars.pop(env_var_name, None)
-                    continue
                 if env_var_name in os.environ and env_var_name not in node.env_vars:
                     node.env_vars[env_var_name] = os.environ[env_var_name]
                 elif (
@@ -865,10 +824,6 @@ class Cluster:
             env_vars,
             path_env_merge_mode,
         )
-        merged_env_vars = self._enforce_scheduler_owned_env_vars(
-            merged_env_vars,
-            node.env_vars,
-        )
 
         # Update Python interpreter path
         python_interpreter_path = node.python_interpreter_path
@@ -915,6 +870,7 @@ class Cluster:
                 merged_env_vars,
                 self._runtime_code_sync_strip_roots,
             )
+        merged_env_vars.update(self._collective_env_vars)
         runtime_env_worker = Cluster._combine_ray_runtime_env(
             Cluster._job_code_sync_fragment_for_child_runtime_env(
                 self._ray_code_sync_fragment
@@ -988,22 +944,6 @@ class Cluster:
                 )
             else:
                 merged[key] = value
-        return merged
-
-    @classmethod
-    def _enforce_scheduler_owned_env_vars(
-        cls,
-        worker_env_vars: dict[str, str],
-        scheduler_env_vars: dict[str, str],
-    ) -> dict[str, str]:
-        """Restore job-wide environment values after user environment merging."""
-        merged = worker_env_vars.copy()
-        for env_var in cls.SCHEDULER_OWNED_ENV_VARS:
-            env_var_name = cls.get_full_env_var_name(env_var)
-            if env_var_name in scheduler_env_vars:
-                merged[env_var_name] = scheduler_env_vars[env_var_name]
-            else:
-                merged.pop(env_var_name, None)
         return merged
 
     @staticmethod

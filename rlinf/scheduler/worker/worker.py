@@ -43,8 +43,7 @@ from .routing import split_channel_message
 
 if TYPE_CHECKING:
     from ..collective import CollectiveGroupOptions
-    from ..collective.tensor_buffer_pool import TensorBufferPool
-    from ..collective.tensor_compression import TensorCodecPool
+    from ..collective.tensor_compression import TensorCodecProvider
     from ..manager import WorkerInfo
     from .worker_group import WorkerGroup
 
@@ -478,12 +477,6 @@ class Worker(metaclass=WorkerMeta):
         # Init ray and managers
         self._manager_proxy = None
         self._collective = None
-        self._tensor_buffer_pool_options = self._load_tensor_buffer_pool_options()
-        self._tensor_compression = self._load_tensor_compression_options()
-        self._tensor_buffer_pool: Optional["TensorBufferPool"] = None
-        self._tensor_buffer_pool_lock = threading.Lock()
-        self._tensor_codec_pool: Optional["TensorCodecPool"] = None
-        self._tensor_codec_pool_lock = threading.Lock()
         self._setup_managers()
 
         # Setup MASTER_ADDR and MASTER_PORT
@@ -493,6 +486,7 @@ class Worker(metaclass=WorkerMeta):
         self._setup_comm_envs()
 
         self._lock = threading.Lock()
+        self._setup_collective_resources()
         Worker.current_worker = self
         self._has_initialized = True
 
@@ -566,86 +560,6 @@ class Worker(metaclass=WorkerMeta):
 
         return WorkerGroup(cls, args, kwargs)
 
-    def _load_tensor_compression_options(self):
-        """Load the job-wide tensor-compression configuration propagated by Cluster."""
-        raw_config = Cluster.get_sys_env_var(
-            ClusterEnvVar.COLLECTIVE_TENSOR_COMPRESSION
-        )
-        if raw_config is None:
-            return None
-        try:
-            config = json.loads(raw_config)
-        except json.JSONDecodeError as error:
-            raise ValueError(
-                "Invalid collective tensor compression configuration."
-            ) from error
-        if not isinstance(config, dict):
-            raise ValueError(
-                "Collective tensor compression configuration must be a mapping."
-            )
-
-        from ...utils.tensor_codec import probe_tensor_codec_library
-        from ..collective.tensor_compression import TensorCompressionOptions
-
-        options = TensorCompressionOptions.from_dict(config)
-        if options.enabled:
-            probe_tensor_codec_library(options.codec)
-        return options
-
-    def _load_tensor_buffer_pool_options(self):
-        """Load the job-wide tensor-buffer configuration propagated by Cluster."""
-        raw_config = Cluster.get_sys_env_var(
-            ClusterEnvVar.COLLECTIVE_TENSOR_BUFFER_POOL
-        )
-        if raw_config is None:
-            return None
-        try:
-            config = json.loads(raw_config)
-        except json.JSONDecodeError as error:
-            raise ValueError(
-                "Invalid collective tensor buffer pool configuration."
-            ) from error
-        if not isinstance(config, dict):
-            raise ValueError(
-                "Collective tensor buffer pool configuration must be a mapping."
-            )
-
-        from ..collective.tensor_buffer_pool import TensorBufferPoolOptions
-
-        return TensorBufferPoolOptions.from_dict(config)
-
-    def _get_tensor_buffer_pool(self) -> Optional["TensorBufferPool"]:
-        """Return the lazily initialized Worker-wide tensor buffer pool."""
-        options = self._tensor_buffer_pool_options
-        if options is None:
-            return None
-
-        if self._tensor_buffer_pool is not None:
-            return self._tensor_buffer_pool
-
-        with self._tensor_buffer_pool_lock:
-            if self._tensor_buffer_pool is None:
-                from ..collective.tensor_buffer_pool import TensorBufferPool
-
-                self._tensor_buffer_pool = TensorBufferPool(options)
-            return self._tensor_buffer_pool
-
-    def _get_tensor_codec_pool(self) -> Optional["TensorCodecPool"]:
-        """Return the lazily initialized Worker-wide tensor codec pool."""
-        options = self._tensor_compression
-        if options is None or not options.enabled:
-            return None
-
-        if self._tensor_codec_pool is not None:
-            return self._tensor_codec_pool
-
-        with self._tensor_codec_pool_lock:
-            if self._tensor_codec_pool is None:
-                from ..collective.tensor_compression import TensorCodecPool
-
-                self._tensor_codec_pool = TensorCodecPool(options)
-            return self._tensor_codec_pool
-
     def send(
         self,
         object: torch.Tensor | list[torch.Tensor] | dict[str, torch.Tensor] | Any,
@@ -679,7 +593,7 @@ class Worker(metaclass=WorkerMeta):
             dst_group_name (str): The name of the destination worker group.
             dst_rank (int | List[int]): The rank or list of ranks in the destination worker group to send the object to. For SPMD-like workers, this should be a single rank. For SPSD-like workers forked by parent workers, this can be a list of ranks that forms a path from the root worker to the target worker.
             async_op (bool): Whether to perform the operation asynchronously.
-            options (Optional[CollectiveGroupOptions]): Process-group options. They take effect only when two workers first communicate and must match the recv side.
+            options (Optional[CollectiveGroupOptions]): The options for the collective group. The options will only take effect when two workers first communicate with each other, and will be ignored for subsequent communications. This option must match the options of the recv side.
             piggyback_payload (Optional[Any]): The payload to piggyback on the send operation. This payload will be sent to the recv side and can be used to pass additional information to the recv side without disrupting the object's data structure, e.g., list/dict of tensors that are optimized for sending.
 
         Returns:
@@ -717,7 +631,7 @@ class Worker(metaclass=WorkerMeta):
             async_op (bool): Whether to perform the operation asynchronously.
             src_group_name (str): The name of the source worker group.
             src_rank (int | List[int]): The rank or list of ranks in the source worker group to receive the object from. For SPMD-like workers, this should be a single rank. For SPSD-like workers forked by parent workers, this can be a list of ranks that forms a path from the root worker to the target worker.
-            options (Optional[CollectiveGroupOptions]): Process-group options. They take effect only when two workers first communicate and must match the send side.
+            options (Optional[CollectiveGroupOptions]): The options for the collective group. The options will only take effect when two workers first communicate with each other, and will be ignored for subsequent communications. This option must match the options of the send side.
 
         Returns:
             AsyncWork | torch.Tensor | List[torch.Tensor] | Dict[str, torch.Tensor] | Any: An AsyncWork object if async_op is True, otherwise the received object. If the send side sends a piggyback payload, the received object will be a tuple of the received object and the piggyback payload.
@@ -1618,6 +1532,54 @@ class Worker(metaclass=WorkerMeta):
                 self.log_warning(
                     f"{ccl_socket_env_var} is already set to {os.environ[ccl_socket_env_var]}, ignoring {Cluster.get_full_env_var_name(ClusterEnvVar.COMM_NET_DEVICES)}={self._comm_devices}"
                 )
+
+    def _setup_collective_resources(self) -> None:
+        """Initialize Worker-wide collective resources."""
+        from rlinf.utils.tensor_codec import probe_tensor_codec_library
+
+        from ..collective.tensor_buffer_pool import (
+            TensorBufferPool,
+            TensorBufferPoolOptions,
+        )
+        from ..collective.tensor_compression import TensorCompressionOptions
+
+        config = json.loads(
+            Cluster.get_sys_env_var(ClusterEnvVar.COLLECTIVE_CONFIG, "{}")
+        )
+        compression_config = config.get("tensor_compression")
+        self._tensor_compression_options = (
+            TensorCompressionOptions.from_dict(compression_config)
+            if compression_config is not None
+            else None
+        )
+        self._tensor_buffer_pool = TensorBufferPool(
+            TensorBufferPoolOptions.from_dict(config.get("tensor_buffer_pool", {}))
+        )
+        self._tensor_codec_provider = None
+
+        if (
+            self._tensor_compression_options is not None
+            and self._tensor_compression_options.enabled
+        ):
+            probe_tensor_codec_library(self._tensor_compression_options.codec)
+
+    def _get_tensor_codec_provider(self) -> "TensorCodecProvider":
+        """Return the lazily initialized Worker-wide codec provider."""
+        if self._tensor_codec_provider is not None:
+            return self._tensor_codec_provider
+
+        options = self._tensor_compression_options
+        if options is None or not options.enabled:
+            raise ValueError("Tensor compression is not enabled for this Worker.")
+
+        from ..collective.tensor_compression import create_tensor_codec_provider
+
+        with self._lock:
+            if self._tensor_codec_provider is None:
+                self._tensor_codec_provider = create_tensor_codec_provider(
+                    options.provider
+                )
+        return self._tensor_codec_provider
 
     def _setup_logging(self):
         self._logger = logging.getLogger(self._worker_name)

@@ -228,15 +228,6 @@ class ZstdTensorCodec(TensorCodec):
             raise RuntimeError(f"Zstd {operation} failed: {error}.")
 
 
-def create_tensor_codec(name: str, *, level: int = 1) -> TensorCodec:
-    """Construct a direct tensor codec by transport name."""
-    if name == "lz4":
-        return LZ4TensorCodec(acceleration=level)
-    if name == "zstd":
-        return ZstdTensorCodec(level=level)
-    raise ValueError(f"Unsupported tensor codec: {name!r}.")
-
-
 def probe_tensor_codec_library(name: str) -> None:
     """Check that a configured system codec library can be loaded."""
     if name not in {"lz4", "zstd"}:
