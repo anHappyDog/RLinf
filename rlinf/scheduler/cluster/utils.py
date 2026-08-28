@@ -681,6 +681,40 @@ def resolve_group_sizes(spec: Any) -> list[tuple[str, int]]:
     return sizes
 
 
+def resolve_colocation_node_rank(*specs: Any) -> Optional[int]:
+    """Find the node a channel should sit on to stay close to its traffic.
+
+    Returns the cluster node rank of rank 0 of the first group that resolves,
+    trying each spec in the order given. A channel placed on that node keeps one
+    side of its traffic node-local instead of crossing the network twice.
+
+    Args:
+        *specs: Worker group specs, in preference order. Each is a worker group,
+            a group name, an iterable mixing the two, or None.
+
+    Returns:
+        The node rank to place on, or None if no spec names a launched group.
+    """
+    from ..manager import WorkerAddress, WorkerManager
+    from ..worker import WorkerGroup
+
+    for spec in specs:
+        if spec is None:
+            continue
+        groups = spec if isinstance(spec, (list, tuple, set)) else [spec]
+        for group in groups:
+            if isinstance(group, WorkerGroup):
+                if group.worker_info_list:
+                    return group.worker_info_list[0].cluster_node_rank
+            elif isinstance(group, str):
+                info = WorkerManager.get_proxy().get_worker_info(
+                    WorkerAddress(root_group_name=group, ranks=0)
+                )
+                if info is not None:
+                    return info.cluster_node_rank
+    return None
+
+
 def resolve_group_names(spec: Any) -> list[str]:
     """Normalize a worker group spec into a list of group names.
 

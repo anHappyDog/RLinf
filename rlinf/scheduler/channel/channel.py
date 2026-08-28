@@ -19,7 +19,12 @@ from typing import TYPE_CHECKING, Any, Optional
 import ray
 import ray.actor
 
-from ..cluster import Cluster, resolve_group_names, resolve_worker_names
+from ..cluster import (
+    Cluster,
+    resolve_colocation_node_rank,
+    resolve_group_names,
+    resolve_worker_names,
+)
 from ..collective import (
     AsyncChannelCommWork,
     AsyncChannelWork,
@@ -145,7 +150,7 @@ class Channel:
         name: str,
         maxsize: int = 0,
         distributed: bool = False,
-        node_rank: int = 0,
+        node_rank: Optional[int] = None,
         local: bool = False,
         disable_distributed_log: bool = True,
         collector: Any = None,
@@ -161,7 +166,7 @@ class Channel:
             name (str): The name of the channel.
             maxsize (int): The maximum size of the channel queue. Defaults to 0 (unbounded).
             distributed (bool): Whether the channel should be distributed. A distributed channel creates distributed workers on each node, and routes communications to the channel worker on the same node as the current worker, benefiting from the locality of the data. The routing is based on the key of the put/get APIs. So if you expect the key to be randomly distributed, you should set this to False to avoid unnecessary routing overhead.
-            node_rank (int): The node rank of the current worker. Only valid when distributed is False.
+            node_rank (int): The node to place the channel on. Only valid when distributed is False. Defaults to None, which places the channel on the node of its first producer, falling back to its first consumer and then to the creating worker, so channel traffic stays node-local instead of crossing the network to node 0.
             local (bool): Create the channel for intra-process communication. A local channel cannot be connected by other workers, and its data cannot be shared among different processes.
             disable_distributed_log (bool): Whether to disable distributed log for the channel.
             collector (Any): Transforms items on the way into the channel. A registered name,
@@ -203,6 +208,14 @@ class Channel:
         if distributed:
             placement = NodePlacementStrategy(node_ranks=list(range(cluster.num_nodes)))
         else:
+            if node_rank is None:
+                # Producer first: the collector runs here, so items are reduced
+                # before the longer hop to the consumer.
+                node_rank = resolve_colocation_node_rank(producers, consumers)
+            if node_rank is None and Worker.current_worker is not None:
+                node_rank = Worker.current_worker._cluster_node_rank
+            if node_rank is None:
+                node_rank = 0
             placement = NodePlacementStrategy(node_ranks=[node_rank])
         context = ChannelContext(
             name=name,
