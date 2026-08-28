@@ -213,10 +213,10 @@ contract is exact:
    * - ``zstd``
      - ``max_inflight``
      - ``4``
-     - Must be at least ``1``. It bounds reusable Zstd contexts independently
-       for compression and decompression within each Worker. A saturated
-       compressor pool falls back to raw transfer without waiting; a receiver
-       waits for a decoder after an already-compressed payload arrives.
+     - Must be at least ``1``. It bounds the reusable Zstd codecs shared by
+       compression and decompression within each Worker. A sender falls back to
+       raw transfer rather than waiting for a busy codec; a receiver waits for a
+       codec after an already-compressed payload arrives.
 
 Provider parameters are not accepted as top-level compression options. For
 example, top-level ``level`` or ``max_inflight`` is invalid, and LZ4 rejects
@@ -235,19 +235,20 @@ Runtime and Fallback
 
 Each Worker probes the configured system codec library while loading its
 job-wide configuration, so a missing dependency fails during Worker startup.
-Native codec contexts and buffers remain lazy: each Worker creates one
-``TensorCodecPool`` and one independent ``TensorBufferPool`` on first use and
-shares them across all of its ``CollectiveGroup`` instances. The codec pool
-selects an acquisition policy for the configured provider: LZ4 shares one
-stateless codec without a lock or slot limit, while Zstd leases exclusive native
-contexts from bounded encoder and decoder pools. A send uses them as follows:
+Native codec contexts and buffers remain lazy: each Worker creates an empty
+``TensorBufferPool`` while loading its configuration, then creates one
+``TensorCodecProvider`` when an eligible tensor first needs compression. Both
+resources are shared across all of the Worker's ``CollectiveGroup`` instances.
+LZ4 shares one stateless codec without a lock or slot limit. Zstd leases an
+exclusive codec from one bounded LIFO queue shared by compression and
+decompression. A send uses them as follows:
 
-1. It obtains the provider's encoder. LZ4 access cannot be saturated. Zstd does
-   not wait for a busy encoder pool; a saturated pool keeps the transfer raw.
-2. It filters tensors by ``min_bytes`` and ``excluded_dtypes``, then orders the
-   eligible tensors by worst-case output capacity, largest first. It tries to
-   lease a buffer for each tensor. A tensor stays raw when its codec bound is
-   unsupported or no buffer fits within the budget.
+1. It obtains the provider's codec. LZ4 access cannot be saturated. Zstd does
+   not wait for a busy codec queue; a saturated queue keeps the transfer raw.
+2. It visits CPU tensors in their original order, filters them by ``min_bytes``
+   and ``excluded_dtypes``, and tries to lease a buffer for each eligible tensor.
+   A tensor stays raw when its codec bound is unsupported or no buffer fits
+   within the budget.
 3. It keeps the compressed result only when it is smaller than the original.
    Otherwise, the tensor stays raw and that buffer is discarded rather than
    cached.
@@ -262,12 +263,14 @@ When ``cluster.net_emulation`` is also enabled, bandwidth is charged against the
 actual compressed CPU tensor bytes while preserving the original payload's
 metadata estimate. Raw and ineligible tensors keep their original accounting.
 
-The buffer pool indexes idle buffers by capacity and reuses the smallest size
-that fits. It maintains separate lists for repeated sizes and tracks active plus
-cached capacity against ``max_bytes``. When a new allocation needs room, it
-evicts buffers starting with the largest idle size bucket. Buffer acquisition
-never waits; an unavailable buffer therefore preserves baseline behavior for
-that tensor.
+The buffer pool indexes idle buffers by capacity and finds the smallest cached
+size that fits. It reuses that buffer when its capacity is at most twice the
+requested size, or when allocating an exact-size buffer would exceed the budget;
+otherwise it allocates an exact-size buffer. It maintains separate lists for
+repeated sizes and tracks active plus cached capacity against ``max_bytes``. When
+a new allocation needs room, it evicts buffers starting with the largest idle
+size bucket. Buffer acquisition never waits; an unavailable buffer therefore
+preserves baseline behavior for that tensor.
 
 The common dependency installation installs the LZ4 and Zstandard system
 libraries required by these codecs. Ensure the same RLinf version and its

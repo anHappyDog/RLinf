@@ -197,9 +197,9 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
    * - ``zstd``
      - ``max_inflight``
      - ``4``
-     - 必须不小于 ``1``。它在每个 Worker 内分别限制 compression 和 decompression 的
-       可复用 Zstd context。compressor pool 饱和时不会等待，而是保持 raw transfer；已经
-       收到 compressed payload 后，receiver 会等待 decoder。
+     - 必须不小于 ``1``。它限制每个 Worker 内由 compression 和 decompression 共享的
+       可复用 Zstd codec 数量。codec 繁忙时 sender 不会等待，而是保持 raw transfer；已经
+       收到 compressed payload 后，receiver 会等待 codec。
 
 provider 参数不能作为 compression 的顶层选项。例如，顶层 ``level`` 或
 ``max_inflight`` 是非法配置；LZ4 会拒绝 ``max_inflight``，Zstd 会拒绝
@@ -214,17 +214,17 @@ Worker 内 active 与 cached CPU buffer 的总容量，默认值为 2 GiB。配�
 ~~~~~~~~~~
 
 每个 Worker 在加载作业级配置时会 probe 已配置的系统 codec library，因此缺少依赖会在
-Worker 启动期间失败。native codec context 和 buffer 仍然延迟创建：每个 Worker 在首次使用
-时创建一个 ``TensorCodecPool`` 和一个独立的 ``TensorBufferPool``，并由其所有
-``CollectiveGroup`` 共享。codec pool 根据 provider 选择 acquisition policy：LZ4 无锁、
-无 slot 限制地共享一个无状态 codec；Zstd 则从有界 encoder/decoder pool 中独占 native
-context。发送流程如下：
+Worker 启动期间失败。native codec context 和 buffer 仍然延迟创建：每个 Worker 在加载配置
+时创建一个空的 ``TensorBufferPool``，并在首个符合压缩条件的 tensor 出现时创建一个
+``TensorCodecProvider``。两者都由该 Worker 的所有 ``CollectiveGroup`` 共享。LZ4 无锁、
+无 slot 限制地共享一个无状态 codec；Zstd 则从由 compression 和 decompression 共享的单个
+有界 LIFO queue 中独占 codec。发送流程如下：
 
-1. 获取 provider 的 encoder。LZ4 不会耗尽；Zstd encoder pool 饱和时不会等待，本次传输
-   保持 raw。
-2. 先根据 ``min_bytes`` 和 ``excluded_dtypes`` 筛选 tensor，再按最坏情况输出容量从大到
-   小排列候选 tensor，并分别尝试获取 buffer。当 codec 不支持该 tensor 的大小，或者预算
-   内没有可用 buffer 时，该 tensor 保持 raw。
+1. 获取 provider 的 codec。LZ4 不会耗尽；Zstd codec queue 饱和时不会等待，本次传输保持
+   raw。
+2. 按原始顺序遍历 CPU tensor，根据 ``min_bytes`` 和 ``excluded_dtypes`` 筛选，并为每个
+   符合条件的 tensor 尝试获取 buffer。当 codec 不支持该 tensor 的大小，或者预算内没有
+   可用 buffer 时，该 tensor 保持 raw。
 3. 只有压缩结果小于原始 tensor 时才使用它；否则保持 raw，并直接丢弃该 buffer，而不是
    将其放入 cache。
 4. 在现有 metadata 中发送每个 tensor 的压缩大小。接收端直接将压缩 tensor 恢复到预分配
@@ -236,10 +236,12 @@ context。发送流程如下：
 同时启用 ``cluster.net_emulation`` 时，bandwidth 按实际压缩后的 CPU tensor bytes 计费，
 并保留原 payload 的 metadata 估算；raw 或不符合压缩条件的 tensor 仍使用原计费方式。
 
-buffer pool 按 capacity 索引 idle buffer，并复用能够容纳请求的最小 size。相同 size 使用
-独立 list，active 与 cached 容量共同受 ``max_bytes`` 限制。当新分配需要空间时，pool 会
-从最大的 idle size bucket 开始淘汰 buffer。buffer acquisition 不会等待；因此 buffer
-不可用时，该 tensor 会保持 baseline 行为。
+buffer pool 按 capacity 索引 idle buffer，并查找能够容纳请求的最小 cached size。当其
+capacity 不超过请求大小的两倍，或分配精确大小的 buffer 会超出预算时，pool 会复用该
+buffer；否则会分配精确大小的新 buffer。相同 size 使用独立 list，active 与 cached 容量
+共同受 ``max_bytes`` 限制。当新分配需要空间时，pool 会从最大的 idle size bucket 开始
+淘汰 buffer。buffer acquisition 不会等待；因此 buffer 不可用时，该 tensor 会保持
+baseline 行为。
 
 公共依赖安装会安装这两种 codec 所需的 LZ4 和 Zstandard 系统库。请确保所有 Worker 节点
 使用相同版本的 RLinf，并安装相应的 compression 依赖。

@@ -209,6 +209,8 @@ class SenderWorker(Worker):
             data = tensor
         elif container == "list":
             data = [tensor, torch.arange(64, dtype=torch.int64)]
+        elif container == "tuple":
+            data = (tensor, torch.arange(64, dtype=torch.int64))
         elif container == "dict":
             data = {"compressed": tensor, "raw": torch.arange(64)}
         elif container == "dataclass":
@@ -1188,12 +1190,14 @@ class TestCommunication:
                 expected = torch.ones(2, 2) * i
                 assert torch.equal(tensor.cpu(), expected)
 
-    @pytest.mark.parametrize("container", ["tensor", "list", "dict", "dataclass"])
+    @pytest.mark.parametrize(
+        "container", ["tensor", "list", "tuple", "dict", "dataclass"]
+    )
     @pytest.mark.parametrize("async_op", [False, True], ids=["sync", "async_wait"])
     def test_compressed_cpu_tensor_communication(
         self, worker_groups, container, async_op
     ):
-        """Compressed CPU tensors preserve supported container structures."""
+        """Compressed CPU tensors preserve values on supported container paths."""
         results = self._run_test(
             worker_groups,
             "test_send_compressed_data",
@@ -1205,7 +1209,9 @@ class TestCommunication:
         for result in results:
             if container == "tensor":
                 tensor = result
-            elif container == "list":
+            elif container in {"list", "tuple"}:
+                # Tuple inputs use the established tensor-list wire path.
+                assert isinstance(result, list)
                 tensor = result[0]
                 assert torch.equal(result[1], torch.arange(64, dtype=torch.int64))
             elif container == "dict":
