@@ -533,6 +533,12 @@ class Cluster:
             self._node_manager.get_nodes()
         )
         self._num_nodes = len(self._nodes)
+        collective_env_name = self.get_full_env_var_name(
+            ClusterEnvVar.COLLECTIVE_CONFIG
+        )
+        self._collective_env_vars = {
+            collective_env_name: self._nodes[0].env_vars[collective_env_name]
+        }
 
     @staticmethod
     def get_full_env_var_name(var: ClusterEnvVar) -> str:
@@ -588,6 +594,7 @@ class Cluster:
                     default_value := Cluster.DEFAULT_SYS_ENV_VAR[env_var]
                 ) is not None and env_var_name not in node.env_vars:
                     node.env_vars[env_var_name] = default_value
+            node.env_vars.update(self._collective_env_vars)
 
     @staticmethod
     def get_sys_env_var(

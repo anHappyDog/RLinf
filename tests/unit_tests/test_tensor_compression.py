@@ -482,6 +482,42 @@ def test_cluster_serializes_validated_collective_config():
     }
 
 
+def test_cluster_stores_collective_config_in_node_metadata(monkeypatch):
+    """NodeManager metadata retains scheduler-owned collective configuration."""
+    cluster = object.__new__(Cluster)
+    cluster._nodes = [SimpleNamespace(env_vars={})]
+    cluster._set_collective_env_vars(
+        OmegaConf.create({"collective": {"tensor_buffer_pool": {"max_bytes": 4096}}})
+    )
+    env_name = Cluster.get_full_env_var_name(ClusterEnvVar.COLLECTIVE_CONFIG)
+    monkeypatch.setenv(env_name, "stale-worker-value")
+
+    cluster._set_scheduler_env_vars()
+
+    assert (
+        cluster._nodes[0].env_vars[env_name] == cluster._collective_env_vars[env_name]
+    )
+
+
+def test_attached_cluster_restores_collective_config_from_node_metadata(monkeypatch):
+    """A Cluster attached inside a Worker can allocate child Workers."""
+    from rlinf.scheduler.manager.node_manager import NodeManager
+
+    env_name = Cluster.get_full_env_var_name(ClusterEnvVar.COLLECTIVE_CONFIG)
+    serialized_config = json.dumps(
+        {"tensor_buffer_pool": {"max_bytes": 4096}}, sort_keys=True
+    )
+    node = SimpleNamespace(env_vars={env_name: serialized_config})
+    manager = SimpleNamespace(get_nodes=lambda: ([node], [], None))
+    monkeypatch.setattr("ray.is_initialized", lambda: True)
+    monkeypatch.setattr(NodeManager, "get_proxy", lambda no_wait: manager)
+    cluster = object.__new__(Cluster)
+
+    cluster._init_from_existing_managers()
+
+    assert cluster._collective_env_vars == {env_name: serialized_config}
+
+
 @pytest.mark.parametrize(
     ("config", "message"),
     [
