@@ -91,11 +91,7 @@ class AsyncEmbodiedDAGGERFSDPPolicy(EmbodiedDAGGERFSDPPolicy):
         split_num = compute_split_num(send_num, recv_num)
         while not self.should_stop:
             for _ in range(split_num):
-                try:
-                    trajectory = input_channel.get_nowait()
-                except asyncio.QueueEmpty:
-                    time.sleep(0.01)
-                    break
+                trajectory = input_channel.get()
                 self._recv_queue.put(trajectory)
 
     def _drain_received_trajectories(self, max_trajectories: int | None = None):

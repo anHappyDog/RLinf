@@ -263,6 +263,33 @@ def test_stealing_dispatcher_waits_when_no_peer_has_work():
     assert dispatcher.rebalance("k", "actor:1", {"actor:2": 0}) is None
 
 
+@pytest.mark.parametrize("dispatcher", ["round_robin", "least_loaded"])
+def test_each_key_is_dealt_independently(dispatcher):
+    """Traffic on one key must not move another key's split.
+
+    Both dispatchers self-balance, so with per-round counts that are multiples
+    of the consumer count a shared cursor happens to stay even too. Keeping the
+    state per key makes the property hold by construction instead of by that
+    coincidence, which is what a consumer waiting on a fixed count relies on.
+    """
+
+    async def run():
+        worker = _stub_worker(dispatcher=dispatcher)
+        # An odd number on one key leaves its own split uneven, by construction.
+        for index in range(4):
+            await worker._enqueue("other", index, 0)
+        for index in range(3):
+            await worker._enqueue("k", index, 0)
+        return {
+            consumer: queue.qsize()
+            for consumer, queue in worker._consumer_queues["k"].items()
+        }
+
+    # Three items across three consumers: exactly one each, regardless of the
+    # four items already dealt on "other".
+    assert asyncio.run(run()) == {"actor:0": 1, "actor:1": 1, "actor:2": 1}
+
+
 def test_a_consumer_unknown_at_setup_is_still_dealt_to():
     async def run():
         worker = _stub_worker(dispatcher="least_loaded", ctx=_ctx(consumers=()))

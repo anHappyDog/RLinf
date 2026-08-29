@@ -168,40 +168,55 @@ class SharedDispatcher(Dispatcher):
 
 
 class _DealingDispatcher(Dispatcher):
-    """Base for dispatchers that assign each item to one consumer."""
+    """Base for dispatchers that assign each item to one consumer.
+
+    Routing state is kept per queue key. Two streams sharing a channel then
+    balance independently, so a key whose item count is not a multiple of the
+    consumer count cannot skew how a different key is split -- which matters
+    because a consumer waiting on a fixed number of items would otherwise be
+    left short.
+    """
 
     def __init__(self) -> None:
         """Initialize empty routing state."""
         self._consumers: list[str] = []
-        self._assigned: dict[str, int] = {}
+        self._assigned: dict[Any, dict[str, int]] = {}
 
     def setup(self, ctx: ChannelContext) -> None:
         """Record the consumers items may be dealt to."""
         self._consumers = sorted(ctx.consumers)
-        self._assigned = dict.fromkeys(self._consumers, 0)
+        self._assigned = {}
+
+    def counts(self, key: Any) -> dict[str, int]:
+        """Return this key's per-consumer counts, seeding any newcomer at zero."""
+        counts = self._assigned.setdefault(key, {})
+        for consumer in self._consumers:
+            counts.setdefault(consumer, 0)
+        return counts
 
     def observe(self, consumer: str) -> None:
         """Register a consumer discovered after setup."""
-        if consumer not in self._assigned:
+        if consumer not in self._consumers:
             self._consumers = sorted([*self._consumers, consumer])
-            self._assigned[consumer] = 0
 
 
 class RoundRobinDispatcher(_DealingDispatcher):
     """Deal items to consumers in a fixed rotation."""
 
     def __init__(self) -> None:
-        """Initialize the rotation cursor."""
+        """Initialize the per-key rotation cursors."""
         super().__init__()
-        self._cursor = 0
+        self._cursor: dict[Any, int] = {}
 
     def route(self, item: Any, key: str) -> str | None:
-        """Return the next consumer in the rotation."""
+        """Return the next consumer in this key's rotation."""
         if not self._consumers:
             return None
-        consumer = self._consumers[self._cursor % len(self._consumers)]
-        self._cursor += 1
-        self._assigned[consumer] += 1
+        counts = self.counts(key)
+        cursor = self._cursor.get(key, 0)
+        consumer = self._consumers[cursor % len(self._consumers)]
+        self._cursor[key] = cursor + 1
+        counts[consumer] += 1
         return consumer
 
 
@@ -213,11 +228,12 @@ class LeastLoadedDispatcher(_DealingDispatcher):
     """
 
     def route(self, item: Any, key: str) -> str | None:
-        """Return the least-loaded consumer."""
+        """Return the consumer least loaded on this key."""
         if not self._consumers:
             return None
-        consumer = min(self._consumers, key=lambda name: (self._assigned[name], name))
-        self._assigned[consumer] += 1
+        counts = self.counts(key)
+        consumer = min(self._consumers, key=lambda name: (counts[name], name))
+        counts[consumer] += 1
         return consumer
 
 
