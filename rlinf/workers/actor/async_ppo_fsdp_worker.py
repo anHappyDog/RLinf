@@ -16,7 +16,6 @@ import asyncio
 import os
 import queue
 import threading
-import time
 from typing import Any, Optional
 
 import numpy as np
@@ -99,11 +98,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     def _recv_rollout_thread_main(self, input_channel):
         while not self.should_stop:
-            try:
-                trajectory: Trajectory = input_channel.get_nowait()
-            except asyncio.QueueEmpty:
-                time.sleep(0.01)
-                continue
+            trajectory: Trajectory = input_channel.get()
             self.log_info(
                 f"recv trajectory versions.shape={trajectory.versions.shape} "
                 "from trajectory channel"
