@@ -105,15 +105,15 @@ intermediate Python ``bytes`` object.
 
    * - Codec
      - Characteristics
-     - Provider parameters
+     - Codec parameters
      - Choose it when
    * - ``lz4``
      - Prioritizes compression and decompression speed with relatively low CPU
        cost, usually at a lower compression ratio than Zstd.
      - ``acceleration`` controls LZ4 fast compression. Higher values favor speed
        and may reduce the compression ratio.
-     - CPU time matters or the link is only moderately bandwidth-bound. This is
-       the default codec.
+     - CPU time matters or the link is only moderately bandwidth-bound. Start
+       here.
    * - ``zstd``
      - Usually reduces wire bytes more than LZ4, with higher compression and
        decompression cost.
@@ -140,10 +140,9 @@ Configure Compression
          codec: lz4
          min_bytes: 16384
          excluded_dtypes: [float32]
-         params:
-           acceleration: 1
+         acceleration: 1
 
-For Zstd, select its provider and pass only Zstd parameters:
+For Zstd, select it with ``codec`` and pass only Zstd parameters:
 
 .. code-block:: yaml
 
@@ -154,9 +153,8 @@ For Zstd, select its provider and pass only Zstd parameters:
          codec: zstd
          min_bytes: 16384
          excluded_dtypes: [float32]
-         params:
-           level: 1
-           max_inflight: 4
+         level: 1
+         max_inflight: 4
 
 Omit ``tensor_compression`` or set ``enabled: false`` to use the original wire
 path. The compression options and defaults are:
@@ -172,8 +170,9 @@ path. The compression options and defaults are:
      - ``true``
      - Enables compression when the ``tensor_compression`` block is present.
    * - ``codec``
-     - ``lz4``
-     - Selects ``lz4`` or ``zstd``.
+     - required
+     - Selects the codec config that owns the rest of the block: ``lz4`` or
+       ``zstd``.
    * - ``min_bytes``
      - ``16384``
      - Skips tensors smaller than this raw byte count.
@@ -181,21 +180,20 @@ path. The compression options and defaults are:
      - ``[float32]``
      - Skips codec attempts for tensors whose dtype is listed. Set it to ``[]``
        to make every dtype eligible.
-   * - ``params``
+   * - codec parameters
      - codec-specific
-     - Configures only the selected provider. LZ4 accepts ``acceleration``
-       (default ``1``). Zstd accepts ``level`` (default ``1``) and
-       ``max_inflight`` (default ``4``). Parameters from another provider are
-       rejected.
+     - Declared by the selected codec and given in the same block. LZ4 accepts
+       ``acceleration`` (default ``1``). Zstd accepts ``level`` (default ``1``)
+       and ``max_inflight`` (default ``4``).
 
-``params`` must be a mapping nested under ``tensor_compression``. The provider
-contract is exact:
+``codec`` selects a codec configuration class, and only that class's parameters
+are accepted alongside it. The contract is exact:
 
-.. list-table:: Provider parameters
+.. list-table:: Codec parameters
    :header-rows: 1
    :widths: 16 20 14 50
 
-   * - Provider
+   * - Codec
      - Parameter
      - Default
      - Validation and behavior
@@ -218,12 +216,12 @@ contract is exact:
        raw transfer rather than waiting for a busy codec; a receiver waits for a
        codec after an already-compressed payload arrives.
 
-Provider parameters are not accepted as top-level compression options. For
-example, top-level ``level`` or ``max_inflight`` is invalid, and LZ4 rejects
-``max_inflight`` while Zstd rejects ``acceleration``. The driver validates and
-serializes the selected provider configuration once for all Workers; wire
-metadata therefore identifies the codec, while each receiver uses the same
-job-wide provider parameters.
+A codec only accepts its own parameters: LZ4 rejects ``max_inflight`` while
+Zstd rejects ``acceleration``, and both are reported like any other unknown
+``cluster`` key. The driver validates the block once as part of the cluster
+configuration, which then reaches every Worker; wire metadata therefore only
+has to identify the codec, since each receiver already holds the same job-wide
+parameters.
 
 ``tensor_buffer_pool`` is independent of ``tensor_compression``. Its
 ``max_bytes`` option limits the combined active and cached CPU buffer capacity

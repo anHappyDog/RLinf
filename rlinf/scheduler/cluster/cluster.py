@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import atexit
-import json
 import logging
 import os
 import re
@@ -35,7 +34,7 @@ from ray.actor import ActorHandle
 from ray.util.state import list_actors
 
 from ..hardware.accelerators.accelerator import ProfileConfig
-from .config import ClusterConfig
+from .config import ClusterConfig, CollectiveConfig
 from .node import NodeGroupInfo, NodeInfo, NodeProbe
 from .utils import DistributedRayLogCollector, without_http_proxies
 
@@ -108,9 +107,6 @@ class ClusterEnvVar(str, Enum):
     Set explicitly when workers do not share a filesystem with the launch node.
     """
 
-    COLLECTIVE_CONFIG = "COLLECTIVE_CONFIG"
-    """Serialized job-wide collective configuration."""
-
 
 class PathEnvMergeMode(str, Enum):
     """Merge mode for path-like worker env vars."""
@@ -140,7 +136,6 @@ class Cluster:
         ClusterEnvVar.NET_EMULATION: "0",
         ClusterEnvVar.PATH_ENV_MERGE_MODE: PathEnvMergeMode.APPEND.value,
         ClusterEnvVar.CODE_WORKING_DIR: "0",
-        ClusterEnvVar.COLLECTIVE_CONFIG: "{}",
     }
     PATH_LIKE_ENV_VARS = {
         "PYTHONPATH",
@@ -320,7 +315,6 @@ class Cluster:
         self._cluster_cfg = (
             ClusterConfig.from_dict_cfg(cluster_cfg) if cluster_cfg else None
         )
-        self._set_collective_env_vars(cluster_cfg)
         if (
             self._cluster_cfg is not None
             and num_nodes is not None
@@ -533,54 +527,11 @@ class Cluster:
             self._node_manager.get_nodes()
         )
         self._num_nodes = len(self._nodes)
-        collective_env_name = self.get_full_env_var_name(
-            ClusterEnvVar.COLLECTIVE_CONFIG
-        )
-        self._collective_env_vars = {
-            collective_env_name: self._nodes[0].env_vars[collective_env_name]
-        }
 
     @staticmethod
     def get_full_env_var_name(var: ClusterEnvVar) -> str:
         """Get the full environment variable name with system prefix."""
         return f"{Cluster.SYS_NAME.upper()}_{var.value}"
-
-    def _set_collective_env_vars(self, cluster_cfg: Optional[DictConfig]) -> None:
-        """Validate and serialize the job-wide collective configuration."""
-        from ..collective.tensor_buffer_pool import TensorBufferPoolOptions
-        from ..collective.tensor_compression import TensorCompressionOptions
-
-        option_types = {
-            "tensor_compression": TensorCompressionOptions,
-            "tensor_buffer_pool": TensorBufferPoolOptions,
-        }
-        collective_cfg = (
-            OmegaConf.select(cluster_cfg, "collective")
-            if cluster_cfg is not None
-            else None
-        )
-        collective = (
-            OmegaConf.to_container(collective_cfg, resolve=True)
-            if collective_cfg is not None
-            else {}
-        )
-        if not isinstance(collective, dict):
-            raise ValueError("cluster.collective must be a mapping.")
-
-        unknown = collective.keys() - option_types.keys()
-        if unknown:
-            raise ValueError(
-                f"Unsupported cluster.collective options: {sorted(unknown)}"
-            )
-
-        normalized = {}
-        for name, value in collective.items():
-            if not isinstance(value, dict):
-                raise ValueError(f"cluster.collective.{name} must be a mapping.")
-            normalized[name] = option_types[name].from_dict(value).to_dict()
-
-        env_name = self.get_full_env_var_name(ClusterEnvVar.COLLECTIVE_CONFIG)
-        self._collective_env_vars = {env_name: json.dumps(normalized, sort_keys=True)}
 
     def _set_scheduler_env_vars(self):
         """Set default environment variables for the system."""
@@ -594,7 +545,6 @@ class Cluster:
                     default_value := Cluster.DEFAULT_SYS_ENV_VAR[env_var]
                 ) is not None and env_var_name not in node.env_vars:
                     node.env_vars[env_var_name] = default_value
-            node.env_vars.update(self._collective_env_vars)
 
     @staticmethod
     def get_sys_env_var(
@@ -607,6 +557,16 @@ class Cluster:
     def num_nodes(self):
         """Get the number of nodes in the cluster."""
         return self._num_nodes
+
+    @property
+    def collective_config(self) -> Optional["CollectiveConfig"]:
+        """Get the job-wide collective configuration, if one was provided.
+
+        The configuration is validated once on the driver and reaches every
+        Worker with the rest of the :class:`ClusterConfig`, so both ends of a
+        collective agree on it by construction.
+        """
+        return self._cluster_cfg.collective if self._cluster_cfg is not None else None
 
     @property
     def num_accelerators(self):
@@ -714,10 +674,7 @@ class Cluster:
 
         if profiling_cfg.output_dir is None:
             output_dir = tempfile.gettempdir()
-
-            from rlinf.utils.logging import get_logger
-
-            get_logger().warning(
+            logging.getLogger(cls.SYS_NAME).warning(
                 f"Profiling is enabled for worker group '{worker_group_name}' but no "
                 f"output directory is configured. Reports will be saved to: {output_dir}."
             )
@@ -875,7 +832,6 @@ class Cluster:
                 merged_env_vars,
                 self._runtime_code_sync_strip_roots,
             )
-        merged_env_vars.update(self._collective_env_vars)
         runtime_env_worker = Cluster._combine_ray_runtime_env(
             Cluster._job_code_sync_fragment_for_child_runtime_env(
                 self._ray_code_sync_fragment

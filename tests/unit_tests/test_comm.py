@@ -994,7 +994,7 @@ def cluster():
                         "enabled": True,
                         "codec": "lz4",
                         "min_bytes": 1024,
-                        "params": {"acceleration": 1},
+                        "acceleration": 1,
                     }
                 },
             }

@@ -99,12 +99,12 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
 
    * - Codec
      - 特征
-     - Provider 参数
+     - Codec 参数
      - 适用情况
    * - ``lz4``
      - 优先保证压缩和解压缩速度，CPU 开销相对较低，但压缩率通常低于 Zstd。
      - ``acceleration`` 控制 LZ4 fast compression。值越高越偏向速度，并可能降低压缩率。
-     - CPU 时间敏感，或链路仅中度受限。它是默认 codec。
+     - CPU 时间敏感，或链路仅中度受限。可以从它开始。
    * - ``zstd``
      - 通常比 LZ4 减少更多 wire bytes，但压缩和解压缩开销更高。
      - ``level`` 控制压缩率与 CPU 的取舍；``max_inflight`` 限制并发复用的 context 数量。
@@ -128,10 +128,9 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
          codec: lz4
          min_bytes: 16384
          excluded_dtypes: [float32]
-         params:
-           acceleration: 1
+         acceleration: 1
 
-使用 Zstd 时，需要选择对应 provider，并且只传入 Zstd 参数：
+使用 Zstd 时，用 ``codec`` 选择它，并且只传入 Zstd 参数：
 
 .. code-block:: yaml
 
@@ -142,9 +141,8 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
          codec: zstd
          min_bytes: 16384
          excluded_dtypes: [float32]
-         params:
-           level: 1
-           max_inflight: 4
+         level: 1
+         max_inflight: 4
 
 省略 ``tensor_compression``，或设置 ``enabled: false``，即可使用原始 wire 路径。压缩
 选项及默认值如下：
@@ -160,8 +158,8 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
      - ``true``
      - 存在 ``tensor_compression`` 配置段时启用压缩。
    * - ``codec``
-     - ``lz4``
-     - 选择 ``lz4`` 或 ``zstd``。
+     - 必填
+     - 选择承载本段其余参数的 codec 配置：``lz4`` 或 ``zstd``。
    * - ``min_bytes``
      - ``16384``
      - 跳过 raw byte count 小于该值的 tensor。
@@ -169,19 +167,19 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
      - ``[float32]``
      - 跳过列表中 dtype 对应 tensor 的 codec attempt。设为 ``[]`` 可让所有 dtype
        都参与判断。
-   * - ``params``
+   * - codec 参数
      - 由 codec 决定
-     - 只配置当前选择的 provider。LZ4 接受 ``acceleration``\ （默认 ``1``）；Zstd
-       接受 ``level``\ （默认 ``1``）与 ``max_inflight``\ （默认 ``4``）。传入其他
-       provider 的参数会直接报错。
+     - 由所选 codec 声明，并写在同一段中。LZ4 接受 ``acceleration``\ （默认
+       ``1``）；Zstd 接受 ``level``\ （默认 ``1``）与 ``max_inflight``\ （默认
+       ``4``）。
 
-``params`` 必须是嵌套在 ``tensor_compression`` 下的 mapping。provider contract 如下：
+``codec`` 选择一个 codec 配置类，与之并列的参数也只接受该类声明的字段。契约如下：
 
-.. list-table:: Provider 参数
+.. list-table:: Codec 参数
    :header-rows: 1
    :widths: 16 20 14 50
 
-   * - Provider
+   * - Codec
      - 参数
      - 默认值
      - 校验与行为
@@ -201,10 +199,10 @@ shape。压缩和解压缩直接在 tensor 与预分配的 ``torch.uint8`` buffe
        可复用 Zstd codec 数量。codec 繁忙时 sender 不会等待，而是保持 raw transfer；已经
        收到 compressed payload 后，receiver 会等待 codec。
 
-provider 参数不能作为 compression 的顶层选项。例如，顶层 ``level`` 或
-``max_inflight`` 是非法配置；LZ4 会拒绝 ``max_inflight``，Zstd 会拒绝
-``acceleration``。driver 会校验所选 provider 的配置，并统一序列化给所有 Worker；因此
-wire metadata 只需标识 codec，receiver 使用相同的作业级 provider 参数。
+每种 codec 只接受自己的参数：LZ4 会拒绝 ``max_inflight``，Zstd 会拒绝
+``acceleration``，二者都与其他 ``cluster`` 配置项的未知键一样报错。driver 在解析
+cluster 配置时统一校验该配置段，并随之下发到所有 Worker；因此 wire metadata 只需标识
+codec，receiver 已经持有相同的作业级参数。
 
 ``tensor_buffer_pool`` 独立于 ``tensor_compression``。它的 ``max_bytes`` 限制单个
 Worker 内 active 与 cached CPU buffer 的总容量，默认值为 2 GiB。配置压缩但省略该段时，

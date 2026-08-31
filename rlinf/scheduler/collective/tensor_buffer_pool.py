@@ -16,49 +16,19 @@
 
 import threading
 from bisect import bisect_left, insort
-from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 
-
-@dataclass(frozen=True)
-class TensorBufferPoolOptions:
-    """Configure the Worker-wide collective tensor buffer pool."""
-
-    max_bytes: int = 2 * 1024**3
-
-    def __post_init__(self) -> None:
-        """Validate the buffer budget."""
-        if type(self.max_bytes) is not int:
-            raise ValueError("Maximum tensor buffer pool size must be an integer.")
-        if self.max_bytes < 1:
-            raise ValueError(
-                f"Maximum tensor buffer pool size must be >= 1, got {self.max_bytes}."
-            )
-
-    @classmethod
-    def from_dict(cls, config: dict[str, Any]) -> "TensorBufferPoolOptions":
-        """Build validated options from the public YAML mapping."""
-        unknown_keys = set(config) - {"max_bytes"}
-        if unknown_keys:
-            raise ValueError(
-                "Unsupported collective tensor buffer pool options: "
-                + ", ".join(sorted(unknown_keys))
-            )
-        return cls(**config)
-
-    def to_dict(self) -> dict[str, int]:
-        """Serialize BufferPool options for Worker propagation."""
-        return {"max_bytes": self.max_bytes}
+from ..cluster.config import TensorBufferPoolConfig
 
 
 class TensorBufferPool:
     """Share reusable CPU byte buffers within a fixed Worker memory budget."""
 
-    def __init__(self, options: TensorBufferPoolOptions) -> None:
-        """Create an empty buffer cache bounded by ``options.max_bytes``."""
-        self.options = options
+    def __init__(self, config: TensorBufferPoolConfig) -> None:
+        """Create an empty buffer cache bounded by ``config.max_bytes``."""
+        self.config = config
         self._allocated_bytes = 0
         self._cached_bytes = 0
         self._buffers_by_size: dict[int, list[torch.Tensor]] = {}
@@ -106,20 +76,20 @@ class TensorBufferPool:
     def try_acquire(self, capacity: int) -> Optional["BufferLease"]:
         """Acquire a best-fit buffer without exceeding the memory budget."""
         with self._lock:
-            if capacity > self.options.max_bytes:
+            if capacity > self.config.max_bytes:
                 return None
 
             best_index = bisect_left(self._available_sizes, capacity)
             if best_index < len(self._available_sizes) and (
                 self._available_sizes[best_index] <= capacity * 2
-                or self._allocated_bytes + capacity > self.options.max_bytes
+                or self._allocated_bytes + capacity > self.config.max_bytes
             ):
                 return BufferLease(self, self._pop_cached_buffer(best_index))
 
-            bytes_to_free = self._allocated_bytes + capacity - self.options.max_bytes
+            bytes_to_free = self._allocated_bytes + capacity - self.config.max_bytes
             if bytes_to_free > 0:
                 self._evict_cached_buffers(bytes_to_free)
-            if self._allocated_bytes + capacity > self.options.max_bytes:
+            if self._allocated_bytes + capacity > self.config.max_bytes:
                 return None
 
             buffer = torch.empty(capacity, dtype=torch.uint8, device="cpu")

@@ -1402,10 +1402,10 @@ class CollectiveGroup:
         self, tensor_data: TensorData
     ) -> tuple[TensorData, list[BufferLease]]:
         """Prepare eligible CPU tensors for transmission."""
-        options = self._worker._tensor_compression_options
+        config = self._worker._tensor_compression_config
         cpu_tensors = tensor_data.cpu_tensors
-        if options is None or not any(
-            options.should_compress(tensor) for tensor in cpu_tensors
+        if config is None or not any(
+            config.should_compress(tensor) for tensor in cpu_tensors
         ):
             return tensor_data, []
 
@@ -1419,7 +1419,7 @@ class CollectiveGroup:
         payload_buffers: list[BufferLease] = []
         try:
             for index, tensor in enumerate(cpu_tensors):
-                if not options.should_compress(tensor):
+                if not config.should_compress(tensor):
                     continue
 
                 tensor_bytes = tensor.numel() * tensor.element_size()
@@ -1454,7 +1454,7 @@ class CollectiveGroup:
             return tensor_data, []
 
         compression = TensorCompressionWireMetadata(
-            codec=options.codec,
+            codec=config.codec,
             compressed_numel=tuple(compressed_numel),
         )
         return (
@@ -2367,14 +2367,14 @@ class CollectiveGroup:
         if compression is not None:
             if not isinstance(compression, TensorCompressionWireMetadata):
                 raise ValueError("Invalid collective tensor compression metadata.")
-            options = self._worker._tensor_compression_options
-            if options is None or not options.enabled:
+            config = self._worker._tensor_compression_config
+            if config is None or not config.enabled:
                 raise ValueError(
                     "Received compressed tensors while tensor compression is disabled."
                 )
-            if compression.codec != options.codec:
+            if compression.codec != config.codec:
                 raise ValueError(
-                    f"Received {compression.codec} tensors with {options.codec} configured."
+                    f"Received {compression.codec} tensors with {config.codec} configured."
                 )
             compressed_numel = compression.compressed_numel
             if len(compressed_numel) != sum(cpu_tensor_mask):

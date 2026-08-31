@@ -15,7 +15,6 @@
 import ctypes
 import functools
 import inspect
-import json
 import logging
 import os
 import signal
@@ -484,9 +483,9 @@ class Worker(metaclass=WorkerMeta):
 
         # Setup communication envs
         self._setup_comm_envs()
+        self._setup_collective_resources()
 
         self._lock = threading.Lock()
-        self._setup_collective_resources()
         Worker.current_worker = self
         self._has_initialized = True
 
@@ -1535,51 +1534,48 @@ class Worker(metaclass=WorkerMeta):
                 )
 
     def _setup_collective_resources(self) -> None:
-        """Initialize Worker-wide collective resources."""
-        from rlinf.utils.tensor_codec import probe_tensor_codec_library
+        """Initialize Worker-wide collective resources.
 
-        from ..collective.tensor_buffer_pool import (
-            TensorBufferPool,
-            TensorBufferPoolOptions,
-        )
-        from ..collective.tensor_compression import TensorCompressionOptions
+        The collective configuration was validated once on the driver and
+        travels with the ``ClusterConfig``, so every Worker in the job resolves
+        the same settings and both ends of a transfer agree by construction.
+        """
+        from ..cluster.config import TensorBufferPoolConfig
+        from ..collective.tensor_buffer_pool import TensorBufferPool
+        from ..collective.tensor_compression import probe_tensor_codec_library
 
-        config = json.loads(
-            Cluster.get_sys_env_var(ClusterEnvVar.COLLECTIVE_CONFIG, "{}")
-        )
-        compression_config = config.get("tensor_compression")
-        self._tensor_compression_options = (
-            TensorCompressionOptions.from_dict(compression_config)
-            if compression_config is not None
+        collective_config = Cluster().collective_config
+        self._tensor_compression_config = (
+            collective_config.tensor_compression
+            if collective_config is not None
             else None
         )
         self._tensor_buffer_pool = TensorBufferPool(
-            TensorBufferPoolOptions.from_dict(config.get("tensor_buffer_pool", {}))
+            collective_config.tensor_buffer_pool
+            if collective_config is not None
+            else TensorBufferPoolConfig()
         )
         self._tensor_codec_provider = None
+        self._tensor_codec_provider_lock = threading.Lock()
 
         if (
-            self._tensor_compression_options is not None
-            and self._tensor_compression_options.enabled
+            self._tensor_compression_config is not None
+            and self._tensor_compression_config.enabled
         ):
-            probe_tensor_codec_library(self._tensor_compression_options.codec)
+            probe_tensor_codec_library(self._tensor_compression_config.codec)
 
     def _get_tensor_codec_provider(self) -> "TensorCodecProvider":
         """Return the lazily initialized Worker-wide codec provider."""
         if self._tensor_codec_provider is not None:
             return self._tensor_codec_provider
 
-        options = self._tensor_compression_options
-        if options is None or not options.enabled:
+        config = self._tensor_compression_config
+        if config is None or not config.enabled:
             raise ValueError("Tensor compression is not enabled for this Worker.")
 
-        from ..collective.tensor_compression import create_tensor_codec_provider
-
-        with self._lock:
+        with self._tensor_codec_provider_lock:
             if self._tensor_codec_provider is None:
-                self._tensor_codec_provider = create_tensor_codec_provider(
-                    options.provider
-                )
+                self._tensor_codec_provider = config.create_codec_provider()
         return self._tensor_codec_provider
 
     def _setup_logging(self):

@@ -12,185 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Codec-specific acquisition policies for collective tensor compression."""
+"""Codecs available to collective tensor compression.
 
+Each codec contributes three pieces, kept together below: the codec itself,
+which drives a system compression library through ``ctypes``; a configuration
+class registered under its ``CODEC_TYPE`` so that
+``cluster.collective.tensor_compression.codec`` selects it; and a provider that
+owns the codec's runtime resources and their concurrent acquisition policy.
+"""
+
+import ctypes
+import ctypes.util
+import weakref
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from queue import Empty, LifoQueue
-from typing import Any, ClassVar, Literal, Optional, TypeAlias
+from typing import ClassVar, Literal, Optional
 
 import torch
 
-from rlinf.utils.tensor_codec import LZ4TensorCodec, TensorCodec, ZstdTensorCodec
-
-
-@dataclass(frozen=True)
-class LZ4CodecProviderOptions:
-    """Configure the stateless Worker-wide LZ4 provider."""
-
-    codec_name: ClassVar[Literal["lz4"]] = "lz4"
-    acceleration: int = 1
-
-    def __post_init__(self) -> None:
-        """Validate LZ4 provider parameters."""
-        if type(self.acceleration) is not int:
-            raise ValueError("LZ4 acceleration must be an integer.")
-        if self.acceleration < 1:
-            raise ValueError(f"LZ4 acceleration must be >= 1, got {self.acceleration}.")
-
-    @classmethod
-    def from_dict(cls, params: dict[str, Any]) -> "LZ4CodecProviderOptions":
-        """Build LZ4 options from its provider-specific parameters."""
-        unknown_keys = set(params) - {"acceleration"}
-        if unknown_keys:
-            raise ValueError(
-                "Unsupported LZ4 provider parameters: "
-                + ", ".join(sorted(unknown_keys))
-            )
-        return cls(**params)
-
-    def to_dict(self) -> dict[str, int]:
-        """Serialize LZ4 provider parameters."""
-        return {"acceleration": self.acceleration}
-
-
-@dataclass(frozen=True)
-class ZstdCodecProviderOptions:
-    """Configure the bounded Worker-wide Zstd context pool."""
-
-    codec_name: ClassVar[Literal["zstd"]] = "zstd"
-    level: int = 1
-    max_inflight: int = 4
-
-    def __post_init__(self) -> None:
-        """Validate Zstd provider parameters."""
-        if type(self.level) is not int:
-            raise ValueError("Zstd level must be an integer.")
-        if self.level < 1:
-            raise ValueError(f"Zstd level must be >= 1, got {self.level}.")
-        if type(self.max_inflight) is not int:
-            raise ValueError("Zstd maximum inflight contexts must be an integer.")
-        if self.max_inflight < 1:
-            raise ValueError(
-                f"Zstd maximum inflight contexts must be >= 1, got {self.max_inflight}."
-            )
-
-    @classmethod
-    def from_dict(cls, params: dict[str, Any]) -> "ZstdCodecProviderOptions":
-        """Build Zstd options from its provider-specific parameters."""
-        unknown_keys = set(params) - {"level", "max_inflight"}
-        if unknown_keys:
-            raise ValueError(
-                "Unsupported Zstd provider parameters: "
-                + ", ".join(sorted(unknown_keys))
-            )
-        return cls(**params)
-
-    def to_dict(self) -> dict[str, int]:
-        """Serialize Zstd provider parameters."""
-        return {"level": self.level, "max_inflight": self.max_inflight}
-
-
-CodecProviderOptions: TypeAlias = LZ4CodecProviderOptions | ZstdCodecProviderOptions
-
-
-@dataclass(frozen=True)
-class TensorCompressionOptions:
-    """Configure optional CPU tensor compression for a collective send."""
-
-    enabled: bool = True
-    min_bytes: int = 16 * 1024
-    excluded_dtypes: tuple[str, ...] = ("float32",)
-    provider: CodecProviderOptions = field(default_factory=LZ4CodecProviderOptions)
-    _excluded_dtype_values: frozenset[torch.dtype] = field(
-        init=False, repr=False, compare=False
-    )
-
-    @property
-    def codec(self) -> Literal["lz4", "zstd"]:
-        """Return the selected provider name."""
-        return self.provider.codec_name
-
-    def __post_init__(self) -> None:
-        """Validate compression settings."""
-        if not isinstance(self.enabled, bool):
-            raise ValueError("Compression enabled must be a boolean.")
-        if type(self.min_bytes) is not int:
-            raise ValueError("Minimum compression size must be an integer.")
-        if self.min_bytes < 1:
-            raise ValueError(
-                f"Minimum compression size must be >= 1, got {self.min_bytes}."
-            )
-        if not isinstance(self.excluded_dtypes, (list, tuple)):
-            raise ValueError("Excluded tensor dtypes must be a list.")
-        if not isinstance(
-            self.provider, (LZ4CodecProviderOptions, ZstdCodecProviderOptions)
-        ):
-            raise ValueError("Compression provider options have an unsupported type.")
-
-        dtype_names = tuple(self.excluded_dtypes)
-        if len(set(dtype_names)) != len(dtype_names):
-            raise ValueError("Excluded tensor dtypes must not contain duplicates.")
-        dtype_values = []
-        for name in dtype_names:
-            dtype = getattr(torch, name, None) if isinstance(name, str) else None
-            if not isinstance(dtype, torch.dtype) or str(dtype) != f"torch.{name}":
-                raise ValueError(f"Unsupported excluded tensor dtype: {name!r}.")
-            dtype_values.append(dtype)
-        object.__setattr__(self, "excluded_dtypes", dtype_names)
-        object.__setattr__(self, "_excluded_dtype_values", frozenset(dtype_values))
-
-    @classmethod
-    def from_dict(cls, config: dict[str, Any]) -> "TensorCompressionOptions":
-        """Build validated options from the ``cluster.collective`` YAML mapping."""
-        valid_keys = {
-            "enabled",
-            "codec",
-            "min_bytes",
-            "excluded_dtypes",
-            "params",
-        }
-        unknown_keys = set(config) - valid_keys
-        if unknown_keys:
-            raise ValueError(
-                "Unsupported collective tensor compression options: "
-                + ", ".join(sorted(unknown_keys))
-            )
-        codec = config.get("codec", "lz4")
-        params = config.get("params", {})
-        if not isinstance(params, dict):
-            raise ValueError("Tensor codec provider params must be a mapping.")
-        if codec == "lz4":
-            provider = LZ4CodecProviderOptions.from_dict(params)
-        elif codec == "zstd":
-            provider = ZstdCodecProviderOptions.from_dict(params)
-        else:
-            raise ValueError(f"Unsupported tensor codec: {codec!r}.")
-        return cls(
-            enabled=config.get("enabled", True),
-            min_bytes=config.get("min_bytes", 16 * 1024),
-            excluded_dtypes=config.get("excluded_dtypes", ["float32"]),
-            provider=provider,
-        )
-
-    def should_compress(self, tensor: torch.Tensor) -> bool:
-        """Return whether a CPU tensor is eligible for a codec attempt."""
-        return (
-            self.enabled
-            and tensor.is_cpu
-            and tensor.dtype not in self._excluded_dtype_values
-            and tensor.numel() * tensor.element_size() >= self.min_bytes
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize the validated configuration for Worker propagation."""
-        return {
-            "enabled": self.enabled,
-            "codec": self.codec,
-            "min_bytes": self.min_bytes,
-            "excluded_dtypes": list(self.excluded_dtypes),
-            "params": self.provider.to_dict(),
-        }
+from ..cluster.config import TensorCompressionConfig, TensorCompressionManager
 
 
 @dataclass(frozen=True)
@@ -199,6 +40,27 @@ class TensorCompressionWireMetadata:
 
     codec: Literal["lz4", "zstd"]
     compressed_numel: tuple[Optional[int], ...]
+
+
+class TensorCodec(ABC):
+    """Compress tensors into preallocated uint8 tensors without Python bytes."""
+
+    @abstractmethod
+    def compress_bound(self, source_bytes: int) -> int | None:
+        """Return worst-case capacity, or ``None`` when the input is unsupported."""
+
+    @abstractmethod
+    def compress_into(self, source: torch.Tensor, destination: torch.Tensor) -> int:
+        """Compress source into destination and return the encoded byte count."""
+
+    @abstractmethod
+    def decompress_into(
+        self,
+        source: torch.Tensor,
+        compressed_bytes: int,
+        destination: torch.Tensor,
+    ) -> None:
+        """Decompress source directly into destination."""
 
 
 class TensorCodecProvider(ABC):
@@ -219,14 +81,133 @@ class TensorCodecProvider(ABC):
         """Release a previously acquired codec."""
 
 
+class LZ4TensorCodec(TensorCodec):
+    """LZ4-fast tensor codec backed by the system liblz4 library."""
+
+    _MAX_INPUT_SIZE = 0x7E000000
+
+    def __init__(self, acceleration: int = 1) -> None:
+        """Bind the system liblz4 entry points used by this codec."""
+        if acceleration <= 0:
+            raise ValueError("LZ4 acceleration must be positive.")
+        self.acceleration = acceleration
+        self._library = _load_library("lz4")
+        self._library.LZ4_compressBound.argtypes = [ctypes.c_int]
+        self._library.LZ4_compressBound.restype = ctypes.c_int
+        self._library.LZ4_compress_fast.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self._library.LZ4_compress_fast.restype = ctypes.c_int
+        self._library.LZ4_decompress_safe.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self._library.LZ4_decompress_safe.restype = ctypes.c_int
+
+    def compress_bound(self, source_bytes: int) -> int | None:
+        """Return worst-case capacity, or ``None`` past LZ4's input-size limit."""
+        if not 0 <= source_bytes <= self._MAX_INPUT_SIZE:
+            return None
+        return int(self._library.LZ4_compressBound(source_bytes))
+
+    def compress_into(self, source: torch.Tensor, destination: torch.Tensor) -> int:
+        """Compress source into destination and return the encoded byte count."""
+        source_bytes = _tensor_bytes(source, "source")
+        destination_bytes = _byte_tensor(destination, "destination")
+        required_bytes = self.compress_bound(source_bytes)
+        if required_bytes is None:
+            raise ValueError(f"LZ4 does not support source size {source_bytes}.")
+        if destination_bytes < required_bytes:
+            raise ValueError(
+                f"LZ4 destination requires {required_bytes} bytes, got "
+                f"{destination_bytes}."
+            )
+        if source_bytes == 0:
+            return 0
+        compressed_bytes = self._library.LZ4_compress_fast(
+            source.data_ptr(),
+            destination.data_ptr(),
+            source_bytes,
+            destination_bytes,
+            self.acceleration,
+        )
+        if compressed_bytes <= 0:
+            raise RuntimeError("LZ4 compression failed.")
+        return int(compressed_bytes)
+
+    def decompress_into(
+        self,
+        source: torch.Tensor,
+        compressed_bytes: int,
+        destination: torch.Tensor,
+    ) -> None:
+        """Restore source into destination, which must be exactly the raw size."""
+        source_capacity = _byte_tensor(source, "source")
+        destination_bytes = _tensor_bytes(destination, "destination")
+        _validate_compressed_size(compressed_bytes, source_capacity)
+        if compressed_bytes == 0 and destination_bytes == 0:
+            return
+        restored_bytes = self._library.LZ4_decompress_safe(
+            source.data_ptr(),
+            destination.data_ptr(),
+            compressed_bytes,
+            destination_bytes,
+        )
+        if restored_bytes < 0:
+            raise RuntimeError("LZ4 decompression detected invalid compressed data.")
+        if restored_bytes != destination_bytes:
+            raise ValueError(
+                f"LZ4 restored {restored_bytes} bytes, expected {destination_bytes}."
+            )
+
+
+@TensorCompressionManager.register_codec_config
+@dataclass
+class LZ4CompressionConfig(TensorCompressionConfig):
+    """LZ4 codec configuration.
+
+    LZ4 favors codec speed over compression ratio and is stateless, so one codec
+    is shared by all of a Worker's threads without an acquisition limit.
+    """
+
+    CODEC_TYPE: ClassVar[str] = "lz4"
+
+    acceleration: int = 1
+    """LZ4 fast-compression acceleration. Higher trades ratio for speed."""
+
+    def __post_init__(self):
+        """Validate the LZ4 parameters."""
+        super().__post_init__()
+        if type(self.acceleration) is not int:
+            raise ValueError(
+                "cluster.collective.tensor_compression.acceleration must be an "
+                f"integer. But got {type(self.acceleration)}: {self.acceleration}"
+            )
+        if self.acceleration < 1:
+            raise ValueError(
+                "cluster.collective.tensor_compression.acceleration must be >= 1, "
+                f"got {self.acceleration}."
+            )
+
+    def create_codec_provider(self) -> "LZ4CodecProvider":
+        """Create the shared-codec provider for LZ4."""
+        return LZ4CodecProvider(self)
+
+
 class LZ4CodecProvider(TensorCodecProvider):
     """Share one stateless LZ4 codec across Worker threads."""
 
-    codec_name = LZ4CodecProviderOptions.codec_name
+    codec_name = LZ4CompressionConfig.CODEC_TYPE
 
-    def __init__(self, options: LZ4CodecProviderOptions) -> None:
+    def __init__(self, config: LZ4CompressionConfig) -> None:
         """Create the shared LZ4 codec."""
-        self._codec = LZ4TensorCodec(acceleration=options.acceleration)
+        self._codec = LZ4TensorCodec(acceleration=config.acceleration)
 
     def try_acquire_compressor(self) -> TensorCodec:
         """Return the shared codec without blocking."""
@@ -241,16 +222,170 @@ class LZ4CodecProvider(TensorCodecProvider):
         pass
 
 
+class ZstdTensorCodec(TensorCodec):
+    """Zstandard tensor codec with reusable native contexts.
+
+    One instance must not be used concurrently by multiple threads.
+    """
+
+    def __init__(self, level: int = 1) -> None:
+        """Bind the system libzstd entry points and allocate native contexts."""
+        if type(level) is not int or level < 1:
+            raise ValueError("Zstd compression level must be a positive integer.")
+        self.level = level
+        self._library = _load_library("zstd")
+        self._library.ZSTD_compressBound.argtypes = [ctypes.c_size_t]
+        self._library.ZSTD_compressBound.restype = ctypes.c_size_t
+        self._library.ZSTD_createCCtx.restype = ctypes.c_void_p
+        self._library.ZSTD_freeCCtx.argtypes = [ctypes.c_void_p]
+        self._library.ZSTD_compressCCtx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        self._library.ZSTD_compressCCtx.restype = ctypes.c_size_t
+        self._library.ZSTD_createDCtx.restype = ctypes.c_void_p
+        self._library.ZSTD_freeDCtx.argtypes = [ctypes.c_void_p]
+        self._library.ZSTD_decompressDCtx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        self._library.ZSTD_decompressDCtx.restype = ctypes.c_size_t
+        self._library.ZSTD_isError.argtypes = [ctypes.c_size_t]
+        self._library.ZSTD_isError.restype = ctypes.c_uint
+        self._library.ZSTD_getErrorName.argtypes = [ctypes.c_size_t]
+        self._library.ZSTD_getErrorName.restype = ctypes.c_char_p
+        self._compression_context = self._library.ZSTD_createCCtx()
+        self._decompression_context = self._library.ZSTD_createDCtx()
+        if not self._compression_context or not self._decompression_context:
+            raise RuntimeError("Zstd failed to allocate codec contexts.")
+        self._compression_finalizer = weakref.finalize(
+            self, self._library.ZSTD_freeCCtx, self._compression_context
+        )
+        self._decompression_finalizer = weakref.finalize(
+            self, self._library.ZSTD_freeDCtx, self._decompression_context
+        )
+
+    def compress_bound(self, source_bytes: int) -> int | None:
+        """Return worst-case capacity, or ``None`` for a negative size."""
+        if source_bytes < 0:
+            return None
+        return int(self._library.ZSTD_compressBound(source_bytes))
+
+    def compress_into(self, source: torch.Tensor, destination: torch.Tensor) -> int:
+        """Compress source into destination and return the encoded byte count."""
+        source_bytes = _tensor_bytes(source, "source")
+        destination_bytes = _byte_tensor(destination, "destination")
+        required_bytes = self.compress_bound(source_bytes)
+        if required_bytes is None:
+            raise ValueError(f"Zstd does not support source size {source_bytes}.")
+        if destination_bytes < required_bytes:
+            raise ValueError(
+                f"Zstd destination requires {required_bytes} bytes, got "
+                f"{destination_bytes}."
+            )
+        compressed_bytes = self._library.ZSTD_compressCCtx(
+            self._compression_context,
+            destination.data_ptr(),
+            destination_bytes,
+            source.data_ptr(),
+            source_bytes,
+            self.level,
+        )
+        self._check_result(compressed_bytes, "compression")
+        return int(compressed_bytes)
+
+    def decompress_into(
+        self,
+        source: torch.Tensor,
+        compressed_bytes: int,
+        destination: torch.Tensor,
+    ) -> None:
+        """Restore source into destination, which must be exactly the raw size."""
+        source_capacity = _byte_tensor(source, "source")
+        destination_bytes = _tensor_bytes(destination, "destination")
+        _validate_compressed_size(compressed_bytes, source_capacity)
+        restored_bytes = self._library.ZSTD_decompressDCtx(
+            self._decompression_context,
+            destination.data_ptr(),
+            destination_bytes,
+            source.data_ptr(),
+            compressed_bytes,
+        )
+        self._check_result(restored_bytes, "decompression")
+        if restored_bytes != destination_bytes:
+            raise ValueError(
+                f"Zstd restored {restored_bytes} bytes, expected {destination_bytes}."
+            )
+
+    def _check_result(self, result: int, operation: str) -> None:
+        if self._library.ZSTD_isError(result):
+            error = self._library.ZSTD_getErrorName(result).decode()
+            raise RuntimeError(f"Zstd {operation} failed: {error}.")
+
+
+@TensorCompressionManager.register_codec_config
+@dataclass
+class ZstdCompressionConfig(TensorCompressionConfig):
+    """Zstandard codec configuration.
+
+    Zstd usually reduces wire bytes more than LZ4 at a higher codec cost, and
+    its native contexts are stateful, so ``max_inflight`` of them are leased
+    exclusively within each Worker.
+    """
+
+    CODEC_TYPE: ClassVar[str] = "zstd"
+
+    level: int = 1
+    """Zstd compression level. Higher spends more CPU for a better ratio."""
+
+    max_inflight: int = 4
+    """Reusable Zstd contexts per Worker, shared by compression and decompression."""
+
+    def __post_init__(self):
+        """Validate the Zstd parameters."""
+        super().__post_init__()
+        if type(self.level) is not int:
+            raise ValueError(
+                "cluster.collective.tensor_compression.level must be an integer. "
+                f"But got {type(self.level)}: {self.level}"
+            )
+        if self.level < 1:
+            raise ValueError(
+                f"cluster.collective.tensor_compression.level must be >= 1, got {self.level}."
+            )
+        if type(self.max_inflight) is not int:
+            raise ValueError(
+                "cluster.collective.tensor_compression.max_inflight must be an "
+                f"integer. But got {type(self.max_inflight)}: {self.max_inflight}"
+            )
+        if self.max_inflight < 1:
+            raise ValueError(
+                "cluster.collective.tensor_compression.max_inflight must be >= 1, "
+                f"got {self.max_inflight}."
+            )
+
+    def create_codec_provider(self) -> "ZstdCodecProvider":
+        """Create the bounded context-pool provider for Zstd."""
+        return ZstdCodecProvider(self)
+
+
 class ZstdCodecProvider(TensorCodecProvider):
     """Bound concurrent use of reusable Zstd codec contexts."""
 
-    codec_name = ZstdCodecProviderOptions.codec_name
+    codec_name = ZstdCompressionConfig.CODEC_TYPE
 
-    def __init__(self, options: ZstdCodecProviderOptions) -> None:
+    def __init__(self, config: ZstdCompressionConfig) -> None:
         """Create the bounded Zstd codec queue."""
-        self._codecs: LifoQueue[TensorCodec] = LifoQueue(maxsize=options.max_inflight)
-        for _ in range(options.max_inflight):
-            self._codecs.put_nowait(ZstdTensorCodec(level=options.level))
+        self._codecs: LifoQueue[TensorCodec] = LifoQueue(maxsize=config.max_inflight)
+        for _ in range(config.max_inflight):
+            self._codecs.put_nowait(ZstdTensorCodec(level=config.level))
 
     def try_acquire_compressor(self) -> Optional[TensorCodec]:
         """Return an available codec without blocking."""
@@ -268,12 +403,44 @@ class ZstdCodecProvider(TensorCodecProvider):
         self._codecs.put_nowait(codec)
 
 
-def create_tensor_codec_provider(
-    options: CodecProviderOptions,
-) -> TensorCodecProvider:
-    """Create the runtime provider for validated codec options."""
-    if isinstance(options, LZ4CodecProviderOptions):
-        return LZ4CodecProvider(options)
-    if isinstance(options, ZstdCodecProviderOptions):
-        return ZstdCodecProvider(options)
-    raise ValueError(f"Unsupported tensor codec provider options: {options!r}.")
+def probe_tensor_codec_library(codec: str) -> None:
+    """Check that a configured codec's system library can be loaded.
+
+    Args:
+        codec (str): The registered codec name, whose system library shares it.
+
+    Raises:
+        ValueError: The codec is not registered.
+    """
+    if codec not in TensorCompressionManager.codec_config_register:
+        raise ValueError(f"Unsupported tensor codec: {codec!r}.")
+    _load_library(codec)
+
+
+def _load_library(name: str) -> ctypes.CDLL:
+    library_path = ctypes.util.find_library(name)
+    if library_path is None:
+        raise RuntimeError(f"System lib{name} is not available.")
+    return ctypes.CDLL(library_path)
+
+
+def _tensor_bytes(tensor: torch.Tensor, name: str) -> int:
+    if tensor.device.type != "cpu":
+        raise ValueError(f"{name} must be a CPU tensor.")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous.")
+    return tensor.numel() * tensor.element_size()
+
+
+def _byte_tensor(tensor: torch.Tensor, name: str) -> int:
+    size = _tensor_bytes(tensor, name)
+    if tensor.dtype != torch.uint8:
+        raise ValueError(f"{name} must have dtype torch.uint8.")
+    return size
+
+
+def _validate_compressed_size(compressed_bytes: int, capacity: int) -> None:
+    if not 0 <= compressed_bytes <= capacity:
+        raise ValueError(
+            f"Compressed size must be in [0, {capacity}], got {compressed_bytes}."
+        )
