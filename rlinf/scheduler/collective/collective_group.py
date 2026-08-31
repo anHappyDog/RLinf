@@ -18,7 +18,7 @@ import logging
 import threading
 import time
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, is_dataclass, replace
 from pickle import Pickler, Unpickler
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Iterable, Optional
