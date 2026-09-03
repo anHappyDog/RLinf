@@ -182,6 +182,7 @@ def compute_ppo_actor_loss(
     clip_log_ratio_min: Optional[float] = None,
     clip_log_ratio_max: Optional[float] = None,
     fast_path_zero_loss_mask: Optional[bool] = False,
+    sample_weights: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, dict]:
     """
@@ -264,12 +265,16 @@ def compute_ppo_actor_loss(
     else:
         dual_clip_mask = torch.zeros_like(clip_mask)
 
-    metric_policy_loss_abs = loss_agg_func(
-        policy_loss.abs(), loss_mask, loss_mask_ratio
-    )
-    policy_loss = loss_agg_func(
-        policy_loss, loss_mask, loss_mask_ratio
-    )  # default max_episode_steps is None
+    if sample_weights is not None:
+        metric_policy_loss_abs = (policy_loss.abs() * loss_mask * sample_weights).mean()
+        policy_loss = (policy_loss * loss_mask * sample_weights).mean()
+    else:
+        metric_policy_loss_abs = loss_agg_func(
+            policy_loss.abs(), loss_mask, loss_mask_ratio
+        )
+        policy_loss = loss_agg_func(
+            policy_loss, loss_mask, loss_mask_ratio
+        )  # default max_episode_steps is None
 
     clip_mask = policy_loss1.detach() < policy_loss2.detach()
     dual_clip_mask = (dual_clip_mask * loss_mask).bool()
@@ -321,6 +326,7 @@ def compute_ppo_critic_loss(
     loss_mask: Optional[torch.Tensor] = None,
     max_episode_steps: Optional[int] = None,
     loss_mask_sum: Optional[torch.Tensor] = None,
+    sample_weights: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, dict]:
     """
@@ -358,7 +364,10 @@ def compute_ppo_critic_loss(
         returns - value_pred_clipped, huber_delta
     )  # [bsz, ] | [bsz, chunk-step]
     value_loss = torch.max(value_loss_original, value_loss_clipped)
-    value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
+    if sample_weights is not None:
+        value_loss = (value_loss * loss_mask * sample_weights).mean()
+    else:
+        value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
 
     value_clip_indicator = (value_pred_clipped - prev_values).abs() > value_clip
     value_clip_ratio = value_clip_indicator.float().mean()

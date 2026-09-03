@@ -466,7 +466,7 @@ def validate_model_cfg_by_hf_config(cfg, hf_model_path):
     return cfg
 
 
-def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
+def validate_fsdp_cfg(cfg: DictConfig, world_size: int | None = None) -> DictConfig:
     def validate_amp_cfg(config: DictConfig) -> DictConfig:
         """Validate AMP configuration and ensure mutual exclusivity with FSDP mixed_precision."""
 
@@ -516,6 +516,40 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
         cfg.fsdp_config.sharding_strategy = cfg.fsdp_config.get(
             "sharding_strategy", "full_shard"
         )
+        supported_sharding_strategies = {
+            "full_shard",
+            "shard_grad_op",
+            "hybrid_shard",
+            "no_shard",
+        }
+        assert cfg.fsdp_config.sharding_strategy in supported_sharding_strategies, (
+            "fsdp_config.sharding_strategy must be one of "
+            f"{sorted(supported_sharding_strategies)}"
+        )
+
+        cfg.fsdp_config.hybrid_shard_size = cfg.fsdp_config.get(
+            "hybrid_shard_size", None
+        )
+        if cfg.fsdp_config.sharding_strategy == "hybrid_shard":
+            assert cfg.fsdp_config.strategy == "fsdp", (
+                "hybrid_shard currently requires fsdp_config.strategy='fsdp'"
+            )
+            assert (
+                type(cfg.fsdp_config.hybrid_shard_size) is int
+                and cfg.fsdp_config.hybrid_shard_size > 0
+            ), (
+                "fsdp_config.hybrid_shard_size must be a positive integer when "
+                "sharding_strategy='hybrid_shard'"
+            )
+            if world_size is not None:
+                assert world_size % cfg.fsdp_config.hybrid_shard_size == 0, (
+                    f"FSDP world size {world_size} must be divisible by "
+                    "fsdp_config.hybrid_shard_size "
+                    f"({cfg.fsdp_config.hybrid_shard_size})"
+                )
+                assert world_size // cfg.fsdp_config.hybrid_shard_size >= 2, (
+                    "hybrid_shard requires at least two replica groups"
+                )
 
         cfg.fsdp_config.forward_prefetch = cfg.fsdp_config.get(
             "forward_prefetch", False
@@ -992,8 +1026,8 @@ def validate_embodied_cfg(cfg):
                 )
 
     if not only_eval and cfg.runner.get("use_training_pipeline", False):
-        assert cfg.algorithm.adv_type == "gae", (
-            "algorithm.adv_type only supports 'gae' now"
+        assert cfg.algorithm.adv_type in ("gae", "subtask_gae"), (
+            "algorithm.adv_type only supports 'gae' and 'subtask_gae' now"
             "when runner.use_training_pipeline is True."
         )
 
@@ -1180,6 +1214,50 @@ def validate_embodied_cfg(cfg):
                 assert cfg.env.train.base_config_name == "r1pro_behavior", (
                     f"Only r1pro_behavior is supported for omnigibson, got {cfg.env.train.base_config_name}"
                 )
+                if OmegaConf.select(cfg.env.train, "subpool.enabled", default=False):
+                    assert cfg.env.train.get("num_env_subprocess", 1) == 1, (
+                        "BEHAVIOR subpool RL requires num_env_subprocess=1."
+                    )
+                    assert not cfg.env.train.get(
+                        "skip_intermediate_obs_in_chunk", False
+                    ), (
+                        "BEHAVIOR subpool RL requires "
+                        "skip_intermediate_obs_in_chunk=false."
+                    )
+                    assert not cfg.env.train.auto_reset, (
+                        "BEHAVIOR subpool RL requires auto_reset=false."
+                    )
+                    assert not cfg.env.train.get("enable_offload", False), (
+                        "BEHAVIOR subpool RL requires env.train.enable_offload=false."
+                    )
+                    assert cfg.env.train.get("renderer_mode", "rlinf") == "official", (
+                        "BEHAVIOR subpool RL requires env.train.renderer_mode=official."
+                    )
+                    assert cfg.rollout.pipeline_stage_num == 1, (
+                        "BEHAVIOR subpool RL requires rollout.pipeline_stage_num=1."
+                    )
+                    assert not cfg.runner.get("use_training_pipeline", False), (
+                        "BEHAVIOR subpool RL disables use_training_pipeline so "
+                        "advantages can be normalized per subtask over the full batch."
+                    )
+                    assert cfg.algorithm.adv_type == "subtask_gae", (
+                        "BEHAVIOR subpool RL requires algorithm.adv_type=subtask_gae."
+                    )
+                    assert cfg.algorithm.reward_type == "subtask_chunk_level", (
+                        "BEHAVIOR subpool RL requires "
+                        "algorithm.reward_type=subtask_chunk_level."
+                    )
+                    assert cfg.algorithm.logprob_type == "chunk_level", (
+                        "BEHAVIOR subpool RL requires "
+                        "algorithm.logprob_type=chunk_level."
+                    )
+                    assert not cfg.algorithm.get("filter_rewards", False), (
+                        "BEHAVIOR subpool RL disables reward filtering because it "
+                        "would selectively remove low-return subtasks."
+                    )
+                    assert cfg.algorithm.get("normalize_advantages", True), (
+                        "BEHAVIOR subpool RL requires taskwise advantage normalization."
+                    )
     return cfg
 
 
@@ -1561,7 +1639,7 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
         ), (
             f"actor.global_batch_size ({cfg.actor.global_batch_size}) must be divisible by (actor.micro_batch_size ({cfg.actor.micro_batch_size}) * actor_world_size ({actor_world_size}))"
         )
-        cfg.actor = validate_fsdp_cfg(cfg.actor)
+        cfg.actor = validate_fsdp_cfg(cfg.actor, world_size=actor_world_size)
 
     if cfg.get("critic", None) is not None:
         if cfg.critic.use_critic_model and cfg.critic.training_backend == "megatron":

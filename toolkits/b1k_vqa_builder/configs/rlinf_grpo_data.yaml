@@ -1,0 +1,23 @@
+# Merge this data block into an RLinf VLM GRPO configuration.
+data:
+  type: vlm
+  dataset_name: robo2vlm
+  train_data_paths:
+    - /mnt/public/daibo/results/b1k_vqa_v01/dataset/train
+  val_data_paths:
+    - /mnt/public/daibo/results/b1k_vqa_v01/dataset/validation
+  prompt_key: question
+  choice_key: choices
+  answer_key: correct_answer
+  solution_key: solution
+  image_keys: [image]
+  use_chat_template: true
+  max_prompt_length: 1024
+  lazy_loading: true
+
+reward:
+  reward_type: vqa
+  reward_weights:
+    qa_accuracy: 1.0
+    think_format: 0.0
+    answer_format: 0.0

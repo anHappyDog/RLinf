@@ -59,6 +59,15 @@ warnings.filterwarnings(
 )
 
 
+def _get_grad_norm_process_group(device_mesh):
+    """Return the non-replicated group used to aggregate sharded gradients."""
+    if "shard" in device_mesh.mesh_dim_names:
+        return device_mesh["shard"].get_group()
+    if "ddp" in device_mesh.mesh_dim_names:
+        return device_mesh["ddp"].get_group()
+    return None
+
+
 class FSDPModelManager:
     """
     FSDP Model Manager for RL training
@@ -96,12 +105,25 @@ class FSDPModelManager:
         if cfg.get("tokenizer", {}).get("tokenizer_model", None) is not None:
             self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
 
-        self._device_mesh = create_device_mesh(world_size)
-        self._dp_group = (
-            self._device_mesh["ddp"].get_group()
-            if "ddp" in self._device_mesh.mesh_dim_names
-            else None
+        node_local_world_size = os.environ.get("NODE_LOCAL_WORLD_SIZE")
+        self._device_mesh = create_device_mesh(
+            world_size,
+            sharding_strategy=self._cfg.fsdp_config.sharding_strategy,
+            hybrid_shard_size=self._cfg.fsdp_config.hybrid_shard_size,
+            node_local_world_size=(
+                int(node_local_world_size)
+                if node_local_world_size is not None
+                else None
+            ),
         )
+        self._logger.info(
+            f"[FSDP] Device mesh shape={tuple(self._device_mesh.mesh.shape)} "
+            f"dimensions={self._device_mesh.mesh_dim_names}."
+        )
+        # HYBRID_SHARD gradients are replicated across the outer mesh
+        # dimension. Compute their norm once within a sharding group;
+        # reducing over the full world would count every replica again.
+        self._dp_group = _get_grad_norm_process_group(self._device_mesh)
 
         self._strategy = FSDPStrategyBase.create(
             self._cfg, world_size, self._dp_group, self._logger

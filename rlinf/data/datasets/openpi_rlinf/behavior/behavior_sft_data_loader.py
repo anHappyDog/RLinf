@@ -18,13 +18,22 @@ import dataclasses
 import logging
 import multiprocessing
 import typing
+from pathlib import Path
 
 import numpy as np
 import torch
 from openpi.transforms import DataTransformFn, compose
 
+from rlinf.data.b1k_grounded import (
+    ControlProfile,
+    ReservedTokenMapping,
+)
 from rlinf.data.datasets.openpi_rlinf.behavior.behavior_sft_dataset import (
     BehaviorSftDataset,
+)
+from rlinf.data.datasets.openpi_rlinf.behavior.grounded_sft_dataset import (
+    EpisodeShardedSampler,
+    GroundedBehaviorSftDataset,
 )
 from rlinf.data.storage.lerobot import (
     resolve_lerobot_repo_id,
@@ -111,7 +120,27 @@ class _TransformedStreamingDataset(torch.utils.data.Dataset):
         return len(self._dataset.hf_dataset)
 
 
-def _sft_collate(items) -> tuple[Observation, torch.Tensor]:
+class _TransformedMapDataset(torch.utils.data.Dataset):
+    """Apply the shared OpenPI transforms to an index-respecting dataset."""
+
+    def __init__(self, dataset: torch.utils.data.Dataset, transform):
+        self._dataset = dataset
+        self._transform = transform
+
+    def __getitem__(self, idx):
+        item = dict(self._dataset[idx])
+        action_is_pad = item.pop("action_is_pad")
+        transformed = self._transform(item)
+        transformed["action_is_pad"] = action_is_pad
+        return transformed
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
+def _sft_collate(
+    items,
+) -> tuple[Observation, torch.Tensor] | tuple[Observation, torch.Tensor, torch.Tensor]:
     """Collate per-sample transform dicts into ``(Observation, actions)``.
 
     Plain numpy/torch stacking (no JAX): each per-sample dict is the openpi
@@ -153,7 +182,10 @@ def _sft_collate(items) -> tuple[Observation, torch.Tensor]:
         }
     )
     actions = _stack("actions", np.float32)
-    return observation, actions
+    if "action_is_pad" not in items[0]:
+        return observation, actions
+    action_is_pad = _stack("action_is_pad", np.bool_)
+    return observation, actions, action_is_pad
 
 
 @dataclasses.dataclass(frozen=True)
@@ -165,6 +197,7 @@ class BehaviorSftDataConfig:
     action_dim: int
     action_horizon: int
     max_token_len: int
+    grounded_control_profile: str | None = None
 
 
 def _worker_init_fn(worker_id: int) -> None:
@@ -199,8 +232,11 @@ def create_behavior_sft_data_loader(
     dist_rank: int,
     dist_world_size: int,
     data_kwargs: dict | None = None,
+    grounded_sidecar_path: str | None = None,
+    grounded_token_mapping_path: str | None = None,
+    grounded_control_profile: str | None = None,
 ) -> "BehaviorSftDataLoader":
-    """Build the BEHAVIOR-1K SFT data loader yielding ``(Observation, actions)``.
+    """Build the BEHAVIOR-1K SFT data loader.
 
     Args:
         behavior_dataset_root: Local root of the LeRobot BEHAVIOR dataset.
@@ -232,30 +268,68 @@ def create_behavior_sft_data_loader(
         dist_rank: This rank's id, threaded into the per-rank chunk partition.
         dist_world_size: Total ranks, threaded into the per-rank chunk partition.
         data_kwargs: Optional ``openpi_data`` overrides forwarded to the pipeline.
+        grounded_sidecar_path: Optional pilot Parquet containing structured
+            grounded-control rows.
+        grounded_token_mapping_path: Frozen structural-token mapping required
+            with ``grounded_sidecar_path``.
+        grounded_control_profile: P0/P1/P2 profile used to serialize sidecar rows.
 
     Returns:
-        A loader whose iteration yields ``(Observation, actions)`` 2-tuples.
+        A loader yielding ``(Observation, actions)`` for the legacy dataset or
+        ``(Observation, actions, action_is_pad)`` for grounded sidecars.
     """
-    dataset = BehaviorSftDataset(
-        repo_id=repo_id,
-        root=behavior_dataset_root,
-        tolerance_s=tolerance_s,
-        tasks=tasks or None,
-        modalities=modalities or ["rgb"],
-        local_only=True,
-        delta_timestamps={"action": [t / 30.0 for t in range(action_horizon)]},
-        chunk_streaming_using_keyframe=True,
-        shuffle=shuffle,
-        seed=seed,
-        fine_grained_level=fine_grained_level,
-        skill_labels=skill_labels,
-        use_skill=use_skill,
-        enable_gap=enable_gap,
-        allow_left=allow_left,
-        allow_right=allow_right,
-        dist_rank=dist_rank,
-        dist_world_size=dist_world_size,
+    grounded_values = (
+        grounded_sidecar_path,
+        grounded_token_mapping_path,
+        grounded_control_profile,
     )
+    uses_grounded_sidecar = grounded_sidecar_path is not None
+    if uses_grounded_sidecar != all(value is not None for value in grounded_values):
+        raise ValueError(
+            "grounded_sidecar_path, grounded_token_mapping_path, and "
+            "grounded_control_profile must be configured together."
+        )
+    if uses_grounded_sidecar and max_token_len < 512:
+        raise ValueError(
+            "Grounded Oracle profiles require max_token_len >= 512; the audited "
+            "P2 pilot reaches 445 tokens and all profiles must share one budget."
+        )
+
+    if uses_grounded_sidecar:
+        if use_skill:
+            raise ValueError(
+                "use_skill must be false when grounded_sidecar_path provides prompts."
+            )
+        mapping = ReservedTokenMapping.from_json(
+            Path(grounded_token_mapping_path).read_text()
+        )
+        dataset = GroundedBehaviorSftDataset(
+            dataset_root=behavior_dataset_root,
+            sidecar_path=grounded_sidecar_path,
+            token_mapping=mapping,
+            profile=ControlProfile(grounded_control_profile),
+        )
+    else:
+        dataset = BehaviorSftDataset(
+            repo_id=repo_id,
+            root=behavior_dataset_root,
+            tolerance_s=tolerance_s,
+            tasks=tasks or None,
+            modalities=modalities or ["rgb"],
+            local_only=True,
+            delta_timestamps={"action": [t / 30.0 for t in range(action_horizon)]},
+            chunk_streaming_using_keyframe=True,
+            shuffle=shuffle,
+            seed=seed,
+            fine_grained_level=fine_grained_level,
+            skill_labels=skill_labels,
+            use_skill=use_skill,
+            enable_gap=enable_gap,
+            allow_left=allow_left,
+            allow_right=allow_right,
+            dist_rank=dist_rank,
+            dist_world_size=dist_world_size,
+        )
 
     # The shared openpi input pipeline (BehaviorInputs -> Normalize -> ModelTransform),
     # keyed off the checkpoint / config_name, with norm stats from assets_dir/asset_id.
@@ -268,33 +342,50 @@ def create_behavior_sft_data_loader(
         data_kwargs=data_kwargs,
         norm_stats_dir=assets_dir,
         norm_stats_asset_id=asset_id,
+        max_token_len=max_token_len,
     )
-    source = _TransformedStreamingDataset(
-        dataset, compose([_Repack(), *input_transforms])
+    transform = compose([_Repack(), *input_transforms])
+    source = (
+        _TransformedMapDataset(dataset, transform)
+        if uses_grounded_sidecar
+        else _TransformedStreamingDataset(dataset, transform)
     )
 
-    # The streaming dataset partitions chunks per (rank, worker) on its own, so a
-    # DistributedSampler is intentionally omitted (see module docstring).
+    # The legacy streaming dataset partitions chunks per (rank, worker) itself.
+    # Grounded map-style rows instead use an episode-level rank partition below.
     mp_context = multiprocessing.get_context("spawn") if num_workers > 0 else None
 
     generator = torch.Generator()
     generator.manual_seed(seed)
 
+    sampler = (
+        EpisodeShardedSampler(
+            dataset.episode_groups,
+            num_replicas=dist_world_size,
+            rank=dist_rank,
+            shuffle=shuffle,
+            seed=seed,
+        )
+        if uses_grounded_sidecar
+        else None
+    )
+
     logger.info(
         "BEHAVIOR SFT data loader: batch_size=%d, num_workers=%d, action_horizon=%d, "
-        "norm_stats=%s/%s",
+        "norm_stats=%s/%s, grounded_profile=%s",
         batch_size,
         num_workers,
         action_horizon,
         assets_dir,
         asset_id,
+        grounded_control_profile,
     )
 
     torch_loader = torch.utils.data.DataLoader(
         typing.cast(torch.utils.data.Dataset, source),
         batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=None,
+        shuffle=shuffle and sampler is None,
+        sampler=sampler,
         num_workers=num_workers,
         multiprocessing_context=mp_context,
         persistent_workers=num_workers > 0,
@@ -309,25 +400,30 @@ def create_behavior_sft_data_loader(
         action_dim=action_dim,
         action_horizon=action_horizon,
         max_token_len=max_token_len,
+        grounded_control_profile=grounded_control_profile,
     )
-    return BehaviorSftDataLoader(torch_loader, data_config)
+    return BehaviorSftDataLoader(torch_loader, data_config, sampler=sampler)
 
 
 class BehaviorSftDataLoader:
-    """Infinite ``(Observation, actions)`` loop over the BEHAVIOR SFT dataset.
+    """Infinite loop over the BEHAVIOR SFT dataset.
 
     Re-iterates the underlying ``torch`` ``DataLoader`` forever. Each batch is
-    already collated into an :class:`Observation` plus an actions tensor of shape
-    ``[batch, action_horizon, action_dim]`` by :func:`_sft_collate`.
+    already collated into an :class:`Observation` and actions tensor. Grounded
+    sidecars add a boolean ``action_is_pad`` tensor for boundary-safe flow loss.
     """
 
     def __init__(
         self,
         torch_loader: torch.utils.data.DataLoader,
         data_config: BehaviorSftDataConfig,
+        *,
+        sampler: EpisodeShardedSampler | None = None,
     ):
         self._torch_loader = torch_loader
         self._data_config = data_config
+        self._sampler = sampler
+        self._epoch = 0
 
     def data_config(self) -> BehaviorSftDataConfig:
         """Return the resolved data-pipeline metadata."""
@@ -340,7 +436,10 @@ class BehaviorSftDataLoader:
 
     def __iter__(self):
         while True:
+            if self._sampler is not None:
+                self._sampler.set_epoch(self._epoch)
             yield from self._torch_loader
+            self._epoch += 1
 
     def __len__(self) -> int:
         return len(self._torch_loader)
@@ -376,6 +475,15 @@ def build_behavior_sft_dataloader(
     data_kwargs = OmegaConf.select(cfg.actor, "openpi_data", default=None)
     if data_kwargs is not None:
         data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
+    grounded_sidecar_path = OmegaConf.select(
+        data_cfg, "grounded_sidecar_path", default=None
+    )
+    grounded_token_mapping_path = OmegaConf.select(
+        data_cfg, "grounded_token_mapping_path", default=None
+    )
+    grounded_control_profile = OmegaConf.select(
+        data_cfg, "grounded_control_profile", default=None
+    )
 
     # `cfg.data` is the production source of truth for the BEHAVIOR task set and the
     # prompt-source flag. `use_skill: true` trains on the per-frame REFERENCE skill
@@ -433,5 +541,18 @@ def build_behavior_sft_dataloader(
         dist_rank=rank,
         dist_world_size=world_size,
         data_kwargs=data_kwargs,
+        grounded_sidecar_path=(
+            str(grounded_sidecar_path) if grounded_sidecar_path is not None else None
+        ),
+        grounded_token_mapping_path=(
+            str(grounded_token_mapping_path)
+            if grounded_token_mapping_path is not None
+            else None
+        ),
+        grounded_control_profile=(
+            str(grounded_control_profile)
+            if grounded_control_profile is not None
+            else None
+        ),
     )
     return loader, loader.data_config()

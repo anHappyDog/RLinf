@@ -101,10 +101,24 @@ def set_camera_resolution(camera_cfg: dict | None) -> None:
         eval_utils.WRIST_RESOLUTION = tuple(wrist_resolution)
 
 
-def apply_runtime_renderer_settings() -> None:
+def apply_runtime_renderer_settings(renderer_mode: str = "rlinf") -> None:
+    """Apply the selected renderer policy after OmniGibson has launched.
+
+    Args:
+        renderer_mode: ``official`` preserves the B1K evaluator's Kit defaults.
+            ``rlinf`` applies RLinf's reduced texture-streaming memory budget.
     """
-    RLinf-specific renderer overrides after OmniGibson has launched.
-    """
+
+    if renderer_mode == "official":
+        get_logger().info(
+            "Using official B1K renderer defaults without RLinf overrides."
+        )
+        return
+    if renderer_mode != "rlinf":
+        raise ValueError(
+            f"Unsupported BEHAVIOR renderer_mode {renderer_mode!r}; "
+            "expected 'official' or 'rlinf'."
+        )
 
     import omnigibson.lazy as lazy
 
@@ -302,3 +316,103 @@ def setup_omni_cfg(cfg: DictConfig) -> DictConfig:
     )
 
     return omni_cfg
+
+
+def setup_subpool_omni_cfg(cfg: DictConfig) -> DictConfig:
+    """Build the exact official B1K evaluator scene for subpool training.
+
+    The generic RLinf BEHAVIOR example differs from the challenge evaluator in
+    robot spawn pose, self-collision, control / render frequency, sensor setup,
+    and scene robot loading. Those fields change both state compatibility and
+    action semantics, so a subpool run must start from the official generator.
+    """
+    from gello.robots.sim_robot.og_teleop_cfg import DISABLED_TRANSITION_RULES
+    from gello.robots.sim_robot.og_teleop_utils import (
+        augment_rooms,
+        generate_robot_config,
+        get_task_relevant_room_types,
+        load_available_tasks,
+    )
+    from omnigibson.learning.utils.eval_utils import (
+        PROPRIOCEPTION_INDICES,
+        generate_basic_environment_config,
+    )
+    from omnigibson.macros import gm, macros
+
+    for rule in DISABLED_TRANSITION_RULES:
+        rule.ENABLED = False
+
+    override_cfg = OmegaConf.select(cfg, "omni_config")
+    activity_name = str(OmegaConf.select(override_cfg, "task.activity_name"))
+    expected_scene = str(OmegaConf.select(override_cfg, "scene.scene_model"))
+    available_tasks = load_available_tasks()
+    if activity_name not in available_tasks:
+        raise ValueError(f"Unknown official B1K activity {activity_name!r}.")
+    task_cfg = available_tasks[activity_name][0]
+    official_scene = str(task_cfg["scene_model"])
+    if official_scene != expected_scene:
+        raise ValueError(
+            f"Manifest scene {expected_scene!r} does not match the official B1K "
+            f"scene {official_scene!r} for {activity_name!r}."
+        )
+
+    omni_cfg = generate_basic_environment_config(
+        task_name=activity_name,
+        task_cfg=task_cfg,
+    )
+    omni_cfg["task"]["activity_instance_id"] = int(
+        OmegaConf.select(override_cfg, "task.activity_instance_id")
+    )
+    omni_cfg["task"]["activity_instance_dir"] = None
+    omni_cfg["task"]["instance_file_format"] = "tro_state"
+    omni_cfg["task"]["instance_resample_mode"] = "disabled"
+    omni_cfg["task"]["online_object_sampling"] = False
+    omni_cfg["task"]["use_presampled_robot_pose"] = True
+    omni_cfg["task"]["include_obs"] = False
+    omni_cfg["task"]["reward_config"].update(
+        {
+            "reward_mode": "task",
+            "task_specific_reward_name": activity_name,
+            "task_specific_reward_kwargs": {},
+        }
+    )
+    max_episode_steps = int(OmegaConf.select(cfg, "max_episode_steps")) - 1
+    omni_cfg["task"]["termination_config"]["max_steps"] = max_episode_steps
+
+    if bool(OmegaConf.select(override_cfg, "scene.partial_scene_load", default=True)):
+        relevant_rooms = get_task_relevant_room_types(activity_name=activity_name)
+        relevant_rooms = augment_rooms(
+            relevant_rooms,
+            official_scene,
+            activity_name,
+        )
+        # Preserve the evaluator's order: object registration and UUID assignment
+        # depend on construction order in the flat legacy state format.
+        omni_cfg["scene"]["load_room_types"] = relevant_rooms
+
+    robot_cfg = generate_robot_config(
+        task_name=activity_name,
+        task_cfg=task_cfg,
+    )
+    robot_cfg["obs_modalities"] = ["proprio", "rgb"]
+    robot_cfg["proprio_obs"] = list(PROPRIOCEPTION_INDICES["R1Pro"].keys())
+    omni_cfg["robots"] = [robot_cfg]
+
+    macro_cfg = OmegaConf.select(override_cfg, "macro")
+    gm.HEADLESS = bool(macro_cfg.headless)
+    gm.ENABLE_FLATCACHE = bool(macro_cfg.enable_flatcache)
+    gm.ENABLE_OBJECT_STATES = bool(macro_cfg.enable_object_states)
+    gm.USE_GPU_DYNAMICS = bool(macro_cfg.use_gpu_dynamics)
+    gm.ENABLE_TRANSITION_RULES = bool(macro_cfg.enable_transition_rules)
+    gm.RENDER_VIEWER_CAMERA = bool(macro_cfg.render_viewer_camera)
+    gm.USE_NUMPY_CONTROLLER_BACKEND = bool(macro_cfg.use_numpy_controller_backend)
+    with macros.unlocked():
+        macros.robots.manipulation_robot.GRASP_WINDOW = 0.75
+    set_camera_resolution(OmegaConf.select(override_cfg, "camera"))
+
+    get_logger().info(
+        "Using official B1K evaluator config for %s in %s.",
+        activity_name,
+        official_scene,
+    )
+    return OmegaConf.create(omni_cfg, flags={"allow_objects": True})

@@ -1,0 +1,94 @@
+# Formal grounded-control SFT on broad midpoint coverage plus boundary-safe,
+# button-grounded stride-8 press intervals and dense radio trajectories. Override only
+# data.grounded_control_profile and runner.logger.log_path for paired P1/P2 runs.
+defaults:
+  - model/pi0_5_rlinf@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: /mnt/public/daibo/results/b1k_grounded_control_v01/training/pi05_mixed1000_radio_dense_boundarysafe_p1_2000
+    project_name: rlinf
+    experiment_name: "run"
+    logger_backends: ["tensorboard"]
+  max_epochs: 100
+  max_steps: 2000
+  val_check_interval: -1
+  save_interval: 250
+  resume_dir: null
+
+data:
+  train_data_paths: /mnt/public/daibo/datasets/behavior-1k/2025-challenge-demos
+  behavior_dataset_root: /mnt/public/daibo/datasets/behavior-1k/2025-challenge-demos
+  repo_id: "behavior-1k/2025-challenge-demos"
+  modalities: ["rgb"]
+  num_workers: 0
+  fine_grained_level: 0
+  tolerance_s: 1.0e-4
+  tasks: []
+  use_skill: false
+  task_subtasks: {}
+  grounded_sidecar_path: /mnt/public/daibo/results/b1k_grounded_control_v01/oracle_1000ep_press_stride8_radio_dense_button_boundarysafe_v3/data/part-00000.parquet
+  grounded_token_mapping_path: /mnt/public/daibo/results/b1k_grounded_control_v01/oracle_1000ep_press_stride8_radio_dense_button_boundarysafe_v3/structural_token_mapping.json
+  grounded_control_profile: p1_simple_sg
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  eval_batch_size: 1
+  global_batch_size: 32
+  seed: 42
+  model:
+    is_lora: false
+    model_path: /mnt/public/daibo/models/pi05_b1kpt50_pt
+    openpi:
+      assets_dir: /mnt/public/daibo/models/pi05_b1kpt50_pt
+      asset_id: "physical-intelligence/behavior"
+      max_token_len: 512
+  optim:
+    lr: 2.5e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 2000
+    lr_warmup_steps: 200
+    lr_scheduler: "openpi_cosine"
+    num_cycles: 0.5
+    min_lr: 0.0
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    use_orig_params: true
+    gradient_checkpointing: true
+    gradient_checkpointing_use_reentrant: false
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false

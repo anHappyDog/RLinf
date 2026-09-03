@@ -793,9 +793,16 @@ def preprocess_embodied_batch(
         dones = batch["dones"]
         loss_mask, loss_mask_sum = compute_loss_mask(dones)
 
-        if reward_type == "chunk_level":
+        executed_action_mask = batch.get("executed_action_mask")
+        if executed_action_mask is not None:
+            loss_mask &= executed_action_mask.to(torch.bool)
+            loss_mask_sum = loss_mask.sum(dim=(0, 2), keepdim=True).expand_as(
+                loss_mask
+            )
+
+        if reward_type in ("chunk_level", "subtask_chunk_level"):
             loss_mask = loss_mask.any(dim=-1, keepdim=True)
-            loss_mask_sum = loss_mask_sum[..., -1:]
+            loss_mask_sum = loss_mask.sum(dim=0, keepdim=True).expand_as(loss_mask)
 
         batch["loss_mask"] = loss_mask
         batch["loss_mask_sum"] = loss_mask_sum
@@ -828,5 +835,21 @@ def preprocess_embodied_batch(
             batch["loss_mask"] = reward_filter_mask & batch["loss_mask"]
         else:
             batch["loss_mask"] = reward_filter_mask
+
+    if reward_type == "subtask_chunk_level":
+        from rlinf.algorithms.subtask import (
+            align_subtask_ids,
+            balanced_subtask_weights,
+        )
+
+        if "subtask_ids" not in batch or "loss_mask" not in batch:
+            raise ValueError(
+                "subtask_chunk_level requires subtask_ids and loss_mask in the batch."
+            )
+        valid_mask = batch["loss_mask"].squeeze(-1)
+        subtask_ids = align_subtask_ids(batch["subtask_ids"], valid_mask)
+        batch["sample_weights"] = balanced_subtask_weights(
+            subtask_ids, valid_mask
+        ).unsqueeze(-1)
 
     return batch

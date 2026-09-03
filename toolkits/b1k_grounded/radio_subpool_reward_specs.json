@@ -1,0 +1,68 @@
+{
+  "move to": {
+    "potential_terms": [
+      {
+        "key": "base_position_error",
+        "scale": 1.0,
+        "direction": "decrease"
+      },
+      {
+        "key": "base_yaw_error",
+        "scale": 0.2,
+        "direction": "decrease"
+      }
+    ],
+    "success_bonus": 10.0,
+    "timeout_penalty": -2.0,
+    "step_penalty": -0.0026041666666666665,
+    "progress_clip": 1.0,
+    "max_steps": 384
+  },
+  "pick up from": {
+    "potential_terms": [
+      {
+        "key": "right_eef_to_obj_distance",
+        "scale": 1.0,
+        "direction": "decrease"
+      }
+    ],
+    "success_bonus": 10.0,
+    "timeout_penalty": -2.0,
+    "step_penalty": -0.0008680555555555555,
+    "progress_clip": 1.0,
+    "max_steps": 1152
+  },
+  "press": {
+    "potential_terms": [
+      {
+        "key": "left_eef_to_toggle_distance",
+        "scale": 1.0,
+        "direction": "decrease"
+      },
+      {
+        "key": "toggle_steps",
+        "scale": 0.1,
+        "direction": "increase"
+      }
+    ],
+    "success_bonus": 10.0,
+    "timeout_penalty": -2.0,
+    "step_penalty": -0.0026041666666666665,
+    "progress_clip": 1.0,
+    "max_steps": 384
+  },
+  "place on": {
+    "potential_terms": [
+      {
+        "key": "object_to_support_surface_distance",
+        "scale": 1.0,
+        "direction": "decrease"
+      }
+    ],
+    "success_bonus": 10.0,
+    "timeout_penalty": -2.0,
+    "step_penalty": -0.001953125,
+    "progress_clip": 1.0,
+    "max_steps": 512
+  }
+}

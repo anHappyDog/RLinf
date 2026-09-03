@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 
 from rlinf.algorithms.registry import register_advantage
+from rlinf.algorithms.subtask import compute_subtask_gae
 from rlinf.algorithms.utils import kl_penalty, safe_normalize
 from rlinf.utils.utils import masked_mean
 
@@ -84,6 +85,33 @@ def compute_gae_advantages_and_returns(
         returns = safe_normalize(returns, loss_mask=loss_mask)
 
     return advantages, returns
+
+
+@register_advantage("subtask_gae")
+def compute_subtask_gae_advantages_and_returns(
+    rewards: torch.Tensor,
+    discounts: torch.Tensor,
+    dones: torch.Tensor,
+    values: torch.Tensor,
+    subtask_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    gae_lambda: float = 0.95,
+    normalize_advantages: bool = True,
+    advantage_std_floor: float = 0.1,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute duration-aware GAE and normalize within each subtask."""
+    return compute_subtask_gae(
+        rewards,
+        discounts,
+        dones,
+        values,
+        subtask_ids,
+        loss_mask.to(torch.bool),
+        gae_lambda=gae_lambda,
+        normalize_advantages=normalize_advantages,
+        advantage_std_floor=advantage_std_floor,
+    )
 
 
 @register_advantage("grpo")

@@ -413,6 +413,98 @@ def compute_evaluate_metrics(eval_metrics_list):
             else np.asarray(0.0, dtype=np.float64)
         )
 
+    # Subpool rollouts carry aligned task ids, outcomes, and timeout flags.
+    # Aggregate them together per shard so a missing metric on one rank cannot
+    # silently misalign task labels with outcomes from another rank.
+    subtask_id_keys = {
+        key
+        for key in env_info_keys
+        if key == "subtask_id" or key.endswith("/subtask_id")
+    }
+    for subtask_id_key in subtask_id_keys:
+        prefix = subtask_id_key[: -len("subtask_id")]
+        success_key = f"{prefix}success"
+        timeout_key = f"{prefix}subtask_timeout"
+        aligned_shards = []
+        for eval_metrics in eval_metrics_list:
+            if not all(
+                key in eval_metrics
+                for key in (subtask_id_key, success_key, timeout_key)
+            ):
+                continue
+            subtask_ids = _normalize_metric_shard(eval_metrics[subtask_id_key])
+            successes = _normalize_metric_shard(eval_metrics[success_key])
+            timeouts = _normalize_metric_shard(eval_metrics[timeout_key])
+            if not (subtask_ids.numel() == successes.numel() == timeouts.numel()):
+                raise ValueError(
+                    "Subpool metric shards must contain one subtask id, success, "
+                    "and timeout value per trajectory."
+                )
+            aligned_shards.append((subtask_ids, successes, timeouts))
+        if not aligned_shards:
+            continue
+
+        subtask_ids = torch.cat([shard[0] for shard in aligned_shards]).long()
+        successes = torch.cat([shard[1] for shard in aligned_shards]).float()
+        timeouts = torch.cat([shard[2] for shard in aligned_shards]).float()
+        for subtask_id in torch.unique(subtask_ids, sorted=True).tolist():
+            mask = subtask_ids == subtask_id
+            metric_prefix = f"{prefix}subtask/{subtask_id}"
+            aggregated_eval_metrics[f"{metric_prefix}/success"] = (
+                successes[mask].mean().numpy()
+            )
+            aggregated_eval_metrics[f"{metric_prefix}/timeout"] = (
+                timeouts[mask].mean().numpy()
+            )
+            aggregated_eval_metrics[f"{metric_prefix}/attempts"] = int(mask.sum())
+
+        subpool_id_key = f"{prefix}subpool_id"
+        pool_shards = []
+        for eval_metrics in eval_metrics_list:
+            if not all(
+                key in eval_metrics
+                for key in (
+                    subtask_id_key,
+                    subpool_id_key,
+                    success_key,
+                    timeout_key,
+                )
+            ):
+                continue
+            shard_values = tuple(
+                _normalize_metric_shard(eval_metrics[key])
+                for key in (
+                    subtask_id_key,
+                    subpool_id_key,
+                    success_key,
+                    timeout_key,
+                )
+            )
+            if len({value.numel() for value in shard_values}) != 1:
+                raise ValueError(
+                    "Subpool metric shards must contain one pool id per trajectory."
+                )
+            pool_shards.append(shard_values)
+        if not pool_shards:
+            continue
+        pool_subtask_ids = torch.cat([shard[0] for shard in pool_shards]).long()
+        subpool_ids = torch.cat([shard[1] for shard in pool_shards]).long()
+        pool_successes = torch.cat([shard[2] for shard in pool_shards]).float()
+        pool_timeouts = torch.cat([shard[3] for shard in pool_shards]).float()
+        task_pool_pairs = torch.unique(
+            torch.stack((pool_subtask_ids, subpool_ids), dim=1), dim=0, sorted=True
+        )
+        for subtask_id, subpool_id in task_pool_pairs.tolist():
+            mask = (pool_subtask_ids == subtask_id) & (subpool_ids == subpool_id)
+            metric_prefix = f"{prefix}subtask/{subtask_id}/pool/{subpool_id}"
+            aggregated_eval_metrics[f"{metric_prefix}/success"] = (
+                pool_successes[mask].mean().numpy()
+            )
+            aggregated_eval_metrics[f"{metric_prefix}/timeout"] = (
+                pool_timeouts[mask].mean().numpy()
+            )
+            aggregated_eval_metrics[f"{metric_prefix}/attempts"] = int(mask.sum())
+
     # Add total trajectory count to metrics
     aggregated_eval_metrics["num_trajectories"] = sum(trajectory_counts)
 

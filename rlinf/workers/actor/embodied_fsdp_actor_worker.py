@@ -225,9 +225,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             ]  # [n_chunk_step, rollout_epoch x bsz, num_action_chunks]
             loss_mask, loss_mask_sum = compute_loss_mask(dones)
 
-            if self.cfg.algorithm.reward_type == "chunk_level":
+            executed_action_mask = rollout_batch.get("executed_action_mask")
+            if executed_action_mask is not None:
+                loss_mask &= executed_action_mask.to(torch.bool)
+                loss_mask_sum = loss_mask.sum(dim=(0, 2), keepdim=True).expand_as(
+                    loss_mask
+                )
+
+            if self.cfg.algorithm.reward_type in (
+                "chunk_level",
+                "subtask_chunk_level",
+            ):
                 loss_mask = loss_mask.any(dim=-1, keepdim=True)
-                loss_mask_sum = loss_mask_sum[..., -1:]
+                loss_mask_sum = loss_mask.sum(dim=0, keepdim=True).expand_as(loss_mask)
 
             rollout_batch["loss_mask"] = loss_mask
             rollout_batch["loss_mask_sum"] = loss_mask_sum
@@ -281,6 +291,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             else:
                 rollout_batch["loss_mask"] = reward_filter_mask
 
+        if self.cfg.algorithm.reward_type == "subtask_chunk_level":
+            from rlinf.algorithms.subtask import (
+                align_subtask_ids,
+                balanced_subtask_weights,
+            )
+
+            valid_mask = rollout_batch["loss_mask"].squeeze(-1)
+            subtask_ids = align_subtask_ids(
+                rollout_batch["subtask_ids"], valid_mask
+            )
+            rollout_batch["sample_weights"] = balanced_subtask_weights(
+                subtask_ids,
+                valid_mask,
+            ).unsqueeze(-1)
+
         return rollout_batch
 
     @Worker.timer("actor/compute_adv")
@@ -306,7 +331,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "executed_action_mask": self.rollout_batch.get(
+                "executed_action_mask", None
+            ),
+            "subtask_ids": self.rollout_batch.get("subtask_ids", None),
             "advantage_mode": self.cfg.algorithm.get("advantage_mode", None),
+            "advantage_std_floor": self.cfg.algorithm.get("advantage_std_floor", 0.1),
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
@@ -620,7 +650,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ]:
             kwargs["prev_logprobs"] = prev_logprobs
 
-        compute_values = self.cfg.algorithm.adv_type == "gae"
+        compute_values = self.cfg.algorithm.adv_type in ("gae", "subtask_gae")
         with self.amp_context:
             output_dict = self.model(
                 forward_inputs=forward_inputs,
@@ -656,6 +686,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "huber_delta": self.cfg.algorithm.get("huber_delta", None),
             "loss_mask": loss_mask,
             "loss_mask_sum": loss_mask_sum,
+            "executed_action_mask": micro_batch.get("executed_action_mask", None),
+            "sample_weights": micro_batch.get("sample_weights", None),
             "max_episode_steps": self.cfg.env.train.max_episode_steps,
             "task_type": self.cfg.runner.task_type,
             "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,

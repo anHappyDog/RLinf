@@ -48,6 +48,9 @@ class EmbodiedTrajectoryBuilder:
         default_factory=list
     )  # trajectory_length
     rewards: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    executed_action_mask: list[torch.Tensor] = field(default_factory=list)
+    subtask_ids: list[torch.Tensor] = field(default_factory=list)
+    subpool_ids: list[torch.Tensor] = field(default_factory=list)
     terminations: list[torch.Tensor] = field(
         default_factory=list
     )  # trajectory_length + rollout_epoch
@@ -77,6 +80,12 @@ class EmbodiedTrajectoryBuilder:
             )
         if result.rewards is not None:
             self.rewards.append(result.rewards)
+            if result.executed_action_mask is not None:
+                self.executed_action_mask.append(result.executed_action_mask)
+            if result.subtask_ids is not None:
+                self.subtask_ids.append(result.subtask_ids)
+            if result.subpool_ids is not None:
+                self.subpool_ids.append(result.subpool_ids)
         if result.terminations is not None:
             self.terminations.append(result.terminations)
         if result.truncations is not None:
@@ -163,6 +172,9 @@ class EmbodiedTrajectoryBuilder:
         self.actions.clear()
         self.intervene_flags.clear()
         self.rewards.clear()
+        self.executed_action_mask.clear()
+        self.subtask_ids.clear()
+        self.subpool_ids.clear()
         self.terminations.clear()
         self.truncations.clear()
         self.dones.clear()
@@ -185,6 +197,18 @@ class EmbodiedTrajectoryBuilder:
             )
         if len(self.rewards) > 0:
             trajectory.rewards = torch.stack(self.rewards, dim=0).cpu().contiguous()
+        if len(self.executed_action_mask) > 0:
+            trajectory.executed_action_mask = (
+                torch.stack(self.executed_action_mask, dim=0).cpu().contiguous()
+            )
+        if len(self.subtask_ids) > 0:
+            trajectory.subtask_ids = (
+                torch.stack(self.subtask_ids, dim=0).cpu().contiguous()
+            )
+        if len(self.subpool_ids) > 0:
+            trajectory.subpool_ids = (
+                torch.stack(self.subpool_ids, dim=0).cpu().contiguous()
+            )
         if len(self.terminations) > 0:
             trajectory.terminations = (
                 torch.stack(self.terminations, dim=0).cpu().contiguous()

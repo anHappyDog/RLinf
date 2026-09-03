@@ -62,9 +62,68 @@ class FSDPVersion(str, Enum):
     FSDP2 = "fsdp2"
 
 
-def create_device_mesh(world_size):
+def create_device_mesh(
+    world_size: int,
+    *,
+    sharding_strategy: str = "full_shard",
+    hybrid_shard_size: Optional[int] = None,
+    node_local_world_size: Optional[int] = None,
+) -> DeviceMesh:
+    """Create the data-parallel mesh required by the FSDP strategy.
+
+    Classic FSDP expects hybrid sharding to use a two-dimensional mesh whose
+    outer dimension replicates the model and whose inner dimension shards it.
+    RLinf assigns contiguous global ranks to each node, so choosing the node's
+    local worker count as ``hybrid_shard_size`` keeps parameter collectives
+    intra-node.
+
+    Args:
+        world_size: Total number of FSDP workers.
+        sharding_strategy: Configured FSDP sharding strategy.
+        hybrid_shard_size: Number of ranks in each parameter-sharding group.
+        node_local_world_size: Number of FSDP workers placed on this node, when
+            known. Hybrid sharding requires it to match ``hybrid_shard_size``.
+
+    Returns:
+        The one-dimensional FSDP mesh, or a ``(replicate, shard)`` hybrid mesh.
+
+    Raises:
+        ValueError: If the requested hybrid topology is invalid.
+    """
+    if sharding_strategy != "hybrid_shard":
+        return init_device_mesh(
+            Worker.torch_device_type,
+            mesh_shape=(world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+
+    if type(hybrid_shard_size) is not int or hybrid_shard_size <= 0:
+        raise ValueError(
+            "fsdp_config.hybrid_shard_size must be a positive integer when "
+            "sharding_strategy is 'hybrid_shard'."
+        )
+    if world_size % hybrid_shard_size != 0:
+        raise ValueError(
+            f"FSDP world size {world_size} is not divisible by hybrid shard "
+            f"size {hybrid_shard_size}."
+        )
+
+    replicate_size = world_size // hybrid_shard_size
+    if replicate_size < 2:
+        raise ValueError(
+            "Hybrid sharding requires at least two replica groups; increase "
+            "world_size or reduce fsdp_config.hybrid_shard_size."
+        )
+    if node_local_world_size is not None and node_local_world_size != hybrid_shard_size:
+        raise ValueError(
+            f"Hybrid shard size {hybrid_shard_size} must match the node-local "
+            f"FSDP worker count {node_local_world_size}."
+        )
+
     return init_device_mesh(
-        Worker.torch_device_type, mesh_shape=(world_size,), mesh_dim_names=["fsdp"]
+        Worker.torch_device_type,
+        mesh_shape=(replicate_size, hybrid_shard_size),
+        mesh_dim_names=("replicate", "shard"),
     )
 
 

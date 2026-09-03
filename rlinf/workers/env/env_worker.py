@@ -182,6 +182,19 @@ class EnvWorker(Worker):
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
         )
+        if (
+            self.enable_train
+            and OmegaConf.select(self.cfg.env.train, "subpool.enabled", default=False)
+            and self.actor_split_num != 1
+        ):
+            env_world_size = self._component_placement.get_world_size("env")
+            actor_world_size = self._component_placement.get_world_size("actor")
+            raise ValueError(
+                "BEHAVIOR subpool RL cannot split a single-simulator trajectory "
+                "across FSDP ranks. The env world size must be an integer multiple "
+                f"of the actor world size, got env={env_world_size}, "
+                f"actor={actor_world_size}."
+            )
         if self.use_training_pipeline and self.enable_train:
             self._init_pipeline_params()
 
@@ -566,6 +579,11 @@ class EnvWorker(Worker):
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
             rlt_switch_flags=rlt_switch_flags,
+            executed_action_mask=get_env_attr(
+                self.env_list[stage_id], "last_executed_action_mask"
+            ),
+            subtask_ids=get_env_attr(self.env_list[stage_id], "subtask_ids"),
+            subpool_ids=get_env_attr(self.env_list[stage_id], "subpool_ids"),
         )
         chunk_step_payload = {
             "chunk_actions": exec_actions,
@@ -1193,6 +1211,9 @@ class EnvWorker(Worker):
                         truncations=env_output.truncations,
                         terminations=env_output.terminations,
                         rewards=rewards,
+                        executed_action_mask=env_output.executed_action_mask,
+                        subtask_ids=env_output.subtask_ids,
+                        subpool_ids=env_output.subpool_ids,
                     )
 
                     self.trajectory_builders[stage_id].append_step_result(
@@ -1345,6 +1366,9 @@ class EnvWorker(Worker):
                     truncations=env_output.truncations,
                     terminations=env_output.terminations,
                     rewards=rewards,
+                    executed_action_mask=env_output.executed_action_mask,
+                    subtask_ids=env_output.subtask_ids,
+                    subpool_ids=env_output.subpool_ids,
                 )
                 self.trajectory_builders[stage_id].append_step_result(chunk_step_result)
                 if (
@@ -1538,8 +1562,11 @@ class EnvWorker(Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": rollout_batch.get("loss_mask", None),
             "loss_mask_sum": rollout_batch.get("loss_mask_sum", None),
+            "executed_action_mask": rollout_batch.get("executed_action_mask", None),
+            "subtask_ids": rollout_batch.get("subtask_ids", None),
             "normalize_advantages": self.cfg.algorithm.get("normalize_advantages", True)
             and not self.use_training_pipeline,
+            "advantage_std_floor": self.cfg.algorithm.get("advantage_std_floor", 0.1),
         }
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
         rollout_batch.update(advantages_and_returns)

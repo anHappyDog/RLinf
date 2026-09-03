@@ -79,7 +79,10 @@ def _build_eval_model(
         )
 
     input_transforms, output_transforms = build_openpi_transforms(
-        cfg.model_path, config_name, data_kwargs=_resolve_data_kwargs(cfg)
+        cfg.model_path,
+        config_name,
+        data_kwargs=_resolve_data_kwargs(cfg),
+        max_token_len=int(model_cfg.max_token_len),
     )
 
     eval_model = OpenPiPytorchEvalActionModel(
@@ -156,7 +159,10 @@ def _build_rl_model(
         )
 
     input_transforms, output_transforms = build_openpi_transforms(
-        cfg.model_path, config_name, data_kwargs=_resolve_data_kwargs(cfg)
+        cfg.model_path,
+        config_name,
+        data_kwargs=_resolve_data_kwargs(cfg),
+        max_token_len=int(model_cfg.max_token_len),
     )
 
     rl_cfg = OpenPiPytorchRLConfig(

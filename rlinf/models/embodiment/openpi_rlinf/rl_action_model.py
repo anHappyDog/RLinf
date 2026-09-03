@@ -183,8 +183,14 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
 
         # VLM-pooled value (BEHAVIOR pi05): one value per sample, reused as the
         # rollout ``prev_values`` independent of the chosen denoise index.
+        critic_prefix_out = (
+            prefix_out.detach() if rl_cfg.detach_critic_input else prefix_out
+        )
         vlm_value = rl_sampler.value_from_prefix(
-            self.value_head, prefix_out, prefix_mask, mode=rl_cfg.value_vlm_mode
+            self.value_head,
+            critic_prefix_out,
+            prefix_mask,
+            mode=rl_cfg.value_vlm_mode,
         )
 
         # Single stochastic denoise step picked uniformly; the remaining steps
@@ -353,8 +359,14 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
         )
 
         if compute_values and rl_cfg.add_value_head and rl_cfg.value_after_vlm:
+            critic_prefix_out = (
+                prefix_out.detach() if rl_cfg.detach_critic_input else prefix_out
+            )
             values = rl_sampler.value_from_prefix(
-                self.value_head, prefix_out, prefix_mask, mode=rl_cfg.value_vlm_mode
+                self.value_head,
+                critic_prefix_out,
+                prefix_mask,
+                mode=rl_cfg.value_vlm_mode,
             )
         else:
             values = torch.zeros(B, device=device, dtype=torch.float32)

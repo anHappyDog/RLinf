@@ -1,0 +1,50 @@
+defaults:
+  - behavior_r1pro
+  - _self_
+
+# Correctness-first settings. BehaviorSubpoolEnv rejects the run if any of these
+# are changed to an optimized / asynchronous mode.
+auto_reset: false
+ignore_terminations: false
+skip_intermediate_obs_in_chunk: false
+num_env_subprocess: 1
+enable_offload: false
+enable_init_offload: false
+# Preserve the official evaluator's Kit renderer defaults. In particular, do
+# not apply RLinf's 10% texture-streaming memory budget.
+renderer_mode: official
+
+subpool:
+  enabled: true
+  # Official B1K evaluation creates the scene from seed template 0, then loads
+  # the selected challenge instance's TRO state. Canonical snapshots are dumped
+  # after that mutation; do not replace this with the episode instance id.
+  bootstrap_instance_id: 0
+  manifest_path: ${oc.env:B1K_SUBPOOL_MANIFEST}
+  token_mapping_path: ${oc.env:B1K_GROUNDED_TOKEN_MAPPING}
+  asset_fingerprint: ${oc.env:B1K_ASSET_FINGERPRINT}
+  fixed_subtask_id: null
+  # Rank-offset round robin makes every group of skill_count env workers cover
+  # every skill exactly once, independent of pool size and success rate.
+  subtask_sampling: round_robin
+  pool_weights:
+    canonical: 0.5
+    predecessor_success: 0.3
+    recovery: 0.2
+  dynamic_updates: true
+  max_dynamic_per_subtask_pool: 32
+  state_capture_interval: 8
+  state_ring_size: 32
+  # Recovery starts are sampled from this temporal lag window; the direct
+  # timeout state is never inserted.
+  recovery_min_lag_states: 2
+  recovery_max_lag_states: 16
+
+omni_config:
+  task:
+    # The subpool tracker owns reward magnitudes, but it needs the official
+    # sequential task reward for direct per-stage predicates and diagnostics.
+    reward_config:
+      reward_mode: task
+      task_specific_reward_name: null
+      task_specific_reward_kwargs: {}
