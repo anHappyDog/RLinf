@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Literal, Sequence
 
 import numpy as np
@@ -61,6 +63,9 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         config_name: str = "",
         state_indices: Sequence[int] | None = None,
         rlt_cfg: OpenPiPytorchRLTConfig | None = None,
+        eval_snapshot_dir: str | None = None,
+        eval_observation_override_path: str | None = None,
+        eval_model_action_override_path: str | None = None,
     ):
         super().__init__(
             pi0_model,
@@ -78,6 +83,22 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         # Optional subset of the raw env state dim (openpi ``state_indices``).
         # ``None`` (the BEHAVIOR default) is an identity passthrough.
         self.state_indices = list(state_indices) if state_indices else None
+        self._eval_snapshot_dir = (
+            Path(eval_snapshot_dir).expanduser() if eval_snapshot_dir else None
+        )
+        self._eval_snapshot_saved = False
+        self._eval_observation_override_path = (
+            Path(eval_observation_override_path).expanduser()
+            if eval_observation_override_path
+            else None
+        )
+        self._eval_observation_override_consumed = False
+        self._eval_model_action_override_path = (
+            Path(eval_model_action_override_path).expanduser()
+            if eval_model_action_override_path
+            else None
+        )
+        self._eval_model_action_override_consumed = False
 
         # openpi.transforms pipeline state (installed by :meth:`setup_wrappers`).
         self._input_transform_fn = None
@@ -281,7 +302,75 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             token_ar_mask=_move(obs.token_ar_mask),
             token_loss_mask=_move(obs.token_loss_mask),
             pcd_xyz=_move(obs.pcd_xyz),
+            history_states=_move(obs.history_states),
+            history_frame_mask=_move(obs.history_frame_mask),
+            history_time_offsets=_move(obs.history_time_offsets),
         )
+
+    def _attach_short_memory_history(
+        self, processed: dict, env_obs: dict[str, Any]
+    ) -> dict:
+        """Transform raw BEHAVIOR history with the same OpenPI pipeline."""
+        if "history_main_images" not in env_obs:
+            return processed
+        required = {
+            "history_wrist_images",
+            "history_states",
+            "history_frame_mask",
+            "history_time_offsets",
+        }
+        missing = required - env_obs.keys()
+        if missing:
+            raise ValueError(
+                f"Short-memory env observation is missing {sorted(missing)}."
+            )
+
+        main_images = env_obs["history_main_images"]
+        wrist_images = env_obs["history_wrist_images"]
+        states = env_obs["history_states"]
+        batch_size, history_length = main_images.shape[:2]
+        if wrist_images.shape[:2] != (batch_size, history_length):
+            raise ValueError("History camera tensors must share [B, K].")
+        if states.shape[:2] != (batch_size, history_length):
+            raise ValueError("History states must share the camera [B, K].")
+
+        prompts = [
+            prompt
+            for prompt in env_obs["task_descriptions"]
+            for _ in range(history_length)
+        ]
+        history_repacked = {
+            "observation/image": main_images.reshape(
+                batch_size * history_length, *main_images.shape[2:]
+            ),
+            "observation/wrist_image": wrist_images.reshape(
+                batch_size * history_length, *wrist_images.shape[2:]
+            ),
+            "observation/state": states.reshape(
+                batch_size * history_length, states.shape[-1]
+            ),
+            "prompt": prompts,
+        }
+        history_processed = self.input_transform(history_repacked, transpose=False)
+
+        processed["image"] = {
+            key: value.reshape(batch_size, history_length, *value.shape[1:])
+            for key, value in history_processed["image"].items()
+        }
+        frame_mask = torch.as_tensor(env_obs["history_frame_mask"]).bool()
+        processed["image_mask"] = {
+            key: value.reshape(batch_size, history_length).bool() & frame_mask
+            for key, value in history_processed["image_mask"].items()
+        }
+        state_dim = self.model._config.short_memory_state_dim
+        processed["history_states"] = history_processed["state"].reshape(
+            batch_size, history_length, -1
+        )[..., :state_dim]
+        processed["history_frame_mask"] = frame_mask
+        processed["history_time_offsets"] = torch.as_tensor(
+            env_obs["history_time_offsets"], dtype=torch.float32
+        )
+        return processed
 
     # ------------------------------------------------------------------ rollout
 
@@ -315,8 +404,42 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         # openpi.transforms pipeline (eval / RL).
         repacked = self._repack_env_obs(env_obs)
         processed = self.input_transform(repacked, transpose=False)
+        processed = self._attach_short_memory_history(processed, env_obs)
         observation = self._observation_dict_to_device(processed)
+        observation = self._maybe_override_first_eval_observation(observation)
         return self._predict_eval(observation, noise=noise, rng=rng)
+
+    def _maybe_override_first_eval_observation(
+        self, observation: Observation
+    ) -> Observation:
+        """Replace the first eval input with a ranked normalized observation."""
+        path = self._eval_observation_override_path
+        if path is None or self._eval_observation_override_consumed:
+            return observation
+        if not path.is_file():
+            raise FileNotFoundError(f"Eval observation override not found: {path}")
+
+        rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK")
+        if rank is None:
+            raise RuntimeError(
+                "Eval observation override requires RANK or LOCAL_RANK to "
+                "select the per-worker input."
+            )
+        worker_key = f"rank_{rank}"
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if worker_key not in payload:
+            raise KeyError(
+                f"Eval observation override {path} has no {worker_key!r}; "
+                f"available keys are {sorted(payload)}."
+            )
+        override = self._observation_dict_to_device(payload[worker_key])
+        if override.state.shape[0] != observation.state.shape[0]:
+            raise ValueError(
+                "Eval observation override batch size does not match live "
+                f"input: {override.state.shape[0]} != {observation.state.shape[0]}."
+            )
+        self._eval_observation_override_consumed = True
+        return override
 
     def _predict_eval(
         self,
@@ -336,6 +459,7 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         model_actions = self.model.sample_actions(
             observation, num_steps=self.num_steps, noise=noise, rng=rng
         )
+        model_actions = self._maybe_override_first_eval_model_actions(model_actions)
         env_outputs = self.output_transform(
             {"actions": model_actions, "state": observation.state}
         )
@@ -343,6 +467,7 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         # match the legacy eval processor's ``.astype(np.float32)`` contract (and
         # the action dtype the env/rollout worker expects).
         actions = env_outputs["actions"].to(device=self.device, dtype=torch.float32)
+        self._save_eval_snapshot(observation, model_actions, actions)
         B = actions.shape[0]
         result = {
             "prev_logprobs": None,
@@ -353,6 +478,69 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             },
         }
         return actions, result
+
+    def _maybe_override_first_eval_model_actions(
+        self, model_actions: torch.Tensor
+    ) -> torch.Tensor:
+        """Replace the first sampled chunk with ranked normalized oracle actions."""
+        path = self._eval_model_action_override_path
+        if path is None or self._eval_model_action_override_consumed:
+            return model_actions
+        if not path.is_file():
+            raise FileNotFoundError(f"Eval model-action override not found: {path}")
+
+        rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK")
+        if rank is None:
+            raise RuntimeError(
+                "Eval model-action override requires RANK or LOCAL_RANK to "
+                "select the per-worker action chunk."
+            )
+        worker_key = f"rank_{rank}"
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if worker_key not in payload:
+            raise KeyError(
+                f"Eval model-action override {path} has no {worker_key!r}; "
+                f"available keys are {sorted(payload)}."
+            )
+        override = payload[worker_key]
+        if override.ndim == model_actions.ndim - 1:
+            override = override.unsqueeze(0)
+        if override.shape != model_actions.shape:
+            raise ValueError(
+                "Eval model-action override shape does not match sampled actions: "
+                f"{tuple(override.shape)} != {tuple(model_actions.shape)}."
+            )
+        self._eval_model_action_override_consumed = True
+        return override.to(device=model_actions.device, dtype=model_actions.dtype)
+
+    def _save_eval_snapshot(
+        self,
+        observation: Observation,
+        model_actions: torch.Tensor,
+        env_actions: torch.Tensor,
+    ) -> None:
+        """Save the first exact normalized model input for parity diagnostics."""
+        if self._eval_snapshot_dir is None or self._eval_snapshot_saved:
+            return
+        self._eval_snapshot_dir.mkdir(parents=True, exist_ok=True)
+        rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK")
+        worker_id = f"rank_{rank}" if rank is not None else f"pid_{os.getpid()}"
+
+        def _cpu(value):
+            if torch.is_tensor(value):
+                return value.detach().cpu()
+            return value
+
+        snapshot = {
+            "observation": {
+                key: tree_map(_cpu, value)
+                for key, value in vars(observation).items()
+            },
+            "model_actions": model_actions.detach().cpu(),
+            "env_actions": env_actions.detach().cpu(),
+        }
+        torch.save(snapshot, self._eval_snapshot_dir / f"{worker_id}.pt")
+        self._eval_snapshot_saved = True
 
     @torch.no_grad()
     def extract_rlt_obs(self, env_obs: dict[str, Any]) -> dict[str, torch.Tensor]:

@@ -23,10 +23,12 @@ runner:
     experiment_name: "sft_behavior_pi05_vla"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 20
-  max_steps: 30000
+  # R2 task-0000 pilot: evaluate the 500/1,000/2,000-step checkpoints before
+  # scaling either the step count or task set.
+  max_epochs: -1
+  max_steps: 2000
   val_check_interval: -1
-  save_interval: 1000
+  save_interval: 500
 
 data:
   # Set this to your local BEHAVIOR streaming dataset folder (the
@@ -39,11 +41,20 @@ data:
   num_workers: 8
   fine_grained_level: 0
   tolerance_s: 1.0e-4
-  # BEHAVIOR task-0000. `use_skill: false` trains on the main-task text;
-  # `true` trains on the per-frame REFERENCE skill text selected by the window
-  # logic from `task_subtasks` below. The dataset's collapsed orchestrators are NOT
-  # a valid label source.
+  # Prompt supervision: `task` uses the full task, `skill` uses the configured
+  # reference labels below, `primitive` reads canonical oracle primitives, and
+  # `mixed` trains one policy on task and primitive prompts. Primitive and mixed
+  # modes drop action chunks that cross a primitive boundary.
   tasks: ["turning_on_radio"]
+  prompt_source: task
+  # Used only by mixed mode. A deterministic per-frame split keeps the prompt
+  # mixture reproducible across ranks and data-loader workers.
+  primitive_prompt_probability: 0.5
+  # Preserve the original R2 data contract by default. Conservative recipes can
+  # fall back to task prompts instead of dropping cross-primitive transitions.
+  mixed_boundary_fallback_to_task: false
+  # Backward-compatible skill-mode alias. Keep false when prompt_source is task,
+  # primitive, or mixed; old configs may set true without prompt_source.
   use_skill: false
   # Reference per-task skill labels (same as env/behavior_skill_library.yaml). When
   # `use_skill: true`, the builder maps task_subtasks[<task>] -> {0: label0, ...}.
@@ -82,8 +93,8 @@ actor:
     adam_eps: 1.0e-08
     weight_decay: 1e-10
     clip_grad: 1.0
-    total_training_steps: 30000
-    lr_warmup_steps: 1000
+    total_training_steps: 2000
+    lr_warmup_steps: 100
     lr_scheduler: "openpi_cosine"
     num_cycles: 0.5
     min_lr: 0.0
@@ -94,6 +105,15 @@ actor:
     use_orig_params: True
     gradient_checkpointing: True
     gradient_checkpointing_use_reentrant: False
+    # The π0.5 graph is static, so both prefetch directions are safe. Keep the
+    # all-gather rate limiter enabled to leave headroom for the 32-sample
+    # per-GPU micro-batch. Non-final accumulation micro-batches use no_sync().
+    enable_gradient_accumulation: True
+    forward_prefetch: True
+    backward_prefetch: "pre"
+    limit_all_gathers: True
+    # Four A100-80GB GPUs fit the validated micro-batch without host offload.
+    cpu_offload: False
     mixed_precision:
       param_dtype: bf16
       reduce_dtype: fp32

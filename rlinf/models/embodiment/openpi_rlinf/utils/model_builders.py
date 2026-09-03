@@ -78,8 +78,16 @@ def _build_eval_model(
             "(it selects the upstream openpi TrainConfig, e.g. 'pi05_behavior')."
         )
 
+    discrete_state_input = OmegaConf.select(
+        model_cfg, "discrete_state_input", default=None
+    )
     input_transforms, output_transforms = build_openpi_transforms(
-        cfg.model_path, config_name, data_kwargs=_resolve_data_kwargs(cfg)
+        cfg.model_path,
+        config_name,
+        data_kwargs=_resolve_data_kwargs(cfg),
+        discrete_state_input=(
+            None if discrete_state_input is None else bool(discrete_state_input)
+        ),
     )
 
     eval_model = OpenPiPytorchEvalActionModel(
@@ -90,6 +98,15 @@ def _build_eval_model(
         config_name=config_name,
         state_indices=OmegaConf.select(model_cfg, "state_indices", default=None),
         rlt_cfg=build_rlt_config(model_cfg),
+        eval_snapshot_dir=OmegaConf.select(
+            model_cfg, "eval_snapshot_dir", default=None
+        ),
+        eval_observation_override_path=OmegaConf.select(
+            model_cfg, "eval_observation_override_path", default=None
+        ),
+        eval_model_action_override_path=OmegaConf.select(
+            model_cfg, "eval_model_action_override_path", default=None
+        ),
     )
     eval_model.setup_wrappers(input_transforms, output_transforms)
     return eval_model
@@ -109,16 +126,72 @@ def _build_sft_model(
     pipeline the eval/RL paths use, so the SFT model holds no processor and no
     transforms — it just computes the flow-matching loss.
     """
+    from omegaconf import OmegaConf
+
     from rlinf.models.embodiment.openpi_rlinf.sft_action_model import (
         OpenPiPytorchSFTActionModel,
     )
 
-    return OpenPiPytorchSFTActionModel(
+    sft_model = OpenPiPytorchSFTActionModel(
         model,
         num_steps=num_steps,
         action_env_dim=action_env_dim,
         rlt_cfg=build_rlt_config(model_cfg),
+        history_contrastive_weight=float(
+            OmegaConf.select(
+                model_cfg,
+                "short_memory.contrastive.weight",
+                default=0.0,
+            )
+        ),
+        history_contrastive_margin=float(
+            OmegaConf.select(
+                model_cfg,
+                "short_memory.contrastive.margin",
+                default=0.01,
+            )
+        ),
+        history_contrastive_conditions=tuple(
+            str(condition)
+            for condition in OmegaConf.select(
+                model_cfg,
+                "short_memory.contrastive.conditions",
+                default=["repeat_current", "shuffle_past"],
+            )
+        ),
+        history_contrastive_min_valid_frames=int(
+            OmegaConf.select(
+                model_cfg,
+                "short_memory.contrastive.min_valid_frames",
+                default=6,
+            )
+        ),
     )
+    train_expert_only = bool(
+        OmegaConf.select(model_cfg, "train_expert_only", default=False)
+    )
+    freeze_vision_encoder = bool(
+        OmegaConf.select(model_cfg, "freeze_vision_encoder", default=False)
+    )
+    if train_expert_only and freeze_vision_encoder:
+        raise ValueError(
+            "train_expert_only and freeze_vision_encoder are mutually exclusive."
+        )
+    if train_expert_only:
+        frozen = sft_model.freeze_vlm()
+        logger.info(
+            "openpi_rlinf[sft]: train_expert_only=True; froze %d parameter "
+            "tensors (SigLIP + gemma expert-0)",
+            frozen,
+        )
+    elif freeze_vision_encoder:
+        frozen = sft_model.freeze_vision_encoder()
+        logger.info(
+            "openpi_rlinf[sft]: freeze_vision_encoder=True; froze %d SigLIP "
+            "parameter tensors",
+            frozen,
+        )
+    return sft_model
 
 
 def _build_rl_model(
@@ -155,8 +228,16 @@ def _build_rl_model(
             "(it selects the upstream openpi TrainConfig, e.g. 'pi05_behavior')."
         )
 
+    discrete_state_input = OmegaConf.select(
+        model_cfg, "discrete_state_input", default=None
+    )
     input_transforms, output_transforms = build_openpi_transforms(
-        cfg.model_path, config_name, data_kwargs=_resolve_data_kwargs(cfg)
+        cfg.model_path,
+        config_name,
+        data_kwargs=_resolve_data_kwargs(cfg),
+        discrete_state_input=(
+            None if discrete_state_input is None else bool(discrete_state_input)
+        ),
     )
 
     rl_cfg = OpenPiPytorchRLConfig(

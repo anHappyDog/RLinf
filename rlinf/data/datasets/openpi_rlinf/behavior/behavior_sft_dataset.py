@@ -115,6 +115,12 @@ except ModuleNotFoundError:  # lerobot < 0.2
 from openpi.transforms import DataTransformFn
 from torch.utils.data import Dataset, get_worker_info
 
+from rlinf.data.datasets.openpi_rlinf.behavior.high_level import (
+    PrimitivePromptInterval,
+    build_primitive_prompt_intervals,
+    resolve_primitive_prompt,
+)
+
 logger = logging.getLogger("BehaviorSftDataset")
 
 # ---------------------------------------------------------------------------
@@ -576,21 +582,44 @@ def partition_chunk_indices(
     return list(range(global_worker_id, num_chunks, stride))
 
 
+def _chunks_are_episode_contiguous(
+    previous: tuple[int, int, int], current: tuple[int, int, int]
+) -> bool:
+    """Return whether two keyframe chunks are adjacent in the same episode."""
+    previous_start, previous_end, previous_local_start = previous
+    expected_local_start = previous_local_start + (previous_end - previous_start)
+    return current[0] == previous_end and current[2] == expected_local_start
+
+
+def _group_episode_chunks(
+    chunks: list[tuple[int, int, int]],
+) -> list[list[tuple[int, int, int]]]:
+    """Group an ordered chunk list without crossing episode boundaries."""
+    groups: list[list[tuple[int, int, int]]] = []
+    for chunk in chunks:
+        if not groups or not _chunks_are_episode_contiguous(groups[-1][-1], chunk):
+            groups.append([])
+        groups[-1].append(chunk)
+    return groups
+
+
 class BehaviorSftDataset(LeRobotDataset):
     """Streaming BEHAVIOR-1K dataset for pi05 SFT (task filtering + chunk streaming).
 
     The dataset streams contiguous keyframe *chunks* of each episode rather than
     returning the frame at a random ``idx``: ``__getitem__`` ignores ``idx`` and
-    advances an internal streaming cursor. Chunks are partitioned across data
-    loader workers (and, in this port, across distributed ranks) so that every
-    consumer sees a disjoint stream — see :meth:`__getitem__`.
+    advances an internal streaming cursor. Memoryless training partitions chunks
+    across consumers. Short-memory training partitions complete episodes and
+    preserves their internal chunk order so history never crosses episodes or
+    resets at an artificial chunk boundary — see :meth:`__getitem__`.
 
     Direct-task mode (the default) sets the per-frame prompt to the fine-grained
-    task text. Skill mode (``skill_labels`` provided) additionally resolves each
-    frame to a skill-level label and skips gap frames; the skill-boundary logic
-    is carried over from the old pipeline via :meth:`_build_skill_boundaries` /
-    :meth:`_get_skill_label` and is intended to be aligned to the reference
-    ``openpi-comet`` semantics in a follow-up.
+    task text. Skill mode resolves a configured reference skill label. Primitive
+    mode resolves the canonical oracle primitive from the native B1K annotation
+    and skips samples whose action chunk crosses a primitive boundary. Mixed mode
+    trains one policy on both task and primitive prompts. It can either retain
+    the same boundary-safe distribution for both prompt types or fall back to a
+    task prompt for cross-boundary chunks so transition actions are preserved.
     """
 
     def __init__(
@@ -621,6 +650,17 @@ class BehaviorSftDataset(LeRobotDataset):
         skill_list: list[str] | None = None,
         skill_labels: dict[int, str] | None = None,
         use_skill: bool = False,
+        prompt_source: str | None = None,
+        primitive_prompt_probability: float = 0.5,
+        mixed_boundary_fallback_to_task: bool = False,
+        history_length: int = 1,
+        history_frame_stride: int = 1,
+        memory_critical_enabled: bool = False,
+        memory_critical_primitive_prompts: Iterable[str] | None = None,
+        memory_critical_gripper_indices: tuple[int, int] = (14, 22),
+        memory_critical_close_threshold: float = 0.0,
+        memory_noncritical_keep_probability: float = 1.0,
+        memory_critical_require_full_history: bool = True,
         enable_gap: bool = True,
         allow_left: int = 0,
         allow_right: int = 0,
@@ -654,6 +694,63 @@ class BehaviorSftDataset(LeRobotDataset):
         # `skill_labels` are required in that case (the production builder sources
         # them from config), otherwise the constructor raises below.
         self.use_skill = use_skill
+        legacy_prompt_source = "skill" if use_skill else "task"
+        self.prompt_source = prompt_source or legacy_prompt_source
+        if self.prompt_source not in {"task", "skill", "primitive", "mixed"}:
+            raise ValueError(
+                "prompt_source must be one of 'task', 'skill', 'primitive', or "
+                "'mixed'; "
+                f"got {self.prompt_source!r}."
+            )
+        if not 0.0 <= primitive_prompt_probability <= 1.0:
+            raise ValueError(
+                "primitive_prompt_probability must be in [0, 1]; "
+                f"got {primitive_prompt_probability}."
+            )
+        self.primitive_prompt_probability = primitive_prompt_probability
+        self.mixed_boundary_fallback_to_task = bool(mixed_boundary_fallback_to_task)
+        self.history_length = int(history_length)
+        self.history_frame_stride = int(history_frame_stride)
+        if self.history_length <= 0:
+            raise ValueError("history_length must be positive.")
+        if self.history_frame_stride <= 0:
+            raise ValueError("history_frame_stride must be positive.")
+        self.memory_critical_enabled = bool(memory_critical_enabled)
+        self.memory_critical_primitive_prompts = frozenset(
+            memory_critical_primitive_prompts or ()
+        )
+        self.memory_critical_gripper_indices = tuple(
+            int(index) for index in memory_critical_gripper_indices
+        )
+        self.memory_critical_close_threshold = float(
+            memory_critical_close_threshold
+        )
+        self.memory_noncritical_keep_probability = float(
+            memory_noncritical_keep_probability
+        )
+        self.memory_critical_require_full_history = bool(
+            memory_critical_require_full_history
+        )
+        if self.memory_critical_enabled and self.history_length <= 1:
+            raise ValueError(
+                "memory-critical sampling requires history_length > 1."
+            )
+        if len(self.memory_critical_gripper_indices) != 2 or min(
+            self.memory_critical_gripper_indices
+        ) < 0:
+            raise ValueError(
+                "memory_critical_gripper_indices must contain two non-negative "
+                "action indices."
+            )
+        if not 0.0 <= self.memory_noncritical_keep_probability <= 1.0:
+            raise ValueError(
+                "memory_noncritical_keep_probability must be in [0, 1]."
+            )
+        self._stream_history: list[dict] = []
+        if use_skill and self.prompt_source != "skill":
+            raise ValueError(
+                "use_skill=True is only compatible with prompt_source='skill'."
+            )
         # Skill-mode windowing, aligned with the JAX openpi-comet semantics:
         # `enable_gap` absorbs a true gap into both adjacent skills (so the gap
         # region overlaps and is shared); `allow_left` / `allow_right` are frame
@@ -687,6 +784,7 @@ class BehaviorSftDataset(LeRobotDataset):
         self.root.mkdir(exist_ok=True, parents=True)
 
         self.seed = seed
+        self.shuffle = shuffle
         if modalities is None:
             modalities = ["rgb"]
         if cameras is None:
@@ -724,14 +822,8 @@ class BehaviorSftDataset(LeRobotDataset):
         self._chunk_streaming_using_keyframe = chunk_streaming_using_keyframe
         if self._chunk_streaming_using_keyframe:
             self.chunks = self._get_keyframe_chunk_indices()
-            if shuffle:
-                self.current_streaming_chunk_idx = None
-                self.current_streaming_frame_idx = None
-            else:
-                self.current_streaming_chunk_idx = 0
-                self.current_streaming_frame_idx = self.chunks[
-                    self.current_streaming_chunk_idx
-                ][0]
+            self.current_streaming_chunk_idx = None
+            self.current_streaming_frame_idx = None
             self.obs_loaders = {}
             self._should_obs_loaders_reload = True
 
@@ -785,20 +877,50 @@ class BehaviorSftDataset(LeRobotDataset):
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
+        action_indices = (
+            self.delta_indices.get("action", [])
+            if self.delta_indices is not None
+            else []
+        )
+        self.prompt_action_horizon = len(action_indices) or 1
+
         self.prepare_task(fine_grained_level)
 
         # Skill mode requires explicit REFERENCE skill_labels (sourced from config by
         # the builder). Deriving them from this dataset's orchestrators is unsafe —
         # the real 2025-challenge-demos collapses every orchestrator level to the full
         # task text, so derived labels would equal the task prompt — hence fail loudly.
-        if self.use_skill and self.skill_labels is None:
+        if self.prompt_source == "skill" and self.skill_labels is None:
             raise ValueError(
-                "BehaviorSftDataset(use_skill=True) requires explicit skill_labels "
+                "BehaviorSftDataset(prompt_source='skill') requires explicit "
+                "skill_labels "
                 "(the reference per-task subtask labels); none were supplied. The "
                 "production builder sources them from data.task_subtasks."
             )
         if self.skill_labels is not None:
             self._build_skill_boundaries()
+
+        self.primitive_prompt_intervals: dict[int, list[PrimitivePromptInterval]] = {}
+        if self.prompt_source in {"primitive", "mixed"}:
+            for episode_index in self.episodes:
+                annotation = self.meta.annotations.get(episode_index)
+                if annotation is None:
+                    raise ValueError(
+                        "Primitive prompt mode requires a B1K annotation for "
+                        f"episode {episode_index}."
+                    )
+                try:
+                    intervals = build_primitive_prompt_intervals(annotation)
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        "Failed to build primitive prompts for episode "
+                        f"{episode_index}: {error}"
+                    ) from error
+                if not intervals:
+                    raise ValueError(
+                        f"Episode {episode_index} has no primitive prompt intervals."
+                    )
+                self.primitive_prompt_intervals[episode_index] = intervals
 
         self.omnigibson_mapping = {
             ep_idx: defaultdict(dict) for ep_idx in self.episodes
@@ -979,10 +1101,11 @@ class BehaviorSftDataset(LeRobotDataset):
         Reads the distributed ``rank`` / ``world_size`` and the data-loader
         ``worker_id`` / ``num_workers``, folds them into the keyframe-chunk
         partition (via :func:`partition_chunk_indices`), shuffles the resulting
-        chunks with a per-``(rank, worker)`` seed, and sets the streaming cursor
-        to the start of the chosen chunk. Folding the rank in is what makes each
-        distributed rank stream a disjoint set of chunks (a ``DistributedSampler``
-        cannot, since this dataset ignores ``idx``).
+        work with a per-``(rank, worker)`` seed, and sets the streaming cursor.
+        Short-memory streams partition complete episodes and preserve their
+        internal chunk order, so history survives chunk boundaries without an
+        expensive prefix decode. Memoryless streams retain the original
+        independent-chunk sampling behavior.
         """
         # Prefer the explicit rank/world_size captured at construction (in the main
         # process); spawned DataLoader workers cannot read ``torch.distributed``, so
@@ -1002,25 +1125,62 @@ class BehaviorSftDataset(LeRobotDataset):
         worker_id = 0 if worker_info is None else worker_info.id
         num_workers = 1 if worker_info is None else worker_info.num_workers
         global_worker_id = rank * num_workers + worker_id
+        preserve_episode_history = getattr(self, "history_length", 1) > 1
         if not hasattr(self, "_active_chunks") or self._active_chunks is None:
-            indices = partition_chunk_indices(
-                len(self.chunks),
-                rank=rank,
-                world_size=world_size,
-                worker_id=worker_id,
-                num_workers=num_workers,
-            )
-            worker_chunks = [self.chunks[i] for i in indices]
             rng = np.random.default_rng(self.seed + global_worker_id)
-            rng.shuffle(worker_chunks)
-            self._active_chunks = worker_chunks
+            if preserve_episode_history:
+                episode_chunks = _group_episode_chunks(self.chunks)
+                indices = partition_chunk_indices(
+                    len(episode_chunks),
+                    rank=rank,
+                    world_size=world_size,
+                    worker_id=worker_id,
+                    num_workers=num_workers,
+                )
+                worker_episodes = [episode_chunks[i] for i in indices]
+                if self.shuffle:
+                    rng.shuffle(worker_episodes)
+                self._active_chunks = [
+                    chunk for episode in worker_episodes for chunk in episode
+                ]
+            else:
+                indices = partition_chunk_indices(
+                    len(self.chunks),
+                    rank=rank,
+                    world_size=world_size,
+                    worker_id=worker_id,
+                    num_workers=num_workers,
+                )
+                worker_chunks = [self.chunks[i] for i in indices]
+                if self.shuffle:
+                    rng.shuffle(worker_chunks)
+                self._active_chunks = worker_chunks
         rng = np.random.default_rng(self.seed + global_worker_id)
-        self.current_streaming_chunk_idx = rng.integers(
-            0, len(self._active_chunks)
-        ).item()
+        self.current_streaming_chunk_idx = int(
+            rng.integers(0, len(self._active_chunks))
+            if self.shuffle and not preserve_episode_history
+            else 0
+        )
         self.current_streaming_frame_idx = self._active_chunks[
             self.current_streaming_chunk_idx
         ][0]
+
+    def _advance_streaming_chunk_if_needed(self) -> None:
+        """Advance the chunk cursor while retaining same-episode history."""
+        current_chunk = self._active_chunks[self.current_streaming_chunk_idx]
+        if self.current_streaming_frame_idx < current_chunk[1]:
+            return
+
+        self.current_streaming_chunk_idx = (
+            self.current_streaming_chunk_idx + 1
+        ) % len(self._active_chunks)
+        next_chunk = self._active_chunks[self.current_streaming_chunk_idx]
+        self.current_streaming_frame_idx = next_chunk[0]
+        preserve_history = getattr(self, "history_length", 1) > 1
+        if not preserve_history or not _chunks_are_episode_contiguous(
+            current_chunk, next_chunk
+        ):
+            self._should_obs_loaders_reload = True
 
     def __getitem__(self, idx) -> dict:
         """Return the next streamed frame (the ``idx`` argument is ignored).
@@ -1046,17 +1206,7 @@ class BehaviorSftDataset(LeRobotDataset):
         if self.current_streaming_chunk_idx is None:
             self._select_streaming_chunk()
 
-        if (
-            self.current_streaming_frame_idx
-            >= self._active_chunks[self.current_streaming_chunk_idx][1]
-        ):
-            self.current_streaming_chunk_idx += 1
-            if self.current_streaming_chunk_idx >= len(self._active_chunks):
-                self.current_streaming_chunk_idx = 0
-            self.current_streaming_frame_idx = self._active_chunks[
-                self.current_streaming_chunk_idx
-            ][0]
-            self._should_obs_loaders_reload = True
+        self._advance_streaming_chunk_if_needed()
 
         item = self.hf_dataset[self.current_streaming_frame_idx]
         if "observation.task_info" in item:
@@ -1067,6 +1217,7 @@ class BehaviorSftDataset(LeRobotDataset):
             for loader in self.obs_loaders.values():
                 loader.close()
             self.obs_loaders = {}
+            self._stream_history = []
             self.current_streaming_episode_idx = ep_idx
             for vid_key in self.meta.video_keys:
                 kwargs = {}
@@ -1093,6 +1244,14 @@ class BehaviorSftDataset(LeRobotDataset):
                 )
             self._should_obs_loaders_reload = False
 
+        requires_boundary_safe_prompt = self.prompt_source == "primitive" or (
+            self.prompt_source == "mixed" and not self.mixed_boundary_fallback_to_task
+        )
+        if requires_boundary_safe_prompt:
+            frame_index = round(item["timestamp"].item() * self.fps)
+            if self._get_primitive_prompt(ep_idx, frame_index) is None:
+                return self._skip_streaming_frame(idx, item)
+
         query_indices = None
         if self.delta_indices is not None:
             query_indices, padding = self._get_query_indices(
@@ -1103,23 +1262,27 @@ class BehaviorSftDataset(LeRobotDataset):
             for key, val in query_result.items():
                 item[key] = val
 
+        memory_critical = self._is_memory_critical_sample(item, ep_idx)
+        if (
+            self.memory_critical_enabled
+            and not memory_critical
+            and not self._keep_noncritical_sample(item, ep_idx)
+        ):
+            return self._skip_streaming_frame(idx, item)
+        if self.memory_critical_enabled:
+            item["_history_contrastive_mask"] = memory_critical
+
         task_skill = self._get_current_task_skill(item)
         weight = skill_weight(task_skill, self.skill_list)
         if not random.choices([True, False], weights=[weight, 1 - weight])[0]:
-            self.current_streaming_frame_idx += 1
-            for key in self.obs_loaders:
-                next(self.obs_loaders[key])[0]
-            return self.__getitem__(idx)
+            return self._skip_streaming_frame(idx, item)
 
         # Skip frames that fall in gaps between skill ranges.
         if self.skill_labels is not None and self.enable_gap:
             ep_idx_val = item["episode_index"].item()
             frame_index_val = round(item["timestamp"].item() * self.fps)
             if self._is_gap_frame(ep_idx_val, frame_index_val):
-                self.current_streaming_frame_idx += 1
-                for key in self.obs_loaders:
-                    next(self.obs_loaders[key])[0]
-                return self.__getitem__(idx)
+                return self._skip_streaming_frame(idx, item)
 
         for key in self.obs_loaders:
             item[key] = next(self.obs_loaders[key])[0]
@@ -1130,8 +1293,142 @@ class BehaviorSftDataset(LeRobotDataset):
                 item[cam] = self.image_transforms(item[cam])
 
         self._set_prompt(item)
+        self._append_stream_history(item)
+        self._attach_stream_history(item)
         self.current_streaming_frame_idx += 1
         return item
+
+    def _skip_streaming_frame(self, idx: int, item: dict | None = None) -> dict:
+        """Advance all streaming cursors once and return the next valid item."""
+        if item is not None:
+            for key in self.obs_loaders:
+                item[key] = next(self.obs_loaders[key])[0]
+            if self.image_transforms is not None:
+                for camera_key in self.meta.camera_keys:
+                    item[camera_key] = self.image_transforms(item[camera_key])
+            self._append_stream_history(item)
+        else:
+            for key in self.obs_loaders:
+                next(self.obs_loaders[key])[0]
+        self.current_streaming_frame_idx += 1
+        return self.__getitem__(idx)
+
+    def _append_stream_history(self, item: dict) -> None:
+        """Record one decoded frame for later short-memory SFT samples."""
+        if self.history_length == 1:
+            return
+        frame = {
+            key: item[key]
+            for key in (*self.meta.camera_keys, "observation.state", "timestamp")
+        }
+        self._stream_history.append(frame)
+        retained_frames = (self.history_length - 1) * self.history_frame_stride + 1
+        self._stream_history = self._stream_history[-retained_frames:]
+
+    def _attach_stream_history(self, item: dict) -> None:
+        """Attach oldest-to-current raw history, masks, and relative seconds."""
+        if self.history_length == 1:
+            return
+        history: list[dict | None] = []
+        for position in range(self.history_length):
+            reverse_index = (
+                self.history_length - 1 - position
+            ) * self.history_frame_stride
+            source_index = len(self._stream_history) - 1 - reverse_index
+            history.append(
+                self._stream_history[source_index] if source_index >= 0 else None
+            )
+
+        current_time = float(item["timestamp"].item())
+        item["_history_frames"] = history
+        item["_history_frame_mask"] = th.tensor(
+            [frame is not None for frame in history], dtype=th.bool
+        )
+        item["_history_time_offsets"] = th.tensor(
+            [
+                0.0
+                if frame is None
+                else float(frame["timestamp"].item()) - current_time
+                for frame in history
+            ],
+            dtype=th.float32,
+        )
+
+    def _get_primitive_prompt(
+        self, episode_index: int, frame_index: int
+    ) -> PrimitivePromptInterval | None:
+        """Resolve an oracle prompt whose action chunk stays in one primitive."""
+        return resolve_primitive_prompt(
+            self.primitive_prompt_intervals[episode_index],
+            frame_index,
+            action_horizon=self.prompt_action_horizon,
+        )
+
+    def _is_memory_critical_sample(self, item: dict, episode_index: int) -> bool:
+        """Identify annotation-aligned gripper-event action windows."""
+        if not self.memory_critical_enabled:
+            return False
+        if self.memory_critical_require_full_history:
+            required_past_frames = (
+                self.history_length - 1
+            ) * self.history_frame_stride
+            if len(self._stream_history) < required_past_frames:
+                return False
+        actions = item.get("action")
+        if actions is None:
+            raise ValueError(
+                "memory-critical sampling requires the future action chunk."
+            )
+        actions = th.as_tensor(actions)
+        if actions.ndim != 2:
+            raise ValueError(
+                "memory-critical action chunks must have shape [T, D], "
+                f"got {tuple(actions.shape)}."
+            )
+        if max(self.memory_critical_gripper_indices) >= actions.shape[-1]:
+            raise ValueError(
+                "memory-critical gripper index exceeds the action dimension "
+                f"{actions.shape[-1]}."
+            )
+
+        frame_index = round(float(item["timestamp"].item()) * self.fps)
+        if self.memory_critical_primitive_prompts:
+            interval = self._get_primitive_prompt(episode_index, frame_index)
+            if (
+                interval is None
+                or interval.subtask not in self.memory_critical_primitive_prompts
+            ):
+                return False
+        grippers = actions[:, list(self.memory_critical_gripper_indices)]
+        return bool((grippers < self.memory_critical_close_threshold).any())
+
+    def _keep_noncritical_sample(self, item: dict, episode_index: int) -> bool:
+        """Deterministically retain a configured fraction of control windows."""
+        probability = self.memory_noncritical_keep_probability
+        if probability >= 1.0:
+            return True
+        if probability <= 0.0:
+            return False
+        frame_index = round(float(item["timestamp"].item()) * self.fps)
+        sample_hash = (
+            episode_index * 2_654_435_761
+            + frame_index * 2_246_822_519
+            + self.seed * 3_266_489_917
+            + 0x9E3779B9
+        ) & 0xFFFFFFFF
+        return sample_hash < int(probability * (1 << 32))
+
+    def _mixed_prompt_uses_primitive(
+        self, episode_index: int, frame_index: int
+    ) -> bool:
+        """Choose a reproducible task/primitive prompt for one action chunk."""
+        mixed_hash = (
+            episode_index * 2_654_435_761
+            + frame_index * 2_246_822_519
+            + self.seed * 3_266_489_917
+        ) & 0xFFFFFFFF
+        threshold = int(self.primitive_prompt_probability * (1 << 32))
+        return mixed_hash < threshold
 
     def _get_current_task_skill(self, item: dict) -> str:
         """Look up the level-1 (skill) task text for the current frame."""
@@ -1165,17 +1462,41 @@ class BehaviorSftDataset(LeRobotDataset):
     def _set_prompt(self, item: dict) -> None:
         """Set the per-frame training-prompt fields on ``item``.
 
-        Always sets ``item["task"]`` (the fine-grained main-task text). In skill mode
-        it also resolves the per-frame skill text (``item["skill_label"]``) and, when
-        ``use_skill`` is on, makes that skill text the training prompt
-        (``item["prompt"]``, which the transform prefers over ``item["task"]``). With
-        ``use_skill`` off, no ``prompt`` key is set, so the prompt is the task text.
+        Always sets ``item["task"]`` (the fine-grained main-task text). Skill and
+        primitive modes additionally set ``item["prompt"]``, which the transform
+        prefers over the full task. Mixed mode deterministically selects task or
+        primitive text per action chunk, so the choice is reproducible across
+        ranks and data-loader workers.
         """
         item["task"] = self._get_fine_grained_task(item)
-        if self.skill_labels is not None:
+        if self.prompt_source == "skill":
             item["skill_label"] = self._get_skill_label(item)
-            if self.use_skill:
-                item["prompt"] = item["skill_label"]
+            item["prompt"] = item["skill_label"]
+        elif self.prompt_source in {"primitive", "mixed"}:
+            episode_index = item["episode_index"].item()
+            frame_index = round(item["timestamp"].item() * self.fps)
+            interval = self._get_primitive_prompt(episode_index, frame_index)
+            if interval is None:
+                if (
+                    self.prompt_source == "mixed"
+                    and self.mixed_boundary_fallback_to_task
+                ):
+                    item["prompt_source"] = "task"
+                    item["prompt"] = item["task"]
+                    return
+                raise ValueError(
+                    "Primitive prompt requested for a frame whose action chunk "
+                    f"crosses a boundary: episode={episode_index}, "
+                    f"frame={frame_index}, horizon={self.prompt_action_horizon}."
+                )
+            item["primitive_label"] = interval.subtask
+            item["primitive_index"] = interval.primitive_index
+            use_primitive = self.prompt_source == "primitive" or (
+                self.prompt_source == "mixed"
+                and self._mixed_prompt_uses_primitive(episode_index, frame_index)
+            )
+            item["prompt_source"] = "primitive" if use_primitive else "task"
+            item["prompt"] = interval.subtask if use_primitive else item["task"]
 
     def _get_query_indices(self, idx: int, ep_idx: int):
         """Compute action-horizon query indices and per-key padding masks."""

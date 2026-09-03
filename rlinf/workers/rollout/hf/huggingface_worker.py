@@ -36,6 +36,7 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.obs_compression import decompress_obs, infer_obs_batch_size
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.utils import seed_everything
 
 
 class MultiStepRolloutWorker(Worker):
@@ -139,6 +140,10 @@ class MultiStepRolloutWorker(Worker):
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
 
     def init_worker(self):
+        rollout_seed = OmegaConf.select(self.cfg, "rollout.seed", default=None)
+        if rollout_seed is not None:
+            seed_everything(int(rollout_seed) + self._rank)
+
         rollout_model_config = copy.deepcopy(self.model_cfg)
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision

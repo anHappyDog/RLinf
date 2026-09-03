@@ -1,0 +1,13 @@
+defaults:
+  - pi0_5_rlinf
+
+# Functional MEM short-memory branch. Selected SigLIP blocks reuse their own
+# attention weights for a causal temporal pass over equal patch locations.
+openpi:
+  # MEM projects all K proprioceptive states as continuous prefix tokens.
+  discrete_state_input: false
+  short_memory:
+    enabled: true
+    temporal_layers: [3, 7, 11, 15]
+    drop_history_layer: 15
+    state_dim: 23

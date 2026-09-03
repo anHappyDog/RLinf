@@ -215,6 +215,32 @@ def test_policy_output_split_merge_invariant():
     assert torch.equal(merged.versions, policy_output.versions)
 
 
+def test_env_output_preserves_short_memory_observations():
+    obs = _make_obs(0, 2)
+    obs.update(
+        history_main_images=torch.ones(2, 3, 4, 4, 3),
+        history_wrist_images=torch.ones(2, 3, 2, 4, 4, 3),
+        history_states=torch.ones(2, 3, 23),
+        history_frame_mask=torch.tensor(
+            [[False, True, True], [True, True, True]]
+        ),
+        history_time_offsets=torch.tensor(
+            [[0.0, -1.0, 0.0], [-2.0, -1.0, 0.0]]
+        ),
+    )
+
+    prepared = EnvOutput(obs=obs).to_dict()["obs"]
+
+    for key in (
+        "history_main_images",
+        "history_wrist_images",
+        "history_states",
+        "history_frame_mask",
+        "history_time_offsets",
+    ):
+        assert torch.equal(prepared[key], obs[key])
+
+
 def test_merge_env_outputs_with_partial_optional_fields():
     env_output_0 = EnvOutput(
         obs=_make_obs(0, 2),

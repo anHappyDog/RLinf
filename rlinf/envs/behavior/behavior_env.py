@@ -16,6 +16,7 @@ import gc
 import inspect
 import json
 import os
+import pathlib
 import time
 from typing import ClassVar
 
@@ -24,7 +25,15 @@ import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.envs.behavior.demonstration_reset import (
+    DemonstrationResetSpec,
+    restore_demonstration_observations,
+)
 from rlinf.envs.behavior.instance_loader import ActivityInstanceLoader
+from rlinf.envs.behavior.oracle_prompt import (
+    StagePromptController,
+    extract_sequential_reward_info,
+)
 from rlinf.envs.behavior.utils import (
     apply_env_wrapper,
     apply_runtime_renderer_settings,
@@ -34,7 +43,100 @@ from rlinf.envs.behavior.utils import (
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 from rlinf.utils.logging import get_logger
 
-__all__ = ["BehaviorEnv"]
+__all__ = [
+    "BehaviorEnv",
+    "apply_short_memory_history_ablation",
+    "apply_short_memory_history_valid_lengths",
+]
+
+
+_SHORT_MEMORY_HISTORY_ABLATIONS = {
+    "none",
+    "repeat_current",
+    "shuffle_past",
+}
+
+
+def apply_short_memory_history_ablation(
+    history: dict[str, torch.Tensor], mode: str
+) -> dict[str, torch.Tensor]:
+    """Apply a deterministic content control to a short-memory observation.
+
+    The current observation, padding mask, and time offsets remain unchanged.
+    ``repeat_current`` replaces every valid past observation with the current
+    one. ``shuffle_past`` reverses only the valid past observations, providing
+    a reproducible order counterfactual without moving padding into valid slots.
+    """
+    if mode not in _SHORT_MEMORY_HISTORY_ABLATIONS:
+        choices = ", ".join(sorted(_SHORT_MEMORY_HISTORY_ABLATIONS))
+        raise ValueError(f"history_ablation must be one of {choices}, got {mode!r}.")
+    if mode == "none":
+        return history
+
+    frame_mask = history["history_frame_mask"]
+    result = dict(history)
+    content_keys = (
+        "history_main_images",
+        "history_wrist_images",
+        "history_states",
+    )
+    for key in content_keys:
+        value = history[key]
+        controlled = value.clone()
+        if mode == "repeat_current":
+            content_mask = frame_mask.reshape(
+                *frame_mask.shape, *((1,) * (value.ndim - frame_mask.ndim))
+            )
+            current = value[:, -1:].expand_as(value)
+            controlled = torch.where(content_mask, current, controlled)
+        else:
+            for batch_index, mask in enumerate(frame_mask):
+                valid_past = torch.nonzero(mask[:-1], as_tuple=False).flatten()
+                controlled[batch_index, valid_past] = value[
+                    batch_index, valid_past.flip(0)
+                ]
+        result[key] = controlled
+    return result
+
+
+def apply_short_memory_history_valid_lengths(
+    history: dict[str, torch.Tensor], valid_lengths: list[int]
+) -> dict[str, torch.Tensor]:
+    """Mask leading history frames to reproduce a loader's padded sample."""
+    frame_mask = history["history_frame_mask"]
+    batch_size, history_length = frame_mask.shape
+    if len(valid_lengths) != batch_size:
+        raise ValueError(
+            f"Expected {batch_size} valid history lengths, got {len(valid_lengths)}."
+        )
+    if any(length < 1 or length > history_length for length in valid_lengths):
+        raise ValueError(
+            f"History valid lengths must be in [1, {history_length}], got "
+            f"{valid_lengths}."
+        )
+
+    result = dict(history)
+    limited_mask = frame_mask.clone()
+    for batch_index, valid_length in enumerate(valid_lengths):
+        limited_mask[batch_index, : history_length - valid_length] = False
+    result["history_frame_mask"] = limited_mask
+
+    for key in (
+        "history_main_images",
+        "history_wrist_images",
+        "history_states",
+    ):
+        value = history[key]
+        content_mask = limited_mask.reshape(
+            *limited_mask.shape, *((1,) * (value.ndim - limited_mask.ndim))
+        )
+        result[key] = torch.where(content_mask, value, torch.zeros_like(value))
+    result["history_time_offsets"] = torch.where(
+        limited_mask,
+        history["history_time_offsets"],
+        torch.zeros_like(history["history_time_offsets"]),
+    )
+    return result
 
 
 def _preload_numba_llvmlite() -> None:
@@ -64,6 +166,8 @@ class BehaviorProcess:
         cfg: DictConfig,
         num_envs: int,
         pipeline_stage_num: int,
+        activity_instance_ids: list[int] | None = None,
+        demonstration_reset_specs: list[dict] | None = None,
     ):
         _preload_numba_llvmlite()
         from omnigibson.envs import VectorEnvironment
@@ -72,6 +176,20 @@ class BehaviorProcess:
         self.pipeline_stage_num = pipeline_stage_num
         omni_cfg = setup_omni_cfg(cfg)
         self.instance_loader = ActivityInstanceLoader.from_omni_cfg(omni_cfg)
+        if activity_instance_ids is not None:
+            self.instance_loader.with_fixed_instance_ids(activity_instance_ids)
+        self.demonstration_reset_specs = (
+            tuple(DemonstrationResetSpec(**spec) for spec in demonstration_reset_specs)
+            if demonstration_reset_specs is not None
+            else ()
+        )
+        if self.demonstration_reset_specs and (
+            num_envs != 1 or len(self.demonstration_reset_specs) != num_envs
+        ):
+            raise ValueError(
+                "Demonstration reset requires exactly one env and one reset spec "
+                "per OmniGibson subprocess."
+            )
 
         # create env and apply env wrapper if enabled
         omni_cfg_dict = OmegaConf.to_container(
@@ -111,6 +229,9 @@ class BehaviorProcess:
         self.step_supports_env_indices = "env_indices" in step_signature.parameters
         self.skip_intermediate_obs_in_chunk = bool(
             OmegaConf.select(cfg, "skip_intermediate_obs_in_chunk", default=False)
+        )
+        self.decision_trace_object_name = OmegaConf.select(
+            cfg, "decision_trace_object_name", default=None
         )
 
         if self.skip_intermediate_obs_in_chunk and not self.step_supports_get_obs:
@@ -152,6 +273,7 @@ class BehaviorProcess:
         actions: torch.Tensor,
         env_indices: list[int],
         need_obs: bool,
+        record_trace_state: bool = False,
     ):
         """Step one shard for a single chunk timestep.
 
@@ -181,6 +303,21 @@ class BehaviorProcess:
             truncates = [truncates[i] for i in env_indices]
             infos = [infos[i] for i in env_indices]
 
+        instance_ids = self.instance_loader.current_instance_ids
+        for info, env_index in zip(infos, env_indices, strict=True):
+            if instance_ids:
+                info["activity_instance_id"] = instance_ids[env_index]
+            if record_trace_state and self.decision_trace_object_name is not None:
+                env = self.env.envs[env_index]
+                target = env.scene.object_registry(
+                    "name", self.decision_trace_object_name
+                )
+                position, orientation = target.get_position_orientation()
+                info["decision_trace_state"] = {
+                    "object_position": position.detach().cpu().tolist(),
+                    "object_orientation": orientation.detach().cpu().tolist(),
+                }
+
         return (
             list(raw_obs) if need_obs else None,
             to_tensor(rewards),
@@ -205,20 +342,43 @@ class BehaviorProcess:
             is_last = t == chunk_size - 1
             need_obs = not self.skip_intermediate_obs_in_chunk or is_last
             results.append(
-                self._step_shard(actions[:, t], env_indices, need_obs=need_obs)
+                self._step_shard(
+                    actions[:, t],
+                    env_indices,
+                    need_obs=need_obs,
+                    record_trace_state=is_last,
+                )
             )
         return tuple(zip(*results))
 
     def reset(self, reset_indices=None, get_obs=True):
-        self.instance_loader.prepare_reset(self.env)
-        result = self._call_reset(
-            reset_indices=reset_indices,
-            get_obs=get_obs,
-        )
+        instance_ids = self.instance_loader.prepare_reset(self.env)
+        if self.demonstration_reset_specs:
+            if reset_indices is not None and list(reset_indices) != [0]:
+                raise ValueError(
+                    "The single-env demonstration reset only accepts reset_indices=[0]."
+                )
+            self._call_reset(reset_indices=reset_indices, get_obs=False)
+            history = restore_demonstration_observations(
+                self.env.envs[0], self.demonstration_reset_specs[0]
+            )
+            result = (
+                [history[-1][1]],
+                [{"_rlinf_demonstration_history": history}],
+            )
+        else:
+            result = self._call_reset(
+                reset_indices=reset_indices,
+                get_obs=get_obs,
+            )
         if not get_obs:
             return None, None
 
         raw_obs, infos = result
+        if reset_indices is not None:
+            instance_ids = tuple(instance_ids[index] for index in reset_indices)
+        for info, instance_id in zip(infos, instance_ids, strict=True):
+            info["activity_instance_id"] = instance_id
         return list(raw_obs), list(infos)
 
     def close(self):
@@ -244,6 +404,8 @@ class BehaviorProcessPool:
         worker_info,
         pipeline_stage_num: int,
         num_envs: int,
+        activity_instance_ids: list[int] | None = None,
+        demonstration_reset_specs: list[dict] | None = None,
     ) -> tuple["BehaviorProcessPool", int]:
         """Attach to the shared pool and return ``(pool, pool_offset)``."""
         if cls._shared_pool is None:  # pool init
@@ -257,6 +419,8 @@ class BehaviorProcessPool:
                 total_envs_per_worker,
                 num_env_subprocess,
                 pipeline_stage_num,
+                activity_instance_ids=activity_instance_ids,
+                demonstration_reset_specs=demonstration_reset_specs,
             )
 
         idx = cls._pipeline_next_idx
@@ -290,6 +454,8 @@ class BehaviorProcessPool:
         total_num_envs: int,
         num_env_subprocess: int,
         pipeline_stage_num: int,
+        activity_instance_ids: list[int] | None = None,
+        demonstration_reset_specs: list[dict] | None = None,
     ):
         if total_num_envs % num_env_subprocess != 0:
             raise ValueError(
@@ -304,6 +470,23 @@ class BehaviorProcessPool:
         self.skip_intermediate_obs_in_chunk = bool(
             OmegaConf.select(cfg, "skip_intermediate_obs_in_chunk", default=False)
         )
+        if (
+            activity_instance_ids is not None
+            and len(activity_instance_ids) != total_num_envs
+        ):
+            raise ValueError(
+                "activity_instance_ids must contain one id per local BEHAVIOR env, "
+                f"got {len(activity_instance_ids)} and {total_num_envs}."
+            )
+        if (
+            demonstration_reset_specs is not None
+            and len(demonstration_reset_specs) != total_num_envs
+        ):
+            raise ValueError(
+                "demonstration_reset_specs must contain one spec per local "
+                f"BEHAVIOR env, got {len(demonstration_reset_specs)} and "
+                f"{total_num_envs}."
+            )
 
         # Create subprocess actors with a retry/backoff loop. Actor startup
         # can fail (e.g. simulator plugin errors); retry a few times to handle
@@ -325,8 +508,18 @@ class BehaviorProcessPool:
                         self.cfg,
                         self.num_env_shard,
                         pipeline_stage_num,
+                        (
+                            activity_instance_ids[process_index::num_env_subprocess]
+                            if activity_instance_ids is not None
+                            else None
+                        ),
+                        (
+                            demonstration_reset_specs[process_index::num_env_subprocess]
+                            if demonstration_reset_specs is not None
+                            else None
+                        ),
                     )
-                    for _ in range(self.num_env_subprocess)
+                    for process_index in range(self.num_env_subprocess)
                 ]
 
                 # Wait for all instances to initialize and fetch their activity name
@@ -495,6 +688,8 @@ class BehaviorProcessPool:
 
 
 class BehaviorEnv(gym.Env):
+    _decision_trace_dir = None
+
     def __init__(
         self,
         cfg,
@@ -520,6 +715,42 @@ class BehaviorEnv(gym.Env):
         self.pool = None
         self.pool_offset = None
         self.task_description = None
+        self.prompt_controller = None
+        self.history_length = int(OmegaConf.select(cfg, "history_length", default=1))
+        if self.history_length <= 0:
+            raise ValueError("history_length must be positive.")
+        self.history_decision_stride = int(
+            OmegaConf.select(cfg, "history_decision_stride", default=1)
+        )
+        if self.history_decision_stride <= 0:
+            raise ValueError("history_decision_stride must be positive.")
+        self.history_ablation = str(
+            OmegaConf.select(cfg, "history_ablation", default="none")
+        )
+        if self.history_ablation not in _SHORT_MEMORY_HISTORY_ABLATIONS:
+            choices = ", ".join(sorted(_SHORT_MEMORY_HISTORY_ABLATIONS))
+            raise ValueError(
+                "history_ablation must be one of "
+                f"{choices}, got {self.history_ablation!r}."
+            )
+        self._observation_history = []
+        self._history_step = 0
+        self._action_frequency = float(
+            OmegaConf.select(cfg, "omni_config.env.action_frequency", default=60.0)
+        )
+        self._decision_trace_dir = OmegaConf.select(
+            cfg, "decision_trace_dir", default=None
+        )
+        self._decision_trace_object_name = OmegaConf.select(
+            cfg, "decision_trace_object_name", default=None
+        )
+        self._decision_trace_gripper_indices = tuple(
+            OmegaConf.select(cfg, "decision_trace_gripper_indices", default=[14, 22])
+        )
+        if len(self._decision_trace_gripper_indices) != 2:
+            raise ValueError("decision_trace_gripper_indices must contain two indices.")
+        self._decision_trace_records = []
+        self._decision_index = 0
         if total_num_processes % worker_info.group_world_size != 0:
             raise ValueError(
                 f"total_num_processes ({total_num_processes}) must be divisible by "
@@ -538,11 +769,111 @@ class BehaviorEnv(gym.Env):
 
     def _ensure_pool(self):
         if self.pool is None:
+            activity_instance_ids = OmegaConf.select(
+                self.cfg, "activity_instance_ids", default=None
+            )
+            local_instance_ids = None
+            local_demonstration_specs = None
+            start = None
+            total_envs_per_worker = None
+            if activity_instance_ids is not None:
+                activity_instance_ids = list(activity_instance_ids)
+                total_num_envs = int(self.cfg.total_num_envs)
+                if len(activity_instance_ids) != total_num_envs:
+                    raise ValueError(
+                        "activity_instance_ids must contain one id per global "
+                        f"BEHAVIOR env, got {len(activity_instance_ids)} and "
+                        f"total_num_envs={total_num_envs}."
+                    )
+                if total_num_envs % int(self.worker_info.group_world_size) != 0:
+                    raise ValueError(
+                        "total_num_envs must be divisible by the env worker world "
+                        "size when activity_instance_ids are fixed."
+                    )
+                total_envs_per_worker = int(self.cfg.total_num_envs) // int(
+                    self.worker_info.group_world_size
+                )
+                start = int(self.worker_info.rank) * total_envs_per_worker
+                local_instance_ids = activity_instance_ids[
+                    start : start + total_envs_per_worker
+                ]
+            demonstration_paths = OmegaConf.select(
+                self.cfg, "demonstration_reset_paths", default=None
+            )
+            demonstration_frames = OmegaConf.select(
+                self.cfg, "demonstration_reset_frame_indices", default=None
+            )
+            if demonstration_paths is not None or demonstration_frames is not None:
+                if demonstration_paths is None or demonstration_frames is None:
+                    raise ValueError(
+                        "demonstration_reset_paths and "
+                        "demonstration_reset_frame_indices must be configured together."
+                    )
+                demonstration_paths = list(demonstration_paths)
+                demonstration_frames = list(demonstration_frames)
+                total_num_envs = int(self.cfg.total_num_envs)
+                if (
+                    len(demonstration_paths) != total_num_envs
+                    or len(demonstration_frames) != total_num_envs
+                ):
+                    raise ValueError(
+                        "Demonstration reset path/frame lists must contain one entry "
+                        f"per global env ({total_num_envs})."
+                    )
+                valid_history_lengths = OmegaConf.select(
+                    self.cfg,
+                    "demonstration_reset_valid_history_lengths",
+                    default=None,
+                )
+                if valid_history_lengths is not None:
+                    valid_history_lengths = list(valid_history_lengths)
+                    if len(valid_history_lengths) != total_num_envs:
+                        raise ValueError(
+                            "demonstration_reset_valid_history_lengths must "
+                            f"contain one entry per global env ({total_num_envs})."
+                        )
+                    if any(
+                        int(length) < 1 or int(length) > self.history_length
+                        for length in valid_history_lengths
+                    ):
+                        raise ValueError(
+                            "Demonstration valid history lengths must be within "
+                            f"[1, {self.history_length}]."
+                        )
+                if (
+                    local_instance_ids is None
+                    or start is None
+                    or total_envs_per_worker is None
+                ):
+                    raise ValueError(
+                        "Demonstration reset requires matching activity_instance_ids."
+                    )
+                history_stride = int(
+                    OmegaConf.select(
+                        self.cfg, "demonstration_reset_history_stride", default=30
+                    )
+                )
+                initial_stage_name = OmegaConf.select(
+                    self.cfg, "demonstration_reset_stage", default=None
+                )
+                local_demonstration_specs = [
+                    {
+                        "path": demonstration_paths[index],
+                        "frame_index": int(demonstration_frames[index]),
+                        "history_length": self.history_length,
+                        "history_stride": history_stride,
+                        "expected_instance_id": int(local_instance_ids[index - start]),
+                        "initial_stage_name": initial_stage_name,
+                    }
+                    for index in range(start, start + total_envs_per_worker)
+                ]
             self.pool, self.pool_offset = BehaviorProcessPool.acquire_shared(
                 self.cfg,
                 self.worker_info,
                 self.pipeline_stage_num,
                 self.num_envs,
+                activity_instance_ids=local_instance_ids,
+                demonstration_reset_specs=local_demonstration_specs,
             )
 
     def _load_tasks_cfg(self, activity_name: str):
@@ -563,6 +894,20 @@ class BehaviorEnv(gym.Env):
     def _init_env(self):
         self._ensure_pool()
         self._load_tasks_cfg(self.pool.activity_name)
+        stage_prompts = OmegaConf.select(self.cfg, "oracle_stage_prompts", default={})
+        if OmegaConf.is_config(stage_prompts):
+            stage_prompts = OmegaConf.to_container(stage_prompts, resolve=True)
+        else:
+            stage_prompts = dict(stage_prompts)
+        self.prompt_controller = StagePromptController(
+            task_prompt=self.task_description,
+            num_envs=self.num_envs,
+            mode=str(OmegaConf.select(self.cfg, "prompt_mode", default="task")),
+            stage_prompts=stage_prompts,
+            initial_stage=OmegaConf.select(
+                self.cfg, "oracle_initial_stage", default=None
+            ),
+        )
 
     def env_reset(self):
         self._ensure_pool()
@@ -601,12 +946,20 @@ class BehaviorEnv(gym.Env):
             "state": state,
         }
 
-    def _wrap_obs(self, obs_list):
+    def _wrap_obs(self, obs_list, raw_infos=None, *, record_history=True):
+        """Convert raw observations and optionally record a policy memory frame.
+
+        A BEHAVIOR action chunk contains many simulator steps but produces one
+        policy decision. Intermediate observations are useful for complete
+        videos; they must not change the decision-rate short-memory buffer.
+        """
         extracted_obs_list = []
         for obs in obs_list:
             extracted_obs = self._extract_obs_image(obs)
             extracted_obs_list.append(extracted_obs)
 
+        if raw_infos is not None:
+            self.prompt_controller.update(raw_infos)
         obs = {
             "main_images": torch.stack(
                 [obs["main_images"] for obs in extracted_obs_list], axis=0
@@ -614,12 +967,59 @@ class BehaviorEnv(gym.Env):
             "wrist_images": torch.stack(
                 [obs["wrist_images"] for obs in extracted_obs_list], axis=0
             ),  # [N_ENV, N_IMG, H, W, C]
-            "task_descriptions": [self.task_description for _ in range(self.num_envs)],
+            "task_descriptions": self.prompt_controller.prompts(),
             "states": torch.stack(
                 [obs["state"] for obs in extracted_obs_list], axis=0
             ),  # [N_ENV, 32]
         }
+        if self.history_length > 1 and record_history:
+            self._append_history(obs)
+            obs.update(self._build_history_observation())
         return obs
+
+    def _append_history(self, obs):
+        entry = {
+            "main_images": obs["main_images"],
+            "wrist_images": obs["wrist_images"],
+            "states": obs["states"],
+            "time_seconds": self._history_step / self._action_frequency,
+        }
+        self._observation_history.append(entry)
+        raw_history_length = (
+            self.history_length - 1
+        ) * self.history_decision_stride + 1
+        self._observation_history = self._observation_history[-raw_history_length:]
+
+    def _build_history_observation(self):
+        current = self._observation_history[-1]
+        selected = self._observation_history[:: -self.history_decision_stride][
+            : self.history_length
+        ]
+        selected.reverse()
+        missing = self.history_length - len(selected)
+
+        def _stack_history(key):
+            padding = [torch.zeros_like(current[key]) for _ in range(missing)]
+            values = [*padding, *(entry[key] for entry in selected)]
+            return torch.stack(values, dim=1)
+
+        history_mask = torch.zeros(self.num_envs, self.history_length, dtype=torch.bool)
+        history_mask[:, missing:] = True
+        current_time = current["time_seconds"]
+        offsets = [0.0] * missing + [
+            entry["time_seconds"] - current_time for entry in selected
+        ]
+        time_offsets = torch.tensor(offsets, dtype=torch.float32).expand(
+            self.num_envs, -1
+        )
+        history = {
+            "history_main_images": _stack_history("main_images"),
+            "history_wrist_images": _stack_history("wrist_images"),
+            "history_states": _stack_history("states"),
+            "history_frame_mask": history_mask,
+            "history_time_offsets": time_offsets,
+        }
+        return apply_short_memory_history_ablation(history, self.history_ablation)
 
     def _calc_step_reward(self, reward):
         return self.reward_coef * reward
@@ -628,7 +1028,55 @@ class BehaviorEnv(gym.Env):
         if self.enable_offload and self.pool is None:
             self._init_env()
         raw_obs, infos = self.env_reset()
-        obs = self._wrap_obs(raw_obs)
+        self.prompt_controller.reset()
+        self._observation_history = []
+        self._history_step = 0
+        self._decision_trace_records = []
+        self._decision_index = 0
+        demonstration_histories = [
+            info.pop("_rlinf_demonstration_history", None) for info in infos
+        ]
+        if any(history is not None for history in demonstration_histories):
+            if not all(history is not None for history in demonstration_histories):
+                raise ValueError(
+                    "Demonstration reset history must be present for every env."
+                )
+            history_sizes = {len(history) for history in demonstration_histories}
+            if history_sizes != {self.history_length}:
+                raise ValueError(
+                    "Demonstration reset history length does not match the policy: "
+                    f"got {sorted(history_sizes)}, expected {self.history_length}."
+                )
+            for history_position in range(self.history_length):
+                self._history_step = history_position * int(
+                    OmegaConf.select(
+                        self.cfg, "demonstration_reset_history_stride", default=30
+                    )
+                )
+                history_raw_obs = [
+                    history[history_position][1] for history in demonstration_histories
+                ]
+                obs = self._wrap_obs(history_raw_obs)
+            valid_history_lengths = OmegaConf.select(
+                self.cfg,
+                "demonstration_reset_valid_history_lengths",
+                default=None,
+            )
+            if valid_history_lengths is not None:
+                start = int(self.worker_info.rank) * self.num_envs
+                local_valid_lengths = [
+                    int(length)
+                    for length in list(valid_history_lengths)[
+                        start : start + self.num_envs
+                    ]
+                ]
+                obs.update(
+                    apply_short_memory_history_valid_lengths(
+                        obs, local_valid_lengths
+                    )
+                )
+        else:
+            obs = self._wrap_obs(raw_obs)
         rewards = torch.zeros(self.num_envs, dtype=bool)
         infos = self._record_metrics(rewards, infos)
         self._reset_metrics()
@@ -637,6 +1085,7 @@ class BehaviorEnv(gym.Env):
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim].
         chunk_actions = torch.as_tensor(chunk_actions).detach().cpu()
+        decision_prompts = self.prompt_controller.prompts()
         (
             raw_obs_list,
             raw_rewards_list,
@@ -650,16 +1099,31 @@ class BehaviorEnv(gym.Env):
         scaled_rewards_list = []
         merged_terminations_list = []
         info_done_flags = []
-        for raw_obs, raw_rewards, raw_terminations, step_infos in zip(
-            raw_obs_list,
-            raw_rewards_list,
-            raw_terminations_list,
-            raw_infos_list,
+        chunk_size = len(raw_obs_list)
+        for step_index, (
+            raw_obs,
+            raw_rewards,
+            raw_terminations,
+            step_infos,
+        ) in enumerate(
+            zip(
+                raw_obs_list,
+                raw_rewards_list,
+                raw_terminations_list,
+                raw_infos_list,
+            )
         ):
+            self._history_step += 1
             if raw_obs is None:
                 obs_list.append(None)
             else:
-                obs_list.append(self._wrap_obs(raw_obs))
+                obs_list.append(
+                    self._wrap_obs(
+                        raw_obs,
+                        step_infos,
+                        record_history=step_index == chunk_size - 1,
+                    )
+                )
             step_rewards = self._calc_step_reward(raw_rewards)
             infos_list.append(self._record_metrics(step_rewards, step_infos))
             if self.ignore_terminations:
@@ -672,6 +1136,13 @@ class BehaviorEnv(gym.Env):
                 for info in step_infos
             ]
             info_done_flags.append(torch.tensor(step_done, dtype=torch.bool))
+
+        self._record_decision_trace(
+            chunk_actions=chunk_actions,
+            raw_infos_list=raw_infos_list,
+            decision_prompts=decision_prompts,
+            final_obs=obs_list[-1],
+        )
 
         chunk_rewards = torch.stack(
             scaled_rewards_list, dim=1
@@ -718,6 +1189,105 @@ class BehaviorEnv(gym.Env):
             infos_list,
         )
 
+    def _record_decision_trace(
+        self,
+        chunk_actions: torch.Tensor,
+        raw_infos_list: list,
+        decision_prompts: list[str],
+        final_obs: dict,
+    ) -> None:
+        """Record one compact trace row per environment and policy decision."""
+        if self._decision_trace_dir is None:
+            return
+
+        left_index, right_index = self._decision_trace_gripper_indices
+        if chunk_actions.shape[-1] <= max(left_index, right_index):
+            raise ValueError(
+                "Configured gripper action index exceeds action dimension "
+                f"{chunk_actions.shape[-1]}."
+            )
+
+        final_states = final_obs["states"]
+        for env_index in range(self.num_envs):
+            sequential_steps = [
+                extract_sequential_reward_info(step_infos[env_index])
+                for step_infos in raw_infos_list
+            ]
+            distances = []
+            in_hand = []
+            on_support = []
+            has_left_support = []
+            has_picked_up = []
+            for sequential_info in sequential_steps:
+                stage_name = sequential_info.get("current_stage_name")
+                stage_info = sequential_info.get("stage_infos", {}).get(stage_name, {})
+                if "eef_to_obj_distance" in stage_info:
+                    distances.append(float(stage_info["eef_to_obj_distance"]))
+                if "in_hand" in stage_info:
+                    in_hand.append(bool(stage_info["in_hand"]))
+                if "on_support" in stage_info:
+                    on_support.append(bool(stage_info["on_support"]))
+                if "has_left_support" in stage_info:
+                    has_left_support.append(bool(stage_info["has_left_support"]))
+                if "has_picked_up" in stage_info:
+                    has_picked_up.append(bool(stage_info["has_picked_up"]))
+
+            final_info = sequential_steps[-1]
+            final_raw_info = raw_infos_list[-1][env_index]
+            trace_state = final_raw_info.get("decision_trace_state", {})
+            policy_state = final_states[env_index]
+            self._decision_trace_records.append(
+                {
+                    "decision_index": self._decision_index,
+                    "sim_step_end": self._history_step,
+                    "activity_instance_id": final_raw_info.get(
+                        "activity_instance_id", -1
+                    ),
+                    "prompt": decision_prompts[env_index],
+                    "stage_name": final_info.get("current_stage_name"),
+                    "completed_stage_count": final_info.get("completed_stage_count", 0),
+                    "eef_to_obj_distance_min": min(distances) if distances else None,
+                    "eef_to_obj_distance_final": distances[-1] if distances else None,
+                    "in_hand_any": any(in_hand),
+                    "in_hand_final": in_hand[-1] if in_hand else None,
+                    "on_support_final": on_support[-1] if on_support else None,
+                    "has_left_support_any": any(has_left_support),
+                    "has_picked_up_any": any(has_picked_up),
+                    "left_gripper_command": chunk_actions[
+                        env_index, :, left_index
+                    ].tolist(),
+                    "right_gripper_command": chunk_actions[
+                        env_index, :, right_index
+                    ].tolist(),
+                    "left_gripper_width": float(policy_state[193:195].sum()),
+                    "right_gripper_width": float(policy_state[232:234].sum()),
+                    "object_position": trace_state.get("object_position"),
+                    "object_orientation": trace_state.get("object_orientation"),
+                }
+            )
+        self._decision_index += 1
+
+    def flush_decision_trace(self) -> None:
+        """Write this env worker's decision trace to a rank-specific JSON file."""
+        if self._decision_trace_dir is None:
+            return
+
+        output_dir = pathlib.Path(self._decision_trace_dir).expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / (
+            f"rank_{self.worker_info.rank}_seed_{self.seed}.json"
+        )
+        with output_path.open("w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "object_name": self._decision_trace_object_name,
+                    "gripper_action_indices": self._decision_trace_gripper_indices,
+                    "records": self._decision_trace_records,
+                },
+                file,
+                indent=2,
+            )
+
     @property
     def device(self):
         return "cuda"
@@ -760,7 +1330,19 @@ class BehaviorEnv(gym.Env):
             episode_info = {
                 "success": done_dict.get("success", False),
                 "episode_length": info.get("episode_length", 0),
+                "activity_instance_id": info.get("activity_instance_id", -1),
             }
+            sequential_info = extract_sequential_reward_info(info)
+            if sequential_info:
+                episode_info.update(
+                    oracle_stage_index=sequential_info.get("current_stage_idx", -1),
+                    oracle_completed_stage_count=sequential_info.get(
+                        "completed_stage_count", 0
+                    ),
+                    oracle_all_stages_completed=sequential_info.get(
+                        "all_stages_completed", False
+                    ),
+                )
             self.returns[env_idx] += reward
             self.success_once[env_idx] = self.success_once[env_idx] | done_dict.get(
                 "success", False

@@ -790,6 +790,11 @@ class EnvWorker(Worker):
                 self.env_list[i].update_reset_state_ids()
         elif mode == "eval":
             for i in range(self.stage_num):
+                flush_decision_trace = get_env_attr(
+                    self.eval_env_list[i], "flush_decision_trace"
+                )
+                if callable(flush_decision_trace):
+                    flush_decision_trace()
                 if self.cfg.env.eval.video_cfg.save_video:
                     flush_video = get_env_attr(self.eval_env_list[i], "flush_video")
                     if callable(flush_video):

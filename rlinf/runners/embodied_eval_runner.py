@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import pathlib
 import time
 import typing
+
+import torch
 
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
@@ -86,9 +90,40 @@ class EmbodiedEvalRunner:
             rollout_metrics = {}
 
         env_metrics_list = [results for results in env_results if results is not None]
+        raw_metrics_path = self.cfg.runner.get("raw_metrics_path", None)
+        if raw_metrics_path is not None:
+            self._save_raw_metrics(env_metrics_list, raw_metrics_path)
         eval_metrics = compute_evaluate_metrics(env_metrics_list)
         eval_metrics.update(rollout_metrics)
         return eval_metrics
+
+    @staticmethod
+    def _save_raw_metrics(metrics_list: list[dict], output_path: str) -> None:
+        """Write per-episode numeric metrics before aggregate reduction."""
+        merged: dict[str, list] = {}
+        for metrics in metrics_list:
+            for key, values in metrics.items():
+                tensor = torch.as_tensor(values).detach().cpu().reshape(-1)
+                merged.setdefault(key, []).extend(tensor.tolist())
+
+        lengths = {len(values) for values in merged.values()}
+        if len(lengths) > 1:
+            raise ValueError(
+                "Raw evaluation metrics do not share one episode dimension: "
+                f"{ {key: len(values) for key, values in merged.items()} }."
+            )
+        num_records = lengths.pop() if lengths else 0
+        records = [
+            {key: values[index] for key, values in merged.items()}
+            for index in range(num_records)
+        ]
+
+        path = pathlib.Path(output_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(
+                {"num_episodes": num_records, "episodes": records}, file, indent=2
+            )
 
     def run(self):
         start_time = time.time()

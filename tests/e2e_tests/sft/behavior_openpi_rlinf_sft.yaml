@@ -39,6 +39,8 @@ data:
   fine_grained_level: 0
   tolerance_s: 1.0e-4
   tasks: ["turning_on_radio"]
+  prompt_source: task
+  primitive_prompt_probability: 0.5
   use_skill: false
   task_subtasks:
     turning_on_radio:

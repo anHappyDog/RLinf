@@ -47,6 +47,7 @@ _BARE_PI0_PREFIXES = (
     "action_time_mlp_in.",
     "action_time_mlp_out.",
     "pointnet.",
+    "history_state_encoder.",
 )
 
 _OLD_OPENPI_PREFIX = "paligemma_with_expert."
@@ -187,7 +188,9 @@ def load_full_wrapper_weights(wrapper, weights_path, *, expect_rlt: bool) -> Non
         )
 
 
-def load_base_safetensors(model, safetensors_path) -> None:
+def load_base_safetensors(
+    model, safetensors_path, *, allow_missing_prefixes: tuple[str, ...] = ()
+) -> None:
     """Load a base checkpoint, accepting new and legacy OpenPI layouts."""
     import safetensors.torch
 
@@ -202,4 +205,19 @@ def load_base_safetensors(model, safetensors_path) -> None:
             "openpi_rlinf: converted OpenPI PyTorch checkpoint keys from %s in memory",
             safetensors_path,
         )
-    model.load_state_dict(state_dict, strict=True)
+    if not allow_missing_prefixes:
+        model.load_state_dict(state_dict, strict=True)
+        return
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    unexpected = list(incompatible.unexpected_keys)
+    disallowed_missing = [
+        key
+        for key in incompatible.missing_keys
+        if not key.startswith(allow_missing_prefixes)
+    ]
+    if unexpected or disallowed_missing:
+        raise RuntimeError(
+            f"Checkpoint {safetensors_path} is incompatible with the requested "
+            f"model: missing={disallowed_missing[:8]}, unexpected={unexpected[:8]}."
+        )

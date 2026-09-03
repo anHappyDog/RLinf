@@ -102,6 +102,57 @@ class OpenPiPytorchActionModel(nn.Module):
     def gradient_checkpointing_disable(self, **kwargs) -> None:
         self.model.gradient_checkpointing_disable()
 
+    def freeze_vlm(self) -> int:
+        """Freeze the PaliGemma vision encoder and Gemma expert-0.
+
+        The action expert (expert-1) and the action/state/time projections stay
+        trainable. Returns the number of parameter tensors newly frozen.
+        """
+        frozen = self.freeze_vision_encoder()
+        llm = self.model.llm
+        for parameter in llm.embedder.parameters():
+            if parameter.requires_grad:
+                parameter.requires_grad = False
+                frozen += 1
+        for block in llm.layers:
+            for module in (
+                block.pre_attention_norms[0],
+                block.pre_ffw_norms[0],
+                block.mlps[0],
+            ):
+                for parameter in module.parameters():
+                    if parameter.requires_grad:
+                        parameter.requires_grad = False
+                        frozen += 1
+            for projections in (
+                block.attn.q_proj,
+                block.attn.k_proj,
+                block.attn.v_proj,
+                block.attn.o_proj,
+            ):
+                projection = projections[0]
+                if projection is None:
+                    continue
+                for parameter in projection.parameters():
+                    if parameter.requires_grad:
+                        parameter.requires_grad = False
+                        frozen += 1
+        if llm.final_norms[0] is not None:
+            for parameter in llm.final_norms[0].parameters():
+                if parameter.requires_grad:
+                    parameter.requires_grad = False
+                    frozen += 1
+        return frozen
+
+    def freeze_vision_encoder(self) -> int:
+        """Freeze SigLIP while leaving both Gemma experts trainable."""
+        frozen = 0
+        for parameter in self.model.img.parameters():
+            if parameter.requires_grad:
+                parameter.requires_grad = False
+                frozen += 1
+        return frozen
+
     def _require_rlt(self) -> None:
         if not self.rlt_cfg.use_rlt or not hasattr(self, "rlt_module"):
             raise ValueError("RLT operation requires actor.model.openpi.use_rlt=True.")

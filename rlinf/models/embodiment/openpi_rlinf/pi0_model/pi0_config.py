@@ -37,6 +37,10 @@ class Pi0Config(model.BaseModelConfig):
     pi05: bool = False
     discrete_state_input: bool | None = None
     pcd: bool = False
+    short_memory: bool = False
+    short_memory_temporal_layers: tuple[int, ...] = (3, 7, 11, 15)
+    short_memory_drop_history_layer: int = 15
+    short_memory_state_dim: int = 23
 
     def __post_init__(self):
         if self.pi05 and self.max_token_len == 48:

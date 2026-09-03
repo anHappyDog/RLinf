@@ -56,11 +56,10 @@ def resize_with_pad_torch(
     Returns:
         Resized and padded tensor
     """
-    if images.dim() == 3:
-        images = images.unsqueeze(0)
-        squeeze_batch = True
-    else:
-        squeeze_batch = False
+    if images.ndim < 3:
+        raise ValueError(f"images must end in [H, W, C], got {images.shape}.")
+    leading_shape = images.shape[:-3]
+    images = images.reshape(-1, *images.shape[-3:])
 
     # (B, H, W, C) -> (B, C, H, W)
     images = images.permute(0, 3, 1, 2)
@@ -92,9 +91,7 @@ def resize_with_pad_torch(
     # (B, C, H, W) -> (B, H, W, C)
     padded = padded.permute(0, 2, 3, 1)
 
-    if squeeze_batch:
-        padded = padded.squeeze(0)
-    return padded
+    return padded.reshape(*leading_shape, height, width, padded.shape[-1])
 
 
 @dataclasses.dataclass
@@ -109,6 +106,10 @@ class Observation:
     token_ar_mask: torch.Tensor | None = None
     token_loss_mask: torch.Tensor | None = None
     pcd_xyz: torch.Tensor | None = None
+    history_states: torch.Tensor | None = None
+    history_frame_mask: torch.Tensor | None = None
+    history_time_offsets: torch.Tensor | None = None
+    history_contrastive_mask: torch.Tensor | None = None
 
     @classmethod
     def from_observation_like(cls, observation: Any) -> Observation:
@@ -160,6 +161,10 @@ class Observation:
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             pcd_xyz=data.get("pcd_xyz"),
+            history_states=data.get("history_states"),
+            history_frame_mask=data.get("history_frame_mask"),
+            history_time_offsets=data.get("history_time_offsets"),
+            history_contrastive_mask=data.get("history_contrastive_mask"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -198,6 +203,12 @@ def _observation_to_dtype(obs: Observation, dtype: torch.dtype) -> Observation:
         token_ar_mask=_tensor_to_dtype(obs.token_ar_mask, dtype),
         token_loss_mask=_tensor_to_dtype(obs.token_loss_mask, dtype),
         pcd_xyz=_tensor_to_dtype(obs.pcd_xyz, dtype),
+        history_states=_tensor_to_dtype(obs.history_states, dtype),
+        history_frame_mask=_tensor_to_dtype(obs.history_frame_mask, dtype),
+        history_time_offsets=_tensor_to_dtype(obs.history_time_offsets, dtype),
+        history_contrastive_mask=_tensor_to_dtype(
+            obs.history_contrastive_mask, dtype
+        ),
     )
 
 
@@ -219,19 +230,23 @@ def preprocess_observation(
             f"images dict missing keys: expected {image_keys}, got {list(observation.images)}"
         )
 
-    batch_shape = observation.state.shape[:-1]
-
     out_images = {}
     for key in image_keys:
         image = observation.images[key]
 
-        # Standardize to (B, H, W, C) format if input is (B, C, H, W)
-        if image.shape[-1] <= 4 and image.shape[1] > 4:
-            pass  # already (B, H, W, C)
-        elif image.shape[1] <= 4:
+        # Standardize images or videos to channels-last format.
+        if image.shape[-1] <= 4:
+            pass
+        elif image.ndim == 4 and image.shape[1] <= 4:
             image = image.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+        elif image.ndim == 5 and image.shape[2] <= 4:
+            image = image.permute(0, 1, 3, 4, 2)
+        else:
+            raise ValueError(
+                f"Cannot infer image channel dimension from {image.shape}."
+            )
 
-        if image.shape[1:3] != image_resolution:
+        if image.shape[-3:-1] != image_resolution:
             image = resize_with_pad_torch(image, *image_resolution)
 
         if train:
@@ -239,6 +254,8 @@ def preprocess_observation(
             image = image / 2.0 + 0.5
             # image is in (B, H, W, C) format
             # Apply augmentations per image in batch
+            leading_shape = image.shape[:-3]
+            image = image.reshape(-1, *image.shape[-3:])
             B = image.shape[0]
             augmented = []
             for i in range(B):
@@ -284,7 +301,9 @@ def preprocess_observation(
 
                 aug_image = aug_image.permute(1, 2, 0)  # back to (H, W, C)
                 augmented.append(aug_image)
-            image = torch.stack(augmented, dim=0)
+            image = torch.stack(augmented, dim=0).reshape(
+                *leading_shape, *image.shape[-3:]
+            )
 
             # Back to [-1, 1]
             image = image * 2.0 - 1.0
@@ -295,7 +314,11 @@ def preprocess_observation(
     out_masks = {}
     for key in out_images:
         if key not in observation.image_masks:
-            out_masks[key] = torch.ones(batch_shape, dtype=torch.bool)
+            out_masks[key] = torch.ones(
+                out_images[key].shape[:-3],
+                dtype=torch.bool,
+                device=out_images[key].device,
+            )
         else:
             mask = observation.image_masks[key]
             if not isinstance(mask, torch.Tensor):
@@ -311,6 +334,10 @@ def preprocess_observation(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         pcd_xyz=observation.pcd_xyz,
+        history_states=observation.history_states,
+        history_frame_mask=observation.history_frame_mask,
+        history_time_offsets=observation.history_time_offsets,
+        history_contrastive_mask=observation.history_contrastive_mask,
     )
 
 

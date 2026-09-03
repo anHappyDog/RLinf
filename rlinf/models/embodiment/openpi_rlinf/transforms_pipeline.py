@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 from typing import Any, Sequence
 
@@ -25,6 +26,7 @@ def build_openpi_transforms(
     *,
     norm_stats_dir: str | None = None,
     norm_stats_asset_id: str | None = None,
+    discrete_state_input: bool | None = None,
 ) -> tuple[Sequence, Sequence]:
     """Build ``(input_transforms, output_transforms)`` for ``config_name``.
 
@@ -49,6 +51,14 @@ def build_openpi_transforms(
     train_config = get_openpi_config(
         config_name, model_path=str(model_path), data_kwargs=data_kwargs
     )
+    if discrete_state_input is not None:
+        train_config = dataclasses.replace(
+            train_config,
+            model=dataclasses.replace(
+                train_config.model,
+                discrete_state_input=discrete_state_input,
+            ),
+        )
     upstream_model_config = train_config.model
 
     data_config = train_config.data.create(

@@ -79,6 +79,29 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
         "dtype": "bfloat16",
         "pcd": False,
     }
+    short_memory_enabled = bool(
+        OmegaConf.select(model_cfg, "short_memory.enabled", default=False)
+    )
+    if short_memory_enabled:
+        pi0_kwargs.update(
+            short_memory=True,
+            short_memory_temporal_layers=tuple(
+                int(index)
+                for index in OmegaConf.select(
+                    model_cfg,
+                    "short_memory.temporal_layers",
+                    default=[3, 7, 11, 15],
+                )
+            ),
+            short_memory_drop_history_layer=int(
+                OmegaConf.select(
+                    model_cfg, "short_memory.drop_history_layer", default=15
+                )
+            ),
+            short_memory_state_dim=int(
+                OmegaConf.select(model_cfg, "short_memory.state_dim", default=23)
+            ),
+        )
     discrete_state_input = OmegaConf.select(
         model_cfg, "discrete_state_input", default=None
     )
@@ -91,7 +114,13 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     pi0_config = Pi0Config(**pi0_kwargs)
     model = pi0_config.create()
     if safetensors_path is not None and full_weights_path is None:
-        load_base_safetensors(model, safetensors_path)
+        load_base_safetensors(
+            model,
+            safetensors_path,
+            allow_missing_prefixes=(
+                ("history_state_encoder.",) if short_memory_enabled else ()
+            ),
+        )
     n_params = sum(param.numel() for param in model.parameters())
     if target_dtype is not None:
         model = model.to(target_dtype)

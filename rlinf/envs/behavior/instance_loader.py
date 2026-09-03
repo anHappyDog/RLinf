@@ -245,12 +245,15 @@ class ActivityInstanceLoader:
         activity_instance_id: int,
         instance_resample_mode: str,
         activity_instances: tuple[ActivityInstanceFile, ...],
+        fixed_instance_ids: tuple[int, ...] = (),
     ):
         self.omni_cfg = omni_cfg
         self.activity_name = activity_name
         self.activity_instance_id = activity_instance_id
         self.instance_resample_mode = instance_resample_mode
         self.activity_instances = activity_instances
+        self.fixed_instance_ids = fixed_instance_ids
+        self.current_instance_ids: tuple[int, ...] = ()
 
     @classmethod
     def from_omni_cfg(cls, omni_cfg: DictConfig) -> "ActivityInstanceLoader":
@@ -378,7 +381,22 @@ class ActivityInstanceLoader:
             activity_instances=activity_instances,
         )
 
-    def prepare_reset(self, vec_env) -> None:
+    def with_fixed_instance_ids(
+        self, instance_ids: list[int] | tuple[int, ...]
+    ) -> "ActivityInstanceLoader":
+        """Return this loader configured for an explicit paired-eval instance list."""
+        fixed_ids = tuple(int(instance_id) for instance_id in instance_ids)
+        discovered_ids = {entry.instance_id for entry in self.activity_instances}
+        missing_ids = sorted(set(fixed_ids) - discovered_ids)
+        if missing_ids:
+            raise ValueError(
+                "Paired evaluation requested undiscovered BEHAVIOR instances: "
+                f"{missing_ids}."
+            )
+        self.fixed_instance_ids = fixed_ids
+        return self
+
+    def prepare_reset(self, vec_env) -> tuple[int, ...]:
         """Apply any reset-time task-instance mutation required by the config.
 
         Args:
@@ -389,12 +407,28 @@ class ActivityInstanceLoader:
             task_cfg = OmegaConf.select(self.omni_cfg, "task")
             for env in vec_env.envs:
                 env.update_task(task_config=task_cfg)
-            return
+            self.current_instance_ids = tuple(
+                int(env.task.activity_instance_id) for env in vec_env.envs
+            )
+            return self.current_instance_ids
 
         if not self.activity_instances:
-            return
+            self.current_instance_ids = tuple(
+                int(env.task.activity_instance_id) for env in vec_env.envs
+            )
+            return self.current_instance_ids
 
-        if self.instance_resample_mode == "offline":
+        if self.fixed_instance_ids:
+            if len(self.fixed_instance_ids) != len(vec_env.envs):
+                raise ValueError(
+                    "Fixed BEHAVIOR instance count must match vector env count, "
+                    f"got {len(self.fixed_instance_ids)} and {len(vec_env.envs)}."
+                )
+            instance_files = [
+                self._get_activity_instance(instance_id)
+                for instance_id in self.fixed_instance_ids
+            ]
+        elif self.instance_resample_mode == "offline":
             instance_files = [
                 random.choice(self.activity_instances) for _ in range(len(vec_env.envs))
             ]
@@ -403,6 +437,8 @@ class ActivityInstanceLoader:
             instance_files = [instance_file] * len(vec_env.envs)
 
         self._apply_instance_files(vec_env, instance_files)
+        self.current_instance_ids = tuple(item.instance_id for item in instance_files)
+        return self.current_instance_ids
 
     def _get_activity_instance(self, instance_id: int) -> ActivityInstanceFile:
         for instance_file in self.activity_instances:

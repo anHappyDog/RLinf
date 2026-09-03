@@ -1,0 +1,20 @@
+defaults:
+  - pi0_5_rlinf
+
+# Functional π0.5 short-memory reproduction. It reuses each selected SigLIP
+# layer's attention weights for causal same-patch temporal attention and drops
+# historical image tokens after layer 15. All K normalized 23D states become
+# continuous Gemma-width tokens, including the current state.
+openpi:
+  discrete_state_input: false
+  # Optional first-decision normalized input/action dump for offline parity.
+  eval_snapshot_dir: null
+  # Optional ranked normalized input used only for the first eval decision.
+  eval_observation_override_path: null
+  # Optional ranked normalized oracle action chunk for the first eval decision.
+  eval_model_action_override_path: null
+  short_memory:
+    enabled: true
+    temporal_layers: [3, 7, 11, 15]
+    drop_history_layer: 15
+    state_dim: 23

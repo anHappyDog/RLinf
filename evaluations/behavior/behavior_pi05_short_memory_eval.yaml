@@ -1,0 +1,125 @@
+defaults:
+  - env/behavior_r1pro@env.eval
+  - model/pi0_5_short_memory@rollout.model
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    rollout,env: all
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: /path/to/results
+    project_name: rlinf
+    experiment_name: behavior_pi05_short_memory_eval
+    logger_backends: [tensorboard]
+  raw_metrics_path: ${runner.logger.log_path}/raw_metrics.json
+  only_eval: true
+  max_epochs: 1
+  max_steps: 1
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+env:
+  group_name: EnvGroup
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 4
+    # The official B1K evaluation cadence is 30 Hz. With 32-action chunks,
+    # 2048 steps provide 64 policy decisions and about 68 seconds of control.
+    max_episode_steps: 2048
+    max_steps_per_rollout_epoch: 2048
+    auto_reset: false
+    # Canonical evaluation renders and collects every simulator step. This
+    # avoids coupling the result to OmniGibson's render-skipping optimization.
+    skip_intermediate_obs_in_chunk: false
+    num_env_subprocess: 1
+    seed: 42
+    history_length: 6
+    # One policy decision spans 32 actions at 30 Hz, so consecutive decisions
+    # are 1.067 s apart and K=6 covers a 5.33 s oldest-to-current window.
+    history_decision_stride: 1
+    # Counterfactual controls: none, repeat_current, or shuffle_past. The last
+    # option deterministically reverses valid past frames while keeping the
+    # current frame, padding, and temporal offsets fixed.
+    history_ablation: none
+    # Optional policy-decision diagnostics. Set decision_trace_dir to an output
+    # directory to save one rank-specific JSON file per environment worker.
+    decision_trace_dir: null
+    decision_trace_object_name: radio_89
+    # R1Pro's 23-D action uses left/right gripper commands at indices 14/22.
+    decision_trace_gripper_indices: [14, 22]
+    activity_instance_ids: [242, 295, 211, 203]
+    # Optional raw-HDF5 mid-stage reset. Configure both lists together with one
+    # path/frame per env. The loader restores K states at the history stride
+    # without executing demonstration actions before policy takeover.
+    demonstration_reset_paths: null
+    demonstration_reset_frame_indices: null
+    demonstration_reset_history_stride: 30
+    demonstration_reset_stage: null
+    demonstration_reset_valid_history_lengths: null
+    prompt_mode: task
+    oracle_initial_stage: move_to_radio
+    oracle_stage_prompts:
+      # Simulator stages are finer-grained than B1K primitive annotations. The
+      # pickup primitive starts at frame zero and includes navigation/reaching.
+      move_to_radio: pick up radio from coffee table
+      pickup_from_support: pick up radio from coffee table
+      press_radio: press radio
+      place_on_support: place radio on coffee table
+    video_cfg:
+      save_video: true
+      video_base_dir: ${runner.logger.log_path}/video
+      # Match the official B1K action and rendering cadence.
+      fps: 30
+    omni_config:
+      env:
+        action_frequency: 30
+        rendering_frequency: 30
+        physics_frequency: 120
+      task:
+        activity_name: turning_on_radio
+        activity_definition_id: 0
+        # Load the shared base template first; fixed public-test tro_state files
+        # are applied by ActivityInstanceLoader before reset.
+        activity_instance_id: 0
+        activity_instance_dir: /path/to/turning_on_radio_instances
+        instance_file_format: tro_state
+        instance_resample_mode: disabled
+        online_object_sampling: false
+        reward_config:
+          reward_mode: task
+          task_specific_reward_name: turning_on_radio
+          task_specific_reward_kwargs: {}
+
+rollout:
+  group_name: RolloutGroup
+  backend: huggingface
+  rollout_backend: huggingface
+  enable_offload: true
+  pipeline_stage_num: 1
+  seed: 42
+  sampling_params:
+    do_sample: true
+    temperature_train: 1.0
+    temperature_eval: 0.0
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    max_new_tokens: null
+  model:
+    model_path: /path/to/short_memory_fsdp_checkpoint
+    openpi_data:
+      norm_stats_path: /path/to/pi05_b1kpt50_pt/physical-intelligence/behavior/norm_stats.json

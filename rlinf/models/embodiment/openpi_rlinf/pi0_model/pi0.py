@@ -19,6 +19,7 @@ Flow matching model for continuous action generation.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 import einops
@@ -26,11 +27,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import gemma, model, pointnet, siglip
+from . import gemma, model, pointnet, short_memory, siglip
 from .pi0_config import Pi0Config
 from .utils import _str_to_dtype
 
 logger = logging.getLogger("openpi")
+
+
+@dataclasses.dataclass(frozen=True)
+class TextLossOutput:
+    """Token-level metrics for a PaliGemma text training batch."""
+
+    loss: torch.Tensor
+    token_accuracy: torch.Tensor
+    token_count: torch.Tensor
 
 
 def make_attn_mask(input_mask: torch.Tensor, mask_ar: torch.Tensor) -> torch.Tensor:
@@ -112,6 +122,17 @@ class Pi0(model.BaseModel):
             use_gradient_checkpointing=False,
             dtype_mm=config.dtype,
         )
+        self.short_memory_encoder = None
+        self.history_state_encoder = None
+        if config.short_memory:
+            self.short_memory_encoder = short_memory.ShortMemoryVisionEncoder(
+                temporal_layers=config.short_memory_temporal_layers,
+                drop_history_layer=config.short_memory_drop_history_layer,
+            )
+            self.history_state_encoder = short_memory.HistoricalStateEncoder(
+                state_dim=config.short_memory_state_dim,
+                output_dim=paligemma_config.width,
+            )
 
         action_expert_width = action_expert_config.width
         self.action_dim = config.action_dim
@@ -182,16 +203,46 @@ class Pi0(model.BaseModel):
 
         # Embed images through SigLIP
         for name in obs.images:
-            image_tokens, _ = self.img(obs.images[name])  # (B, num_patches, width)
+            images = obs.images[name]
+            if images.ndim == 5:
+                if self.short_memory_encoder is None:
+                    raise ValueError(
+                        "Video observations require Pi0Config(short_memory=True)."
+                    )
+                image_tokens = self.short_memory_encoder(
+                    self.img,
+                    images,
+                    frame_mask=obs.image_masks[name],
+                    time_offsets=obs.history_time_offsets,
+                )
+                image_mask = obs.image_masks[name][:, -1]
+            else:
+                image_tokens, _ = self.img(images)
+                image_mask = obs.image_masks[name]
             tokens.append(image_tokens)
 
             # Image tokens use bidirectional attention
             input_mask.append(
-                einops.repeat(
-                    obs.image_masks[name], "b -> b s", s=image_tokens.shape[1]
-                )
+                einops.repeat(image_mask, "b -> b s", s=image_tokens.shape[1])
             )
             ar_mask += [False] * image_tokens.shape[1]
+
+        if obs.history_states is not None:
+            if self.history_state_encoder is None:
+                raise ValueError("history_states require Pi0Config(short_memory=True).")
+            if obs.history_frame_mask is None or obs.history_time_offsets is None:
+                raise ValueError(
+                    "history_states require history_frame_mask and "
+                    "history_time_offsets."
+                )
+            state_tokens, state_mask = self.history_state_encoder(
+                obs.history_states,
+                frame_mask=obs.history_frame_mask,
+                time_offsets=obs.history_time_offsets,
+            )
+            tokens.append(state_tokens)
+            input_mask.append(state_mask)
+            ar_mask += [False] * state_tokens.shape[1]
 
         # Add language tokens
         if obs.tokenized_prompt is not None:
@@ -223,6 +274,227 @@ class Pi0(model.BaseModel):
         input_mask = torch.cat(input_mask, dim=1)
         ar_mask = torch.tensor(ar_mask, device=tokens.device)
         return tokens, input_mask, ar_mask
+
+    def embed_text_inputs(
+        self, obs: model.Observation
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Embed image and text tokens with a per-token autoregressive mask.
+
+        The ordinary action path treats the entire language prompt as a
+        bidirectional prefix. Text training additionally marks every response
+        token as a new autoregressive block through ``token_ar_mask``. Keeping
+        this as a separate path preserves the existing action-prefix behavior.
+
+        Returns:
+            Embedded tokens, input mask, autoregressive mask, and the number of
+            image tokens prepended to the text sequence.
+        """
+        if self.pcd:
+            raise NotImplementedError(
+                "Text training is not implemented for point-cloud Pi0 models."
+            )
+        if obs.tokenized_prompt is None or obs.tokenized_prompt_mask is None:
+            raise ValueError("Text inputs require tokenized_prompt and its mask.")
+        if obs.token_ar_mask is None:
+            raise ValueError("Text inputs require token_ar_mask.")
+        if obs.tokenized_prompt.shape != obs.tokenized_prompt_mask.shape:
+            raise ValueError(
+                "tokenized_prompt and tokenized_prompt_mask must have the same shape."
+            )
+        if obs.tokenized_prompt.shape != obs.token_ar_mask.shape:
+            raise ValueError(
+                "tokenized_prompt and token_ar_mask must have the same shape."
+            )
+
+        tokens, input_mask, _ = self.embed_prefix(obs)
+        text_length = obs.tokenized_prompt.shape[1]
+        image_token_count = tokens.shape[1] - text_length
+        image_ar_mask = torch.zeros(
+            tokens.shape[0],
+            image_token_count,
+            dtype=obs.token_ar_mask.dtype,
+            device=tokens.device,
+        )
+        ar_mask = torch.cat(
+            [image_ar_mask, obs.token_ar_mask.to(device=tokens.device)], dim=1
+        )
+        return tokens, input_mask, ar_mask, image_token_count
+
+    def compute_text_loss(
+        self,
+        observation: model.Observation,
+        *,
+        train: bool = False,
+        rng: torch.Generator | None = None,
+    ) -> TextLossOutput:
+        """Compute causal next-token loss on the masked text response.
+
+        ``tokenized_prompt`` contains the full ``prefix + response + EOS``
+        sequence. Each token predicts the following token, so model inputs and
+        labels are shifted by one. ``token_loss_mask`` selects response and EOS
+        labels only. Vocabulary logits are materialized only for selected
+        positions because the PaliGemma vocabulary projection is large.
+        """
+        if observation.tokenized_prompt is None:
+            raise ValueError("Text loss requires tokenized_prompt.")
+        if observation.token_loss_mask is None:
+            raise ValueError("Text loss requires token_loss_mask.")
+        if observation.tokenized_prompt.shape != observation.token_loss_mask.shape:
+            raise ValueError(
+                "tokenized_prompt and token_loss_mask must have the same shape."
+            )
+        if observation.tokenized_prompt.shape[1] < 2:
+            raise ValueError("Text loss requires at least two token positions.")
+
+        observation = model.preprocess_observation(observation, train=train, rng=rng)
+        observation = model._observation_to_dtype(observation, self.embed_dtype)
+        tokens, input_mask, ar_mask, image_token_count = self.embed_text_inputs(
+            observation
+        )
+
+        # The last text token has no next-token label, matching the official
+        # Pi0-FAST training convention.
+        input_tokens = tokens[:, :-1]
+        input_mask = input_mask[:, :-1]
+        ar_mask = ar_mask[:, :-1]
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = torch.cumsum(input_mask.int(), dim=1) - 1
+
+        text_output = self.llm(
+            [input_tokens, None],
+            positions=positions,
+            mask=attn_mask,
+        )[0][0][:, image_token_count:]
+
+        labels = observation.tokenized_prompt[:, 1:]
+        loss_mask = observation.token_loss_mask[:, 1:].bool()
+        loss_mask = torch.logical_and(
+            loss_mask, observation.tokenized_prompt_mask[:, 1:].bool()
+        )
+        token_count = loss_mask.sum()
+        if token_count.item() == 0:
+            raise ValueError("Text loss mask selects no response tokens.")
+
+        selected_output = text_output[loss_mask]
+        selected_labels = labels[loss_mask]
+        decoder_dtype = self.llm.embedder.embedding.weight.dtype
+        logits = self.llm.embedder.decode(selected_output.to(decoder_dtype))
+        loss = F.cross_entropy(logits.float(), selected_labels)
+        token_accuracy = (logits.argmax(dim=-1) == selected_labels).float().mean()
+        return TextLossOutput(
+            loss=loss,
+            token_accuracy=token_accuracy,
+            token_count=token_count,
+        )
+
+    @torch.no_grad()
+    def generate_text(
+        self,
+        observation: model.Observation,
+        *,
+        eos_token_id: int,
+        max_new_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Greedily generate response tokens with a cached image-text prefix.
+
+        Returns:
+            A pair ``(generated_tokens, generated_mask)`` with shape
+            ``[batch, max_new_tokens]``. The mask is true through each sample's
+            EOS token and false for unused capacity.
+        """
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive.")
+        if observation.tokenized_prompt is None:
+            raise ValueError("Text generation requires tokenized_prompt.")
+        if observation.tokenized_prompt_mask is None:
+            raise ValueError("Text generation requires tokenized_prompt_mask.")
+        if observation.token_ar_mask is None:
+            raise ValueError("Text generation requires token_ar_mask.")
+
+        observation = model.preprocess_observation(observation, train=False)
+        observation = model._observation_to_dtype(observation, self.embed_dtype)
+        prompt_mask = observation.tokenized_prompt_mask.bool()
+        lengths = prompt_mask.sum(dim=1).long()
+        if torch.any(lengths == 0):
+            raise ValueError("Text generation requires a non-empty prefix.")
+
+        batch_size, sequence_capacity = observation.tokenized_prompt.shape
+        generated = torch.zeros(
+            batch_size,
+            max_new_tokens,
+            dtype=observation.tokenized_prompt.dtype,
+            device=observation.tokenized_prompt.device,
+        )
+        generated_mask = torch.zeros(
+            batch_size,
+            max_new_tokens,
+            dtype=torch.bool,
+            device=generated.device,
+        )
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=generated.device)
+
+        active_length = int(lengths.max().item())
+        prefix_observation = dataclasses.replace(
+            observation,
+            tokenized_prompt=observation.tokenized_prompt[:, :active_length],
+            tokenized_prompt_mask=prompt_mask[:, :active_length],
+            token_ar_mask=observation.token_ar_mask[:, :active_length],
+            token_loss_mask=None,
+        )
+        tokens, cache_mask, token_ar_mask, image_token_count = self.embed_text_inputs(
+            prefix_observation
+        )
+        if cache_mask.ndim != 2:
+            raise ValueError(
+                f"Expected a [batch, sequence] prefix mask, got {cache_mask.shape}."
+            )
+        attn_mask = make_attn_mask(cache_mask, token_ar_mask)
+        positions = torch.cumsum(cache_mask.int(), dim=1) - 1
+        outputs, kv_cache = self.llm(
+            [tokens, None],
+            positions=positions,
+            mask=attn_mask,
+        )
+        batch_indices = torch.arange(batch_size, device=generated.device)
+        last_hidden = outputs[0][batch_indices, image_token_count + lengths - 1]
+        decoder_dtype = self.llm.embedder.embedding.weight.dtype
+
+        for step in range(max_new_tokens):
+            can_append = lengths < sequence_capacity
+            active = torch.logical_and(~finished, can_append).reshape(batch_size)
+            if not torch.any(active):
+                break
+
+            next_tokens = self.llm.embedder.decode(
+                last_hidden.to(decoder_dtype)
+            ).argmax(dim=-1)
+            next_tokens = torch.where(active, next_tokens, 0)
+
+            active_indices = torch.nonzero(active, as_tuple=False).squeeze(1)
+            active_tokens = next_tokens[active_indices]
+            lengths[active_indices] += 1
+            generated[active_indices, step] = active_tokens
+            generated_mask[active_indices, step] = True
+            finished[active_indices] = active_tokens == eos_token_id
+
+            if step + 1 == max_new_tokens or not torch.any(
+                torch.logical_and(~finished, lengths < sequence_capacity)
+            ):
+                continue
+
+            token_positions = cache_mask.sum(dim=1, keepdim=True)
+            cache_mask = torch.cat([cache_mask, active[:, None]], dim=1)
+            step_attn_mask = cache_mask[:, None, :]
+            token_embeddings = self.llm.embed(next_tokens[:, None])
+            outputs, kv_cache = self.llm(
+                [token_embeddings, None],
+                positions=token_positions,
+                mask=step_attn_mask,
+                kv_cache=kv_cache,
+            )
+            last_hidden = outputs[0][:, 0]
+
+        return generated, generated_mask
 
     def embed_suffix(
         self,

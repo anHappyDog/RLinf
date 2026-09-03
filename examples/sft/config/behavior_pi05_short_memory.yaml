@@ -1,0 +1,104 @@
+defaults:
+  - model/pi0_5_short_memory@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "sft_behavior_pi05_short_memory"
+    logger_backends: ["tensorboard"]
+  max_epochs: -1
+  max_steps: 2000
+  val_check_interval: -1
+  # Save early causal-gate checkpoints before committing to the full run.
+  save_interval: 100
+
+data:
+  train_data_paths: /path/to/2025-challenge-demos
+  behavior_dataset_root: /path/to/2025-challenge-demos
+  repo_id: "behavior-1k/2025-challenge-demos"
+  modalities: ["rgb"]
+  num_workers: 8
+  fine_grained_level: 0
+  tolerance_s: 1.0e-4
+  tasks: ["turning_on_radio"]
+  prompt_source: mixed
+  primitive_prompt_probability: 0.5
+  use_skill: false
+  # Match MEM pre-training: five past observations plus the current one, with
+  # one second between frames in the 30 Hz BEHAVIOR demonstrations.
+  history_length: 6
+  history_frame_stride: 30
+  task_subtasks:
+    turning_on_radio:
+      - "move to radio"
+      - "pick up radio from coffee table"
+      - "press radio"
+      - "place radio on coffee table"
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  # Keep the optimizer-step data budget aligned with the memoryless baseline.
+  # On 4 GPUs this accumulates 16 micro-batches per rank.
+  micro_batch_size: 4
+  eval_batch_size: 1
+  global_batch_size: 256
+  seed: 42
+  model:
+    model_path: /path/to/pi05_base_pytorch_new
+    openpi:
+      assets_dir: /path/to/assets
+      asset_id: "behavior-1k/2025-challenge-demos"
+  optim:
+    lr: 2.5e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1e-10
+    clip_grad: 1.0
+    total_training_steps: 2000
+    lr_warmup_steps: 100
+    lr_scheduler: "openpi_cosine"
+    num_cycles: 0.5
+    min_lr: 0.0
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    use_orig_params: true
+    gradient_checkpointing: true
+    gradient_checkpointing_use_reentrant: false
+    enable_gradient_accumulation: true
+    forward_prefetch: true
+    backward_prefetch: "pre"
+    limit_all_gathers: true
+    cpu_offload: false
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false
