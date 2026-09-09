@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from collections.abc import Iterable
 from contextlib import nullcontext
 from typing import ContextManager, Union
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 from torch.optim import Optimizer
 
 from rlinf.config import torch_dtype_from_precision
@@ -32,7 +35,9 @@ from rlinf.hybrid_engines.fsdp.utils import (
     FSDPVersion,
     apply_fsdp2_to_model,
     clip_grad_by_total_norm_,
-    get_grad_norm,
+)
+from rlinf.hybrid_engines.fsdp.utils import (
+    get_grad_norm as get_fsdp_grad_norm,
 )
 from rlinf.utils.utils import clear_memory
 
@@ -154,9 +159,50 @@ class FSDP2Strategy(FSDPStrategyBase):
                         del v
         clear_memory()
 
+    def get_grad_norm(
+        self,
+        model: FSDPModule,
+        parameters: Iterable[torch.nn.Parameter],
+        norm_type: Union[float, int] = 2.0,
+    ) -> float:
+        """Return the global norm of a parameter subset's gradients."""
+        del model
+        parameters = list(parameters)
+        sharded_parameters = [
+            parameter
+            for parameter in parameters
+            if isinstance(parameter, DTensor)
+            and any(isinstance(placement, Shard) for placement in parameter.placements)
+        ]
+        sharded_parameter_ids = {id(parameter) for parameter in sharded_parameters}
+        replicated_parameters = [
+            parameter
+            for parameter in parameters
+            if id(parameter) not in sharded_parameter_ids
+        ]
+        sharded_norm = get_fsdp_grad_norm(
+            sharded_parameters,
+            dp_group=self._dp_group,
+            norm_type=norm_type,
+        )
+        replicated_norm = get_fsdp_grad_norm(
+            replicated_parameters,
+            dp_group=None,
+            norm_type=norm_type,
+        )
+        norm_type = float(norm_type)
+        if norm_type == torch.inf:
+            return max(sharded_norm, replicated_norm)
+        return math.pow(
+            math.pow(sharded_norm, norm_type) + math.pow(replicated_norm, norm_type),
+            1.0 / norm_type,
+        )
+
     def clip_grad_norm_(
         self,
         model: FSDPModule,
+        parameters: Iterable[torch.nn.Parameter] | None = None,
+        max_norm: float | None = None,
         norm_type: Union[float, int] = 2.0,
     ) -> float:
         """
@@ -164,19 +210,19 @@ class FSDP2Strategy(FSDPStrategyBase):
 
         Args:
             - model (FSDPModule): The FSDP2 wrapped model.
+            - parameters: Parameters to include. Defaults to all model parameters.
+            - max_norm: Maximum gradient norm. Defaults to ``optim.clip_grad``.
             - norm_type (float): The type of the used p-norm.
 
         Returns:
             - float: The total norm of the gradients before clipping.
         """
-        grad_norm = get_grad_norm(
-            model.parameters(),
-            dp_group=self._dp_group,
-            norm_type=norm_type,
-        )
+        parameters = list(model.parameters() if parameters is None else parameters)
+        max_norm = self.cfg.optim.clip_grad if max_norm is None else max_norm
+        grad_norm = self.get_grad_norm(model, parameters, norm_type)
         clip_grad_by_total_norm_(
-            model.parameters(),
-            max_grad_norm=self.cfg.optim.clip_grad,
+            parameters,
+            max_grad_norm=max_norm,
             total_norm=grad_norm,
         )
         return grad_norm

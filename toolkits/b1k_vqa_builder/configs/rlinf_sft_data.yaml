@@ -1,0 +1,14 @@
+# Merge this data block into an RLinf VLM SFT configuration.
+data:
+  type: vlm
+  dataset_name: robo2vlmsft
+  train_data_paths: /mnt/public/daibo/results/b1k_vqa_v01/dataset/train
+  val_data_paths: /mnt/public/daibo/results/b1k_vqa_v01/dataset/validation
+  prompt_key: question
+  choice_key: choices
+  answer_key: correct_answer
+  image_keys: [image]
+  apply_chat_template: true
+  use_chat_template: true
+  max_prompt_length: 1024
+  lazy_loading: true

@@ -80,6 +80,7 @@ class FSDPSftWorker(FSDPModelManager, Worker):
         # set the dataloader epoch and data iter offset
         self._data_epoch = 0
         self._data_iter_offset = 0
+        self._data_position_initialized = False
 
     def init_worker(self):
         self.setup_model_and_optimizer()
@@ -98,6 +99,13 @@ class FSDPSftWorker(FSDPModelManager, Worker):
         self.global_step = global_step
         if hasattr(self.model, "set_global_step"):
             self.model.set_global_step(global_step)
+        if not self._data_position_initialized:
+            if self.data_loader is not None and hasattr(
+                self.data_loader, "set_global_step"
+            ):
+                self.data_loader.set_global_step(global_step)
+                self.data_iter = iter(self.data_loader)
+            self._data_position_initialized = True
 
     def get_max_steps_per_epoch(self):
         if self.data_loader is not None:

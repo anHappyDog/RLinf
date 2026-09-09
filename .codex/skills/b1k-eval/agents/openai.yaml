@@ -1,0 +1,4 @@
+interface:
+  display_name: "B1K Eval"
+  short_description: "Launch reproducible BEHAVIOR-1K closed-loop evaluations"
+  default_prompt: "Use $b1k-eval to launch a BEHAVIOR-1K closed-loop evaluation and report its tmux sessions and output paths."

@@ -123,6 +123,7 @@ def value_from_prefix(
     prefix_out: torch.Tensor,
     prefix_mask: torch.Tensor,
     *,
+    state: torch.Tensor | None = None,
     mode: str = "mean_token",
 ) -> torch.Tensor:
     """Pool ``prefix_out`` with ``prefix_mask`` and run ``value_head`` → ``[B]``.
@@ -133,10 +134,11 @@ def value_from_prefix(
     here — they raise ``NotImplementedError`` so a config typo fails loudly
     rather than silently producing a wrong value.
     """
-    if mode != "mean_token":
+    if mode not in ("mean_token", "state_fusion", "state_attention"):
         raise NotImplementedError(
             f"value_vlm_mode={mode!r} is not implemented in the PyTorch OpenPI "
-            "RL port. Supported: 'mean_token'."
+            "RL port. Supported: 'mean_token', 'state_fusion', "
+            "'state_attention'."
         )
     mask_f = prefix_mask.to(prefix_out.dtype).unsqueeze(-1)
     summed = (prefix_out * mask_f).sum(dim=1)
@@ -145,4 +147,13 @@ def value_from_prefix(
     # weights line up; promote the scalar output to fp32 for the PPO critic loss
     # (which assert-checks float32 alignment with returns / prev_values).
     pooled = summed / denom
-    return value_head(pooled)[:, 0].to(torch.float32)
+    if mode in ("state_fusion", "state_attention"):
+        if state is None:
+            raise ValueError(f"value_vlm_mode={mode!r} requires robot state.")
+        if mode == "state_attention":
+            values = value_head(pooled, state, prefix_out, prefix_mask)
+        else:
+            values = value_head(pooled, state)
+    else:
+        values = value_head(pooled)
+    return values[:, 0].to(torch.float32)

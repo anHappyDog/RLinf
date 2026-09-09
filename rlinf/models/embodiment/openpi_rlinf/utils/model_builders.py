@@ -79,7 +79,10 @@ def _build_eval_model(
         )
 
     input_transforms, output_transforms = build_openpi_transforms(
-        cfg.model_path, config_name, data_kwargs=_resolve_data_kwargs(cfg)
+        cfg.model_path,
+        config_name,
+        data_kwargs=_resolve_data_kwargs(cfg),
+        max_token_len=int(model_cfg.max_token_len),
     )
 
     eval_model = OpenPiPytorchEvalActionModel(
@@ -156,7 +159,10 @@ def _build_rl_model(
         )
 
     input_transforms, output_transforms = build_openpi_transforms(
-        cfg.model_path, config_name, data_kwargs=_resolve_data_kwargs(cfg)
+        cfg.model_path,
+        config_name,
+        data_kwargs=_resolve_data_kwargs(cfg),
+        max_token_len=int(model_cfg.max_token_len),
     )
 
     rl_cfg = OpenPiPytorchRLConfig(
@@ -189,6 +195,7 @@ def _build_rl_model(
         action_env_dim=action_env_dim,
         rl_cfg=rl_cfg,
         paligemma_width=paligemma_width,
+        state_dim=int(cfg.proprio_dim),
     )
     rl_model.setup_wrappers(input_transforms, output_transforms)
     if bool(OmegaConf.select(model_cfg, "train_expert_only", default=False)):

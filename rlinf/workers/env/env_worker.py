@@ -23,6 +23,10 @@ from omegaconf import DictConfig, OmegaConf
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.algorithms.rlt.transition import update_rlt_transitions
+from rlinf.algorithms.subtask import (
+    outcome_actor_channel_key,
+    parallel_outcome_sampling_enabled,
+)
 from rlinf.data.schema.embodied_trajectory_builder import (
     EmbodiedLerobotTrajectoryBuilder,
     EmbodiedTrajectoryBuilder,
@@ -80,6 +84,7 @@ class EnvWorker(Worker):
         self.last_obs_list = []
         self.last_intervened_info_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
+        self._forced_train_bootstrap: list[EnvOutput] | None = None
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
@@ -182,6 +187,19 @@ class EnvWorker(Worker):
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
         )
+        if (
+            self.enable_train
+            and OmegaConf.select(self.cfg.env.train, "subpool.enabled", default=False)
+            and self.actor_split_num != 1
+        ):
+            env_world_size = self._component_placement.get_world_size("env")
+            actor_world_size = self._component_placement.get_world_size("actor")
+            raise ValueError(
+                "BEHAVIOR subpool RL cannot split a single-simulator trajectory "
+                "across FSDP ranks. The env world size must be an integer multiple "
+                f"of the actor world size, got env={env_world_size}, "
+                f"actor={actor_world_size}."
+            )
         if self.use_training_pipeline and self.enable_train:
             self._init_pipeline_params()
 
@@ -540,8 +558,9 @@ class EnvWorker(Worker):
         elif chunk_dones.any():
             if "final_info" in infos:
                 final_info = infos["final_info"]
+                done_envs = chunk_dones.any(dim=1)
                 for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+                    env_info[key] = final_info["episode"][key][done_envs].cpu()
 
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
@@ -566,6 +585,11 @@ class EnvWorker(Worker):
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
             rlt_switch_flags=rlt_switch_flags,
+            executed_action_mask=get_env_attr(
+                self.env_list[stage_id], "last_executed_action_mask"
+            ),
+            subtask_ids=get_env_attr(self.env_list[stage_id], "subtask_ids"),
+            subpool_ids=get_env_attr(self.env_list[stage_id], "subpool_ids"),
         )
         chunk_step_payload = {
             "chunk_actions": exec_actions,
@@ -779,6 +803,39 @@ class EnvWorker(Worker):
         adjusted_rewards[:, -1] += self.cfg.algorithm.gamma * final_values
         return adjusted_rewards
 
+    @staticmethod
+    def _extract_success_outcomes(env_output: EnvOutput) -> torch.Tensor | None:
+        """Extract per-environment terminal outcomes for dynamic sampling."""
+        if not env_output.env_infos:
+            return None
+        episode_info = env_output.env_infos.get("episode")
+        if not isinstance(episode_info, dict):
+            return None
+        outcomes = episode_info.get("success_once", episode_info.get("success"))
+        if outcomes is None:
+            return None
+        outcomes = torch.as_tensor(outcomes, dtype=torch.bool).reshape(-1)
+
+        final_info = env_output.env_infos.get("final_info")
+        final_mask = env_output.env_infos.get("_final_info")
+        if not isinstance(final_info, dict) or final_mask is None:
+            return outcomes
+        final_episode = final_info.get("episode")
+        if not isinstance(final_episode, dict):
+            return outcomes
+        final_outcomes = final_episode.get("success_once", final_episode.get("success"))
+        if final_outcomes is None:
+            return outcomes
+        final_outcomes = torch.as_tensor(final_outcomes, dtype=torch.bool).reshape(-1)
+        final_mask = torch.as_tensor(final_mask, dtype=torch.bool)
+        if final_mask.ndim > 1:
+            final_mask = final_mask.reshape(final_mask.shape[0], -1).any(dim=-1)
+        else:
+            final_mask = final_mask.reshape(-1)
+        if outcomes.shape != final_outcomes.shape or outcomes.shape != final_mask.shape:
+            raise ValueError("Auto-reset terminal outcomes are not batch-aligned.")
+        return torch.where(final_mask, final_outcomes, outcomes)
+
     def finish_rollout(self, mode="train"):
         # reset
         if mode == "train":
@@ -926,6 +983,11 @@ class EnvWorker(Worker):
                 .repeat(1, self.model_cfg.num_action_chunks)
             )
 
+        if self._forced_train_bootstrap is not None:
+            env_outputs = self._forced_train_bootstrap
+            self._forced_train_bootstrap = None
+            return env_outputs
+
         env_outputs: list[EnvOutput] = []
         if not self.cfg.env.train.auto_reset:
             for stage_id in range(self.stage_num):
@@ -1065,16 +1127,106 @@ class EnvWorker(Worker):
             for env_output in env_output_list
         ]
 
+    def reset_train_envs_for_outcome_group(
+        self, collection_index: int
+    ) -> list[dict[str, Any]]:
+        """Synchronously reset each train env for a DAPO candidate rollout."""
+        if self._prefetched_train_bootstrap is not None:
+            raise RuntimeError(
+                "Cannot force an outcome-group reset while a train bootstrap is "
+                "prefetched. Disable runner.overlap_env_bootstrap for dynamic "
+                "outcome sampling."
+            )
+        if self._forced_train_bootstrap is not None:
+            raise RuntimeError("An outcome-group bootstrap is already pending.")
+
+        env_outputs = []
+        reset_metadata = []
+        for stage_id, env in enumerate(self.env_list):
+            prepare_reset = get_env_attr(env, "prepare_outcome_group_reset")
+            if not callable(prepare_reset):
+                raise TypeError(
+                    "Outcome dynamic sampling requires an environment with "
+                    "prepare_outcome_group_reset()."
+                )
+            prepare_reset(collection_index)
+            env.is_start = True
+            extracted_obs, infos = env.reset()
+            dones = torch.zeros(
+                (self.train_num_envs_per_stage, self.model_cfg.num_action_chunks),
+                dtype=torch.bool,
+            )
+            env_outputs.append(
+                EnvOutput(
+                    obs=extracted_obs,
+                    dones=dones,
+                    terminations=dones.clone(),
+                    truncations=dones.clone(),
+                    final_obs=(
+                        infos.get("final_observation")
+                        if isinstance(infos, dict)
+                        else None
+                    ),
+                    env_infos=infos if isinstance(infos, dict) else None,
+                    intervene_actions=None,
+                    intervene_flags=None,
+                )
+            )
+
+            group_ids = self._outcome_group_ids(stage_id)
+            if group_ids is None or group_ids.numel() != 1:
+                raise RuntimeError(
+                    "Synchronized outcome reset requires exactly one environment "
+                    "per BEHAVIOR EnvWorker stage."
+                )
+            metadata = get_env_attr(env, "outcome_group_reset_metadata")
+            if not isinstance(metadata, dict):
+                raise TypeError(
+                    "Outcome dynamic sampling requires reset metadata from the "
+                    "environment."
+                )
+            reset_metadata.append(
+                {
+                    **metadata,
+                    "worker_rank": self._rank,
+                    "stage_id": stage_id,
+                    "outcome_group_id": int(group_ids.item()),
+                }
+            )
+
+        self._forced_train_bootstrap = env_outputs
+        self.store_last_obs_and_intervened_info(env_outputs)
+        return reset_metadata
+
     @Worker.timer("env/send_rollout_trajectories")
     async def send_rollout_trajectories(
-        self, trajectory_builder: EmbodiedTrajectoryBuilder, channel: Channel
+        self,
+        trajectory_builder: EmbodiedTrajectoryBuilder,
+        channel: Channel,
+        stage_id: int,
     ):
         trajectories: list[Trajectory] = trajectory_builder.to_splited_trajectories(
             self.actor_split_num
         )
         trajectory_builder.clear()
-        for trajectory in trajectories:
-            channel.put(trajectory, async_op=True)
+        sampling_cfg = OmegaConf.select(
+            self.cfg,
+            "algorithm.outcome_dynamic_sampling",
+            default={},
+        )
+        parallel_groups = parallel_outcome_sampling_enabled(sampling_cfg)
+        for split_index, trajectory in enumerate(trajectories):
+            channel_key = None
+            if parallel_groups:
+                global_env_index = (
+                    self._rank * self.stage_num + stage_id
+                ) * self.train_num_envs_per_stage + split_index
+                group_size = int(self.cfg.algorithm.outcome_dynamic_sampling.group_size)
+                channel_key = outcome_actor_channel_key(global_env_index % group_size)
+            if channel_key is None:
+                channel.put(trajectory, async_op=True)
+            else:
+                channel.put(trajectory, key=channel_key, async_op=True)
         del trajectories
         gc.collect()
 
@@ -1193,6 +1345,11 @@ class EnvWorker(Worker):
                         truncations=env_output.truncations,
                         terminations=env_output.terminations,
                         rewards=rewards,
+                        successes=self._extract_success_outcomes(env_output),
+                        executed_action_mask=env_output.executed_action_mask,
+                        subtask_ids=env_output.subtask_ids,
+                        subpool_ids=env_output.subpool_ids,
+                        outcome_group_ids=self._outcome_group_ids(stage_id),
                     )
 
                     self.trajectory_builders[stage_id].append_step_result(
@@ -1345,6 +1502,11 @@ class EnvWorker(Worker):
                     truncations=env_output.truncations,
                     terminations=env_output.terminations,
                     rewards=rewards,
+                    successes=self._extract_success_outcomes(env_output),
+                    executed_action_mask=env_output.executed_action_mask,
+                    subtask_ids=env_output.subtask_ids,
+                    subpool_ids=env_output.subpool_ids,
+                    outcome_group_ids=self._outcome_group_ids(stage_id),
                 )
                 self.trajectory_builders[stage_id].append_step_result(chunk_step_result)
                 if (
@@ -1383,7 +1545,7 @@ class EnvWorker(Worker):
             else:
                 for stage_id in range(self.stage_num):
                     await self.send_rollout_trajectories(
-                        self.trajectory_builders[stage_id], actor_channel
+                        self.trajectory_builders[stage_id], actor_channel, stage_id
                     )
 
         for key, value in env_metrics.items():
@@ -1511,6 +1673,20 @@ class EnvWorker(Worker):
         split_num = compute_split_num(recv_num, send_num)
         return split_num
 
+    def _outcome_group_ids(self, stage_id: int) -> torch.Tensor | None:
+        """Identify the independent outcome group for each local environment."""
+        sampling_cfg = self.cfg.algorithm.get("outcome_dynamic_sampling", {})
+        if not sampling_cfg.get("enabled", False):
+            return None
+        global_env_offset = (
+            self._rank * self.stage_num + stage_id
+        ) * self.train_num_envs_per_stage
+        global_env_ids = torch.arange(
+            global_env_offset,
+            global_env_offset + self.train_num_envs_per_stage,
+        )
+        return global_env_ids // int(sampling_cfg.group_size)
+
     def compute_advantages_and_returns(
         self, rollout_batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
@@ -1538,8 +1714,11 @@ class EnvWorker(Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": rollout_batch.get("loss_mask", None),
             "loss_mask_sum": rollout_batch.get("loss_mask_sum", None),
+            "executed_action_mask": rollout_batch.get("executed_action_mask", None),
+            "subtask_ids": rollout_batch.get("subtask_ids", None),
             "normalize_advantages": self.cfg.algorithm.get("normalize_advantages", True)
             and not self.use_training_pipeline,
+            "advantage_std_floor": self.cfg.algorithm.get("advantage_std_floor", 0.1),
         }
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
         rollout_batch.update(advantages_and_returns)

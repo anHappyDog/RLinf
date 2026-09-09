@@ -14,6 +14,18 @@
 
 """Data package public entrypoints."""
 
-from rlinf.data import schema, storage
+from __future__ import annotations
+
+import importlib
+from types import ModuleType
 
 __all__ = ["schema", "storage"]
+
+
+def __getattr__(name: str) -> ModuleType:
+    """Load the public schema and storage modules only when requested."""
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(f"{__name__}.{name}")
+    globals()[name] = module
+    return module

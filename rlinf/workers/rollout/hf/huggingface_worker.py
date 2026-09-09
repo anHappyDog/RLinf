@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import random
 import time
 from typing import Any, Callable, Literal, Optional
 
@@ -36,6 +37,15 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.obs_compression import decompress_obs, infer_obs_batch_size
 from rlinf.utils.placement import HybridComponentPlacement
+
+
+def _seed_rollout_sampling(base_seed: int, rank: int) -> int:
+    """Seed one rollout rank without sharing its stochastic action stream."""
+    rank_seed = int(base_seed) + int(rank)
+    random.seed(rank_seed)
+    np.random.seed(rank_seed)
+    torch.manual_seed(rank_seed)
+    return rank_seed
 
 
 class MultiStepRolloutWorker(Worker):
@@ -187,6 +197,10 @@ class MultiStepRolloutWorker(Worker):
                 train_batch_size=self.per_node_train_batch_size,
                 eval_batch_size=self.per_node_eval_batch_size,
             )
+
+        rollout_seed = self.cfg.rollout.get("seed", None)
+        if rollout_seed is not None:
+            _seed_rollout_sampling(rollout_seed, self._rank)
 
         self.setup_sample_params()
         if self.enable_offload:

@@ -1,0 +1,62 @@
+seed: 831
+output_root: /mnt/public/daibo/results/b1k_vqa_v01
+
+source:
+  sidecar_path: /mnt/public/daibo/results/b1k_grounded_control_v01/pilot_50ep_best3/data
+  dataset_root: /mnt/public/daibo/datasets/behavior-1k/2025-challenge-demos
+
+splits:
+  # The current sidecar has one episode per task, so task-level splitting is
+  # the only leak-free three-way split. Use episode_index after adding more
+  # episodes for every task.
+  group_by: task_index
+  train_fraction: 0.8
+  validation_fraction: 0.1
+
+candidates:
+  question_types:
+    - object_recognition
+    - part_recognition
+    - role_identification
+    - skill_identification
+  choice_count: 4
+  distractor_pool_size: 24
+  max_questions_per_sample: 4
+  require_fully_grounded: true
+
+quality:
+  min_visible_pixels: 256
+  min_bbox_side_pixels: 12
+  max_bbox_area_fraction: 0.8
+  min_mask_fill_fraction: 0.05
+
+prompts:
+  generate: /mnt/public/daibo/timeline/0831/RLinf/toolkits/b1k_vqa_builder/prompts/generator.txt
+  judge: /mnt/public/daibo/timeline/0831/RLinf/toolkits/b1k_vqa_builder/prompts/judge.txt
+
+sglang:
+  base_url: http://127.0.0.1:30000/v1
+  model: Qwen/Qwen3.8-27B
+  concurrency: 16
+  timeout_seconds: 180
+  retries: 3
+  temperature: 0.2
+  max_tokens: 512
+  choice_count: 4
+  # false lets Qwen propose semantically close negatives (for example speaker
+  # for radio) when the B1K category vocabulary has no suitable alternative.
+  # The blind Judge must still accept the resulting question.
+  restrict_distractors_to_pool: false
+  json_response_format: true
+  disable_thinking: true
+  api_key_env: null
+  # Keep false for a server on this machine; this also avoids cluster-wide
+  # HTTP_PROXY/ALL_PROXY settings intercepting localhost requests.
+  use_environment_proxy: false
+
+filters:
+  require_generator_visually_answerable: true
+  reject_generator_ambiguous: true
+  require_judge_visually_answerable: true
+  reject_judge_ambiguous: true
+  require_judge_correct: true

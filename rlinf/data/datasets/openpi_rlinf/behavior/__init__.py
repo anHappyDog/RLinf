@@ -21,11 +21,21 @@ from rlinf.data.datasets.openpi_rlinf.behavior.behavior_sft_data_loader import (
 from rlinf.data.datasets.openpi_rlinf.behavior.behavior_sft_dataset import (
     BehaviorSftDataset,
 )
+from rlinf.data.datasets.openpi_rlinf.behavior.grounded_sft_dataset import (
+    EpisodeShardedSampler,
+    GroundedBehaviorSftDataset,
+    GroundedEpisodeGroup,
+    TaskEpisodeStageSampler,
+)
 
 __all__ = [
     "BehaviorSftDataConfig",
     "BehaviorSftDataLoader",
     "BehaviorSftDataset",
+    "EpisodeShardedSampler",
+    "GroundedEpisodeGroup",
+    "GroundedBehaviorSftDataset",
+    "TaskEpisodeStageSampler",
     "build_behavior_sft_dataloader",
     "create_behavior_sft_data_loader",
 ]

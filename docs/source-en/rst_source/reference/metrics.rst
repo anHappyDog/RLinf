@@ -28,8 +28,26 @@ Policy- and value-optimization statistics, logged every actor update.
      - Fraction of updates where the probability ratio was clipped.
    * - ``train/actor/clipped_ratio``
      - Mean of the clipped probability ratios.
+   * - ``train/actor/grad_norm_before_clip``
+     - Gradient norm before clipping, reported by the embodied FSDP actor. For a joint actor-critic optimizer, this covers all optimized parameters rather than only the policy branch.
+   * - ``train/actor/grad_norm_after_clip``
+     - Effective total gradient norm after clipping. When branch-specific limits are configured, this is the L2 combination of the independently clipped policy and value norms.
+   * - ``train/actor/grad_clip_coef``
+     - Ratio of the effective total norm after clipping to the total norm before clipping; ``1`` means that no clipping was needed.
+   * - ``train/actor/policy_grad_norm_before_clip``
+     - Global pre-clipping norm of policy-branch gradients. FSDP shards are reduced once across their sharding group.
+   * - ``train/actor/policy_grad_norm_after_clip``
+     - Policy gradient norm after applying ``actor.optim.policy_clip_grad`` (or the shared ``actor.optim.clip_grad`` when independent clipping is disabled).
+   * - ``train/actor/policy_grad_clip_coef``
+     - Coefficient applied only to policy gradients.
+   * - ``train/critic/value_grad_norm_before_clip``
+     - Global pre-clipping norm of value-head gradients. Compare it with the policy norm to identify which branch drives total-gradient clipping.
+   * - ``train/critic/value_grad_norm_after_clip``
+     - Value-head gradient norm after applying ``actor.optim.value_clip_grad`` (or the shared ``actor.optim.clip_grad`` when independent clipping is disabled).
+   * - ``train/critic/value_grad_clip_coef``
+     - Coefficient applied only to value-head gradients.
    * - ``train/actor/grad_norm``
-     - Gradient norm of the actor.
+     - Legacy pre-clipping metric still emitted by other actor workers. Prefer the explicit metrics above when available.
    * - ``train/actor/lr``
      - Current learning rate.
    * - ``train/actor/policy_loss``
@@ -50,6 +68,12 @@ Rollout metrics — ``rollout/``
 
 Statistics of the advantages and rewards collected during rollout.
 
+For outcome-dynamic sampling, ``algorithm.outcome_dynamic_sampling.groups_per_update``
+sets how many independently quota-filtered groups are concatenated into one actor
+update. Rejected homogeneous groups are resampled until the quota is met, and
+``attempt_warning_interval`` controls how often prolonged sampling emits a warning.
+Keep ``env.train.rollout_epoch`` at ``1`` so quotas are checked per initial state.
+
 .. list-table::
    :header-rows: 1
    :widths: 34 66
@@ -64,6 +88,16 @@ Statistics of the advantages and rewards collected during rollout.
      - Minimum advantage in the batch.
    * - ``rollout/rewards``
      - Reward of a rollout chunk.
+   * - ``rollout/dynamic_sampling/groups_per_update``
+     - Number of independently accepted positive/negative groups in this actor update.
+   * - ``rollout/dynamic_sampling/attempts``
+     - Total candidate groups sampled while filling the update.
+   * - ``rollout/dynamic_sampling/rejected_groups``
+     - Candidate groups rejected for not satisfying the success/failure quotas.
+   * - ``rollout/dynamic_sampling/successes`` / ``failures``
+     - Successful and failed trajectories retained across all accepted groups.
+   * - ``rollout/dynamic_sampling/candidate_successes`` / ``candidate_failures``
+     - Outcomes across accepted and rejected candidate groups.
 
 Environment metrics — ``env/``
 ------------------------------

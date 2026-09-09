@@ -17,6 +17,7 @@ import importlib.util
 import logging
 import os
 from dataclasses import asdict
+from math import gcd
 from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Union
 
 import torch
@@ -37,6 +38,159 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 logging.getLogger().setLevel(logging.INFO)
+
+
+def _validate_embodied_rollout_batch_alignment(
+    *,
+    max_steps_per_rollout_epoch: int,
+    num_action_chunks: int,
+    rollout_epoch: int,
+    total_num_envs: int,
+    global_batch_size: int,
+    groups_per_update: int = 1,
+) -> None:
+    """Validate that each embodied rollout contains full actor batches."""
+    if max_steps_per_rollout_epoch % num_action_chunks != 0:
+        raise ValueError(
+            "env.train.max_steps_per_rollout_epoch "
+            f"({max_steps_per_rollout_epoch}) must be divisible by "
+            f"actor.model.num_action_chunks ({num_action_chunks})."
+        )
+
+    num_trajectories = rollout_epoch * total_num_envs * groups_per_update
+    rollout_size = max_steps_per_rollout_epoch // num_action_chunks * num_trajectories
+    if rollout_size % global_batch_size != 0:
+        required_step_multiple = num_action_chunks * (
+            global_batch_size // gcd(global_batch_size, num_trajectories)
+        )
+        raise ValueError(
+            "The embodied rollout cannot be split into full actor batches: "
+            f"{rollout_size} chunk transitions from "
+            f"max_steps_per_rollout_epoch={max_steps_per_rollout_epoch}, "
+            f"rollout_epoch={rollout_epoch}, total_num_envs={total_num_envs}, "
+            f"and groups_per_update={groups_per_update} "
+            f"is not divisible by actor.global_batch_size={global_batch_size}. "
+            "For this configuration, env.train.max_steps_per_rollout_epoch "
+            f"must be a multiple of {required_step_multiple} primitive steps."
+        )
+
+
+def _validate_outcome_dynamic_sampling(
+    cfg: DictConfig,
+    model_cfg: DictConfig,
+    *,
+    env_world_size: int | None = None,
+    actor_world_size: int | None = None,
+) -> None:
+    """Validate DAPO-style outcome quotas for BEHAVIOR subpool PPO."""
+    sampling_cfg = cfg.algorithm.get("outcome_dynamic_sampling", {})
+    if not sampling_cfg.get("enabled", False):
+        return
+
+    group_size = int(sampling_cfg.get("group_size", 0))
+    min_successes = int(sampling_cfg.get("min_successes", 0))
+    min_failures = int(sampling_cfg.get("min_failures", 0))
+    warning_interval = int(
+        sampling_cfg.get(
+            "attempt_warning_interval",
+            sampling_cfg.get("max_rollout_attempts", 0),
+        )
+    )
+    groups_per_update = int(sampling_cfg.get("groups_per_update", 1))
+    parallel_groups = bool(sampling_cfg.get("parallel_groups", False))
+    assert cfg.env.train.rollout_epoch == 1, (
+        "Outcome dynamic sampling requires env.train.rollout_epoch=1."
+    )
+    if parallel_groups:
+        assert cfg.env.train.total_num_envs == group_size * groups_per_update, (
+            "Parallel outcome sampling requires total_num_envs == "
+            "group_size * groups_per_update."
+        )
+        assert env_world_size == cfg.env.train.total_num_envs, (
+            "Parallel outcome sampling requires one environment per EnvWorker."
+        )
+        assert actor_world_size == group_size, (
+            "Parallel outcome sampling requires one trajectory from each group "
+            "on every actor rank: actor world size must equal group_size."
+        )
+        assert cfg.rollout.pipeline_stage_num == 1, (
+            "Parallel outcome sampling requires rollout.pipeline_stage_num=1."
+        )
+    else:
+        assert group_size == cfg.env.train.total_num_envs, (
+            "Serial outcome sampling requires one global group: group_size must "
+            "equal env.train.total_num_envs."
+        )
+    assert cfg.env.train.subpool.get("outcome_group_size", 1) == group_size, (
+        "env.train.subpool.outcome_group_size must equal "
+        "algorithm.outcome_dynamic_sampling.group_size."
+    )
+    assert min_successes > 0 and min_failures > 0, (
+        "Outcome dynamic sampling requires positive min_successes and min_failures."
+    )
+    assert min_successes + min_failures <= group_size, (
+        "Outcome dynamic sampling success/failure quotas cannot exceed group_size."
+    )
+    assert warning_interval > 0, (
+        "Outcome dynamic sampling requires a positive attempt_warning_interval."
+    )
+    assert groups_per_update > 0, (
+        "Outcome dynamic sampling requires a positive groups_per_update."
+    )
+    rollout_seed = cfg.rollout.get("seed", None)
+    assert type(rollout_seed) is int and rollout_seed >= 0, (
+        "Outcome dynamic sampling requires rollout.seed so same-state rollout "
+        "ranks use independent, reproducible sampling streams."
+    )
+    if SupportedModel(model_cfg.model_type) == SupportedModel.OPENPI_RLINF:
+        assert (
+            model_cfg.openpi.get("noise_method", "flow_ode") == "flow_sde"
+            and model_cfg.openpi.get("noise_level", 0.0) > 0.0
+        ), (
+            "Outcome dynamic sampling with openpi_rlinf requires positive flow_sde "
+            "action noise; deterministic same-state rollouts cannot produce a mixed "
+            "outcome group."
+        )
+
+
+def _validate_independent_gradient_clipping(actor_cfg: DictConfig) -> None:
+    """Validate optional policy/value branch-specific clipping limits."""
+    policy_clip_grad = actor_cfg.optim.get("policy_clip_grad", None)
+    value_clip_grad = actor_cfg.optim.get("value_clip_grad", None)
+    if policy_clip_grad is None and value_clip_grad is None:
+        return
+
+    assert policy_clip_grad is not None and value_clip_grad is not None, (
+        "actor.optim.policy_clip_grad and actor.optim.value_clip_grad must be "
+        "configured together."
+    )
+    assert float(policy_clip_grad) > 0.0 and float(value_clip_grad) > 0.0, (
+        "Independent policy/value gradient clipping limits must be positive."
+    )
+    assert actor_cfg.model.get("add_value_head", False), (
+        "Independent policy/value gradient clipping requires "
+        "actor.model.add_value_head=true."
+    )
+    if actor_cfg.fsdp_config.get("strategy", "fsdp2") == "fsdp":
+        assert actor_cfg.fsdp_config.get("use_orig_params", False), (
+            "Classic FSDP independent policy/value gradient clipping requires "
+            "actor.fsdp_config.use_orig_params=true."
+        )
+
+
+def _validate_critic_only(cfg: DictConfig) -> None:
+    """Validate the value-head-only diagnostic training mode."""
+    if not cfg.actor.optim.get("critic_only", False):
+        return
+    assert cfg.actor.model.get("add_value_head", False), (
+        "actor.optim.critic_only requires actor.model.add_value_head=true."
+    )
+    assert cfg.algorithm.loss_type in ("actor_critic", "decoupled_actor_critic"), (
+        "actor.optim.critic_only requires an actor-critic loss."
+    )
+    assert not cfg.actor.get("enable_sft_co_train", False), (
+        "actor.optim.critic_only cannot be combined with SFT co-training."
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -466,7 +620,7 @@ def validate_model_cfg_by_hf_config(cfg, hf_model_path):
     return cfg
 
 
-def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
+def validate_fsdp_cfg(cfg: DictConfig, world_size: int | None = None) -> DictConfig:
     def validate_amp_cfg(config: DictConfig) -> DictConfig:
         """Validate AMP configuration and ensure mutual exclusivity with FSDP mixed_precision."""
 
@@ -516,6 +670,40 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
         cfg.fsdp_config.sharding_strategy = cfg.fsdp_config.get(
             "sharding_strategy", "full_shard"
         )
+        supported_sharding_strategies = {
+            "full_shard",
+            "shard_grad_op",
+            "hybrid_shard",
+            "no_shard",
+        }
+        assert cfg.fsdp_config.sharding_strategy in supported_sharding_strategies, (
+            "fsdp_config.sharding_strategy must be one of "
+            f"{sorted(supported_sharding_strategies)}"
+        )
+
+        cfg.fsdp_config.hybrid_shard_size = cfg.fsdp_config.get(
+            "hybrid_shard_size", None
+        )
+        if cfg.fsdp_config.sharding_strategy == "hybrid_shard":
+            assert cfg.fsdp_config.strategy == "fsdp", (
+                "hybrid_shard currently requires fsdp_config.strategy='fsdp'"
+            )
+            assert (
+                type(cfg.fsdp_config.hybrid_shard_size) is int
+                and cfg.fsdp_config.hybrid_shard_size > 0
+            ), (
+                "fsdp_config.hybrid_shard_size must be a positive integer when "
+                "sharding_strategy='hybrid_shard'"
+            )
+            if world_size is not None:
+                assert world_size % cfg.fsdp_config.hybrid_shard_size == 0, (
+                    f"FSDP world size {world_size} must be divisible by "
+                    "fsdp_config.hybrid_shard_size "
+                    f"({cfg.fsdp_config.hybrid_shard_size})"
+                )
+                assert world_size // cfg.fsdp_config.hybrid_shard_size >= 2, (
+                    "hybrid_shard requires at least two replica groups"
+                )
 
         cfg.fsdp_config.forward_prefetch = cfg.fsdp_config.get(
             "forward_prefetch", False
@@ -992,8 +1180,8 @@ def validate_embodied_cfg(cfg):
                 )
 
     if not only_eval and cfg.runner.get("use_training_pipeline", False):
-        assert cfg.algorithm.adv_type == "gae", (
-            "algorithm.adv_type only supports 'gae' now"
+        assert cfg.algorithm.adv_type in ("gae", "subtask_gae"), (
+            "algorithm.adv_type only supports 'gae' and 'subtask_gae' now"
             "when runner.use_training_pipeline is True."
         )
 
@@ -1010,6 +1198,9 @@ def validate_embodied_cfg(cfg):
             f"actor.model.add_value_head must be True. "
             f"Current value: {add_value_head}"
         )
+    if not only_eval:
+        _validate_independent_gradient_clipping(cfg.actor)
+        _validate_critic_only(cfg)
 
     # MolmoAct2 caches an action queue per batch index inside the LeRobot policy.
     # Pipeline stages hand the same indices to different environments on
@@ -1117,10 +1308,23 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.train.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
         )
-        assert (
-            cfg.env.train.max_steps_per_rollout_epoch % model_cfg.num_action_chunks == 0
-        ), (
-            "env.train.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
+        outcome_sampling_cfg = cfg.algorithm.get("outcome_dynamic_sampling", {})
+        groups_per_update = (
+            int(outcome_sampling_cfg.get("groups_per_update", 1))
+            if outcome_sampling_cfg.get("enabled", False)
+            else 1
+        )
+        parallel_outcome_groups = bool(
+            outcome_sampling_cfg.get("enabled", False)
+            and outcome_sampling_cfg.get("parallel_groups", False)
+        )
+        _validate_embodied_rollout_batch_alignment(
+            max_steps_per_rollout_epoch=cfg.env.train.max_steps_per_rollout_epoch,
+            num_action_chunks=model_cfg.num_action_chunks,
+            rollout_epoch=cfg.env.train.rollout_epoch,
+            total_num_envs=cfg.env.train.total_num_envs,
+            global_batch_size=cfg.actor.global_batch_size,
+            groups_per_update=(1 if parallel_outcome_groups else groups_per_update),
         )
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
@@ -1180,6 +1384,53 @@ def validate_embodied_cfg(cfg):
                 assert cfg.env.train.base_config_name == "r1pro_behavior", (
                     f"Only r1pro_behavior is supported for omnigibson, got {cfg.env.train.base_config_name}"
                 )
+                if OmegaConf.select(cfg.env.train, "subpool.enabled", default=False):
+                    assert cfg.env.train.get("num_env_subprocess", 1) == 1, (
+                        "BEHAVIOR subpool RL requires num_env_subprocess=1."
+                    )
+                    assert not cfg.env.train.get(
+                        "skip_intermediate_obs_in_chunk", False
+                    ), (
+                        "BEHAVIOR subpool RL requires "
+                        "skip_intermediate_obs_in_chunk=false."
+                    )
+                    assert not cfg.env.train.get("enable_offload", False), (
+                        "BEHAVIOR subpool RL requires env.train.enable_offload=false."
+                    )
+                    assert cfg.env.train.get("renderer_mode", "rlinf") == "official", (
+                        "BEHAVIOR subpool RL requires env.train.renderer_mode=official."
+                    )
+                    assert cfg.rollout.pipeline_stage_num == 1, (
+                        "BEHAVIOR subpool RL requires rollout.pipeline_stage_num=1."
+                    )
+                    assert not cfg.runner.get("use_training_pipeline", False), (
+                        "BEHAVIOR subpool RL disables use_training_pipeline so "
+                        "advantages can be normalized per subtask over the full batch."
+                    )
+                    assert cfg.algorithm.adv_type == "subtask_gae", (
+                        "BEHAVIOR subpool RL requires algorithm.adv_type=subtask_gae."
+                    )
+                    assert cfg.algorithm.reward_type == "subtask_chunk_level", (
+                        "BEHAVIOR subpool RL requires "
+                        "algorithm.reward_type=subtask_chunk_level."
+                    )
+                    assert cfg.algorithm.logprob_type == "chunk_level", (
+                        "BEHAVIOR subpool RL requires "
+                        "algorithm.logprob_type=chunk_level."
+                    )
+                    assert not cfg.algorithm.get("filter_rewards", False), (
+                        "BEHAVIOR subpool RL disables reward filtering because it "
+                        "would selectively remove low-return subtasks."
+                    )
+                    assert cfg.algorithm.get("normalize_advantages", True), (
+                        "BEHAVIOR subpool RL requires taskwise advantage normalization."
+                    )
+                    _validate_outcome_dynamic_sampling(
+                        cfg,
+                        model_cfg,
+                        env_world_size=env_world_size,
+                        actor_world_size=component_placement.get_world_size("actor"),
+                    )
     return cfg
 
 
@@ -1561,7 +1812,7 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
         ), (
             f"actor.global_batch_size ({cfg.actor.global_batch_size}) must be divisible by (actor.micro_batch_size ({cfg.actor.micro_batch_size}) * actor_world_size ({actor_world_size}))"
         )
-        cfg.actor = validate_fsdp_cfg(cfg.actor)
+        cfg.actor = validate_fsdp_cfg(cfg.actor, world_size=actor_world_size)
 
     if cfg.get("critic", None) is not None:
         if cfg.critic.use_critic_model and cfg.critic.training_backend == "megatron":

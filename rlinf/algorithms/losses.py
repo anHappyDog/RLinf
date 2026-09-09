@@ -182,6 +182,7 @@ def compute_ppo_actor_loss(
     clip_log_ratio_min: Optional[float] = None,
     clip_log_ratio_max: Optional[float] = None,
     fast_path_zero_loss_mask: Optional[bool] = False,
+    sample_weights: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, dict]:
     """
@@ -264,12 +265,16 @@ def compute_ppo_actor_loss(
     else:
         dual_clip_mask = torch.zeros_like(clip_mask)
 
-    metric_policy_loss_abs = loss_agg_func(
-        policy_loss.abs(), loss_mask, loss_mask_ratio
-    )
-    policy_loss = loss_agg_func(
-        policy_loss, loss_mask, loss_mask_ratio
-    )  # default max_episode_steps is None
+    if sample_weights is not None:
+        metric_policy_loss_abs = (policy_loss.abs() * loss_mask * sample_weights).mean()
+        policy_loss = (policy_loss * loss_mask * sample_weights).mean()
+    else:
+        metric_policy_loss_abs = loss_agg_func(
+            policy_loss.abs(), loss_mask, loss_mask_ratio
+        )
+        policy_loss = loss_agg_func(
+            policy_loss, loss_mask, loss_mask_ratio
+        )  # default max_episode_steps is None
 
     clip_mask = policy_loss1.detach() < policy_loss2.detach()
     dual_clip_mask = (dual_clip_mask * loss_mask).bool()
@@ -321,6 +326,7 @@ def compute_ppo_critic_loss(
     loss_mask: Optional[torch.Tensor] = None,
     max_episode_steps: Optional[int] = None,
     loss_mask_sum: Optional[torch.Tensor] = None,
+    sample_weights: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, dict]:
     """
@@ -358,7 +364,10 @@ def compute_ppo_critic_loss(
         returns - value_pred_clipped, huber_delta
     )  # [bsz, ] | [bsz, chunk-step]
     value_loss = torch.max(value_loss_original, value_loss_clipped)
-    value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
+    if sample_weights is not None:
+        value_loss = (value_loss * loss_mask * sample_weights).mean()
+    else:
+        value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
 
     value_clip_indicator = (value_pred_clipped - prev_values).abs() > value_clip
     value_clip_ratio = value_clip_indicator.float().mean()
@@ -413,13 +422,21 @@ def compute_ppo_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     Returns:
         Tuple[torch.Tensor, Dict]: Loss and metrics dictionary
     """
-    metrics_data = {}
-    actor_loss, actor_metrics_data = compute_ppo_actor_loss(**kwargs)
-    critic_loss, critic_metrics_data = compute_ppo_critic_loss(**kwargs)
+    update_policy = kwargs.pop("update_policy", True)
+    update_value = kwargs.pop("update_value", True)
+    if not update_policy and not update_value:
+        raise ValueError("At least one of update_policy/update_value must be enabled.")
 
-    loss = actor_loss + critic_loss
-    metrics_data.update(actor_metrics_data)
-    metrics_data.update(critic_metrics_data)
+    loss = None
+    metrics_data = {}
+    if update_policy:
+        actor_loss, actor_metrics_data = compute_ppo_actor_loss(**kwargs)
+        loss = actor_loss
+        metrics_data.update(actor_metrics_data)
+    if update_value:
+        critic_loss, critic_metrics_data = compute_ppo_critic_loss(**kwargs)
+        loss = critic_loss if loss is None else loss + critic_loss
+        metrics_data.update(critic_metrics_data)
 
     return loss, metrics_data
 

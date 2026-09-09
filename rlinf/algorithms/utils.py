@@ -16,6 +16,8 @@ from typing import Optional
 
 import torch
 
+from rlinf.algorithms.subtask import align_subtask_ids, discounted_chunk_rewards
+
 
 def huber_loss(error: torch.Tensor, delta: float) -> torch.Tensor:
     return torch.where(
@@ -76,6 +78,51 @@ def preprocess_embodied_advantages_inputs(
     Preprocess inputs before computing advantages & returns.
     Unify names & formats, align with math interfaces.
     """
+    if kwargs["reward_type"] == "subtask_chunk_level":
+        executed_action_mask = kwargs.get("executed_action_mask")
+        subtask_ids = kwargs.get("subtask_ids")
+        if executed_action_mask is None or subtask_ids is None:
+            raise ValueError(
+                "subtask_chunk_level requires executed_action_mask and subtask_ids."
+            )
+        macro_rewards, discounts = discounted_chunk_rewards(
+            rewards,
+            executed_action_mask,
+            gamma=float(kwargs["gamma"]),
+        )
+        macro_dones = dones[1:].any(dim=-1)
+        valid_mask = executed_action_mask.any(dim=-1)
+        if loss_mask is not None:
+            valid_mask &= loss_mask.any(dim=-1)
+        subtask_ids = align_subtask_ids(subtask_ids, macro_rewards)
+        if values is None:
+            raise ValueError("subtask_gae requires critic values.")
+        if values.shape[-1] != 1:
+            raise ValueError(
+                "subtask_gae expects one value per macro transition, got "
+                f"values.shape={values.shape}."
+            )
+        values = values.squeeze(-1)
+        num_chunk, bsz = macro_rewards.shape
+        kwargs.update(
+            {
+                "num_chunk": num_chunk,
+                "batch_size": bsz,
+                "chunk_size": 1,
+                "n_steps": num_chunk,
+                "rewards": macro_rewards,
+                "discounts": discounts,
+                "dones": macro_dones,
+                "values": values,
+                "subtask_ids": subtask_ids,
+                "loss_mask": valid_mask,
+                "loss_mask_sum": valid_mask.sum(dim=0, keepdim=True).expand_as(
+                    valid_mask
+                ),
+            }
+        )
+        return kwargs
+
     if kwargs["reward_type"] == "chunk_level":
         # TODO: need check
         # rewards, dones, loss_mask, loss_mask_sum: [n_chunk_steps, bsz, num_action_chunks] -> [n_chunk_steps, bsz, 1]
@@ -278,8 +325,8 @@ def postprocess_reasoning_advantages_outputs(
 
 
 def preprocess_loss_inputs(
-    logprobs: torch.Tensor,
-    old_logprobs: torch.Tensor,
+    logprobs: Optional[torch.Tensor],
+    old_logprobs: Optional[torch.Tensor],
     advantages: torch.Tensor,
     logprob_type: Optional[str] = None,
     single_action_dim: Optional[int] = None,
@@ -290,9 +337,12 @@ def preprocess_loss_inputs(
     returns: Optional[torch.Tensor] = None,
     reward_type: Optional[str] = None,
     versions: Optional[torch.Tensor] = None,
+    executed_action_mask: Optional[torch.Tensor] = None,
+    sample_weights: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> dict:
-    if reward_type == "chunk_level":
+    update_policy = bool(kwargs.get("update_policy", True))
+    if reward_type in ("chunk_level", "subtask_chunk_level"):
         advantages = advantages.flatten()
         if loss_mask is not None:
             loss_mask = loss_mask.flatten()
@@ -305,9 +355,21 @@ def preprocess_loss_inputs(
         if returns is not None:
             returns = returns.flatten()
 
-    bsz = logprobs.shape[0]
     proximal_logprobs = kwargs.get("proximal_logprobs", None)
-    if logprob_type == "token_level":
+    if not update_policy:
+        if values is None:
+            raise ValueError("A value-only update requires value predictions.")
+        target_shape = values.shape
+        logprobs = None
+        old_logprobs = None
+        proximal_logprobs = None
+        versions = None
+    elif logprobs is None or old_logprobs is None:
+        raise ValueError("A policy update requires current and old log-probabilities.")
+    else:
+        bsz = logprobs.shape[0]
+
+    if update_policy and logprob_type == "token_level":
         # logprobs, old_logprobs: [bsz, num_action_chunks, action_dim] -> [bsz, num_action_chunks, action_dim]
         logprobs = logprobs.reshape(bsz, -1, single_action_dim)
         old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim)
@@ -327,7 +389,7 @@ def preprocess_loss_inputs(
         if loss_mask_sum is not None:
             loss_mask_sum = loss_mask_sum.unsqueeze(-1)
 
-    elif logprob_type == "action_level":
+    elif update_policy and logprob_type == "action_level":
         # logprobs, old_logprobs: [bsz, num_action_chunks, action_dim] -> [bsz, num_action_chunks]
         logprobs = logprobs.reshape(bsz, -1, single_action_dim).sum(dim=-1)
         old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim).sum(dim=-1)
@@ -338,18 +400,30 @@ def preprocess_loss_inputs(
         if versions is not None:
             versions = versions.reshape(bsz, -1, single_action_dim)[..., 0]
 
-    elif logprob_type == "chunk_level":
+    elif update_policy and logprob_type == "chunk_level":
         # logprobs, old_logprobs: [bsz, num_action_chunks, action_dim] -> [bsz]
-        logprobs = logprobs.reshape(bsz, -1, single_action_dim).sum(dim=[1, 2])
-        old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim).sum(dim=[1, 2])
+        logprobs = logprobs.reshape(bsz, -1, single_action_dim)
+        old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim)
+        if reward_type == "subtask_chunk_level":
+            if executed_action_mask is None:
+                raise ValueError(
+                    "subtask_chunk_level loss requires executed_action_mask."
+                )
+            action_mask = executed_action_mask.reshape(bsz, -1).unsqueeze(-1)
+            logprobs = logprobs * action_mask
+            old_logprobs = old_logprobs * action_mask
+        logprobs = logprobs.sum(dim=[1, 2])
+        old_logprobs = old_logprobs.sum(dim=[1, 2])
         if proximal_logprobs is not None:
-            proximal_logprobs = proximal_logprobs.reshape(
-                bsz, -1, single_action_dim
-            ).sum(dim=[1, 2])
+            proximal_logprobs = proximal_logprobs.reshape(bsz, -1, single_action_dim)
+            if reward_type == "subtask_chunk_level":
+                proximal_logprobs = proximal_logprobs * action_mask
+            proximal_logprobs = proximal_logprobs.sum(dim=[1, 2])
         if versions is not None:
             versions = versions.reshape(bsz, -1, single_action_dim)[:, 0, 0]
 
-    target_shape = logprobs.shape
+    if update_policy:
+        target_shape = logprobs.shape
     advantages = expand_to_target_dim(advantages, target_shape)
     loss_mask = expand_to_target_dim(loss_mask, target_shape)
     loss_mask_sum = expand_to_target_dim(loss_mask_sum, target_shape)
@@ -357,6 +431,7 @@ def preprocess_loss_inputs(
     prev_values = expand_to_target_dim(prev_values, target_shape)
     returns = expand_to_target_dim(returns, target_shape)
     versions = expand_to_target_dim(versions, target_shape)
+    sample_weights = expand_to_target_dim(sample_weights, target_shape)
 
     kwargs.update(
         {
@@ -370,6 +445,7 @@ def preprocess_loss_inputs(
             "values": values,
             "prev_values": prev_values,
             "returns": returns,
+            "sample_weights": sample_weights,
         }
     )
 

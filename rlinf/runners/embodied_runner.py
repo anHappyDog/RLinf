@@ -18,10 +18,12 @@ import queue
 import threading
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
+from rlinf.algorithms.subtask import outcome_group_is_trainable
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.checkpoint import parse_global_step_from_checkpoint_path
@@ -33,6 +35,99 @@ from rlinf.utils.runner_utils import check_progress
 from rlinf.utils.timers import Timer
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_outcome_reset_metadata(
+    metadata_shards: list[list[dict]],
+    *,
+    expected_group_ids: set[int],
+    group_size: int,
+) -> dict[int, dict]:
+    """Verify that every DAPO group was reset to one identical snapshot."""
+    grouped_metadata: dict[int, list[dict]] = defaultdict(list)
+    for worker_metadata in metadata_shards:
+        if not isinstance(worker_metadata, list):
+            raise RuntimeError(
+                "Outcome reset metadata must be a list from every EnvWorker."
+            )
+        for metadata in worker_metadata:
+            grouped_metadata[int(metadata["outcome_group_id"])].append(metadata)
+
+    if set(grouped_metadata) != expected_group_ids:
+        raise RuntimeError(
+            "Outcome reset expected group IDs "
+            f"{sorted(expected_group_ids)}, received {sorted(grouped_metadata)}."
+        )
+
+    synchronized = {}
+    signature_keys = ("snapshot_id", "episode_index", "subtask_id", "pool_type")
+    for group_id, group_metadata in grouped_metadata.items():
+        if len(group_metadata) != group_size:
+            raise RuntimeError(
+                f"Outcome reset group {group_id} expected {group_size} members, "
+                f"received {len(group_metadata)}."
+            )
+        signatures = {
+            tuple(metadata[key] for key in signature_keys)
+            for metadata in group_metadata
+        }
+        if len(signatures) != 1:
+            raise RuntimeError(
+                f"Outcome reset group {group_id} loaded different snapshots: "
+                f"{sorted(signatures)}."
+            )
+        synchronized[group_id] = group_metadata[0]
+    return synchronized
+
+
+def _record_outcome_snapshot_stats(
+    stats: dict[tuple[str, int], dict[str, int]],
+    metadata: dict,
+    *,
+    successes: int,
+    failures: int,
+    accepted: bool,
+) -> None:
+    key = (str(metadata["snapshot_id"]), int(metadata["episode_index"]))
+    state_stats = stats.setdefault(
+        key,
+        {
+            "candidate_groups": 0,
+            "candidate_successes": 0,
+            "candidate_failures": 0,
+            "accepted_groups": 0,
+        },
+    )
+    state_stats["candidate_groups"] += 1
+    state_stats["candidate_successes"] += successes
+    state_stats["candidate_failures"] += failures
+    state_stats["accepted_groups"] += int(accepted)
+
+
+def _outcome_snapshot_metrics(
+    stats: dict[tuple[str, int], dict[str, int]],
+) -> dict[str, float | int]:
+    metrics = {}
+    for (snapshot_id, episode_index), state_stats in stats.items():
+        safe_snapshot_id = snapshot_id.replace("/", "_")
+        prefix = f"dynamic_sampling/snapshot/{safe_snapshot_id}"
+        candidate_count = (
+            state_stats["candidate_successes"] + state_stats["candidate_failures"]
+        )
+        metrics.update(
+            {
+                f"{prefix}/episode_index": episode_index,
+                f"{prefix}/candidate_groups": state_stats["candidate_groups"],
+                f"{prefix}/candidate_successes": state_stats["candidate_successes"],
+                f"{prefix}/candidate_failures": state_stats["candidate_failures"],
+                f"{prefix}/candidate_success_rate": (
+                    state_stats["candidate_successes"] / candidate_count
+                ),
+                f"{prefix}/accepted_groups": state_stats["accepted_groups"],
+            }
+        )
+    return metrics
+
 
 if TYPE_CHECKING:
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
@@ -48,6 +143,25 @@ if TYPE_CHECKING:
         AsyncMultiStepRolloutWorker,
     )
     from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+
+
+@dataclass(frozen=True)
+class _AcceptedOutcomeEnvHandle:
+    """Expose metrics only for outcome groups retained from a parallel round."""
+
+    handle: Handle
+    group_ids: frozenset[int]
+    group_size: int
+
+    def wait(self):
+        results = self.handle.wait()
+        return [
+            result if rank // self.group_size in self.group_ids else None
+            for rank, result in enumerate(results)
+        ]
+
+    def consume_durations(self, *args, **kwargs):
+        return self.handle.consume_durations(*args, **kwargs)
 
 
 class EmbodiedRunner:
@@ -106,6 +220,7 @@ class EmbodiedRunner:
         self.consumed_samples = 0
         # the step here is GRPO step
         self.global_step = 0
+        self._outcome_collection_index = 0
 
         # compute `max_steps`
         self.set_max_steps()
@@ -190,6 +305,294 @@ class EmbodiedRunner:
         actor_handle: Handle = self.actor.sync_model_to_rollout()
         actor_handle.wait()
         rollout_handle.wait()
+
+    def _collect_train_rollout(self):
+        env_handle: Handle = self.env.interact(
+            input_channel=self.env_channel,
+            rollout_channel=self.rollout_channel,
+            reward_channel=self.reward_channel,
+            actor_channel=self.actor_channel,
+        )
+        rollout_handle: Handle = self.rollout.generate(
+            input_channel=self.rollout_channel,
+            output_channel=self.env_channel,
+        )
+        reward_handle = None
+        if self.reward is not None:
+            reward_handle = self.reward.compute_rewards(
+                input_channel=self.reward_channel,
+                output_channel=self.env_channel,
+            )
+        outcome_shards = self.actor.recv_rollout_trajectories(
+            input_channel=self.actor_channel
+        ).wait()
+        rollout_handle.wait()
+        if reward_handle is not None:
+            reward_handle.wait()
+        return env_handle, rollout_handle, reward_handle, outcome_shards
+
+    def _reset_outcome_sampling_envs(self, sampling_cfg: DictConfig) -> dict[int, dict]:
+        """Reset and verify all physical groups before one candidate rollout."""
+        collection_index = getattr(self, "_outcome_collection_index", 0)
+        metadata_shards = self.env.reset_train_envs_for_outcome_group(
+            collection_index
+        ).wait()
+        self._outcome_collection_index = collection_index + 1
+        groups_per_update = int(sampling_cfg.get("groups_per_update", 1))
+        expected_group_ids = (
+            set(range(groups_per_update))
+            if sampling_cfg.get("parallel_groups", False)
+            else {0}
+        )
+        synchronized = _validate_outcome_reset_metadata(
+            metadata_shards,
+            expected_group_ids=expected_group_ids,
+            group_size=int(sampling_cfg.group_size),
+        )
+        summary = ", ".join(
+            f"group={group_id} snapshot={metadata['snapshot_id']} "
+            f"episode={metadata['episode_index']}"
+            for group_id, metadata in sorted(synchronized.items())
+        )
+        self.logger.info(
+            "Synchronized outcome reset collection=%d: %s.",
+            collection_index,
+            summary,
+        )
+        return synchronized
+
+    def _collect_trainable_rollout(self):
+        """Collect independently quota-filtered groups for one on-policy update."""
+        sampling_cfg = self.cfg.algorithm.get("outcome_dynamic_sampling", {})
+        sampling_enabled = bool(sampling_cfg.get("enabled", False))
+        if not sampling_enabled:
+            handles = self._collect_train_rollout()
+            return ([handles[0]], [handles[1]], [handles[2]], {})
+        if sampling_cfg.get("parallel_groups", False):
+            return self._collect_parallel_trainable_rollout(sampling_cfg)
+
+        groups_per_update = int(sampling_cfg.get("groups_per_update", 1))
+        warning_interval = int(
+            sampling_cfg.get(
+                "attempt_warning_interval",
+                sampling_cfg.get("max_rollout_attempts", 0),
+            )
+        )
+        env_handles = []
+        rollout_handles = []
+        reward_handles = []
+        total_attempts = 0
+        accepted_successes = 0
+        accepted_failures = 0
+        candidate_successes = 0
+        candidate_failures = 0
+        snapshot_stats: dict[tuple[str, int], dict[str, int]] = {}
+
+        self.actor.begin_rollout_group_collection().wait()
+        for group_index in range(groups_per_update):
+            group_attempt = 0
+            while True:
+                group_attempt += 1
+                reset_metadata = self._reset_outcome_sampling_envs(sampling_cfg)[0]
+                handles = self._collect_train_rollout()
+                env_handle, rollout_handle, reward_handle, outcome_shards = handles
+                total_attempts += 1
+                if any(shard is None for shard in outcome_shards):
+                    raise RuntimeError(
+                        "Outcome dynamic sampling requires every actor rank to "
+                        "receive explicit rollout success outcomes."
+                    )
+                accepted, successes, failures = outcome_group_is_trainable(
+                    outcome_shards,
+                    expected_size=int(sampling_cfg.group_size),
+                    min_successes=int(sampling_cfg.min_successes),
+                    min_failures=int(sampling_cfg.min_failures),
+                )
+                candidate_successes += successes
+                candidate_failures += failures
+                _record_outcome_snapshot_stats(
+                    snapshot_stats,
+                    reset_metadata,
+                    successes=successes,
+                    failures=failures,
+                    accepted=accepted,
+                )
+                if accepted:
+                    self.actor.accept_rollout_group().wait()
+                    env_handles.append(env_handle)
+                    rollout_handles.append(rollout_handle)
+                    reward_handles.append(reward_handle)
+                    accepted_successes += successes
+                    accepted_failures += failures
+                    break
+
+                log_rejection = (
+                    self.logger.warning
+                    if group_attempt % warning_interval == 0
+                    else self.logger.info
+                )
+                log_rejection(
+                    "Rejected outcome-homogeneous rollout group "
+                    "(group %d/%d, attempt=%d, successes=%d, failures=%d); "
+                    "continuing sampling.",
+                    group_index + 1,
+                    groups_per_update,
+                    group_attempt,
+                    successes,
+                    failures,
+                )
+                # The next attempt replaces this handle. Consume its completed
+                # result so rejected rollout metrics do not occupy Ray object-store
+                # memory for the rest of the update.
+                env_handle.wait()
+
+        self.actor.finalize_rollout_group_collection(groups_per_update).wait()
+        return (
+            env_handles,
+            rollout_handles,
+            reward_handles,
+            {
+                "dynamic_sampling/groups_per_update": groups_per_update,
+                "dynamic_sampling/attempts": total_attempts,
+                "dynamic_sampling/rejected_groups": (
+                    total_attempts - groups_per_update
+                ),
+                "dynamic_sampling/successes": accepted_successes,
+                "dynamic_sampling/failures": accepted_failures,
+                "dynamic_sampling/candidate_successes": candidate_successes,
+                "dynamic_sampling/candidate_failures": candidate_failures,
+                **_outcome_snapshot_metrics(snapshot_stats),
+            },
+        )
+
+    def _collect_parallel_trainable_rollout(self, sampling_cfg: DictConfig):
+        """Collect independent quota-filtered groups in concurrent env rounds."""
+        groups_per_update = int(sampling_cfg.groups_per_update)
+        group_size = int(sampling_cfg.group_size)
+        warning_interval = int(
+            sampling_cfg.get(
+                "attempt_warning_interval",
+                sampling_cfg.get("max_rollout_attempts", 0),
+            )
+        )
+        pending_groups = set(range(groups_per_update))
+        attempts_by_group = [0] * groups_per_update
+        env_handles = []
+        rollout_handles = []
+        reward_handles = []
+        accepted_successes = 0
+        accepted_failures = 0
+        candidate_successes = 0
+        candidate_failures = 0
+        sampling_rounds = 0
+        snapshot_stats: dict[tuple[str, int], dict[str, int]] = {}
+
+        self.actor.begin_rollout_group_collection().wait()
+        while pending_groups:
+            sampling_rounds += 1
+            reset_metadata = self._reset_outcome_sampling_envs(sampling_cfg)
+            env_handle, rollout_handle, reward_handle, outcome_shards = (
+                self._collect_train_rollout()
+            )
+            if any(shard is None for shard in outcome_shards):
+                raise RuntimeError(
+                    "Parallel outcome sampling requires every actor rank to return "
+                    "grouped rollout success outcomes."
+                )
+
+            grouped_shards: dict[int, list[list[bool]]] = defaultdict(list)
+            for actor_shard in outcome_shards:
+                if not isinstance(actor_shard, dict):
+                    raise RuntimeError(
+                        "Parallel outcome sampling requires actor outcomes keyed by "
+                        "group ID."
+                    )
+                for group_id, outcomes in actor_shard.items():
+                    grouped_shards[int(group_id)].append(outcomes)
+            expected_group_ids = set(range(groups_per_update))
+            if set(grouped_shards) != expected_group_ids:
+                raise RuntimeError(
+                    "Parallel outcome sampling expected group IDs "
+                    f"{sorted(expected_group_ids)}, received "
+                    f"{sorted(grouped_shards)}."
+                )
+
+            accepted_this_round = []
+            for group_id in sorted(pending_groups):
+                attempts_by_group[group_id] += 1
+                accepted, successes, failures = outcome_group_is_trainable(
+                    grouped_shards[group_id],
+                    expected_size=group_size,
+                    min_successes=int(sampling_cfg.min_successes),
+                    min_failures=int(sampling_cfg.min_failures),
+                )
+                candidate_successes += successes
+                candidate_failures += failures
+                _record_outcome_snapshot_stats(
+                    snapshot_stats,
+                    reset_metadata[group_id],
+                    successes=successes,
+                    failures=failures,
+                    accepted=accepted,
+                )
+                if accepted:
+                    accepted_this_round.append(group_id)
+                    accepted_successes += successes
+                    accepted_failures += failures
+                    continue
+
+                group_attempt = attempts_by_group[group_id]
+                log_rejection = (
+                    self.logger.warning
+                    if group_attempt % warning_interval == 0
+                    else self.logger.info
+                )
+                log_rejection(
+                    "Rejected outcome-homogeneous parallel rollout group "
+                    "(group %d/%d, attempt=%d, successes=%d, failures=%d); "
+                    "continuing sampling.",
+                    group_id + 1,
+                    groups_per_update,
+                    group_attempt,
+                    successes,
+                    failures,
+                )
+
+            if accepted_this_round:
+                self.actor.accept_rollout_groups(accepted_this_round).wait()
+                pending_groups.difference_update(accepted_this_round)
+                env_handles.append(
+                    _AcceptedOutcomeEnvHandle(
+                        handle=env_handle,
+                        group_ids=frozenset(accepted_this_round),
+                        group_size=group_size,
+                    )
+                )
+                rollout_handles.append(rollout_handle)
+                reward_handles.append(reward_handle)
+            else:
+                env_handle.wait()
+
+        self.actor.finalize_rollout_group_collection(groups_per_update).wait()
+        total_attempts = sum(attempts_by_group)
+        return (
+            env_handles,
+            rollout_handles,
+            reward_handles,
+            {
+                "dynamic_sampling/groups_per_update": groups_per_update,
+                "dynamic_sampling/sampling_rounds": sampling_rounds,
+                "dynamic_sampling/attempts": total_attempts,
+                "dynamic_sampling/rejected_groups": (
+                    total_attempts - groups_per_update
+                ),
+                "dynamic_sampling/successes": accepted_successes,
+                "dynamic_sampling/failures": accepted_failures,
+                "dynamic_sampling/candidate_successes": candidate_successes,
+                "dynamic_sampling/candidate_failures": candidate_failures,
+                **_outcome_snapshot_metrics(snapshot_stats),
+            },
+        )
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
@@ -334,22 +737,22 @@ class EmbodiedRunner:
         step: int,
         start_time: float,
         start_step: int,
-        env_handle: Handle,
-        rollout_handle: Handle,
+        env_handles: list[Handle],
+        rollout_handles: list[Handle],
         actor_training_handle: Handle,
-        reward_handle: Handle | None,
+        reward_handles: list[Handle | None],
         actor_rollout_metrics: list[dict],
         actor_training_metrics: list[dict],
         eval_metrics: dict,
     ) -> None:
         time_metrics = self.timer.consume_durations()
         time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-        env_time_metrics, env_time_metrics_per_rank = env_handle.consume_durations(
+        env_time_metrics, env_time_metrics_per_rank = env_handles[-1].consume_durations(
             return_per_rank=True
         )
-        rollout_time_metrics, rollout_time_metrics_per_rank = (
-            rollout_handle.consume_durations(return_per_rank=True)
-        )
+        rollout_time_metrics, rollout_time_metrics_per_rank = rollout_handles[
+            -1
+        ].consume_durations(return_per_rank=True)
         actor_time_metrics, actor_time_metrics_per_rank = (
             actor_training_handle.consume_durations(return_per_rank=True)
         )
@@ -361,6 +764,7 @@ class EmbodiedRunner:
             {f"time/actor/{k}": v for k, v in actor_time_metrics.items()}
         )
         if self.reward is not None:
+            reward_handle = reward_handles[-1]
             assert reward_handle is not None
             reward_time_metrics, reward_time_metrics_per_rank = (
                 reward_handle.consume_durations(return_per_rank=True)
@@ -369,13 +773,19 @@ class EmbodiedRunner:
                 {f"time/reward/{k}": v for k, v in reward_time_metrics.items()}
             )
 
-        env_results = env_handle.wait()
-        env_results_list = [results for results in env_results if results is not None]
+        env_results_by_group = [handle.wait() for handle in env_handles]
+        env_results_list = [
+            result
+            for group_results in env_results_by_group
+            for result in group_results
+            if result is not None
+        ]
         env_metrics = compute_evaluate_metrics(env_results_list)
         env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
         ranked_env_results = [
             {"rank": rank, "env": rank_metrics}
-            for rank, rank_metrics in enumerate(env_results)
+            for group_results in env_results_by_group
+            for rank, rank_metrics in enumerate(group_results)
             if rank_metrics is not None
         ]
         _, env_metrics_per_rank = self._process_ranked_eval_results(
@@ -500,34 +910,21 @@ class EmbodiedRunner:
                     if _step % self.weight_sync_interval == 0:
                         self.update_rollout_weights()
                 with self.timer("generate_rollouts"):
-                    env_handle: Handle = self.env.interact(
-                        input_channel=self.env_channel,
-                        rollout_channel=self.rollout_channel,
-                        reward_channel=self.reward_channel,
-                        actor_channel=self.actor_channel,
-                    )
-                    rollout_handle: Handle = self.rollout.generate(
-                        input_channel=self.rollout_channel,
-                        output_channel=self.env_channel,
-                    )
-                    reward_handle = None
-                    if self.reward is not None:
-                        reward_handle: Handle = self.reward.compute_rewards(
-                            input_channel=self.reward_channel,
-                            output_channel=self.env_channel,
-                        )
-                    self.actor.recv_rollout_trajectories(
-                        input_channel=self.actor_channel
-                    ).wait()
-                    rollout_handle.wait()
-                    if self.reward is not None:
-                        reward_handle.wait()
+                    (
+                        env_handles,
+                        rollout_handles,
+                        reward_handles,
+                        dynamic_sampling_metrics,
+                    ) = self._collect_trainable_rollout()
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
                     actor_rollout_metrics = (
                         self.actor.compute_advantages_and_returns().wait()
                     )
+                    if dynamic_sampling_metrics:
+                        for metrics in actor_rollout_metrics:
+                            metrics.update(dynamic_sampling_metrics)
 
                 # actor training.
                 with self.timer("actor_training"):
@@ -552,10 +949,10 @@ class EmbodiedRunner:
                 step=_step,
                 start_time=start_time,
                 start_step=start_step,
-                env_handle=env_handle,
-                rollout_handle=rollout_handle,
+                env_handles=env_handles,
+                rollout_handles=rollout_handles,
                 actor_training_handle=actor_training_handle,
-                reward_handle=reward_handle,
+                reward_handles=reward_handles,
                 actor_rollout_metrics=actor_rollout_metrics,
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
@@ -631,10 +1028,10 @@ class EmbodiedRunner:
                 step=_step,
                 start_time=start_time,
                 start_step=start_step,
-                env_handle=env_handle,
-                rollout_handle=rollout_handle,
+                env_handles=[env_handle],
+                rollout_handles=[rollout_handle],
                 actor_training_handle=actor_training_handle,
-                reward_handle=reward_handle,
+                reward_handles=[reward_handle],
                 actor_rollout_metrics=actor_rollout_metrics,
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,

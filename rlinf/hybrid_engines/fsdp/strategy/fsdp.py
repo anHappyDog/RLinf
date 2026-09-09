@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from collections.abc import Iterable
 from contextlib import nullcontext
 from typing import ContextManager, Union
 
@@ -337,36 +338,35 @@ class FSDPStrategy(FSDPStrategyBase):
         clear_memory()
 
     @torch.no_grad()
-    def clip_grad_norm_(
+    def get_grad_norm(
         self,
         model: FSDP,
+        parameters: Iterable[torch.nn.Parameter],
         norm_type: Union[float, int] = 2.0,
     ) -> float:
-        """
-        Clip the gradients of the model parameters to a maximum norm specified in the configuration.
+        """Return the global norm of a parameter subset's gradients."""
+        total_norm, _ = self._get_grad_norm_and_grads(
+            model,
+            parameters,
+            norm_type,
+        )
+        return float(total_norm.item())
 
-        Args:
-            - model (FSDP): The FSDP wrapped model.
-            - norm_type (Union[float, int]): The type of the used p-norm.
-
-        Returns:
-            - float: The total norm of the gradients before clipping.
-        """
-        device = torch.device(f"{Worker.torch_device_type}:{os.environ['LOCAL_RANK']}")
-        max_norm = float(self.cfg.optim.clip_grad)
+    def _get_grad_norm_and_grads(
+        self,
+        model: FSDP,
+        parameters: Iterable[torch.nn.Parameter],
+        norm_type: Union[float, int],
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Compute a global norm while retaining the selected local gradients."""
+        selected_parameters = set(parameters)
         norm_type = float(norm_type)
+        device = torch.device(f"{Worker.torch_device_type}:{os.environ['LOCAL_RANK']}")
         debug_nan_checks = self.cfg.get("debug_nan_checks", False)
         all_handles = getattr(model, "_all_handles", None)
         if all_handles is None:
             raise RuntimeError("Expected FSDP root module with `_all_handles`.")
 
-        all_no_shard = all(not handle.uses_sharded_strategy for handle in all_handles)
-        if all_no_shard:
-            return (
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, norm_type)
-                .cpu()
-                .item()
-            )
         sharded_params_set, nonsharded_params_set = set(), set()
         sharded_params, nonsharded_params = [], []
         grads = []
@@ -377,61 +377,45 @@ class FSDPStrategy(FSDPStrategyBase):
             else:
                 target_set, target_list = nonsharded_params_set, nonsharded_params
 
-            if handle._use_orig_params:
-                for p in handle.flat_param._params:
-                    if p not in target_set:
-                        target_set.add(p)
-                        target_list.append(p)
-                        if p.grad is not None:
-                            grads.append(p.grad)
-            else:
-                fp = handle.flat_param
-                if fp not in target_set:
-                    target_set.add(fp)
-                    target_list.append(fp)
-                    if fp.grad is not None:
-                        grads.append(fp.grad)
-
-        # include non-FSDP-managed params (ignored modules etc.)
-        for p in model.parameters():
-            not_fsdp_managed = (
-                p not in sharded_params_set and p not in nonsharded_params_set
+            handle_parameters = (
+                handle.flat_param._params
+                if handle._use_orig_params
+                else (handle.flat_param,)
             )
-            if not_fsdp_managed:
-                nonsharded_params_set.add(p)
-                nonsharded_params.append(p)
-                if p.grad is not None:
-                    grads.append(p.grad)
+            for parameter in handle_parameters:
+                if parameter not in selected_parameters or parameter in target_set:
+                    continue
+                target_set.add(parameter)
+                target_list.append(parameter)
+                if parameter.grad is not None:
+                    grads.append(parameter.grad)
+
+        # Include selected parameters not managed by FSDP (ignored modules, etc.).
+        for parameter in selected_parameters:
+            if parameter in sharded_params_set or parameter in nonsharded_params_set:
+                continue
+            nonsharded_params_set.add(parameter)
+            nonsharded_params.append(parameter)
+            if parameter.grad is not None:
+                grads.append(parameter.grad)
+
+        zero = torch.tensor(0.0, device=device, dtype=torch.float32)
         local_sharded_norm = get_grad_norm_for_mixed_precision(
             sharded_params,
             norm_type,
-            torch.tensor(0.0, device=device, dtype=torch.float32),
+            zero,
             device,
         )
-        if debug_nan_checks and not torch.isfinite(local_sharded_norm):
-            raise RuntimeError(
-                "Non-finite local_sharded_norm from "
-                "get_grad_norm_for_mixed_precision(sharded_params)."
-            )
         local_nonsharded_norm = (
             get_grad_norm_for_mixed_precision(
                 nonsharded_params,
                 norm_type,
-                torch.tensor(0.0, device=device, dtype=torch.float32),
+                zero,
                 device,
             )
             if nonsharded_params
             else None
         )
-        if (
-            debug_nan_checks
-            and local_nonsharded_norm is not None
-            and not torch.isfinite(local_nonsharded_norm)
-        ):
-            raise RuntimeError(
-                "Non-finite local_nonsharded_norm from "
-                "get_grad_norm_for_mixed_precision(nonsharded_params)."
-            )
 
         if norm_type == torch.inf:
             total_norm = (
@@ -450,19 +434,61 @@ class FSDPStrategy(FSDPStrategyBase):
             if local_nonsharded_norm is not None:
                 total_norm += local_nonsharded_norm**norm_type
             total_norm = total_norm ** (1.0 / norm_type)
+
         if debug_nan_checks and not torch.isfinite(total_norm):
-            nonfinite_grad_count = 0
-            for grad in grads:
-                nonfinite_grad_count += int((~torch.isfinite(grad)).sum().item())
+            nonfinite_grad_count = sum(
+                int((~torch.isfinite(grad)).sum().item()) for grad in grads
+            )
             if nonfinite_grad_count == 0:
                 raise RuntimeError(
-                    "Non-finite total_norm in clip_grad_norm_ with finite gradients. "
+                    "Non-finite total_norm in get_grad_norm with finite gradients. "
                     "Suspect reduction/power path inside grad norm computation."
                 )
             raise RuntimeError(
-                "Non-finite total_norm in clip_grad_norm_ and gradients already "
+                "Non-finite total_norm in get_grad_norm and gradients already "
                 f"contain non-finite values (count={nonfinite_grad_count})."
             )
+
+        return total_norm, grads
+
+    @torch.no_grad()
+    def clip_grad_norm_(
+        self,
+        model: FSDP,
+        parameters: Iterable[torch.nn.Parameter] | None = None,
+        max_norm: float | None = None,
+        norm_type: Union[float, int] = 2.0,
+    ) -> float:
+        """Clip model gradients to the configured maximum global norm.
+
+        Args:
+            - model (FSDP): The FSDP wrapped model.
+            - parameters: Parameters to include. Defaults to all model parameters.
+            - max_norm: Maximum gradient norm. Defaults to ``optim.clip_grad``.
+            - norm_type (Union[float, int]): The type of the used p-norm.
+
+        Returns:
+            - float: The total norm of the gradients before clipping.
+        """
+        parameters = list(model.parameters() if parameters is None else parameters)
+        max_norm = float(self.cfg.optim.clip_grad if max_norm is None else max_norm)
+        norm_type = float(norm_type)
+        all_handles = getattr(model, "_all_handles", None)
+        if all_handles is None:
+            raise RuntimeError("Expected FSDP root module with `_all_handles`.")
+
+        all_no_shard = all(not handle.uses_sharded_strategy for handle in all_handles)
+        if all_no_shard:
+            return (
+                torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type)
+                .cpu()
+                .item()
+            )
+        total_norm, grads = self._get_grad_norm_and_grads(
+            model,
+            parameters,
+            norm_type,
+        )
 
         grad_norm = float(total_norm.item())
 

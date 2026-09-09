@@ -26,8 +26,26 @@ RLinf 通过 :doc:`MetricLogger <../guides/logger>` 在若干命名空间下记�
      - 概率比被裁剪的更新比例。
    * - ``train/actor/clipped_ratio``
      - 被裁剪后概率比的均值。
+   * - ``train/actor/grad_norm_before_clip``
+     - embodied FSDP actor 记录的裁剪前梯度范数。使用 actor-critic 联合优化器时，该值覆盖全部被优化参数，而不只是策略分支。
+   * - ``train/actor/grad_norm_after_clip``
+     - 裁剪后的有效总梯度范数。配置分支独立阈值时，该值是分别裁剪后的 policy 与 value 范数的 L2 合成值。
+   * - ``train/actor/grad_clip_coef``
+     - 裁剪后有效总范数与裁剪前总范数的比值；``1`` 表示无需裁剪。
+   * - ``train/actor/policy_grad_norm_before_clip``
+     - policy 分支的全局裁剪前梯度范数；FSDP 分片仅在其分片进程组内归约一次。
+   * - ``train/actor/policy_grad_norm_after_clip``
+     - 应用 ``actor.optim.policy_clip_grad`` 后的 policy 梯度范数；未开启独立裁剪时使用统一的 ``actor.optim.clip_grad``。
+   * - ``train/actor/policy_grad_clip_coef``
+     - 仅作用于 policy 梯度的裁剪系数。
+   * - ``train/critic/value_grad_norm_before_clip``
+     - value head 的全局裁剪前梯度范数；可与 policy norm 对比，以判断哪个分支主导总梯度裁剪。
+   * - ``train/critic/value_grad_norm_after_clip``
+     - 应用 ``actor.optim.value_clip_grad`` 后的 value-head 梯度范数；未开启独立裁剪时使用统一的 ``actor.optim.clip_grad``。
+   * - ``train/critic/value_grad_clip_coef``
+     - 仅作用于 value-head 梯度的裁剪系数。
    * - ``train/actor/grad_norm``
-     - actor 的梯度范数。
+     - 其他 actor worker 仍会记录的旧版裁剪前指标；如果存在上述显式指标，应优先使用它们。
    * - ``train/actor/lr``
      - 当前学习率。
    * - ``train/actor/policy_loss``
@@ -48,6 +66,11 @@ Rollout 指标 —— ``rollout/``
 
 rollout 阶段收集的优势与奖励统计量。
 
+启用 outcome-dynamic sampling 时，``algorithm.outcome_dynamic_sampling.groups_per_update``
+指定每次 actor 更新要拼接多少个独立通过配额筛选的 group。同质 group 会持续重采样，
+直到满足配额；``attempt_warning_interval`` 控制长时间采样时的告警频率。
+``env.train.rollout_epoch`` 应保持为 ``1``，以便逐个初始状态检查正负样本配额。
+
 .. list-table::
    :header-rows: 1
    :widths: 34 66
@@ -62,6 +85,16 @@ rollout 阶段收集的优势与奖励统计量。
      - 该批次中优势的最小值。
    * - ``rollout/rewards``
      - 一个 rollout chunk 的奖励。
+   * - ``rollout/dynamic_sampling/groups_per_update``
+     - 本次 actor 更新中独立通过正负样本筛选的 group 数量。
+   * - ``rollout/dynamic_sampling/attempts``
+     - 为填满本次更新而采样的候选 group 总数。
+   * - ``rollout/dynamic_sampling/rejected_groups``
+     - 因未满足成功/失败配额而被拒绝的候选 group 数量。
+   * - ``rollout/dynamic_sampling/successes`` / ``failures``
+     - 所有已接受 group 中保留的成功与失败 trajectory 数量。
+   * - ``rollout/dynamic_sampling/candidate_successes`` / ``candidate_failures``
+     - 所有已接受及被拒绝候选 group 的 outcome 计数。
 
 环境指标 —— ``env/``
 --------------------

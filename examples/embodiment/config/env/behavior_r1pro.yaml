@@ -12,6 +12,9 @@ max_episode_steps: 2000 # max episode steps for truncation
 skip_intermediate_obs_in_chunk: True
 # parallel env running in env workers to speed up env.step
 num_env_subprocess: 1
+# rlinf applies a reduced texture-streaming budget; official leaves the B1K
+# evaluator's renderer settings untouched.
+renderer_mode: rlinf
 
 video_cfg:
   save_video: False

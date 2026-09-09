@@ -110,9 +110,23 @@ class FSDPStrategyBase(ABC):
                 )
 
     @abstractmethod
+    def get_grad_norm(
+        self,
+        model: Union[FSDP, FSDPModule],
+        parameters: Iterable[torch.nn.Parameter],
+        norm_type: Union[float, int] = 2.0,
+    ) -> float:
+        """Return the global norm of a parameter subset's gradients."""
+        raise NotImplementedError(
+            "get_grad_norm method must be implemented by subclasses."
+        )
+
+    @abstractmethod
     def clip_grad_norm_(
         self,
         model: Union[FSDP, FSDPModule],
+        parameters: Optional[Iterable[torch.nn.Parameter]] = None,
+        max_norm: Optional[float] = None,
         norm_type: Union[float, int] = 2.0,
     ) -> float:
         """
@@ -120,6 +134,8 @@ class FSDPStrategyBase(ABC):
 
         Args:
             model (Union[FSDP, FSDPModule]): The model whose gradients are to be clipped.
+            parameters: Parameters to include. Defaults to all model parameters.
+            max_norm: Maximum gradient norm. Defaults to ``optim.clip_grad``.
             norm_type (Union[float,int]): The type of the used p-norm.
 
         Returns:

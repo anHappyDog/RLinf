@@ -21,7 +21,11 @@ from typing import Any, Literal
 import torch
 
 from rlinf.models.embodiment.base_policy import ForwardType
-from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.modules.value_head import (
+    StateAttentionValueHead,
+    StateFusionValueHead,
+    ValueHead,
+)
 from rlinf.models.embodiment.openpi_rlinf.eval_action_model import (
     OpenPiPytorchEvalActionModel,
 )
@@ -59,6 +63,7 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
         action_env_dim: int,
         rl_cfg: OpenPiPytorchRLConfig,
         paligemma_width: int,
+        state_dim: int,
     ):
         super().__init__(
             pi0_model,
@@ -81,21 +86,34 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
                     "value_after_vlm=True value head (BEHAVIOR pi05 config); "
                     "suffix-pooled (value_after_vlm=False) is not wired through."
                 )
-            # Same MLP shape the original PPO path uses for pi05 (1024, 512, 256).
-            self.value_head = ValueHead(
-                input_dim=paligemma_width,
-                hidden_sizes=(1024, 512, 256),
-                output_dim=1,
-                activation="relu",
-                bias_last=True,
-            )
-            # Match the wrapped Pi0's parameter dtype so the rollout side (no
-            # FSDP, weights already cast to ``cfg.precision``) does the prefix
-            # → value head pass in one dtype, and so the FSDP-wrapped actor's
-            # MixedPrecisionPolicy(param_dtype=bf16) keeps the value head
-            # consistent with the rest of the model.
-            model_dtype = next(self.model.parameters()).dtype
-            self.value_head.to(model_dtype)
+            if rl_cfg.value_vlm_mode == "mean_token":
+                # Same MLP shape the original PPO path uses for pi05.
+                self.value_head = ValueHead(
+                    input_dim=paligemma_width,
+                    hidden_sizes=(1024, 512, 256),
+                    output_dim=1,
+                    activation="relu",
+                    bias_last=True,
+                )
+            elif rl_cfg.value_vlm_mode == "state_fusion":
+                self.value_head = StateFusionValueHead(
+                    feature_dim=paligemma_width,
+                    state_dim=state_dim,
+                )
+            elif rl_cfg.value_vlm_mode == "state_attention":
+                self.value_head = StateAttentionValueHead(
+                    feature_dim=paligemma_width,
+                    state_dim=state_dim,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported value_vlm_mode={rl_cfg.value_vlm_mode!r}; "
+                    "expected 'mean_token', 'state_fusion', or 'state_attention'."
+                )
+            # Keep the critic's master parameters in fp32. FSDP wraps ValueHead
+            # separately and casts its forward/backward compute according to
+            # mixed_precision.param_dtype, while the unwrapped rollout copy
+            # promotes pooled BF16 features inside ValueHead.forward.
 
     def set_global_step(self, global_step: int) -> None:
         """Noise-annealing hook — currently a no-op (constant noise_level)."""
@@ -183,8 +201,15 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
 
         # VLM-pooled value (BEHAVIOR pi05): one value per sample, reused as the
         # rollout ``prev_values`` independent of the chosen denoise index.
+        critic_prefix_out = (
+            prefix_out.detach() if rl_cfg.detach_critic_input else prefix_out
+        )
         vlm_value = rl_sampler.value_from_prefix(
-            self.value_head, prefix_out, prefix_mask, mode=rl_cfg.value_vlm_mode
+            self.value_head,
+            critic_prefix_out,
+            prefix_mask,
+            state=observation.state,
+            mode=rl_cfg.value_vlm_mode,
         )
 
         # Single stochastic denoise step picked uniformly; the remaining steps
@@ -288,6 +313,7 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
                 "openpi_rlinf RL port supports joint_logprob=False only."
             )
 
+        compute_logprobs = kwargs.get("compute_logprobs", True)
         compute_values = kwargs.get("compute_values", True)
 
         chains = forward_inputs["chains"]
@@ -322,39 +348,46 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
                 observation
             )
 
-        idx0 = denoise_inds[:, 0].to(torch.long)
-        arange_B = torch.arange(B, device=device)
-        chains_pre = chains[arange_B, idx0]  # x_t   at the chosen step
-        chains_next = chains[arange_B, idx0 + 1]  # x_{t-dt} actually drawn at rollout
+        log_probs = None
+        if compute_logprobs:
+            idx0 = denoise_inds[:, 0].to(torch.long)
+            arange_B = torch.arange(B, device=device)
+            chains_pre = chains[arange_B, idx0]
+            chains_next = chains[arange_B, idx0 + 1]
 
-        timesteps = rl_sampler.get_timesteps(self.num_steps, device)
-        t_input = timesteps[idx0].to(torch.float32)
-
-        suffix_act = self.model.run_suffix(
-            observation, chains_pre, t_input, kv_cache, prefix_mask
-        )
-        v_t = self.model.velocity_from_suffix(suffix_act).to(torch.float32)
-
-        x_t_mean, x_t_std = rl_sampler.sample_mean_var(
-            chains_pre.to(torch.float32),
-            v_t,
-            idx0,
-            noise_method=rl_cfg.noise_method,
-            noise_level=rl_cfg.noise_level,
-            num_steps=self.num_steps,
-        )
-        log_probs = rl_sampler.gaussian_logprob(
-            chains_next.to(torch.float32), x_t_mean, x_t_std
-        )
-        log_probs = (
-            log_probs[:, : self.action_chunk, : self.action_env_dim]
-            .float()
-            .contiguous()
-        )
+            timesteps = rl_sampler.get_timesteps(self.num_steps, device)
+            t_input = timesteps[idx0].to(torch.float32)
+            suffix_act = self.model.run_suffix(
+                observation, chains_pre, t_input, kv_cache, prefix_mask
+            )
+            v_t = self.model.velocity_from_suffix(suffix_act).to(torch.float32)
+            x_t_mean, x_t_std = rl_sampler.sample_mean_var(
+                chains_pre.to(torch.float32),
+                v_t,
+                idx0,
+                noise_method=rl_cfg.noise_method,
+                noise_level=rl_cfg.noise_level,
+                num_steps=self.num_steps,
+            )
+            log_probs = rl_sampler.gaussian_logprob(
+                chains_next.to(torch.float32), x_t_mean, x_t_std
+            )
+            log_probs = (
+                log_probs[:, : self.action_chunk, : self.action_env_dim]
+                .float()
+                .contiguous()
+            )
 
         if compute_values and rl_cfg.add_value_head and rl_cfg.value_after_vlm:
+            critic_prefix_out = (
+                prefix_out.detach() if rl_cfg.detach_critic_input else prefix_out
+            )
             values = rl_sampler.value_from_prefix(
-                self.value_head, prefix_out, prefix_mask, mode=rl_cfg.value_vlm_mode
+                self.value_head,
+                critic_prefix_out,
+                prefix_mask,
+                state=observation.state,
+                mode=rl_cfg.value_vlm_mode,
             )
         else:
             values = torch.zeros(B, device=device, dtype=torch.float32)

@@ -30,6 +30,25 @@ from rlinf.models.embodiment.openpi_rlinf.utils.rlt_utils import (
 )
 
 
+def _mean_valid_action_loss(
+    per_timestep_loss: torch.Tensor,
+    action_is_pad: torch.Tensor | None,
+) -> torch.Tensor:
+    """Average flow loss over valid action timesteps only."""
+    if action_is_pad is None:
+        return per_timestep_loss.mean()
+    if action_is_pad.shape != per_timestep_loss.shape:
+        raise ValueError(
+            "action_is_pad must match per-timestep loss shape; "
+            f"got {tuple(action_is_pad.shape)} and "
+            f"{tuple(per_timestep_loss.shape)}."
+        )
+    valid = ~action_is_pad
+    if not valid.any():
+        raise ValueError("SFT batch contains no valid action timesteps.")
+    return per_timestep_loss.masked_select(valid).mean()
+
+
 class OpenPiPytorchSFTActionModel(OpenPiPytorchActionModel):
     """SFT variant of :class:`OpenPiPytorchActionModel`.
 
@@ -75,19 +94,20 @@ class OpenPiPytorchSFTActionModel(OpenPiPytorchActionModel):
         ``(B, action_horizon)`` per-timestep loss from :meth:`Pi0.compute_loss`
         (which samples the flow-matching noise/time internally).
         """
-        observation, actions = self._unpack_sft_batch(data)
+        observation, actions, action_is_pad = self._unpack_sft_batch(data)
         observation = self._observation_to_device(observation)
         actions = self._actions_to_device(actions)
+        action_is_pad = self._action_padding_to_device(action_is_pad, actions)
         if not self.rlt_cfg.use_rlt:
             per_timestep_loss = self.model.compute_loss(
                 observation, actions, train=True
             )
-            return per_timestep_loss.mean()
+            return _mean_valid_action_loss(per_timestep_loss, action_is_pad)
 
         per_timestep_loss, prefix_output, prefix_mask = (
             self._sft_forward_with_rlt_prefix(observation, actions)
         )
-        vla_loss = per_timestep_loss.mean()
+        vla_loss = _mean_valid_action_loss(per_timestep_loss, action_is_pad)
         rlt_loss, _ = self._rlt_forward(prefix_output, prefix_mask)
         return {
             "loss": rlt_loss + self.rlt_cfg.rlt_alpha * vla_loss,
@@ -100,14 +120,16 @@ class OpenPiPytorchSFTActionModel(OpenPiPytorchActionModel):
         return self.sft_forward(data)
 
     @staticmethod
-    def _unpack_sft_batch(data: Any) -> tuple[Any, Any]:
+    def _unpack_sft_batch(data: Any) -> tuple[Any, Any, Any | None]:
         if isinstance(data, (tuple, list)):
-            if len(data) != 2:
+            if len(data) not in {2, 3}:
                 raise ValueError(
-                    "SFT batch tuple must be (observation, actions); "
+                    "SFT batch tuple must be (observation, actions) or "
+                    "(observation, actions, action_is_pad); "
                     f"got length {len(data)}."
                 )
-            observation, actions = data
+            observation, actions = data[:2]
+            action_is_pad = data[2] if len(data) == 3 else None
         elif isinstance(data, dict):
             if "observation" not in data or "actions" not in data:
                 raise ValueError(
@@ -115,11 +137,28 @@ class OpenPiPytorchSFTActionModel(OpenPiPytorchActionModel):
                     f"got keys {sorted(data)}."
                 )
             observation, actions = data["observation"], data["actions"]
+            action_is_pad = data.get("action_is_pad")
         else:
             raise TypeError(f"Unsupported SFT batch type: {type(data)!r}.")
         if observation is None or actions is None:
             raise ValueError("SFT batch is missing observation or actions.")
-        return observation, actions
+        return observation, actions, action_is_pad
+
+    def _action_padding_to_device(
+        self,
+        action_is_pad: Any | None,
+        actions: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if action_is_pad is None:
+            return None
+        action_is_pad = torch.as_tensor(action_is_pad, device=self.device).bool()
+        if action_is_pad.shape != actions.shape[:2]:
+            raise ValueError(
+                "action_is_pad must have shape [B, action_horizon]; "
+                f"got {tuple(action_is_pad.shape)} for actions "
+                f"{tuple(actions.shape)}."
+            )
+        return action_is_pad
 
     def _observation_to_device(self, observation: Any) -> Observation:
         observation = Observation.from_observation_like(observation)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import warnings
 from typing import ContextManager, Union
@@ -47,6 +48,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.models.tokenization.hf import hf_tokenizer
 from rlinf.scheduler import Worker
 from rlinf.utils.logging import get_logger
+from rlinf.utils.metric_utils import compute_gradient_clipping_metrics
 from rlinf.utils.utils import (
     collect_param_names_need_sync,
     warmup_optimizer_state,
@@ -57,6 +59,17 @@ warnings.filterwarnings(
     message=".*NO_SHARD.*full_state_dict.*",
     category=UserWarning,
 )
+
+
+def _get_grad_norm_process_group(device_mesh):
+    """Return the non-replicated group used to aggregate sharded gradients."""
+    if "shard" in device_mesh.mesh_dim_names:
+        return device_mesh["shard"].get_group()
+    if "ddp" in device_mesh.mesh_dim_names:
+        return device_mesh["ddp"].get_group()
+    if "fsdp" in device_mesh.mesh_dim_names:
+        return device_mesh["fsdp"].get_group()
+    return None
 
 
 class FSDPModelManager:
@@ -86,22 +99,45 @@ class FSDPModelManager:
             )
 
         self.optimizer_steps = 0
+        self.critic_only = bool(self._cfg.get("optim", {}).get("critic_only", False))
         self.critic_warmup_steps = 0
-        if self._cfg.get("optim", {}).get(
-            "critic_warmup_steps", None
-        ) and self._cfg.model.get("add_value_head", False):
+        if (
+            not self.critic_only
+            and self._cfg.get("optim", {}).get("critic_warmup_steps", None)
+            and self._cfg.model.get("add_value_head", False)
+        ):
             self.critic_warmup_steps = self._cfg.optim.critic_warmup_steps
         self.store_requires_grad_param_name = []
+        self._optimizer_parameters_by_role: dict[str, list[torch.nn.Parameter]] = {}
+        self._optimizer_group_roles: list[str] = []
+        self.last_grad_norms_before_clip: dict[str, float] = {}
+        self.last_grad_norms_after_clip: dict[str, float] = {}
+        self.last_grad_clip_coefs: dict[str, float] = {}
+        self.last_grad_norm_after_clip = 0.0
+        self.last_grad_clip_coef = 1.0
 
         if cfg.get("tokenizer", {}).get("tokenizer_model", None) is not None:
             self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
 
-        self._device_mesh = create_device_mesh(world_size)
-        self._dp_group = (
-            self._device_mesh["ddp"].get_group()
-            if "ddp" in self._device_mesh.mesh_dim_names
-            else None
+        node_local_world_size = os.environ.get("NODE_LOCAL_WORLD_SIZE")
+        self._device_mesh = create_device_mesh(
+            world_size,
+            sharding_strategy=self._cfg.fsdp_config.sharding_strategy,
+            hybrid_shard_size=self._cfg.fsdp_config.hybrid_shard_size,
+            node_local_world_size=(
+                int(node_local_world_size)
+                if node_local_world_size is not None
+                else None
+            ),
         )
+        self._logger.info(
+            f"[FSDP] Device mesh shape={tuple(self._device_mesh.mesh.shape)} "
+            f"dimensions={self._device_mesh.mesh_dim_names}."
+        )
+        # HYBRID_SHARD gradients are replicated across the outer mesh
+        # dimension. Compute their norm once within a sharding group;
+        # reducing over the full world would count every replica again.
+        self._dp_group = _get_grad_norm_process_group(self._device_mesh)
 
         self._strategy = FSDPStrategyBase.create(
             self._cfg, world_size, self._dp_group, self._logger
@@ -431,13 +467,85 @@ class FSDPModelManager:
         Perform optimizer step using its optimizer, lr_scheduler and grad_scaler.
 
         Returns:
-            A tuple of (grad_norm, lr_list), lr_list contains learning rates for all param groups.
+            A tuple of the total gradient norm before clipping and the learning
+            rates for all optimizer parameter groups. Detailed clipping metrics
+            are exposed through the ``last_grad_*`` attributes.
         """
         self.optimizer_steps += 1
         self.grad_scaler.unscale_(self.optimizer)
-        grad_norm = self._strategy.clip_grad_norm_(
-            model=self.model,
+
+        policy_clip_grad = self._cfg.optim.get("policy_clip_grad", None)
+        value_clip_grad = self._cfg.optim.get("value_clip_grad", None)
+        use_independent_clipping = (
+            policy_clip_grad is not None and value_clip_grad is not None
         )
+        branch_clip_limits = (
+            {
+                "policy": float(policy_clip_grad),
+                "value": float(value_clip_grad),
+            }
+            if use_independent_clipping
+            else {}
+        )
+        self.last_grad_norms_before_clip = {}
+        self.last_grad_norms_after_clip = {}
+        self.last_grad_clip_coefs = {}
+
+        if use_independent_clipping:
+            for role, parameters in self._optimizer_parameters_by_role.items():
+                if not parameters:
+                    continue
+                norm = self._strategy.clip_grad_norm_(
+                    model=self.model,
+                    parameters=parameters,
+                    max_norm=branch_clip_limits[role],
+                )
+                clipping_metrics = compute_gradient_clipping_metrics(
+                    norm,
+                    branch_clip_limits[role],
+                )
+                self.last_grad_norms_before_clip[role] = norm
+                self.last_grad_norms_after_clip[role] = clipping_metrics[
+                    "grad_norm_after_clip"
+                ]
+                self.last_grad_clip_coefs[role] = clipping_metrics["grad_clip_coef"]
+
+            grad_norm = math.sqrt(
+                sum(norm**2 for norm in self.last_grad_norms_before_clip.values())
+            )
+            self.last_grad_norm_after_clip = math.sqrt(
+                sum(norm**2 for norm in self.last_grad_norms_after_clip.values())
+            )
+            self.last_grad_clip_coef = (
+                self.last_grad_norm_after_clip / grad_norm
+                if grad_norm > 0.0 and math.isfinite(grad_norm)
+                else (1.0 if grad_norm == 0.0 else math.nan)
+            )
+        else:
+            if self._cfg.model.get("add_value_head", False):
+                self.last_grad_norms_before_clip = {
+                    role: self._strategy.get_grad_norm(
+                        model=self.model,
+                        parameters=parameters,
+                    )
+                    for role, parameters in self._optimizer_parameters_by_role.items()
+                    if parameters
+                }
+            grad_norm = self._strategy.clip_grad_norm_(model=self.model)
+            clipping_metrics = compute_gradient_clipping_metrics(
+                grad_norm,
+                self._cfg.optim.clip_grad,
+            )
+            self.last_grad_norm_after_clip = clipping_metrics["grad_norm_after_clip"]
+            self.last_grad_clip_coef = clipping_metrics["grad_clip_coef"]
+            self.last_grad_norms_after_clip = {
+                role: norm * self.last_grad_clip_coef
+                for role, norm in self.last_grad_norms_before_clip.items()
+            }
+            self.last_grad_clip_coefs = dict.fromkeys(
+                self.last_grad_norms_before_clip,
+                self.last_grad_clip_coef,
+            )
 
         if not torch.isfinite(torch.as_tensor(grad_norm)):
             self._logger.warning(
@@ -461,6 +569,20 @@ class FSDPModelManager:
             lr_list = [group["lr"] for group in self.optimizer.param_groups]
 
         return grad_norm, lr_list
+
+    def _learning_rate_metrics(self, lr_list: list[float]) -> dict[str, float]:
+        """Map optimizer-group learning rates to policy/value namespaces."""
+        if len(lr_list) != len(self._optimizer_group_roles):
+            raise RuntimeError(
+                "Optimizer learning-rate groups no longer match their parameter roles."
+            )
+        metrics = {}
+        for role, learning_rate in zip(
+            self._optimizer_group_roles, lr_list, strict=True
+        ):
+            key = "actor/lr" if role == "policy" else "critic/lr"
+            metrics.setdefault(key, learning_rate)
+        return metrics
 
     def build_lr_scheduler(
         self, optimizer: Optimizer, optim_config: DictConfig, last_epoch: int = -1
@@ -521,7 +643,18 @@ class FSDPModelManager:
         params_critic = []
         actor_params_names = []
 
-        if enable_critic_warmup:
+        if self.critic_only:
+            self._logger.info(
+                "[FSDP] Critic-only mode: freezing all policy parameters."
+            )
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if "value_head" in name or "model.value_head" in name:
+                    params_critic.append(param)
+                else:
+                    param.requires_grad = False
+        elif enable_critic_warmup:
             self._logger.info("[FSDP] Enable critic warmup for value head.")
             for name, param in model.named_parameters():
                 if param.requires_grad:
@@ -545,6 +678,7 @@ class FSDPModelManager:
         lr_multipliers = getattr(model, "lr_multipliers", None)
 
         param_groups = []
+        optimizer_group_roles = []
         if lr_multipliers:
             base_lr = self._cfg.optim.lr
             grouped: dict[float, list] = {}
@@ -557,6 +691,7 @@ class FSDPModelManager:
                 grouped.setdefault(base_lr * mult, []).append(param)
             for lr_value, params in sorted(grouped.items()):
                 param_groups.append({"params": params, "lr": lr_value, "betas": betas})
+                optimizer_group_roles.append("policy")
             self._logger.info(
                 f"[FSDP] Applied lr_multipliers={dict(lr_multipliers)} -> "
                 f"{len(param_groups)} actor param group(s): "
@@ -570,6 +705,7 @@ class FSDPModelManager:
                     "betas": betas,
                 }
             )
+            optimizer_group_roles.append("policy")
         if len(params_critic) > 0:
             param_groups.append(
                 {
@@ -578,6 +714,24 @@ class FSDPModelManager:
                     "betas": betas,
                 }
             )
+            optimizer_group_roles.append("value")
+
+        if not param_groups:
+            raise ValueError("The optimizer has no trainable parameters.")
+
+        self._optimizer_parameters_by_role = {
+            "policy": params_actor,
+            "value": params_critic,
+        }
+        self._optimizer_group_roles = optimizer_group_roles
+        for role, parameters in self._optimizer_parameters_by_role.items():
+            if parameters:
+                dtypes = sorted({str(parameter.dtype) for parameter in parameters})
+                self._logger.info(
+                    "[FSDP] %s optimizer parameter dtype(s): %s",
+                    role,
+                    ", ".join(dtypes),
+                )
 
         # Fused AdamW avoids a large foreach temp buffer during warmup_optimizer_state
         # for NO_SHARD models (e.g. STEAM ensemble SFT). It is unsafe with sharded

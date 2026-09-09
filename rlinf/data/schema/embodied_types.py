@@ -48,6 +48,9 @@ class EnvOutput:
     truncations: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
     env_infos: Optional[dict[str, Any]] = None
+    executed_action_mask: Optional[torch.Tensor] = None  # [B, action_chunk]
+    subtask_ids: Optional[torch.Tensor] = None  # [B]
+    subpool_ids: Optional[torch.Tensor] = None  # [B]
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
@@ -77,6 +80,21 @@ class EnvOutput:
         self.env_infos = (
             put_tensor_device(self.env_infos, "cpu")
             if self.env_infos is not None
+            else None
+        )
+        self.executed_action_mask = (
+            self.executed_action_mask.cpu().contiguous()
+            if self.executed_action_mask is not None
+            else None
+        )
+        self.subtask_ids = (
+            self.subtask_ids.cpu().contiguous()
+            if self.subtask_ids is not None
+            else None
+        )
+        self.subpool_ids = (
+            self.subpool_ids.cpu().contiguous()
+            if self.subpool_ids is not None
             else None
         )
         self.intervene_actions = (
@@ -217,6 +235,9 @@ class EnvOutput:
             terminations=_merge_optional_tensor_field("terminations"),
             truncations=_merge_optional_tensor_field("truncations"),
             rewards=_merge_optional_tensor_field("rewards"),
+            executed_action_mask=_merge_optional_tensor_field("executed_action_mask"),
+            subtask_ids=_merge_optional_tensor_field("subtask_ids"),
+            subpool_ids=_merge_optional_tensor_field("subpool_ids"),
             intervene_actions=_merge_optional_tensor_field(
                 "intervene_actions", allow_partial_none=True, fill_value=0.0
             ),
@@ -241,6 +262,9 @@ class EnvOutput:
             "truncations": self.truncations,
             "rewards": self.rewards,
             "env_infos": self.env_infos,
+            "executed_action_mask": self.executed_action_mask,
+            "subtask_ids": self.subtask_ids,
+            "subpool_ids": self.subpool_ids,
             "intervene_actions": self.intervene_actions,
             "intervene_flags": self.intervene_flags,
             "rlt_switch_flags": self.rlt_switch_flags,
@@ -352,6 +376,11 @@ class ChunkStepResult:
     truncations: torch.Tensor = None  # [B, 1]
     terminations: torch.Tensor = None  # [B, 1]
     rewards: torch.Tensor = None  # [B, 1]
+    successes: torch.Tensor = None  # [B]
+    executed_action_mask: torch.Tensor = None  # [B, action_chunk]
+    subtask_ids: torch.Tensor = None  # [B]
+    subpool_ids: torch.Tensor = None  # [B]
+    outcome_group_ids: torch.Tensor = None  # [B]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
 
@@ -370,6 +399,16 @@ class ChunkStepResult:
             self.truncations = self.truncations.cpu().contiguous()
         if self.rewards is not None:
             self.rewards = self.rewards.cpu().contiguous()
+        if self.successes is not None:
+            self.successes = self.successes.cpu().contiguous()
+        if self.executed_action_mask is not None:
+            self.executed_action_mask = self.executed_action_mask.cpu().contiguous()
+        if self.subtask_ids is not None:
+            self.subtask_ids = self.subtask_ids.cpu().contiguous()
+        if self.subpool_ids is not None:
+            self.subpool_ids = self.subpool_ids.cpu().contiguous()
+        if self.outcome_group_ids is not None:
+            self.outcome_group_ids = self.outcome_group_ids.cpu().contiguous()
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
@@ -387,6 +426,11 @@ class Trajectory:
     actions: torch.Tensor = None
     intervene_flags: torch.Tensor = None
     rewards: torch.Tensor = None
+    successes: torch.Tensor = None
+    executed_action_mask: torch.Tensor = None
+    subtask_ids: torch.Tensor = None
+    subpool_ids: torch.Tensor = None
+    outcome_group_ids: torch.Tensor = None
     terminations: torch.Tensor = None
     truncations: torch.Tensor = None
     dones: torch.Tensor = None
@@ -463,6 +507,8 @@ class Trajectory:
                 continue
             actions = apply_mask(self.actions, i)
             rewards = apply_mask(self.rewards, i)
+            successes = apply_mask(self.successes, i)
+            outcome_group_ids = apply_mask(self.outcome_group_ids, i)
             prev_logprobs = apply_mask(self.prev_logprobs, i)
             prev_values = apply_mask(self.prev_values, i)
             intervene_flags = apply_mask(self.intervene_flags, i)
@@ -484,6 +530,8 @@ class Trajectory:
                     actions=actions,
                     intervene_flags=intervene_flags,
                     rewards=rewards,
+                    successes=successes,
+                    outcome_group_ids=outcome_group_ids,
                     terminations=terminations,
                     truncations=truncations,
                     dones=dones,
