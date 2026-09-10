@@ -854,6 +854,13 @@ class EnvWorker(Worker):
                 if not self.cfg.env.eval.auto_reset:
                     self.eval_env_list[i].update_reset_state_ids()
 
+    def close_envs(self) -> None:
+        """Close all environments owned by this worker."""
+        for env in self.env_list:
+            env.close()
+        for env in self.eval_env_list:
+            env.close()
+
     @Worker.timer("get_reward_model_output")
     def get_reward_model_output(
         self,
@@ -1415,6 +1422,14 @@ class EnvWorker(Worker):
                         env_metrics["time/interact_delay"].append(
                             self.env_list[stage_id].insert_delay_metrics()
                         )
+                    remote_metrics = get_env_attr(
+                        self.env_list[stage_id], "remote_collector_metrics"
+                    )
+                    if callable(remote_metrics):
+                        for key, value in remote_metrics().items():
+                            env_metrics[key].append(
+                                torch.tensor([value], dtype=torch.float32)
+                            )
                     if self.collect_transitions and not self.enable_rlt:
                         next_obs = (
                             env_output.final_obs

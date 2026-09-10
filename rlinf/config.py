@@ -153,6 +153,54 @@ def _validate_outcome_dynamic_sampling(
         )
 
 
+def _validate_remote_behavior_collectors(
+    env_cfg: DictConfig, *, env_world_size: int
+) -> None:
+    """Validate cross-datacenter collector assignments before launching workers."""
+    remote_cfg = env_cfg.get("remote_collector", {})
+    if not remote_cfg.get("enabled", False):
+        return
+    assert OmegaConf.select(env_cfg, "subpool.enabled", default=False), (
+        "Remote BEHAVIOR collectors currently require subpool.enabled=true."
+    )
+    assert not OmegaConf.select(env_cfg, "subpool.dynamic_updates", default=True), (
+        "Remote BEHAVIOR collectors require subpool.dynamic_updates=false because "
+        "collector filesystems are not shared."
+    )
+    endpoints = list(remote_cfg.get("endpoints", []))
+    assert endpoints, "remote_collector.endpoints must not be empty."
+    total_num_envs = int(env_cfg.total_num_envs)
+    assert env_world_size == total_num_envs, (
+        "Remote BEHAVIOR collectors require exactly one logical environment per "
+        f"EnvWorker, got env world size {env_world_size} and "
+        f"total_num_envs {total_num_envs}."
+    )
+    ranks = [int(endpoint.env_rank) for endpoint in endpoints]
+    assert len(ranks) == len(set(ranks)), (
+        "Each remote collector endpoint must have a unique env_rank."
+    )
+    assert all(0 <= rank < total_num_envs for rank in ranks), (
+        "Remote collector env_rank values must be in "
+        f"[0, {total_num_envs}), got {ranks}."
+    )
+    for endpoint in endpoints:
+        port = int(endpoint.get("port", 0))
+        assert 1 <= port <= 65535, (
+            f"Remote collector port must be in [1, 65535], got {port}."
+        )
+        assert endpoint.get("ssh_host", None) or endpoint.get("host", None), (
+            "Each remote collector endpoint requires ssh_host or host."
+        )
+        reconnect_attempts = int(endpoint.get("reconnect_attempts", 3))
+        assert reconnect_attempts >= 0, (
+            "Remote collector reconnect_attempts must be non-negative."
+        )
+    token_env = remote_cfg.get("auth_token_env", "RLINF_REMOTE_COLLECTOR_TOKEN")
+    assert isinstance(token_env, str) and token_env, (
+        "remote_collector.auth_token_env must be a non-empty environment variable name."
+    )
+
+
 def _validate_independent_gradient_clipping(actor_cfg: DictConfig) -> None:
     """Validate optional policy/value branch-specific clipping limits."""
     policy_clip_grad = actor_cfg.optim.get("policy_clip_grad", None)
@@ -1385,14 +1433,11 @@ def validate_embodied_cfg(cfg):
                     f"Only r1pro_behavior is supported for omnigibson, got {cfg.env.train.base_config_name}"
                 )
                 if OmegaConf.select(cfg.env.train, "subpool.enabled", default=False):
+                    _validate_remote_behavior_collectors(
+                        cfg.env.train, env_world_size=env_world_size
+                    )
                     assert cfg.env.train.get("num_env_subprocess", 1) == 1, (
                         "BEHAVIOR subpool RL requires num_env_subprocess=1."
-                    )
-                    assert not cfg.env.train.get(
-                        "skip_intermediate_obs_in_chunk", False
-                    ), (
-                        "BEHAVIOR subpool RL requires "
-                        "skip_intermediate_obs_in_chunk=false."
                     )
                     assert not cfg.env.train.get("enable_offload", False), (
                         "BEHAVIOR subpool RL requires env.train.enable_offload=false."

@@ -468,8 +468,6 @@ def validate_subpool_env_config(
         errors.append(f"num_envs must be 1, got {num_envs}")
     if int(select("num_env_subprocess", 1)) != 1:
         errors.append("num_env_subprocess must be 1")
-    if bool(select("skip_intermediate_obs_in_chunk", False)):
-        errors.append("skip_intermediate_obs_in_chunk must be false")
     if pipeline_stage_num != 1:
         errors.append(f"pipeline_stage_num must be 1, got {pipeline_stage_num}")
     if bool(select("enable_offload", False)):

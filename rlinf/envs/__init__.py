@@ -101,6 +101,12 @@ def get_env_cls(env_type: str, env_cfg=None):
         return MetaWorldEnv
     elif env_type == SupportedEnvType.BEHAVIOR:
         if env_cfg is not None and env_cfg.get("subpool", {}).get("enabled", False):
+            if env_cfg.get("remote_collector", {}).get("enabled", False):
+                from rlinf.envs.behavior.remote_collector import (
+                    DistributedBehaviorSubpoolEnv,
+                )
+
+                return DistributedBehaviorSubpoolEnv
             from rlinf.envs.behavior.behavior_env import BehaviorSubpoolEnv
 
             return BehaviorSubpoolEnv

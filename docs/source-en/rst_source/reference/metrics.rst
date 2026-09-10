@@ -118,6 +118,16 @@ Task-level signals from the simulator.
      - Episode return. Under sparse rewards this is near-zero until the terminal success step, so it is not very informative during training.
    * - ``env/reward``
      - Step-level reward (``0`` on intermediate steps, ``1`` on success). The logged value is normalized by episode length, which makes it hard to read as real performance.
+   * - ``env/time/remote_collector_rpc``
+     - End-to-end duration of the latest remote environment RPC, including transport and remote simulator handling.
+   * - ``env/time/remote_collector_handler``
+     - Time spent handling the request inside the remote collector daemon.
+   * - ``env/time/remote_collector_transport``
+     - Estimated network and serialization time, computed as RPC duration minus remote handler duration.
+   * - ``env/remote_collector/request_mib`` / ``response_mib``
+     - Encoded request and response sizes for the latest remote environment RPC, in MiB.
+   * - ``env/remote_collector/reconnects``
+     - Number of SSH-tunnel or socket reconnects needed by the latest RPC. Persistent nonzero values indicate an unstable connection.
 
 See also the :doc:`Logger <../guides/logger>` tutorial for choosing backends (TensorBoard,
 Weights & Biases, SwanLab) and configuring ``runner.logger``.

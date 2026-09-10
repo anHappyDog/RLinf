@@ -21,6 +21,7 @@ from typing import Any, Optional
 import gymnasium as gym
 import imageio
 import numpy as np
+from PIL import Image
 
 try:
     import torch
@@ -57,7 +58,10 @@ class RecordVideo(gym.Wrapper):
             ``video_base_dir`` (output directory root),
             ``fps`` (optional FPS override),
             ``info_on_video`` (whether to render overlay text),
-            ``extra_info_on_video`` (list of ``info`` keys to render).
+            ``extra_info_on_video`` (list of ``info`` keys to render),
+            ``include_wrist_views`` (compose left and right wrist views beside
+            the main image), ``async_save`` (do not wait after every encode),
+            and ``max_pending_videos`` (bound asynchronous encode memory).
         fps: Explicit FPS override. If ``None``, FPS is resolved from
             ``video_cfg.fps``, environment config/metadata, then fallback ``30``.
     """
@@ -78,6 +82,13 @@ class RecordVideo(gym.Wrapper):
         self._num_envs = getattr(env, "num_envs", 1)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._save_futures: list[Future] = []
+        self._include_wrist_views = bool(
+            self.video_cfg.get("include_wrist_views", False)
+        )
+        self._async_save = bool(self.video_cfg.get("async_save", False))
+        self._max_pending_videos = int(self.video_cfg.get("max_pending_videos", 1))
+        if self._max_pending_videos <= 0:
+            raise ValueError("video_cfg.max_pending_videos must be positive.")
 
         if fps is not None:
             self._fps = fps
@@ -115,12 +126,81 @@ class RecordVideo(gym.Wrapper):
 
     def _get_image_from_dict(self, obs: dict) -> Optional[Any]:
         """Pick the best image field from an observation dict."""
-        if hasattr(self.env, "capture_image"):
-            return self.env.capture_image()
         for key in ("main_images", "images", "rgb", "full_image", "main_image"):
             if key in obs and obs[key] is not None:
                 return obs[key]
+        if hasattr(self.env, "capture_image"):
+            return self.env.capture_image()
         return None
+
+    @staticmethod
+    def _as_uint8_hwc(image: Any) -> np.ndarray:
+        """Normalize one image to an uint8 HWC array."""
+        if torch is not None and isinstance(image, torch.Tensor):
+            image = image.detach().cpu().numpy()
+        image = np.asarray(image)
+        if image.ndim != 3:
+            raise ValueError(f"Expected one HWC image, got shape {image.shape}.")
+        if image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4):
+            image = np.transpose(image, (1, 2, 0))
+        if image.dtype != np.uint8:
+            image = image.astype(np.uint8)
+        return image[..., :3]
+
+    @staticmethod
+    def _resize_image(image: np.ndarray, width: int, height: int) -> np.ndarray:
+        """Resize an image for video composition."""
+        resampling = getattr(Image, "Resampling", Image).BILINEAR
+        return np.asarray(Image.fromarray(image).resize((width, height), resampling))
+
+    @classmethod
+    def _compose_robot_views(
+        cls,
+        main_image: Any,
+        left_wrist_image: Any,
+        right_wrist_image: Any,
+    ) -> np.ndarray:
+        """Place two wrist views in a column beside the main camera."""
+        main = cls._as_uint8_hwc(main_image)
+        left = cls._as_uint8_hwc(left_wrist_image)
+        right = cls._as_uint8_hwc(right_wrist_image)
+        main_height, main_width = main.shape[:2]
+        wrist_width = max(main_width // 2, 1)
+        top_height = max(main_height // 2, 1)
+        bottom_height = main_height - top_height
+        left = cls._resize_image(left, wrist_width, top_height)
+        right = cls._resize_image(right, wrist_width, bottom_height)
+        return np.concatenate((main, np.concatenate((left, right), axis=0)), axis=1)
+
+    def _extract_robot_view_batches(self, obs: dict) -> list[list[np.ndarray]]:
+        """Extract per-env composites when main and wrist views are available."""
+        if not self._include_wrist_views or "wrist_images" not in obs:
+            return []
+
+        main = self._to_numpy(obs["main_images"])
+        wrists = self._to_numpy(obs["wrist_images"])
+        if main.ndim == 3:
+            main = main[None]
+        if wrists.ndim == 4:
+            wrists = wrists[None]
+        if main.ndim != 4 or wrists.ndim != 5:
+            raise ValueError(
+                "Multi-view video expects main_images [N,H,W,C] and "
+                f"wrist_images [N,2,H,W,C], got {main.shape} and {wrists.shape}."
+            )
+        if main.shape[0] != wrists.shape[0] or wrists.shape[1] != 2:
+            raise ValueError(
+                "Main/wrist video batches must have matching environments and "
+                f"exactly two wrist views, got {main.shape} and {wrists.shape}."
+            )
+        return [
+            [
+                self._compose_robot_views(
+                    main[env_id], wrists[env_id, 0], wrists[env_id, 1]
+                )
+                for env_id in range(main.shape[0])
+            ]
+        ]
 
     def _extract_frame_batches(self, obs: Any) -> list[list[np.ndarray]]:
         """Extract a list of per-step image batches from obs."""
@@ -128,6 +208,9 @@ class RecordVideo(gym.Wrapper):
             return []
 
         if isinstance(obs, dict):
+            robot_views = self._extract_robot_view_batches(obs)
+            if robot_views:
+                return robot_views
             image_src = self._get_image_from_dict(obs)
             if image_src is None:
                 return []
@@ -139,6 +222,10 @@ class RecordVideo(gym.Wrapper):
             if isinstance(obs[0], dict):
                 frames = []
                 for item in obs:
+                    robot_views = self._extract_robot_view_batches(item)
+                    if robot_views:
+                        frames.extend(robot_views)
+                        continue
                     image_src = self._get_image_from_dict(item)
                     if image_src is None:
                         continue
@@ -438,13 +525,9 @@ class RecordVideo(gym.Wrapper):
     def flush_video(self, video_sub_dir: Optional[str] = None):
         """Write buffered frames to an MP4 file.
 
-        The encode happens on the background thread pool, but we wait for the
-        just-submitted write to complete before returning. The wait is required
-        so the MP4 has a finalized ``moov`` atom on disk: ``imageio`` only writes
-        it during ``writer.close()``, and the pool's worker threads are daemon
-        threads that get killed mid-task at interpreter exit (no ``atexit``
-        handler is run under Ray actor shutdown either). Without this wait,
-        eval videos end at ``mdat`` and no player can open them.
+        With ``async_save`` disabled, wait for the just-submitted encode as in
+        the historical implementation. Asynchronous mode keeps a bounded queue;
+        :meth:`close` must be called during orderly worker shutdown to drain it.
         """
         if not self.render_images:
             return
@@ -461,9 +544,10 @@ class RecordVideo(gym.Wrapper):
         self.render_images = []
         self.video_cnt += 1
         future = self._submit_save(frames, mp4_path)
-        # Block until the encode + writer.close() returns so the MP4 is valid
-        # on disk before the rollout loop continues (or the process exits).
-        future.result()
+        if self._async_save:
+            self._bound_pending_saves()
+        else:
+            future.result()
 
     def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> Future:
         """Submit a background job to save the video, return its Future."""
@@ -475,15 +559,29 @@ class RecordVideo(gym.Wrapper):
     def _save_video(self, frames: list[np.ndarray], mp4_path: str) -> None:
         """Save frames to disk (runs in background)."""
         video_writer = None
+        temporary_path = f"{mp4_path}.partial.mp4"
         try:
-            video_writer = imageio.get_writer(mp4_path, fps=self._fps)
+            video_writer = imageio.get_writer(
+                temporary_path,
+                fps=self._fps,
+                macro_block_size=1,
+            )
             for img in frames:
                 video_writer.append_data(img)
+            video_writer.close()
+            video_writer = None
+            os.replace(temporary_path, mp4_path)
         except Exception as exc:
             warnings.warn(f"Failed to save video {mp4_path}: {exc}")
         finally:
             if video_writer is not None:
                 video_writer.close()
+
+    def _bound_pending_saves(self) -> None:
+        """Apply backpressure before pending frame buffers grow without bound."""
+        self._prune_futures()
+        while len(self._save_futures) > self._max_pending_videos:
+            self._save_futures.pop(0).result()
 
     def _prune_futures(self) -> None:
         """Remove finished futures to avoid unbounded growth."""

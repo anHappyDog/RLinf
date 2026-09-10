@@ -78,7 +78,8 @@ env:
     video_cfg:
       save_video: true
       video_base_dir: ${runner.logger.log_path}/video/train
-      fps: 15
+      # Boundary-only video has one frame per 32 actions: 60 / 32 ~= 1.875 Hz.
+      fps: 2
   eval:
     rollout_epoch: 1
     total_num_envs: 2

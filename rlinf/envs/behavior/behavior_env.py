@@ -56,16 +56,37 @@ from rlinf.utils.logging import get_logger
 
 __all__ = ["BehaviorEnv", "BehaviorSubpoolEnv"]
 
+_BEHAVIOR_CHILD_ENV_VARS = (
+    "TMPDIR",
+    "OMNIGIBSON_DATA_PATH",
+    "OMNIGIBSON_DATASET_PATH",
+    "OMNIGIBSON_KEY_PATH",
+    "OMNIGIBSON_ASSET_PATH",
+    "OMNIGIBSON_APPDATA_PATH",
+    "OMNI_KIT_ACCEPT_EULA",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "TRITON_CACHE_DIR",
+)
 
-def _repeat_terminal_subpool_chunk(last_obs, last_info, chunk_size: int):
+
+def _repeat_terminal_subpool_chunk(
+    last_obs,
+    last_info,
+    chunk_size: int,
+    *,
+    skip_intermediate_obs: bool = False,
+):
     """Return a frozen, non-executed chunk after a subtask has terminated."""
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
     results = []
-    for _ in range(chunk_size):
+    for index in range(chunk_size):
+        observation = (
+            None if skip_intermediate_obs and index < chunk_size - 1 else [last_obs]
+        )
         results.append(
             (
-                [last_obs],
+                observation,
                 torch.zeros(1, dtype=torch.float32),
                 torch.zeros(1, dtype=torch.bool),
                 torch.zeros(1, dtype=torch.bool),
@@ -105,6 +126,55 @@ def _move_state_tensors(value, device):
     if isinstance(value, tuple):
         return tuple(_move_state_tensors(item, device) for item in value)
     return value
+
+
+def _compact_policy_observation(raw_obs: dict) -> dict:
+    """Keep only the observation fields consumed outside BehaviorProcess.
+
+    Online grounding needs instance masks inside the simulator process, but the
+    policy only consumes the three RGB views, proprioception, and the serialized
+    grounded prompt. Compacting here prevents segmentation tensors from crossing
+    the Ray actor boundary.
+    """
+    camera_fragments = {
+        "zed_link:Camera:0": "main_images",
+        "left_realsense_link:Camera:0": "left_wrist_image",
+        "right_realsense_link:Camera:0": "right_wrist_image",
+    }
+    images = {}
+    state = None
+    for sensor_data in raw_obs.values():
+        if not isinstance(sensor_data, dict):
+            continue
+        for sensor_name, modalities in sensor_data.items():
+            if "proprio" in sensor_name:
+                state = modalities
+                continue
+            if not isinstance(modalities, dict):
+                continue
+            for fragment, output_key in camera_fragments.items():
+                if fragment in sensor_name:
+                    images[output_key] = convert_uint8_rgb(modalities["rgb"])
+                    break
+
+    missing = [
+        output_key
+        for output_key in camera_fragments.values()
+        if output_key not in images
+    ]
+    if missing:
+        raise KeyError(f"Missing required BEHAVIOR camera observations: {missing}.")
+    if state is None:
+        raise KeyError("Missing required BEHAVIOR proprio observation.")
+
+    return {
+        "main_images": images["main_images"],
+        "wrist_images": torch.stack(
+            [images["left_wrist_image"], images["right_wrist_image"]], axis=0
+        ),
+        "state": state,
+        "task_description": raw_obs.get("_subpool", {}).get("task_description"),
+    }
 
 
 def _preload_numba_llvmlite() -> None:
@@ -207,6 +277,13 @@ class BehaviorProcess:
         self.state_ring_size = int(
             OmegaConf.select(cfg, "subpool.state_ring_size", default=32)
         )
+        self.boundary_render_iterations = int(
+            OmegaConf.select(
+                cfg,
+                "subpool.boundary_render_iterations",
+                default=2,
+            )
+        )
         self.state_ring = deque(maxlen=self.state_ring_size)
         self.pending_pool_candidates = None
         self.subpool_episode_done = False
@@ -227,6 +304,8 @@ class BehaviorProcess:
                     "subpool.state_ring_size must exceed "
                     "subpool.recovery_min_lag_states."
                 )
+            if self.boundary_render_iterations <= 0:
+                raise ValueError("subpool.boundary_render_iterations must be positive.")
 
         if self.skip_intermediate_obs_in_chunk and not self.step_supports_get_obs:
             self.logger.warning(
@@ -254,8 +333,7 @@ class BehaviorProcess:
             robot = base_env.robots[0]
             for camera_name in ROBOT_CAMERA_NAMES["R1Pro"].values():
                 sensor = robot.sensors[camera_name.split("::")[1]]
-                for modality in ("seg_semantic", "seg_instance_id"):
-                    sensor.add_modality(modality)
+                sensor.add_modality("seg_instance_id")
             base_env.load_observation_space()
 
         from rlinf.data.b1k_grounded import (
@@ -325,6 +403,31 @@ class BehaviorProcess:
         }
         return raw_obs
 
+    def _prepare_policy_observation(self, raw_obs: dict) -> dict:
+        """Ground, then compact an observation before returning it through Ray."""
+        if self.stop_chunk_on_done:
+            raw_obs = self._attach_online_grounding(raw_obs)
+        return _compact_policy_observation(raw_obs)
+
+    def _observe_policy(self, env_indices: list[int]) -> list[dict]:
+        """Render and observe current states without advancing task or physics time."""
+        import omnigibson as og
+        from omnigibson.objects.stateful_object import StatefulObject
+
+        selected_scenes = {self.env.envs[index].scene for index in env_indices}
+        for scene in selected_scenes:
+            for obj in scene.objects:
+                if isinstance(obj, StatefulObject) and obj.initialized:
+                    obj.update_visuals()
+        for _ in range(self.boundary_render_iterations):
+            og.sim.render()
+
+        observations = []
+        for index in env_indices:
+            raw_obs, _obs_info = self.env.envs[index].get_obs()
+            observations.append(self._prepare_policy_observation(raw_obs))
+        return observations
+
     def get_activity_name(self):
         return self.instance_loader.activity_name
 
@@ -382,9 +485,7 @@ class BehaviorProcess:
 
         return (
             (
-                [self._attach_online_grounding(obs) for obs in raw_obs]
-                if need_obs and self.stop_chunk_on_done
-                else list(raw_obs)
+                [self._prepare_policy_observation(obs) for obs in raw_obs]
                 if need_obs
                 else None
             ),
@@ -445,6 +546,7 @@ class BehaviorProcess:
                 self.last_subpool_obs,
                 self.last_subpool_info,
                 chunk_size,
+                skip_intermediate_obs=self.skip_intermediate_obs_in_chunk,
             )
 
         positions = {env_index: pos for pos, env_index in enumerate(env_indices)}
@@ -454,7 +556,7 @@ class BehaviorProcess:
         results = []
 
         for t in range(chunk_size):
-            need_obs = True
+            need_obs = not self.skip_intermediate_obs_in_chunk
             obs_t = list(last_obs)
             rewards_t = torch.zeros(len(env_indices), dtype=torch.float32)
             terms_t = torch.zeros(len(env_indices), dtype=torch.bool)
@@ -467,9 +569,11 @@ class BehaviorProcess:
                     actions[:, t], active_indices, need_obs=need_obs
                 )
                 next_active = []
+                terminal_indices = []
                 for source_index, env_index in enumerate(active_indices):
                     pos = positions[env_index]
-                    obs_t[pos] = raw_obs[source_index]
+                    if need_obs:
+                        obs_t[pos] = raw_obs[source_index]
                     info = infos[source_index]
                     if self.subtask_reward_tracker is None:
                         raise RuntimeError(
@@ -498,6 +602,7 @@ class BehaviorProcess:
                     executed_t[pos] = True
                     is_done = outcome.success or outcome.timeout
                     if is_done:
+                        terminal_indices.append(env_index)
                         self.subpool_episode_done = True
                         terminal_state = self._dump_subpool_state()
                         recovery_state = None
@@ -527,11 +632,27 @@ class BehaviorProcess:
                         self.state_ring.append(self._dump_subpool_state())
                     if not is_done:
                         next_active.append(env_index)
+                if self.skip_intermediate_obs_in_chunk and (
+                    terminal_indices or t == chunk_size - 1
+                ):
+                    observation_indices = terminal_indices + next_active
+                    observations = self._observe_policy(observation_indices)
+                    for env_index, observation in zip(
+                        observation_indices, observations, strict=True
+                    ):
+                        obs_t[positions[env_index]] = observation
                 active_indices = next_active
 
             last_obs = obs_t
             last_infos = infos_t
-            results.append((obs_t, rewards_t, terms_t, truncs_t, infos_t, executed_t))
+            output_obs = (
+                obs_t
+                if not self.skip_intermediate_obs_in_chunk or t == chunk_size - 1
+                else None
+            )
+            results.append(
+                (output_obs, rewards_t, terms_t, truncs_t, infos_t, executed_t)
+            )
 
         if self.subpool_episode_done:
             self.last_subpool_obs = last_obs[0]
@@ -723,7 +844,7 @@ class BehaviorProcess:
         self.subpool_episode_done = False
         self.last_subpool_obs = None
         self.last_subpool_info = None
-        return [self._attach_online_grounding(obs)], [info]
+        return [self._prepare_policy_observation(obs)], [info]
 
     def reset(self, reset_indices=None, get_obs=True):
         self.instance_loader.prepare_reset(self.env)
@@ -735,7 +856,7 @@ class BehaviorProcess:
             return None, None
 
         raw_obs, infos = result
-        return list(raw_obs), list(infos)
+        return [self._prepare_policy_observation(obs) for obs in raw_obs], list(infos)
 
     def close(self):
         if self.env is not None:
@@ -856,6 +977,17 @@ class BehaviorProcessPool:
                     "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
                     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                 }
+                # A collector daemon can attach to a Ray cluster that was
+                # started before its BEHAVIOR paths were configured. Ray
+                # workers inherit the raylet's environment, not the driver's,
+                # unless runtime_env explicitly carries these values.
+                child_env_vars.update(
+                    {
+                        name: os.environ[name]
+                        for name in _BEHAVIOR_CHILD_ENV_VARS
+                        if name in os.environ
+                    }
+                )
                 visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
                 if visible_devices:
                     child_env_vars["CUDA_VISIBLE_DEVICES"] = visible_devices
@@ -1177,30 +1309,9 @@ class BehaviorEnv(gym.Env):
         )
 
     def _extract_obs_image(self, raw_obs):
-        state = None
-        for sensor_data in raw_obs.values():
-            assert isinstance(sensor_data, dict)
-            for k, v in sensor_data.items():
-                if "left_realsense_link:Camera:0" in k:
-                    left_image = convert_uint8_rgb(v["rgb"])
-                elif "right_realsense_link:Camera:0" in k:
-                    right_image = convert_uint8_rgb(v["rgb"])
-                elif "zed_link:Camera:0" in k:
-                    zed_image = convert_uint8_rgb(v["rgb"])
-                elif "proprio" in k:
-                    state = v
-        assert state is not None, (
-            "state is not found in the observation which is required for the behavior training."
-        )
-
-        return {
-            "main_images": zed_image,  # [H, W, C]
-            "wrist_images": torch.stack(
-                [left_image, right_image], axis=0
-            ),  # [N_IMG, H, W, C]
-            "state": state,
-            "task_description": raw_obs.get("_subpool", {}).get("task_description"),
-        }
+        if {"main_images", "wrist_images", "state"}.issubset(raw_obs):
+            return raw_obs
+        return _compact_policy_observation(raw_obs)
 
     def _wrap_obs(self, obs_list):
         extracted_obs_list = []

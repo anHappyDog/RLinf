@@ -44,6 +44,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--subtask-id", type=int, default=1)
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--reset-count", type=int, default=32)
+    parser.add_argument("--skip-intermediate-obs", action="store_true")
     parser.add_argument("--require-all-snapshots", action="store_true")
     return parser.parse_args()
 
@@ -107,6 +108,12 @@ def _compose_env_cfg(args: argparse.Namespace, manifest: Path, record):
                 f"env.train.subpool.asset_fingerprint={record.asset_fingerprint}",
                 f"env.train.subpool.fixed_subtask_id={record.subtask_id}",
                 "env.train.subpool.dynamic_updates=false",
+                # This smoke test checks the explicit frozen-terminal contract.
+                # Training enables auto-reset, which intentionally starts a new
+                # episode on the next chunk instead of returning frozen output.
+                "env.train.auto_reset=false",
+                "env.train.skip_intermediate_obs_in_chunk="
+                f"{str(args.skip_intermediate_obs).lower()}",
             ],
         )
     OmegaConf.resolve(cfg)
@@ -209,6 +216,7 @@ def main() -> None:
             "skill": records[0].skill,
             "source_snapshot_count": len(records),
             "reset_count": args.reset_count,
+            "skip_intermediate_obs": args.skip_intermediate_obs,
             "sampled_snapshot_ids": sorted(sampled_snapshot_ids),
             "sampled_episode_indices": sorted(
                 {

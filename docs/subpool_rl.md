@@ -7,11 +7,24 @@ the official BEHAVIOR-1K evaluator.
 ## Safety invariants
 
 `BehaviorSubpoolEnv` rejects configurations that enable environment subprocess
-sharding, intermediate-observation skipping, environment offload, rollout
-pipeline stages, streaming training-pipeline normalization, or RLinf's reduced
+sharding, environment offload, rollout pipeline stages, streaming
+training-pipeline normalization, or RLinf's reduced
 texture-streaming budget. `renderer_mode: official` leaves the
 Kit renderer settings untouched, matching the official B1K evaluator. Each
 environment worker owns exactly one simulator.
+
+`skip_intermediate_obs_in_chunk` may be enabled for subpool execution. Physics,
+task predicates, rewards, and termination checks still run for every primitive
+action. RGB, proprioception, and online grounding are captured only at the action
+chunk boundary or immediately when the subtask succeeds or times out. Boundary
+capture does not execute an extra action or advance task time.
+
+Instance masks stay inside the simulator process: they are used for online
+grounding and removed before the observation crosses Ray. Subpool videos use the
+already-rendered policy observation and can compose the head view with both wrist
+views. With boundary-only observations, set video FPS to the policy query rate
+(for example, approximately 2 FPS for 60 Hz control and 32-action chunks), not
+the primitive control rate.
 
 Every action chunk records an `executed_action_mask`. A successful or timed-out
 skill stops immediately; remaining actions in that chunk are not sent to the
@@ -340,3 +353,116 @@ The smoke catalog retains every canonical snapshot for the selected subtask. The
 resulting `report.json` requires every snapshot to be sampled across resets, a
 one-action executed prefix, a completely masked chunk suffix, a completely frozen
 next chunk, and an online P2 prompt.
+
+## Cross-datacenter environment collectors
+
+BEHAVIOR simulators can run outside the training Ray cluster. A lightweight
+`EnvWorker` remains inside the cluster and keeps RLinf's existing policy channel,
+trajectory builder, DAPO grouping, and metric interfaces. Only environment RPCs
+(snapshot reset, action chunks, compact policy observations, rewards, and done
+metadata) cross the datacenter boundary.
+
+The collector protocol has these guarantees:
+
+- It uses an authenticated, non-pickle tensor-tree encoding. Bind the daemon to
+  loopback and carry it through SSH; the protocol itself is not encrypted.
+- Every state-mutating request has a session id and monotonically increasing
+  request id. The daemon caches the last encoded response, so a lost connection
+  after `chunk_step()` cannot execute the same action chunk twice.
+- The client owns a persistent SSH local-forward with keepalives and reconnects
+  the tunnel before replaying the same request id.
+- A daemon restart is detected by its instance id and raises an explicit state-loss
+  error. It never continues a trajectory from a silently reset simulator.
+- Remote ranks participate in the same deterministic outcome-group reset as local
+  ranks. DAPO still accepts or rejects complete same-snapshot groups.
+
+A daemon is exclusively owned by one training or evaluation session. A clean
+standalone evaluation shutdown closes its remote environment and releases that
+ownership, so a later evaluation can reuse the persistent daemon. Python-level
+evaluation failures run the same cleanup. If the driver is killed or disconnected
+before cleanup can run, ownership remains fenced because the daemon cannot prove
+whether the last mutating request completed; restart it (or run the manager with
+`--replace`) before resuming. Sharing one daemon between concurrent runs would mix
+simulator state and is rejected by the protocol.
+
+The client retries transient SSH tunnel setup failures with bounded exponential
+backoff. This matters when many environment ranks open tunnels simultaneously,
+because an SSH server may reject part of that initial handshake burst. Persistent
+nonzero reconnect counts still indicate a WAN or SSH configuration problem.
+
+Code, B1K assets, the subpool manifest and its relative `states/` directory, and
+the grounded token mapping must exist on every collector host. They may be at
+different paths: set an endpoint's `env_overrides` to override the resolved local
+environment config before it is sent to that daemon.
+
+Start one independent Ray cluster on each collector host. The collector daemons
+attach to that host-local cluster; they do not join the training cluster. Set the
+BEHAVIOR paths and a shared random token, then start one persistent daemon per GPU:
+
+```bash
+export TMPDIR=/mnt/public/daibo/tmp
+export OMNIGIBSON_DATA_PATH=/mnt/public/daibo/datasets/omni_data
+export OMNIGIBSON_DATASET_PATH=/mnt/public/daibo/datasets/omni_data/behavior-1k-assets
+export OMNIGIBSON_KEY_PATH=/mnt/public/daibo/datasets/omni_data/omnigibson.key
+export OMNIGIBSON_ASSET_PATH=/mnt/public/daibo/datasets/omni_data/omnigibson-robot-assets
+export OMNI_KIT_ACCEPT_EULA=YES
+export RLINF_REMOTE_COLLECTOR_TOKEN="$(openssl rand -hex 32)"
+
+/path/to/behavior_venv/bin/ray start --head --include-dashboard=false
+/path/to/behavior_venv/bin/python \
+  toolkits/b1k_grounded/manage_remote_collectors.py start \
+  --python /path/to/behavior_venv/bin/python \
+  --repo /path/to/RLinf \
+  --log-dir /path/to/collector_logs \
+  --gpus 0,1,2,3 \
+  --ports 46100,46101,46102,46103
+```
+
+Export the same token in the training launch environment. Assign remote daemons
+by the global logical EnvWorker rank. Ranks without an endpoint continue to run a
+local `BehaviorSubpoolEnv`, so local and remote GPUs can form one outcome group:
+
+```yaml
+cluster:
+  component_placement:
+    # Two EnvWorker processes per local simulator GPU: one local simulator and
+    # one light remote bridge. The placement must still expose every logical rank.
+    env:
+      node_group: behavior
+      placement: 0-7:0-15
+
+env:
+  train:
+    total_num_envs: 16
+    subpool:
+      outcome_group_size: 16
+      dynamic_updates: false
+    remote_collector:
+      enabled: true
+      auth_token_env: RLINF_REMOTE_COLLECTOR_TOKEN
+      endpoints:
+        - {env_rank: 1, ssh_host: collector-a, port: 46100}
+        - {env_rank: 3, ssh_host: collector-a, port: 46101}
+        - {env_rank: 5, ssh_host: collector-a, port: 46102}
+        - {env_rank: 7, ssh_host: collector-a, port: 46103}
+        - {env_rank: 9, ssh_host: collector-b, port: 46100}
+        - {env_rank: 11, ssh_host: collector-b, port: 46101}
+        - {env_rank: 13, ssh_host: collector-b, port: 46102}
+        - {env_rank: 15, ssh_host: collector-b, port: 46103}
+
+algorithm:
+  outcome_dynamic_sampling:
+    enabled: true
+    group_size: 16
+    groups_per_update: 4
+    parallel_groups: false
+```
+
+This example keeps 64 trajectories per global step while collecting 16 at a time
+instead of eight. Verify the process-to-GPU mapping produced by the placement
+strategy before choosing which ranks are local. During training, monitor
+`env/time/remote_collector_handler`, `env/time/remote_collector_transport`,
+`env/remote_collector/response_mib`, and
+`env/remote_collector/reconnects`. Persistent nonzero reconnect counts indicate a
+WAN or SSH stability problem; handler time is remote simulation time, while the
+transport difference includes encoding, tunnel, and transfer latency.

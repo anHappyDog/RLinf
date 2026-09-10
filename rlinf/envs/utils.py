@@ -54,7 +54,13 @@ def get_env_attr(env, name: str, default: Any = None) -> Any:
         try:
             return env.get_wrapper_attr(name)
         except AttributeError:
-            return default
+            # Gymnasium's wrapper lookup assumes the base environment also
+            # implements ``get_wrapper_attr``. RLinf supports lightweight
+            # non-Gym environments too, so continue down the explicit wrapper
+            # link without invoking Gymnasium's deprecated ``__getattr__``.
+            wrapped_env = getattr(env, "env", None)
+            if wrapped_env is not None and wrapped_env is not env:
+                return get_env_attr(wrapped_env, name, default)
     return getattr(env, name, default)
 
 

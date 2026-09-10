@@ -115,15 +115,16 @@ env:
     subpool:
       outcome_group_size: 4
     # The audited radio pickup suffixes are at most 989 primitive steps. A 1280
-    # step cap leaves 29% slack, stays below 90 s at 15-fps playback, and its 40
-    # action chunks keep the eight-stream rollout divisible by GBS 64.
+    # step cap leaves 29% slack, and its 40 action chunks keep the eight-stream
+    # rollout divisible by GBS 64.
     max_episode_steps: 1280
     max_steps_per_rollout_epoch: 1280
     reward_coef: ${algorithm.reward_coef}
     video_cfg:
       save_video: true
       video_base_dir: ${runner.logger.log_path}/video/train
-      fps: 15
+      # Boundary-only video has one frame per 32 actions: 60 / 32 ~= 1.875 Hz.
+      fps: 2
   eval:
     rollout_epoch: 1
     total_num_envs: 2

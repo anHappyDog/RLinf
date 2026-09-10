@@ -13,6 +13,7 @@ from rlinf.envs.behavior.behavior_env import (
     BehaviorProcess,
     BehaviorProcessPool,
     BehaviorSubpoolEnv,
+    _compact_policy_observation,
     _repeat_terminal_subpool_chunk,
     _support_surface_distance,
 )
@@ -63,6 +64,47 @@ def _record(state, snapshot_id="state-0", **overrides):
     if "control_json" not in overrides:
         values["control_json"] = json.dumps({"skill": values["skill"]})
     return SubpoolSnapshot(**values)
+
+
+def test_compact_policy_observation_drops_segmentation_payload():
+    head_rgb = torch.zeros(8, 8, 4)
+    left_rgb = torch.ones(4, 4, 4)
+    right_rgb = torch.full((4, 4, 4), 2.0)
+    segmentation = torch.arange(64).reshape(8, 8)
+    state = torch.arange(32)
+    raw_obs = {
+        "robot": {
+            "zed_link:Camera:0": {
+                "rgb": head_rgb,
+                "seg_instance_id": segmentation,
+            },
+            "left_realsense_link:Camera:0": {
+                "rgb": left_rgb,
+                "seg_instance_id": segmentation[:4, :4],
+            },
+            "right_realsense_link:Camera:0": {
+                "rgb": right_rgb,
+                "seg_instance_id": segmentation[:4, :4],
+            },
+            "proprio": state,
+        },
+        "_subpool": {"task_description": "<subgoal>pick up the radio"},
+    }
+
+    compact = _compact_policy_observation(raw_obs)
+
+    assert set(compact) == {
+        "main_images",
+        "wrist_images",
+        "state",
+        "task_description",
+    }
+    assert compact["main_images"].shape == (8, 8, 3)
+    assert compact["main_images"].dtype == torch.uint8
+    assert compact["wrist_images"].shape == (2, 4, 4, 3)
+    assert torch.equal(compact["state"], state)
+    assert compact["task_description"] == "<subgoal>pick up the radio"
+    assert "seg_instance_id" not in str(compact.keys())
 
 
 def test_store_round_trip_and_checksum_validation(tmp_path):
@@ -268,9 +310,8 @@ def test_correctness_config_rejects_unsafe_optimizations():
         pipeline_stage_num=1,
     )
 
-    unsafe = OmegaConf.merge(safe, {"skip_intermediate_obs_in_chunk": True})
-    with pytest.raises(ValueError, match="skip_intermediate_obs_in_chunk"):
-        validate_subpool_env_config(unsafe, num_envs=1, pipeline_stage_num=1)
+    boundary_obs = OmegaConf.merge(safe, {"skip_intermediate_obs_in_chunk": True})
+    validate_subpool_env_config(boundary_obs, num_envs=1, pipeline_stage_num=1)
 
     non_parity = OmegaConf.merge(safe, {"renderer_mode": "rlinf"})
     with pytest.raises(ValueError, match="renderer_mode must be official"):
@@ -330,6 +371,22 @@ def test_terminal_subpool_chunk_freezes_state_and_executes_nothing():
     assert not torch.stack(terms).any()
     assert not torch.stack(truncs).any()
     assert not torch.stack(executed).any()
+
+
+def test_terminal_subpool_chunk_can_return_only_boundary_observation():
+    terminal_obs = {"camera": torch.tensor([1.0])}
+    terminal_info = {"subpool": {"success": True}}
+    observations, _rewards, _terms, _truncs, _infos, _executed = (
+        _repeat_terminal_subpool_chunk(
+            terminal_obs,
+            terminal_info,
+            chunk_size=3,
+            skip_intermediate_obs=True,
+        )
+    )
+
+    assert observations[:2] == (None, None)
+    assert observations[2][0] is terminal_obs
 
 
 def test_subpool_metrics_report_actual_primitive_steps():
@@ -529,6 +586,8 @@ def test_behavior_process_is_pinned_to_parent_env_node_and_gpu(monkeypatch):
     monkeypatch.setattr(ray, "get", lambda _refs: ["turning_on_radio"])
     monkeypatch.setattr(BehaviorProcess, "options", fake_options)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    monkeypatch.setenv("OMNIGIBSON_DATASET_PATH", "/datasets/behavior-1k-assets")
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", "/tmp/collector-inductor-cache")
 
     cfg = OmegaConf.create(
         {
@@ -550,8 +609,10 @@ def test_behavior_process_is_pinned_to_parent_env_node_and_gpu(monkeypatch):
     assert captured["runtime_env"] == {
         "env_vars": {
             "CUDA_VISIBLE_DEVICES": "3",
+            "OMNIGIBSON_DATASET_PATH": "/datasets/behavior-1k-assets",
             "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+            "TORCHINDUCTOR_CACHE_DIR": "/tmp/collector-inductor-cache",
         }
     }
     assert pool.activity_name == "turning_on_radio"

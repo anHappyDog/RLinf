@@ -115,6 +115,16 @@ rollout 阶段收集的优势与奖励统计量。
      - 回合总回报。稀疏奖励下在成功结束前几乎为 0，训练过程中参考价值有限。
    * - ``env/reward``
      - step 级奖励（中间步为 ``0``，成功时为 ``1``）。日志值按回合步数归一化，难以直接反映真实表现。
+   * - ``env/time/remote_collector_rpc``
+     - 最近一次远端环境 RPC 的端到端耗时，包括传输和远端模拟器处理时间。
+   * - ``env/time/remote_collector_handler``
+     - 远端 Collector daemon 内部处理请求的耗时。
+   * - ``env/time/remote_collector_transport``
+     - 估算的网络与序列化耗时，计算方式为 RPC 总耗时减去远端处理耗时。
+   * - ``env/remote_collector/request_mib`` / ``response_mib``
+     - 最近一次远端环境 RPC 编码后的请求和响应大小，单位为 MiB。
+   * - ``env/remote_collector/reconnects``
+     - 最近一次 RPC 所需的 SSH tunnel 或 socket 重连次数；持续出现非零值意味着连接不稳定。
 
 如何选择日志后端（TensorBoard、Weights & Biases、SwanLab）以及配置 ``runner.logger``，参见
 :doc:`日志 <../guides/logger>` 教程。

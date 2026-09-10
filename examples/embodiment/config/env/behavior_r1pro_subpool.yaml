@@ -6,13 +6,22 @@ defaults:
 # done flags still delimit GAE and DAPO compares only each stream's first episode.
 auto_reset: true
 ignore_terminations: false
-skip_intermediate_obs_in_chunk: false
+# Physics/reward/done still run at 60 Hz; render and policy observation once per
+# action chunk (or immediately at an earlier terminal transition).
+skip_intermediate_obs_in_chunk: true
 num_env_subprocess: 1
 enable_offload: false
 enable_init_offload: false
 # Preserve the official evaluator's Kit renderer defaults. In particular, do
 # not apply RLinf's 10% texture-streaming memory budget.
 renderer_mode: official
+
+# Save a diagnostic policy-rate composite instead of triggering a fourth
+# simulator render. The encoder runs behind rollout with one-video backpressure.
+video_cfg:
+  include_wrist_views: true
+  async_save: true
+  max_pending_videos: 1
 
 subpool:
   enabled: true
@@ -38,6 +47,9 @@ subpool:
   max_dynamic_per_subtask_pool: 32
   state_capture_interval: 8
   state_ring_size: 32
+  # Boundary-only observation capture explicitly refreshes visual object states
+  # and renders twice before reading the three policy cameras.
+  boundary_render_iterations: 2
   # Recovery starts are sampled from this temporal lag window; the direct
   # timeout state is never inserted.
   recovery_min_lag_states: 2
