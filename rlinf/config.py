@@ -1459,9 +1459,12 @@ def validate_embodied_cfg(cfg):
                         "BEHAVIOR subpool RL requires "
                         "algorithm.reward_type=subtask_chunk_level."
                     )
-                    assert cfg.algorithm.logprob_type == "chunk_level", (
-                        "BEHAVIOR subpool RL requires "
-                        "algorithm.logprob_type=chunk_level."
+                    assert cfg.algorithm.logprob_type in (
+                        "chunk_level",
+                        "action_level",
+                    ), (
+                        "BEHAVIOR subpool RL requires algorithm.logprob_type to be "
+                        "chunk_level or action_level."
                     )
                     assert not cfg.algorithm.get("filter_rewards", False), (
                         "BEHAVIOR subpool RL disables reward filtering because it "

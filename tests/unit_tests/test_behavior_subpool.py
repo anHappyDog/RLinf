@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -18,11 +19,14 @@ from rlinf.envs.behavior.behavior_env import (
     _support_surface_distance,
 )
 from rlinf.envs.behavior.subpool import (
+    FailureStateStore,
     SubpoolCatalog,
     SubpoolSnapshot,
     SubpoolStore,
+    analyze_subtask_failure,
     full_state_sha256,
     merge_subpool_manifests,
+    relative_tilt_angle_deg,
     validate_round_robin_coverage,
     validate_subpool_env_config,
     validate_subpool_export_request,
@@ -31,6 +35,9 @@ from rlinf.envs.behavior.subpool import (
 from rlinf.envs.behavior.utils import (
     apply_runtime_renderer_settings,
     sync_robot_after_pose_override,
+)
+from toolkits.b1k_grounded.build_failure_recovery_catalog import (
+    build_recovery_catalog,
 )
 
 
@@ -122,6 +129,256 @@ def test_store_round_trip_and_checksum_validation(tmp_path):
     state_path.write_bytes(b"corrupt")
     with pytest.raises(ValueError, match="checksum mismatch"):
         catalog.load_state(record)
+
+
+def test_failure_state_store_writes_restorable_state_and_metadata(tmp_path):
+    state = _state()
+    source_snapshot = _record(state, episode_index=50).to_dict()
+    store = FailureStateStore(tmp_path / "failures", run_id="radio-pickup")
+
+    metadata_path = store.capture(
+        state,
+        policy_global_step=34,
+        collection_index=91,
+        sampling_group=3,
+        capture_kind="terminal",
+        source_snapshot=source_snapshot,
+        outcome={
+            "failure_reason": "timeout",
+            "success": False,
+            "timeout": True,
+            "elapsed_steps": 1280,
+            "return": -2.0,
+        },
+        analysis=analyze_subtask_failure(
+            "pick up from",
+            {
+                "in_hand": False,
+                "on_original_support": True,
+                "tilt_angle_deg": 90.0,
+                "tipped": True,
+            },
+            termination_reason="timeout",
+        ).to_dict(),
+    )
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    state_path = metadata_path.parent / metadata["state_path"]
+    loaded = torch.load(state_path, weights_only=False)
+    assert metadata_path.parent.name == "global_step_000034"
+    assert metadata["run_id"] == "radio-pickup"
+    assert metadata["collection_index"] == 91
+    assert metadata["sampling_group"] == 3
+    assert metadata["source_snapshot"]["snapshot_id"] == "state-0"
+    assert metadata["capture_kind"] == "terminal"
+    assert metadata["outcome"]["failure_reason"] == "timeout"
+    assert metadata["analysis"]["recovery"]["status"] == "eligible"
+    assert (
+        hashlib.sha256(state_path.read_bytes()).hexdigest() == metadata["state_sha256"]
+    )
+    assert torch.equal(loaded["sim"], state["sim"])
+    assert not list((tmp_path / "failures").rglob(".*.pt.*"))
+    assert not list((tmp_path / "failures").rglob(".*.json.*"))
+
+
+def test_failure_state_store_rejects_success_outcome(tmp_path):
+    state = _state()
+    store = FailureStateStore(tmp_path / "failures")
+
+    with pytest.raises(ValueError, match="cannot describe a success"):
+        store.capture(
+            state,
+            policy_global_step=None,
+            collection_index=None,
+            sampling_group=None,
+            capture_kind="terminal",
+            source_snapshot=_record(state).to_dict(),
+            outcome={"success": True, "timeout": False},
+            analysis={
+                "failure_tags": ["gripper_empty"],
+                "recovery": {"status": "not_needed", "reason": "upright"},
+            },
+        )
+
+
+def test_build_recovery_catalog_selects_eligible_terminal_states(tmp_path):
+    state = _state()
+    canonical_manifest = tmp_path / "canonical" / "manifest.jsonl"
+    canonical = _record(state, episode_index=50)
+    SubpoolStore(canonical_manifest).append(canonical, state)
+    failure_store = FailureStateStore(tmp_path / "failures")
+    reference_orientation = [0.0, 0.0, 0.0, 1.0]
+    analysis = analyze_subtask_failure(
+        "pick up from",
+        {
+            "in_hand": False,
+            "on_original_support": True,
+            "reference_orientation_xyzw": reference_orientation,
+            "tilt_angle_deg": 90.0,
+            "tipped": True,
+        },
+        termination_reason="timeout",
+    )
+    terminal_metadata_path = failure_store.capture(
+        state,
+        policy_global_step=20,
+        collection_index=None,
+        sampling_group=0,
+        capture_kind="terminal",
+        source_snapshot=canonical.to_dict(),
+        outcome={"success": False, "timeout": True},
+        analysis=analysis.to_dict(),
+    )
+    failure_store.capture(
+        state,
+        policy_global_step=20,
+        collection_index=None,
+        sampling_group=0,
+        capture_kind="stable_recovery_event",
+        source_snapshot=canonical.to_dict(),
+        outcome={"success": False, "timeout": False},
+        analysis=analysis.to_dict(),
+    )
+
+    output_manifest = tmp_path / "recovery" / "manifest.jsonl"
+    terminal_failure_id = json.loads(
+        terminal_metadata_path.read_text(encoding="utf-8")
+    )["failure_id"]
+    summary = build_recovery_catalog(
+        tmp_path / "failures",
+        canonical_manifest,
+        output_manifest,
+        {terminal_failure_id},
+    )
+
+    catalog = SubpoolCatalog.from_jsonl(output_manifest)
+    recovery = next(
+        record for record in catalog.records if record.pool_type == "recovery"
+    )
+    assert summary == {
+        "canonical_snapshots": 1,
+        "recovery_snapshots": 1,
+        "total_snapshots": 2,
+    }
+    assert recovery.frame_index is None
+    assert (
+        recovery.metadata["recovery_provenance"]["reference_orientation_xyzw"]
+        == reference_orientation
+    )
+    assert torch.equal(catalog.load_state(recovery)["sim"], state["sim"])
+
+
+@pytest.mark.parametrize(
+    ("facts", "expected_status", "expected_tag"),
+    [
+        (
+            {
+                "in_hand": False,
+                "on_original_support": True,
+                "tilt_angle_deg": 2.0,
+                "tipped": False,
+            },
+            "not_needed",
+            "target_upright",
+        ),
+        (
+            {
+                "in_hand": False,
+                "on_original_support": True,
+                "tilt_angle_deg": 82.0,
+                "tipped": True,
+            },
+            "eligible",
+            "target_tipped",
+        ),
+        (
+            {
+                "in_hand": False,
+                "on_original_support": False,
+                "tilt_angle_deg": 90.0,
+                "tipped": True,
+            },
+            "ineligible",
+            "target_off_original_support",
+        ),
+    ],
+)
+def test_pickup_failure_analysis_uses_simulator_facts(
+    facts, expected_status, expected_tag
+):
+    analysis = analyze_subtask_failure(
+        "pick up from",
+        facts,
+        termination_reason="timeout",
+    )
+
+    assert analysis.recovery_status == expected_status
+    assert expected_tag in analysis.failure_tags
+
+
+def test_unknown_skill_failure_is_not_admitted_to_recovery():
+    analysis = analyze_subtask_failure(
+        "press",
+        {"completed": False},
+        termination_reason="timeout",
+    )
+
+    assert analysis.recovery_status == "unknown"
+    assert analysis.analyzer == "generic-v1"
+
+
+def test_relative_tilt_ignores_yaw_but_detects_fall():
+    half_sqrt = np.sqrt(0.5)
+    identity = [0.0, 0.0, 0.0, 1.0]
+    yaw_90 = [0.0, 0.0, half_sqrt, half_sqrt]
+    roll_90 = [half_sqrt, 0.0, 0.0, half_sqrt]
+
+    assert relative_tilt_angle_deg(identity, yaw_90) == pytest.approx(0.0)
+    assert relative_tilt_angle_deg(identity, roll_90) == pytest.approx(90.0)
+
+
+def test_behavior_process_extracts_pickup_failure_facts():
+    class Target:
+        name = "radio_89"
+
+        @staticmethod
+        def get_position_orientation():
+            return torch.tensor([1.0, 2.0, 3.0]), torch.tensor(
+                [np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)]
+            )
+
+        @staticmethod
+        def get_linear_velocity():
+            return torch.tensor([0.01, 0.0, 0.0])
+
+        @staticmethod
+        def get_angular_velocity():
+            return torch.tensor([0.0, 0.02, 0.0])
+
+    process_type = BehaviorProcess.__ray_metadata__.modified_class
+    process = object.__new__(process_type)
+    process.current_control = SimpleNamespace(skill="pick up from")
+    process.active_subtask_index = 1
+    process.active_task_reward = SimpleNamespace(
+        _stage_defs=(
+            {},
+            {"objects": (Target(), SimpleNamespace(name="coffee_table"))},
+        )
+    )
+    process.failure_reference_orientation = [0.0, 0.0, 0.0, 1.0]
+    process.failure_tipped_angle_deg = 45.0
+    process.failure_max_linear_speed = 0.05
+    process.failure_max_angular_speed = 0.2
+
+    facts = process._failure_facts(
+        {"completed": False, "in_hand": False, "on_support": True}
+    )
+
+    assert facts["target_name"] == "radio_89"
+    assert facts["support_name"] == "coffee_table"
+    assert facts["tilt_angle_deg"] == pytest.approx(90.0)
+    assert facts["tipped"] is True
+    assert facts["stable"] is True
 
 
 def test_sampling_balances_subtasks_before_snapshot_count(tmp_path):
@@ -316,6 +573,17 @@ def test_correctness_config_rejects_unsafe_optimizations():
     non_parity = OmegaConf.merge(safe, {"renderer_mode": "rlinf"})
     with pytest.raises(ValueError, match="renderer_mode must be official"):
         validate_subpool_env_config(non_parity, num_envs=1, pipeline_stage_num=1)
+
+    missing_capture_dir = OmegaConf.merge(
+        safe,
+        {"subpool": {"failure_state_capture": {"enabled": True}}},
+    )
+    with pytest.raises(ValueError, match="failure_state_capture.output_dir"):
+        validate_subpool_env_config(
+            missing_capture_dir,
+            num_envs=1,
+            pipeline_stage_num=1,
+        )
 
 
 def test_official_renderer_mode_does_not_import_or_override_omnigibson():

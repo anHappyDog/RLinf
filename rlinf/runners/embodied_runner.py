@@ -896,6 +896,7 @@ class EmbodiedRunner:
             # set global step
             self.actor.set_global_step(self.global_step).wait()
             self.rollout.set_global_step(self.global_step).wait()
+            self.env.set_global_step(self.global_step).wait()
 
             profiled_step = (
                 self.global_step
@@ -967,6 +968,7 @@ class EmbodiedRunner:
             # set global step
             self.actor.set_global_step(self.global_step).wait()
             self.rollout.set_global_step(self.global_step).wait()
+            self.env.set_global_step(self.global_step).wait()
 
             profiled_step = (
                 self.global_step

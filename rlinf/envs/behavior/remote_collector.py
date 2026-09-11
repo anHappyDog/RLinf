@@ -176,6 +176,11 @@ class RemoteBehaviorSubpoolEnv:
         )
         self._consume_response(response)
 
+    def set_policy_global_step(self, global_step: int) -> None:
+        """Associate remote failure artifacts with the active policy version."""
+        response = self._client.call("set_policy_global_step", int(global_step))
+        self._consume_response(response)
+
     def update_reset_state_ids(self) -> None:
         """Match the no-op reset-ID hook exposed by local BEHAVIOR envs."""
 
@@ -284,6 +289,9 @@ class DistributedBehaviorSubpoolEnv:
     def prepare_outcome_group_reset(self, collection_index: int) -> None:
         self._delegate.prepare_outcome_group_reset(collection_index)
 
+    def set_policy_global_step(self, global_step: int) -> None:
+        self._delegate.set_policy_global_step(global_step)
+
     def close(self) -> None:
         self._delegate.close()
 
@@ -305,6 +313,9 @@ class BehaviorCollectorService:
                 result = None
             elif method == "prepare_outcome_group_reset":
                 self.env.prepare_outcome_group_reset(int(payload))
+                result = None
+            elif method == "set_policy_global_step":
+                self.env.set_policy_global_step(int(payload))
                 result = None
             elif method == "reset":
                 result = self.env.reset()

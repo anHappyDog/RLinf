@@ -166,6 +166,22 @@ def test_chunk_logprob_excludes_unexecuted_actions():
     torch.testing.assert_close(inputs["old_logprobs"], torch.tensor([0.0]))
 
 
+def test_action_logprob_masks_unexecuted_actions():
+    inputs = preprocess_loss_inputs(
+        logprobs=torch.ones(1, 4, 2),
+        old_logprobs=torch.zeros(1, 4, 2),
+        advantages=torch.ones(1),
+        logprob_type="action_level",
+        reward_type="subtask_chunk_level",
+        single_action_dim=2,
+        executed_action_mask=torch.tensor([[True, True, False, False]]),
+        loss_mask=torch.ones(1, dtype=torch.bool),
+    )
+
+    torch.testing.assert_close(inputs["logprobs"], torch.full((1, 4), 2.0))
+    assert torch.equal(inputs["loss_mask"], torch.tensor([[True, True, False, False]]))
+
+
 def test_auto_reset_subtask_batch_masks_only_executed_actions():
     executed = torch.tensor(
         [

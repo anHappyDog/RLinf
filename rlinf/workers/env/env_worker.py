@@ -310,6 +310,25 @@ class EnvWorker(Worker):
 
         self._init_env()
 
+    def set_global_step(self, global_step: int) -> None:
+        """Propagate the active policy version to environments that record it."""
+        global_step = int(global_step)
+        if global_step < 0:
+            raise ValueError("global_step must be non-negative.")
+        capture_enabled = bool(
+            OmegaConf.select(
+                self.cfg,
+                "env.train.subpool.failure_state_capture.enabled",
+                default=False,
+            )
+        )
+        if not capture_enabled:
+            return
+        for env in self.env_list:
+            setter = get_env_attr(env, "set_policy_global_step")
+            if callable(setter):
+                setter(global_step)
+
     def update_env_cfg(self):
         if self.enable_train:
             # train env

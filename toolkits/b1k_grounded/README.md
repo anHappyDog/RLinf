@@ -483,3 +483,82 @@ policy serving uses a 512-token prefix budget by default, matching SFT. Demo
 calibration always replays an annotated segment to its end, even if the
 whole-task predicate fires earlier; this is needed to validate post-goal skills
 such as placing a manipulated object back on its support.
+
+## Failure-state capture and recovery eligibility
+
+BEHAVIOR subpool training can persist exact
+`og.sim.dump_state(serialized=False)` states for later DAgger or recovery-data
+collection. Every timeout is retained as an audit artifact. For supported
+skills, the simulator also captures the first stable recovery event before a
+later action can turn a recoverable state into an unrecoverable one. Enable it
+only on the training environment and use an experiment-specific output
+directory:
+
+```yaml
+env:
+  train:
+    subpool:
+      failure_state_capture:
+        enabled: true
+        output_dir: /path/to/experiment/failure_terminal_states
+        run_id: radio-pickup-step20
+        # Set this for standalone checkpoint evaluation. Training supplies it
+        # through the runner automatically.
+        policy_global_step: 20
+        tipped_angle_deg: 45.0
+        stable_steps: 8
+        max_linear_speed: 0.05
+        max_angular_speed: 0.2
+```
+
+The simulator process writes the state locally instead of returning it through
+Ray. Artifacts are grouped as
+`<output_dir>/<hostname>/global_step_XXXXXX/`; each failure has a `.pt` state
+and a `.json` sidecar with its checksum, source snapshot, DAPO collection and
+sampling group, policy global step, reward components, termination reason,
+simulator facts, failure tags, and recovery eligibility. The JSON `state_path`
+is relative to its own directory. Metadata is published only after the state
+file has been atomically installed.
+
+The initial pickup analyzer distinguishes three cases without a VLM:
+
+- `not_needed`: the gripper is empty, but the target remains upright on its
+  original support; the existing pickup policy can retry.
+- `eligible`: the target is tipped by at least `tipped_angle_deg`, remains on
+  its original support, and has stayed below both speed thresholds for
+  `stable_steps` consecutive simulator steps.
+- `ineligible`: the target has left its audited original support, for example
+  a radio that has fallen from the table.
+
+Unsupported skills are marked `unknown`, not admitted optimistically. Extend
+the skill-relative analyzer with task predicates before using those states for
+recovery training. `capture_kind=stable_recovery_event` identifies the early
+eligible capture; `capture_kind=terminal` identifies the exact timeout state.
+
+For SSH-backed cross-datacenter collectors, the same configured path is on the
+collector's filesystem. Sync those host directories back after collection,
+preserving their hostname directory:
+
+```bash
+rsync -avzP remote-host:/path/to/experiment/failure_terminal_states/ \
+  /path/to/experiment/failure_terminal_states/
+```
+
+Captured states are deliberately not inserted into the recovery pool
+automatically. Only simulator-certified `eligible` records should be converted
+to recovery snapshots, followed by a restore smoke test and a short empirical
+recoverability rollout.
+
+To build a catalog containing only certified terminal failures in its recovery
+pool (plus the canonical records required for catalog validation), run:
+
+```bash
+python toolkits/b1k_grounded/build_failure_recovery_catalog.py \
+  --failure-root /path/to/failure_states \
+  --canonical-manifest /path/to/canonical/manifest.jsonl \
+  --output-manifest /new/path/recovery_catalog/manifest.jsonl
+```
+
+Recovery records preserve the canonical target orientation in
+`metadata.recovery_provenance`. This is important: a tipped recovery reset must
+not redefine the tipped pose as the object's new upright reference.

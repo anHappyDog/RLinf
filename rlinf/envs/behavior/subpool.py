@@ -22,8 +22,11 @@ import io
 import json
 import os
 import shutil
+import socket
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -33,6 +36,47 @@ from omegaconf import OmegaConf
 
 SUBPOOL_FORMAT_VERSION = 2
 SUBPOOL_TYPES = ("canonical", "predecessor_success", "recovery")
+FAILURE_STATE_FORMAT_VERSION = 2
+RECOVERY_STATUSES = ("eligible", "ineligible", "not_needed", "unknown")
+
+
+def relative_tilt_angle_deg(
+    reference_quaternion: Sequence[float],
+    current_quaternion: Sequence[float],
+) -> float:
+    """Measure how far an object's original up direction has tilted.
+
+    OmniGibson quaternions use ``(x, y, z, w)`` order. The reference pose
+    determines which object-local direction was vertical at reset, so this
+    remains valid for assets whose local z-axis is not their physical up axis.
+    """
+
+    def rotation_matrix(quaternion: Sequence[float]) -> np.ndarray:
+        value = np.asarray(quaternion, dtype=np.float64)
+        if value.shape != (4,):
+            raise ValueError(
+                f"Expected an xyzw quaternion with shape (4,), got {value.shape}."
+            )
+        norm = np.linalg.norm(value)
+        if not np.isfinite(norm) or norm <= 0:
+            raise ValueError("Quaternion must have a finite, non-zero norm.")
+        x, y, z, w = value / norm
+        return np.asarray(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
+
+    world_up = np.asarray([0.0, 0.0, 1.0])
+    reference_rotation = rotation_matrix(reference_quaternion)
+    current_rotation = rotation_matrix(current_quaternion)
+    reference_local_up = reference_rotation.T @ world_up
+    current_world_up = current_rotation @ reference_local_up
+    cosine = float(np.clip(np.dot(current_world_up, world_up), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
 
 
 def _sha256_file(path: Path) -> str:
@@ -401,6 +445,252 @@ class SubpoolStore:
             fcntl.flock(manifest_file.fileno(), fcntl.LOCK_UN)
 
 
+@dataclass(frozen=True)
+class FailureAnalysis:
+    """Structured, skill-relative interpretation of one failed state."""
+
+    termination_reason: str | None
+    failure_tags: tuple[str, ...]
+    recovery_status: str
+    recovery_reason: str
+    facts: Mapping[str, Any]
+    analyzer: str
+
+    def __post_init__(self) -> None:
+        if self.recovery_status not in RECOVERY_STATUSES:
+            raise ValueError(
+                f"Unsupported recovery_status={self.recovery_status!r}; expected "
+                f"one of {RECOVERY_STATUSES}."
+            )
+        if not self.failure_tags:
+            raise ValueError("failure_tags must not be empty.")
+        if not self.recovery_reason:
+            raise ValueError("recovery_reason must not be empty.")
+        if not self.analyzer:
+            raise ValueError("analyzer must not be empty.")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable analysis record."""
+        return {
+            "termination_reason": self.termination_reason,
+            "failure_tags": list(self.failure_tags),
+            "recovery": {
+                "status": self.recovery_status,
+                "reason": self.recovery_reason,
+            },
+            "facts": dict(self.facts),
+            "analyzer": self.analyzer,
+        }
+
+
+def analyze_subtask_failure(
+    skill: str,
+    facts: Mapping[str, Any],
+    *,
+    termination_reason: str | None,
+) -> FailureAnalysis:
+    """Classify simulator facts relative to the active primitive skill.
+
+    Unknown skills retain their facts for later analyzers instead of being
+    admitted to recovery training without evidence.
+    """
+    normalized_skill = skill.strip().lower()
+    if normalized_skill != "pick up from":
+        return FailureAnalysis(
+            termination_reason=termination_reason,
+            failure_tags=("subtask_incomplete",),
+            recovery_status="unknown",
+            recovery_reason=f"No failure analyzer is registered for {skill!r}.",
+            facts=facts,
+            analyzer="generic-v1",
+        )
+
+    required = ("in_hand", "on_original_support", "tilt_angle_deg")
+    missing = [key for key in required if key not in facts]
+    if missing:
+        raise KeyError(f"Pickup failure facts are missing required keys: {missing}.")
+
+    in_hand = bool(facts["in_hand"])
+    on_support = bool(facts["on_original_support"])
+    tipped = bool(facts.get("tipped", False))
+    common_tags = ["target_in_hand" if in_hand else "gripper_empty"]
+    if on_support:
+        common_tags.append("target_on_original_support")
+    else:
+        common_tags.append("target_off_original_support")
+
+    if in_hand:
+        return FailureAnalysis(
+            termination_reason=termination_reason,
+            failure_tags=tuple(common_tags),
+            recovery_status="unknown",
+            recovery_reason=(
+                "The target is already in hand although pickup did not terminate."
+            ),
+            facts=facts,
+            analyzer="pickup-v1",
+        )
+    if not on_support:
+        return FailureAnalysis(
+            termination_reason=termination_reason,
+            failure_tags=tuple(common_tags),
+            recovery_status="ineligible",
+            recovery_reason="The target has left its audited source support.",
+            facts=facts,
+            analyzer="pickup-v1",
+        )
+    if tipped:
+        return FailureAnalysis(
+            termination_reason=termination_reason,
+            failure_tags=tuple(common_tags + ["target_tipped"]),
+            recovery_status="eligible",
+            recovery_reason=(
+                "The tipped target remains on its audited source support."
+            ),
+            facts=facts,
+            analyzer="pickup-v1",
+        )
+    return FailureAnalysis(
+        termination_reason=termination_reason,
+        failure_tags=tuple(common_tags + ["target_upright"]),
+        recovery_status="not_needed",
+        recovery_reason="The original pickup policy can retry an upright target.",
+        facts=facts,
+        analyzer="pickup-v1",
+    )
+
+
+@dataclass(frozen=True)
+class FailureStateRecord:
+    """Metadata for one failed rollout's restorable terminal state."""
+
+    failure_id: str
+    state_path: str
+    state_sha256: str
+    captured_at_utc: str
+    hostname: str
+    process_id: int
+    run_id: str | None
+    policy_global_step: int | None
+    collection_index: int | None
+    sampling_group: int | None
+    capture_kind: str
+    source_snapshot: Mapping[str, Any]
+    outcome: Mapping[str, Any]
+    analysis: Mapping[str, Any]
+    format_version: int = FAILURE_STATE_FORMAT_VERSION
+
+    def __post_init__(self) -> None:
+        if self.format_version != FAILURE_STATE_FORMAT_VERSION:
+            raise ValueError(
+                f"Unsupported failure-state format_version={self.format_version}; "
+                f"expected {FAILURE_STATE_FORMAT_VERSION}."
+            )
+        if not self.failure_id:
+            raise ValueError("failure_id must not be empty.")
+        if Path(self.state_path).is_absolute() or Path(self.state_path).suffix != ".pt":
+            raise ValueError("state_path must be a relative .pt path.")
+        if len(self.state_sha256) != 64:
+            raise ValueError("state_sha256 must be a hexadecimal SHA-256 digest.")
+        if self.policy_global_step is not None and self.policy_global_step < 0:
+            raise ValueError("policy_global_step must be non-negative.")
+        if not self.source_snapshot.get("snapshot_id"):
+            raise ValueError("source_snapshot.snapshot_id must not be empty.")
+        if bool(self.outcome.get("success", False)):
+            raise ValueError("A failure-state record cannot describe a success.")
+        if self.capture_kind not in ("terminal", "stable_recovery_event"):
+            raise ValueError(f"Unsupported capture_kind={self.capture_kind!r}.")
+        if not self.analysis.get("failure_tags"):
+            raise ValueError("analysis.failure_tags must not be empty.")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable artifact record."""
+        value = asdict(self)
+        value["source_snapshot"] = dict(self.source_snapshot)
+        value["outcome"] = dict(self.outcome)
+        return value
+
+
+class FailureStateStore:
+    """Atomically persist failed rollout terminal states and sidecar metadata."""
+
+    def __init__(
+        self,
+        output_dir: str | os.PathLike[str],
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        self.output_dir = Path(output_dir).expanduser().resolve()
+        self.hostname = socket.gethostname()
+        self.process_id = os.getpid()
+        self.run_id = run_id
+
+    def capture(
+        self,
+        state: Mapping[str, Any],
+        *,
+        policy_global_step: int | None,
+        collection_index: int | None,
+        sampling_group: int | None,
+        capture_kind: str,
+        source_snapshot: Mapping[str, Any],
+        outcome: Mapping[str, Any],
+        analysis: Mapping[str, Any],
+    ) -> Path:
+        """Save one full simulator state and return its metadata path."""
+        state_bytes = _full_state_bytes(state)
+        state_sha256 = hashlib.sha256(state_bytes).hexdigest()
+        failure_id = f"failure-{uuid.uuid4().hex}"
+        step_name = (
+            "global_step_unknown"
+            if policy_global_step is None
+            else f"global_step_{policy_global_step:06d}"
+        )
+        artifact_dir = self.output_dir / self.hostname / step_name
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        state_path = artifact_dir / f"{failure_id}.pt"
+        metadata_path = artifact_dir / f"{failure_id}.json"
+        record = FailureStateRecord(
+            failure_id=failure_id,
+            state_path=state_path.name,
+            state_sha256=state_sha256,
+            captured_at_utc=datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            hostname=self.hostname,
+            process_id=self.process_id,
+            run_id=self.run_id,
+            policy_global_step=policy_global_step,
+            collection_index=collection_index,
+            sampling_group=sampling_group,
+            capture_kind=capture_kind,
+            source_snapshot=dict(source_snapshot),
+            outcome=dict(outcome),
+            analysis=dict(analysis),
+        )
+
+        self._atomic_write(state_path, state_bytes)
+        self._atomic_write(
+            metadata_path,
+            (json.dumps(record.to_dict(), sort_keys=True) + "\n").encode("utf-8"),
+        )
+        return metadata_path
+
+    @staticmethod
+    def _atomic_write(path: Path, contents: bytes) -> None:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(contents)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        try:
+            os.replace(temporary_path, path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+
 def merge_subpool_manifests(
     input_manifests: Sequence[str | os.PathLike[str]],
     output_manifest: str | os.PathLike[str],
@@ -474,6 +764,12 @@ def validate_subpool_env_config(
         errors.append("enable_offload must be false")
     if str(select("renderer_mode", "rlinf")) != "official":
         errors.append("renderer_mode must be official")
+    if bool(select("subpool.failure_state_capture.enabled", False)) and not select(
+        "subpool.failure_state_capture.output_dir", None
+    ):
+        errors.append(
+            "subpool.failure_state_capture.output_dir is required when enabled"
+        )
     if errors:
         raise ValueError(
             "Invalid correctness-first BEHAVIOR subpool config: " + "; ".join(errors)
@@ -546,13 +842,20 @@ def validate_subpool_export_request(
 
 
 __all__ = [
+    "FAILURE_STATE_FORMAT_VERSION",
+    "RECOVERY_STATUSES",
     "SUBPOOL_FORMAT_VERSION",
     "SUBPOOL_TYPES",
+    "FailureAnalysis",
+    "FailureStateRecord",
+    "FailureStateStore",
     "SubpoolCatalog",
     "SubpoolSnapshot",
     "SubpoolStore",
+    "analyze_subtask_failure",
     "full_state_sha256",
     "merge_subpool_manifests",
+    "relative_tilt_angle_deg",
     "validate_round_robin_coverage",
     "validate_subpool_export_request",
     "validate_subpool_env_config",

@@ -27,6 +27,7 @@ from rlinf.algorithms.subtask import (
     reduce_trajectory_group_ids,
     reduce_trajectory_successes,
 )
+from rlinf.algorithms.utils import kl_penalty
 from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import Trajectory, convert_trajectories_to_batch
 from rlinf.data.storage.lerobot import resolve_lerobot_repo_id
@@ -60,9 +61,11 @@ from rlinf.utils.placement import (
 )
 from rlinf.utils.utils import (
     clear_memory,
+    cpu_weight_swap,
     masked_mean,
     preprocess_embodied_batch,
     reshape_entropy,
+    retrieve_model_state_dict_in_cpu,
 )
 
 
@@ -79,6 +82,41 @@ def _select_rollout_trajectories(batch: dict, mask: torch.Tensor) -> dict:
     return selected
 
 
+def _masked_reference_kl(
+    logprobs: torch.Tensor,
+    ref_logprobs: torch.Tensor,
+    *,
+    penalty_type: str,
+    executed_action_mask: torch.Tensor | None,
+    loss_mask: torch.Tensor | None,
+    sample_weights: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return reference-policy KL averaged over executed action coordinates."""
+    if logprobs.shape != ref_logprobs.shape:
+        raise ValueError(
+            "Current and reference log-probabilities must have the same shape; "
+            f"got {tuple(logprobs.shape)} and {tuple(ref_logprobs.shape)}."
+        )
+
+    mask = torch.ones_like(logprobs, dtype=torch.bool)
+    if executed_action_mask is not None:
+        action_mask = executed_action_mask.reshape(logprobs.shape[0], -1, 1)
+        mask &= action_mask.to(torch.bool)
+    if loss_mask is not None:
+        macro_mask = loss_mask.reshape(logprobs.shape[0], -1).any(dim=-1, keepdim=True)
+        mask &= macro_mask.unsqueeze(-1)
+
+    weights = mask.to(logprobs.dtype)
+    if sample_weights is not None:
+        trajectory_weights = sample_weights.reshape(logprobs.shape[0], -1).mean(
+            dim=-1, keepdim=True
+        )
+        weights = weights * trajectory_weights.unsqueeze(-1)
+
+    penalties = kl_penalty(logprobs, ref_logprobs, penalty_type)
+    return (penalties * weights).sum() / weights.sum().clamp_min(1.0)
+
+
 class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -93,6 +131,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.enable_offload = self.cfg.actor.get("enable_offload", False)
         self._opd_teacher_model = None
         self.entropy_op_type = self.cfg.algorithm.get("entropy_op_type", "torch")
+        self.kl_beta = float(self.cfg.algorithm.get("kl_beta", 0.0))
+        self.kl_penalty_type = self.cfg.algorithm.get("kl_penalty_type", "low_var_kl")
+        self.combine_reference_model = bool(
+            self.cfg.actor.get("combine_reference_model", True)
+        )
+        self.ref_policy_state_dict = None
+        self.offload_model_buffer = None
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
@@ -134,9 +179,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.policy_update_epochs = int(policy_epochs or 0)
             self.critic_update_epochs = int(critic_epochs or 0)
             if self.policy_update_epochs < 0 or self.critic_update_epochs < 0:
-                raise ValueError("Policy and critic update epochs must be non-negative.")
+                raise ValueError(
+                    "Policy and critic update epochs must be non-negative."
+                )
             if self.policy_update_epochs + self.critic_update_epochs == 0:
-                raise ValueError("At least one policy or critic update epoch is required.")
+                raise ValueError(
+                    "At least one policy or critic update epoch is required."
+                )
 
         self._sync_weight_comm_options = self.weight_syncer.comm_options
 
@@ -154,6 +203,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if needed, offload model parameters and optimizer states to CPU.
         """
         self.setup_model_and_optimizer()
+
+        if self.kl_beta > 0:
+            if not self.combine_reference_model:
+                raise NotImplementedError(
+                    "Embodied reference KL currently requires "
+                    "actor.combine_reference_model=true."
+                )
+            self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
+            self.offload_model_buffer = {}
+            self.log_info(
+                "Captured the initial actor as the frozen KL reference "
+                f"(beta={self.kl_beta:g}, penalty={self.kl_penalty_type})."
+            )
 
         if self.enable_offload:
             self.offload_param_and_grad()
@@ -613,32 +675,63 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         was_training = self.model.training
         self.model.eval()
-        recomputed = []
+
+        def compute_logprobs() -> torch.Tensor:
+            recomputed = []
+            for micro_batch in split_dict_to_chunk(flat_forward_inputs, num_chunks):
+                micro_batch = put_tensor_device(micro_batch, self.device)
+                with self.amp_context:
+                    output = self.model(
+                        forward_inputs=micro_batch,
+                        compute_logprobs=True,
+                        compute_entropy=False,
+                        compute_values=False,
+                        use_cache=False,
+                    )
+                recomputed.append(output["logprobs"].detach().cpu())
+            return torch.cat(recomputed, dim=0).reshape_as(rollout_logprobs)
+
+        recomputed_logprobs = None
+        ref_logprobs = None
         try:
             with torch.no_grad():
-                for micro_batch in split_dict_to_chunk(flat_forward_inputs, num_chunks):
-                    micro_batch = put_tensor_device(micro_batch, self.device)
-                    with self.amp_context:
-                        output = self.model(
-                            forward_inputs=micro_batch,
-                            compute_logprobs=True,
-                            compute_entropy=False,
-                            compute_values=False,
-                            use_cache=False,
+                recomputed_logprobs = compute_logprobs()
+                if self.kl_beta > 0:
+                    if self.ref_policy_state_dict is None:
+                        raise RuntimeError(
+                            "Reference KL is enabled but the frozen reference "
+                            "policy has not been initialized."
                         )
-                    recomputed.append(output["logprobs"].detach().cpu())
+                    with cpu_weight_swap(
+                        self.model,
+                        self.ref_policy_state_dict,
+                        self.offload_model_buffer,
+                    ):
+                        ref_logprobs = compute_logprobs()
         finally:
             self.model.train(was_training)
 
-        recomputed_logprobs = torch.cat(recomputed, dim=0).reshape_as(rollout_logprobs)
+        assert recomputed_logprobs is not None
         assert recomputed_logprobs.shape == rollout_logprobs.shape
         drift = recomputed_logprobs - rollout_logprobs
         self.rollout_batch["prev_logprobs"] = recomputed_logprobs
-        return {
+        metrics = {
             "actor/rollout_logprob_abs_diff": drift.abs().mean().item(),
             "actor/rollout_logprob_diff": drift.mean().item(),
             "actor/rollout_logprob_abs_diff_max": drift.abs().max().item(),
         }
+        if ref_logprobs is not None:
+            self.rollout_batch["ref_logprobs"] = ref_logprobs
+            reference_drift = recomputed_logprobs - ref_logprobs
+            metrics.update(
+                {
+                    "actor/reference_logprob_abs_diff": (
+                        reference_drift.abs().mean().item()
+                    ),
+                    "actor/reference_logprob_diff": reference_drift.mean().item(),
+                }
+            )
+        return metrics
 
     def _build_sft_data_loader(self):
         if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
@@ -794,18 +887,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             fixed_batch_interval = max(1, update_epochs // 10)
             for update_index in range(update_epochs):
                 collect_epoch_metrics = (
-                    (phase == "critic" and self.use_independent_update_epochs)
-                    or (self.critic_only and update_epochs > 1)
-                )
+                    phase == "critic" and self.use_independent_update_epochs
+                ) or (self.critic_only and update_epochs > 1)
                 epoch_metrics = {} if collect_epoch_metrics else metrics
                 rollout_dataloader_iter = split_dict_to_chunk(
                     self.rollout_batch,
                     rollout_size // batch_size_per_rank,
                 )
                 for train_global_batch in rollout_dataloader_iter:
-                    train_global_batch_size = train_global_batch[
-                        "prev_logprobs"
-                    ].shape[0]
+                    train_global_batch_size = train_global_batch["prev_logprobs"].shape[
+                        0
+                    ]
                     assert (
                         train_global_batch_size
                         == self.cfg.actor.global_batch_size
@@ -991,6 +1083,27 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
 
         loss, metrics_data = policy_loss(**loss_kwargs)
+        kl_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
+        if update_policy and self.kl_beta > 0:
+            ref_logprobs = micro_batch.get("ref_logprobs")
+            if ref_logprobs is None:
+                raise RuntimeError(
+                    "Reference KL is enabled but ref_logprobs are missing from "
+                    "the actor batch."
+                )
+            kl_loss = _masked_reference_kl(
+                output_dict["logprobs"],
+                ref_logprobs,
+                penalty_type=self.kl_penalty_type,
+                executed_action_mask=micro_batch.get("executed_action_mask"),
+                loss_mask=loss_mask,
+                sample_weights=micro_batch.get("sample_weights"),
+            )
+            loss = loss + self.kl_beta * kl_loss
+        if update_policy:
+            metrics_data["actor/kl_loss"] = kl_loss.detach().item()
+            metrics_data["actor/kl_beta"] = self.kl_beta
+
         entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
         if (
             update_policy

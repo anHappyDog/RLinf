@@ -45,6 +45,23 @@ subpool:
     recovery: 0.0
   dynamic_updates: false
   max_dynamic_per_subtask_pool: 32
+  # Optionally retain every timeout's exact serialized=False simulator state
+  # for later DAgger or recovery-data collection. Each simulator writes locally;
+  # cross-datacenter collector directories must be rsynced back after the run.
+  failure_state_capture:
+    enabled: false
+    output_dir: null
+    run_id: null
+    # Standalone evaluation does not receive the runner's training step RPC.
+    # Set this explicitly when collecting from one fixed checkpoint.
+    policy_global_step: null
+    # A pickup target becomes a recovery candidate only after it has tilted
+    # relative to its reset pose and remained nearly stationary for this many
+    # consecutive primitive simulator steps.
+    tipped_angle_deg: 45.0
+    stable_steps: 8
+    max_linear_speed: 0.05
+    max_angular_speed: 0.2
   state_capture_interval: 8
   state_ring_size: 32
   # Boundary-only observation capture explicitly refreshes visual object states

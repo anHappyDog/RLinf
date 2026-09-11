@@ -443,6 +443,42 @@ def test_env_worker_uses_unkeyed_channel_when_sampling_is_disabled():
     channel.put.assert_called_once_with(trajectory, async_op=True)
 
 
+def test_env_worker_propagates_policy_global_step_to_supported_envs():
+    class RecordingEnv:
+        def __init__(self):
+            self.policy_global_step = None
+
+        def set_policy_global_step(self, global_step):
+            self.policy_global_step = global_step
+
+    worker = object.__new__(EnvWorker)
+    recording_env = RecordingEnv()
+    worker.cfg = OmegaConf.create(
+        {"env": {"train": {"subpool": {"failure_state_capture": {"enabled": True}}}}}
+    )
+    worker.env_list = [recording_env, object()]
+
+    worker.set_global_step(34)
+
+    assert recording_env.policy_global_step == 34
+
+    with pytest.raises(ValueError, match="non-negative"):
+        worker.set_global_step(-1)
+
+
+def test_env_worker_skips_policy_step_rpc_when_failure_capture_is_disabled():
+    env = MagicMock()
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {"env": {"train": {"subpool": {"failure_state_capture": {"enabled": False}}}}}
+    )
+    worker.env_list = [env]
+
+    worker.set_global_step(34)
+
+    env.set_policy_global_step.assert_not_called()
+
+
 def _dynamic_sampling_runner(warning_interval=2, groups_per_update=1):
     runner = object.__new__(EmbodiedRunner)
     runner.cfg = OmegaConf.create(

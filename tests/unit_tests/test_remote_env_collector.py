@@ -361,6 +361,25 @@ def test_remote_behavior_matches_noop_reset_state_id_hook():
     assert env.update_reset_state_ids() is None
 
 
+def test_remote_behavior_forwards_policy_global_step():
+    from rlinf.envs.behavior.remote_collector import RemoteBehaviorSubpoolEnv
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, method, payload):
+            self.calls.append((method, payload))
+            return {"result": None, "attributes": {}}
+
+    env = object.__new__(RemoteBehaviorSubpoolEnv)
+    env._client = FakeClient()
+
+    env.set_policy_global_step(34)
+
+    assert env._client.calls == [("set_policy_global_step", 34)]
+
+
 def test_behavior_service_close_releases_environment():
     from rlinf.envs.behavior.remote_collector import BehaviorCollectorService
 

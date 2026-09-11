@@ -399,6 +399,16 @@ def preprocess_loss_inputs(
             ).sum(dim=-1)
         if versions is not None:
             versions = versions.reshape(bsz, -1, single_action_dim)[..., 0]
+        if reward_type == "subtask_chunk_level":
+            if executed_action_mask is None:
+                raise ValueError(
+                    "subtask_chunk_level action loss requires executed_action_mask."
+                )
+            action_mask = executed_action_mask.reshape(bsz, -1).to(torch.bool)
+            if loss_mask is not None:
+                macro_mask = loss_mask.reshape(bsz, -1).any(dim=-1, keepdim=True)
+                action_mask &= macro_mask
+            loss_mask = action_mask
 
     elif update_policy and logprob_type == "chunk_level":
         # logprobs, old_logprobs: [bsz, num_action_chunks, action_dim] -> [bsz]

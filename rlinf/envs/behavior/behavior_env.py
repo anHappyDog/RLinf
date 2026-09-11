@@ -30,10 +30,13 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from rlinf.envs.behavior.instance_loader import ActivityInstanceLoader
 from rlinf.envs.behavior.subpool import (
     SUBPOOL_TYPES,
+    FailureStateStore,
     SubpoolCatalog,
     SubpoolSnapshot,
     SubpoolStore,
+    analyze_subtask_failure,
     full_state_sha256,
+    relative_tilt_angle_deg,
     validate_round_robin_coverage,
     validate_subpool_env_config,
     validate_subpool_rollout_horizons,
@@ -263,7 +266,93 @@ class BehaviorProcess:
         self.active_pool_type = None
         self.current_control = None
         self.current_snapshot_metadata = None
+        self.current_snapshot_record = None
+        self.current_sampling_group = None
+        self.current_collection_index = None
+        configured_policy_step = OmegaConf.select(
+            cfg,
+            "subpool.failure_state_capture.policy_global_step",
+            default=None,
+        )
+        self.policy_global_step = (
+            None if configured_policy_step is None else int(configured_policy_step)
+        )
+        if self.policy_global_step is not None and self.policy_global_step < 0:
+            raise ValueError(
+                "subpool.failure_state_capture.policy_global_step must be non-negative."
+            )
         self.control_serializer = None
+        capture_enabled = bool(
+            OmegaConf.select(
+                cfg,
+                "subpool.failure_state_capture.enabled",
+                default=False,
+            )
+        )
+        self.failure_state_store = None
+        if capture_enabled:
+            output_dir = OmegaConf.select(
+                cfg,
+                "subpool.failure_state_capture.output_dir",
+                default=None,
+            )
+            if not output_dir:
+                raise ValueError(
+                    "subpool.failure_state_capture.output_dir is required when "
+                    "failure-state capture is enabled."
+                )
+            run_id = OmegaConf.select(
+                cfg,
+                "subpool.failure_state_capture.run_id",
+                default=None,
+            )
+            self.failure_state_store = FailureStateStore(
+                output_dir,
+                run_id=str(run_id) if run_id is not None else None,
+            )
+        self.failure_tipped_angle_deg = float(
+            OmegaConf.select(
+                cfg,
+                "subpool.failure_state_capture.tipped_angle_deg",
+                default=45.0,
+            )
+        )
+        self.failure_stable_steps = int(
+            OmegaConf.select(
+                cfg,
+                "subpool.failure_state_capture.stable_steps",
+                default=8,
+            )
+        )
+        self.failure_max_linear_speed = float(
+            OmegaConf.select(
+                cfg,
+                "subpool.failure_state_capture.max_linear_speed",
+                default=0.05,
+            )
+        )
+        self.failure_max_angular_speed = float(
+            OmegaConf.select(
+                cfg,
+                "subpool.failure_state_capture.max_angular_speed",
+                default=0.2,
+            )
+        )
+        if self.failure_tipped_angle_deg <= 0:
+            raise ValueError("failure_state_capture.tipped_angle_deg must be positive.")
+        if self.failure_stable_steps <= 0:
+            raise ValueError("failure_state_capture.stable_steps must be positive.")
+        if self.failure_max_linear_speed < 0:
+            raise ValueError(
+                "failure_state_capture.max_linear_speed must be non-negative."
+            )
+        if self.failure_max_angular_speed < 0:
+            raise ValueError(
+                "failure_state_capture.max_angular_speed must be non-negative."
+            )
+        self.failure_reference_orientation = None
+        self.failure_tip_stable_count = 0
+        self.failure_recovery_event_captured = False
         self.state_capture_interval = int(
             OmegaConf.select(cfg, "subpool.state_capture_interval", default=8)
         )
@@ -583,6 +672,7 @@ class BehaviorProcess:
                     self._apply_direct_navigation_predicate(stage_info)
                     self._attach_arm_specific_distances(stage_info)
                     outcome = self.subtask_reward_tracker.step(stage_info)
+                    self._maybe_capture_stable_recovery_event(stage_info, outcome)
                     info["subpool"] = {
                         "subtask_id": self.active_subtask_index,
                         "pool_type": self.active_pool_type,
@@ -607,6 +697,11 @@ class BehaviorProcess:
                         terminal_state = self._dump_subpool_state()
                         recovery_state = None
                         if outcome.timeout:
+                            self._capture_failure_terminal_state(
+                                terminal_state,
+                                stage_info=stage_info,
+                                outcome=outcome,
+                            )
                             available_max_lag = min(
                                 self.recovery_max_lag_states,
                                 len(self.state_ring) - 1,
@@ -749,11 +844,207 @@ class BehaviorProcess:
                 0.0,
             )
 
+    def _active_stage_objects(self):
+        """Return the simulator objects associated with the active stage."""
+        if self.active_task_reward is None or self.active_subtask_index is None:
+            raise RuntimeError("Subtask stage objects requested before reward priming.")
+        stage_defs = getattr(self.active_task_reward, "_stage_defs", ())
+        if not 0 <= self.active_subtask_index < len(stage_defs):
+            raise IndexError(
+                f"Active reward stage {self.active_subtask_index} is unavailable."
+            )
+        return tuple(stage_defs[self.active_subtask_index].get("objects", ()))
+
+    def _prime_failure_analysis(self) -> None:
+        """Reset episode-local failure state and record the target reference pose."""
+        self.failure_reference_orientation = None
+        self.failure_tip_stable_count = 0
+        self.failure_recovery_event_captured = False
+        if self.failure_state_store is None or self.current_control is None:
+            return
+        if self.current_control.skill.strip().lower() != "pick up from":
+            return
+        objects = self._active_stage_objects()
+        if len(objects) < 2 or objects[1] is None:
+            raise RuntimeError(
+                "Pickup failure analysis requires a target and original support."
+            )
+        recovery_provenance = (self.current_snapshot_metadata or {}).get(
+            "recovery_provenance", {}
+        )
+        reference_orientation = recovery_provenance.get(
+            "reference_orientation_xyzw"
+        )
+        if reference_orientation is None:
+            reference_orientation = (
+                objects[0].get_position_orientation()[1].detach().cpu().tolist()
+            )
+        # Validate catalog-provided recovery provenance before it is used by the
+        # per-step analyzer. This also returns a plain JSON-safe list.
+        relative_tilt_angle_deg(reference_orientation, reference_orientation)
+        self.failure_reference_orientation = [
+            float(value) for value in reference_orientation
+        ]
+
+    def _failure_facts(self, stage_info) -> dict:
+        """Extract JSON-safe simulator facts for the active skill."""
+        facts = {"completed": bool(stage_info.get("completed", False))}
+        if self.current_control is None:
+            raise RuntimeError("Failure analysis started before control priming.")
+        if self.current_control.skill.strip().lower() != "pick up from":
+            return facts
+        if self.failure_reference_orientation is None:
+            raise RuntimeError("Pickup failure analysis has no reference orientation.")
+
+        objects = self._active_stage_objects()
+        if len(objects) < 2 or objects[1] is None:
+            raise RuntimeError(
+                "Pickup failure analysis requires a target and original support."
+            )
+        target, support = objects[:2]
+        position, orientation = target.get_position_orientation()
+        linear_speed = float(
+            torch.linalg.vector_norm(target.get_linear_velocity()).item()
+        )
+        angular_speed = float(
+            torch.linalg.vector_norm(target.get_angular_velocity()).item()
+        )
+        orientation_list = orientation.detach().cpu().tolist()
+        tilt_angle = relative_tilt_angle_deg(
+            self.failure_reference_orientation,
+            orientation_list,
+        )
+        return {
+            "in_hand": bool(stage_info["in_hand"]),
+            "on_original_support": bool(stage_info["on_support"]),
+            "target_name": str(target.name),
+            "support_name": str(support.name),
+            "target_position": position.detach().cpu().tolist(),
+            "target_orientation_xyzw": orientation_list,
+            "reference_orientation_xyzw": list(self.failure_reference_orientation),
+            "tilt_angle_deg": tilt_angle,
+            "tipped": tilt_angle >= self.failure_tipped_angle_deg,
+            "linear_speed": linear_speed,
+            "angular_speed": angular_speed,
+            "stable": (
+                linear_speed <= self.failure_max_linear_speed
+                and angular_speed <= self.failure_max_angular_speed
+            ),
+        }
+
+    def _outcome_metadata(self, outcome, *, failure_reason: str) -> dict:
+        """Build the common reward and termination metadata for a capture."""
+        if self.subtask_reward_tracker is None:
+            raise RuntimeError("Failure capture started before reward priming.")
+        return {
+            "failure_reason": failure_reason,
+            "success": bool(outcome.success),
+            "timeout": bool(outcome.timeout),
+            "elapsed_steps": int(self.subtask_reward_tracker.steps),
+            "potential": float(outcome.potential),
+            "last_progress": float(outcome.progress),
+            "progress_return": float(outcome.cumulative_progress),
+            "step_penalty_return": float(outcome.cumulative_step_penalty),
+            "terminal_return": float(outcome.cumulative_terminal_reward),
+            "return": float(
+                outcome.cumulative_progress
+                + outcome.cumulative_step_penalty
+                + outcome.cumulative_terminal_reward
+            ),
+        }
+
+    def _capture_failure_state(
+        self,
+        state,
+        *,
+        capture_kind: str,
+        stage_info,
+        outcome,
+        failure_reason: str,
+    ) -> None:
+        """Persist one audited state with a skill-relative interpretation."""
+        if self.failure_state_store is None:
+            return
+        if self.current_snapshot_record is None or self.current_control is None:
+            raise RuntimeError("Failure capture started before a subpool reset.")
+        facts = self._failure_facts(stage_info)
+        analysis = analyze_subtask_failure(
+            self.current_control.skill,
+            facts,
+            termination_reason="timeout" if outcome.timeout else None,
+        )
+        metadata_path = self.failure_state_store.capture(
+            state,
+            policy_global_step=self.policy_global_step,
+            collection_index=self.current_collection_index,
+            sampling_group=self.current_sampling_group,
+            capture_kind=capture_kind,
+            source_snapshot=self.current_snapshot_record,
+            outcome=self._outcome_metadata(outcome, failure_reason=failure_reason),
+            analysis=analysis.to_dict(),
+        )
+        self.logger.info(
+            "Saved %s failure state (%s, %s) to %s.",
+            capture_kind,
+            ",".join(analysis.failure_tags),
+            analysis.recovery_status,
+            metadata_path,
+        )
+
+    def _maybe_capture_stable_recovery_event(self, stage_info, outcome) -> None:
+        """Capture the first stable, simulator-certified recovery state."""
+        if (
+            self.failure_state_store is None
+            or self.failure_recovery_event_captured
+            or outcome.success
+            or outcome.timeout
+            or self.current_control is None
+            or self.current_control.skill.strip().lower() != "pick up from"
+        ):
+            return
+        facts = self._failure_facts(stage_info)
+        analysis = analyze_subtask_failure(
+            self.current_control.skill,
+            facts,
+            termination_reason=None,
+        )
+        if analysis.recovery_status == "eligible" and bool(facts["stable"]):
+            self.failure_tip_stable_count += 1
+        else:
+            self.failure_tip_stable_count = 0
+        if self.failure_tip_stable_count < self.failure_stable_steps:
+            return
+        self._capture_failure_state(
+            self._dump_subpool_state(),
+            capture_kind="stable_recovery_event",
+            stage_info=stage_info,
+            outcome=outcome,
+            failure_reason="target_tipped",
+        )
+        self.failure_recovery_event_captured = True
+
     @staticmethod
     def _dump_subpool_state():
         import omnigibson as og
 
         return og.sim.dump_state(serialized=False)
+
+    def _capture_failure_terminal_state(self, state, *, stage_info, outcome) -> None:
+        """Persist the exact timeout state without adding it to a recovery pool."""
+        self._capture_failure_state(
+            state,
+            capture_kind="terminal",
+            stage_info=stage_info,
+            outcome=outcome,
+            failure_reason="timeout",
+        )
+
+    def set_policy_global_step(self, global_step: int) -> None:
+        """Associate later terminal-state artifacts with a policy version."""
+        global_step = int(global_step)
+        if global_step < 0:
+            raise ValueError("global_step must be non-negative.")
+        self.policy_global_step = global_step
 
     def drain_pool_candidates(self):
         """Return terminal/recovery candidates once, then clear them."""
@@ -773,6 +1064,9 @@ class BehaviorProcess:
         reward_spec,
         control_json: str,
         snapshot_metadata,
+        snapshot_record,
+        sampling_group: int,
+        collection_index: int | None,
     ):
         """Reset and restore one audited state in a single-env process."""
         if len(self.env) != 1:
@@ -838,6 +1132,12 @@ class BehaviorProcess:
 
         self.current_control = GroundedControlSpec.from_json(control_json)
         self.current_snapshot_metadata = dict(snapshot_metadata)
+        self.current_snapshot_record = dict(snapshot_record)
+        self.current_sampling_group = int(sampling_group)
+        self.current_collection_index = (
+            None if collection_index is None else int(collection_index)
+        )
+        self._prime_failure_analysis()
         self.state_ring.clear()
         self.state_ring.append(self._dump_subpool_state())
         self.pending_pool_candidates = None
@@ -1108,6 +1408,21 @@ class BehaviorProcessPool:
         shard_results = ray.get(refs)
         return self._merge_shards(shard_results, plan, slice_num_envs, chunk_size)
 
+    def set_policy_global_step(
+        self,
+        global_start: int,
+        num_envs: int,
+        global_step: int,
+    ) -> None:
+        """Set the policy version on subprocesses serving one environment slice."""
+        plan = self._slice_plan(global_start, num_envs)
+        ray.get(
+            [
+                self.env_processes[sp].set_policy_global_step.remote(global_step)
+                for sp, _positions, _local_rows in plan
+            ]
+        )
+
     def load_serialized_state(
         self,
         global_start: int,
@@ -1122,6 +1437,9 @@ class BehaviorProcessPool:
         reward_spec,
         control_json: str,
         snapshot_metadata,
+        snapshot_record,
+        sampling_group: int,
+        collection_index: int | None,
     ):
         """Restore a state through the only safe single-env subpool layout."""
         if self.num_env_subprocess != 1 or self.total_num_envs != 1:
@@ -1141,6 +1459,9 @@ class BehaviorProcessPool:
                 reward_spec=reward_spec,
                 control_json=control_json,
                 snapshot_metadata=snapshot_metadata,
+                snapshot_record=snapshot_record,
+                sampling_group=sampling_group,
+                collection_index=collection_index,
             )
         )
 
@@ -1694,6 +2015,15 @@ class BehaviorSubpoolEnv(BehaviorEnv):
             [SUBPOOL_TYPES.index(self.current_snapshot.pool_type)], dtype=torch.long
         )
 
+    def set_policy_global_step(self, global_step: int) -> None:
+        """Propagate the active policy version to the simulator process."""
+        self._ensure_pool()
+        self.pool.set_policy_global_step(
+            self.pool_offset,
+            self.num_envs,
+            global_step,
+        )
+
     def prepare_outcome_group_reset(self, collection_index: int) -> None:
         """Make the next reset deterministic within an outcome-sampling group.
 
@@ -1763,6 +2093,7 @@ class BehaviorSubpoolEnv(BehaviorEnv):
                     "Dynamic subpool update changed the simulator runtime signature."
                 )
             self.catalog = refreshed_catalog
+        collection_index = self._pending_outcome_collection_index
         snapshot = self._sample_reset_snapshot()
         self.logger.info(
             "Sampled subpool snapshot=%s episode=%s subtask=%d pool=%s.",
@@ -1792,6 +2123,9 @@ class BehaviorSubpoolEnv(BehaviorEnv):
             reward_spec=snapshot.metadata["reward"],
             control_json=snapshot.control_json,
             snapshot_metadata=snapshot.metadata,
+            snapshot_record=snapshot.to_dict(),
+            sampling_group=self._sampling_group,
+            collection_index=collection_index,
         )
         self.current_snapshot = snapshot
         self._pending_outcome_collection_index = None
