@@ -363,6 +363,56 @@ class SubpoolCatalog:
         records = available[pool_name]
         return records[int(rng.integers(len(records)))]
 
+    def shuffled_round_robin_snapshot(
+        self,
+        *,
+        seed: int,
+        update_index: int,
+        logical_group_index: int,
+        subtask_id: int,
+        pool_weights: Mapping[str, float] | None = None,
+    ) -> SubpoolSnapshot:
+        """Assign one snapshot to a logical rollout group without replacement.
+
+        Each update receives a deterministic shuffled traversal of the selected
+        pool. Logical groups beyond the pool size start another independently
+        shuffled cycle. Outcome-quota retries keep the same ``update_index`` and
+        ``logical_group_index``, so they cannot silently switch initial states.
+        """
+        if update_index < 0 or logical_group_index < 0:
+            raise ValueError(
+                "update_index and logical_group_index must be non-negative."
+            )
+        if subtask_id not in self._by_subtask:
+            raise KeyError(f"Unknown subtask_id={subtask_id}.")
+
+        available = self._by_subtask[subtask_id]
+        weights = dict.fromkeys(SUBPOOL_TYPES, 1.0)
+        if pool_weights is not None:
+            unknown = set(pool_weights) - set(SUBPOOL_TYPES)
+            if unknown:
+                raise ValueError(f"Unknown subpool weight keys: {sorted(unknown)}")
+            weights.update(pool_weights)
+        selected_pools = [
+            pool_name for pool_name in available if float(weights[pool_name]) > 0.0
+        ]
+        if len(selected_pools) != 1:
+            raise ValueError(
+                "shuffled_round_robin snapshot scheduling requires exactly one "
+                "positive available pool weight; got "
+                f"{sorted(selected_pools)} for subtask_id={subtask_id}."
+            )
+
+        records = tuple(
+            sorted(available[selected_pools[0]], key=lambda record: record.snapshot_id)
+        )
+        cycle_index, cycle_offset = divmod(logical_group_index, len(records))
+        rng = np.random.default_rng(
+            np.random.SeedSequence([seed, update_index, cycle_index])
+        )
+        permutation = rng.permutation(len(records))
+        return records[int(permutation[cycle_offset])]
+
 
 class SubpoolStore:
     """Append-only writer for states produced by online rollouts."""

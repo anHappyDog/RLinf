@@ -39,6 +39,13 @@ from rlinf.envs.behavior.utils import (
 from toolkits.b1k_grounded.build_failure_recovery_catalog import (
     build_recovery_catalog,
 )
+from toolkits.b1k_grounded.prepare_canonical_pool import (
+    assemble_canonical_pool,
+    collect_snapshot_scores,
+    load_snapshot_scores,
+    write_catalog_partitions,
+    write_stratified_split,
+)
 
 
 def _state(offset=0):
@@ -433,6 +440,157 @@ def test_catalog_samples_initial_states_across_episodes(tmp_path):
     assert sampled_episodes == {10, 20}
 
 
+def test_catalog_shuffled_round_robin_covers_states_and_keeps_retries(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    store = SubpoolStore(manifest)
+    for episode_index in (10, 20, 30, 40):
+        state = _state(episode_index)
+        store.append(
+            _record(
+                state,
+                snapshot_id=f"episode-{episode_index}",
+                episode_index=episode_index,
+            ),
+            state,
+        )
+    catalog = SubpoolCatalog.from_jsonl(manifest)
+
+    first_update = [
+        catalog.shuffled_round_robin_snapshot(
+            seed=123,
+            update_index=7,
+            logical_group_index=group_index,
+            subtask_id=1,
+            pool_weights={"canonical": 1.0, "recovery": 0.0},
+        )
+        for group_index in range(4)
+    ]
+    retry = catalog.shuffled_round_robin_snapshot(
+        seed=123,
+        update_index=7,
+        logical_group_index=2,
+        subtask_id=1,
+        pool_weights={"canonical": 1.0, "recovery": 0.0},
+    )
+
+    assert {record.episode_index for record in first_update} == {10, 20, 30, 40}
+    assert retry.snapshot_id == first_update[2].snapshot_id
+
+
+def test_prepare_canonical_pool_filters_gt_and_writes_matched_split(tmp_path):
+    source_manifest = tmp_path / "source" / "manifest.jsonl"
+    source_store = SubpoolStore(source_manifest)
+    for episode_index in range(8):
+        state = _state(episode_index)
+        control = {"skill": "pick up from", "subgoal": "pick up the radio"}
+        if episode_index == 5:
+            control["subgoal"] = None
+        end_frame = 201 + episode_index
+        if episode_index == 6:
+            end_frame = 1481
+        source_store.append(
+            _record(
+                state,
+                snapshot_id=f"episode-{episode_index}",
+                episode_index=episode_index,
+                control_json=json.dumps(control),
+                metadata={
+                    "instance_id": episode_index,
+                    "gt_validation": {
+                        "success": episode_index != 7,
+                        "start_frame": 200,
+                        "end_frame": end_frame,
+                    },
+                    "reward": {
+                        "max_steps": 3000,
+                        "potential_terms": [{"key": "distance"}],
+                        "step_penalty": -1 / 3000,
+                    },
+                },
+            ),
+            state,
+        )
+
+    assembled_manifest = tmp_path / "assembled" / "manifest.jsonl"
+    records = assemble_canonical_pool(
+        [source_manifest],
+        assembled_manifest,
+        subtask_id=1,
+        horizon=1280,
+    )
+    assert len(records) == 5
+    assert {record.episode_index for record in records} == set(range(5))
+    assert all(record.metadata["reward"]["max_steps"] == 1280 for record in records)
+    assert all(not record.metadata["reward"]["potential_terms"] for record in records)
+
+    scores_path = tmp_path / "scores.json"
+    scores_path.write_text(
+        json.dumps(
+            {
+                "snapshots": {
+                    f"episode-{episode_index}": {
+                        "successes": episode_index * 2,
+                        "attempts": 10,
+                    }
+                    for episode_index in range(5)
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    scores = load_snapshot_scores(scores_path)
+    split_dir = tmp_path / "split"
+    summary = write_stratified_split(
+        assembled_manifest,
+        scores_path,
+        split_dir,
+        split_size=2,
+        seed=9,
+    )
+
+    train = SubpoolCatalog.from_jsonl(split_dir / "train" / "manifest.jsonl")
+    heldout = SubpoolCatalog.from_jsonl(split_dir / "heldout_eval" / "manifest.jsonl")
+    assert len(train.records) == len(heldout.records) == 2
+    assert {record.snapshot_id for record in train.records}.isdisjoint(
+        record.snapshot_id for record in heldout.records
+    )
+    assert summary["train"]["count"] == summary["heldout_eval"]["count"] == 2
+    assert scores["episode-4"].success_rate == pytest.approx(0.8)
+
+    partitions = write_catalog_partitions(
+        assembled_manifest,
+        tmp_path / "partitions",
+        partition_size=2,
+    )
+    assert [len(SubpoolCatalog.from_jsonl(path).records) for path in partitions] == [
+        2,
+        2,
+        1,
+    ]
+    metrics_path = tmp_path / "eval_metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                f"eval/snapshot/episode_{episode_index}/attempts": 10
+                for episode_index in range(5)
+            }
+            | {
+                f"eval/snapshot/episode_{episode_index}/success": episode_index / 10
+                for episode_index in range(5)
+            }
+        ),
+        encoding="utf-8",
+    )
+    baseline_path = tmp_path / "baseline.json"
+    baseline = collect_snapshot_scores(
+        assembled_manifest,
+        [metrics_path],
+        baseline_path,
+        expected_attempts=10,
+    )
+    assert baseline["snapshots"]["episode-4"]["successes"] == 4
+
+
 def test_outcome_group_reset_ignores_desynchronized_auto_reset_rng():
     class FakeCatalog:
         subtask_ids = (1,)
@@ -451,6 +609,11 @@ def test_outcome_group_reset_ignores_desynchronized_auto_reset_rng():
         env._pool_weights = {"canonical": 1.0}
         env._subtask_cursor = 0
         env._pending_outcome_collection_index = None
+        env._pending_outcome_logical_group_index = None
+        env._pending_outcome_update_index = None
+        env._outcome_snapshot_schedule = "random"
+        env._sticky_outcome_snapshot = False
+        env._active_outcome_snapshot = None
         return env
 
     early_env = make_env()
@@ -463,6 +626,41 @@ def test_outcome_group_reset_ignores_desynchronized_auto_reset_rng():
         early_env._sample_reset_snapshot().snapshot_id
         == late_env._sample_reset_snapshot().snapshot_id
     )
+
+
+def test_fixed_snapshot_per_env_is_stable_across_evaluation_resets(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    store = SubpoolStore(manifest)
+    for episode_index in (10, 20):
+        state = _state(episode_index)
+        store.append(
+            _record(
+                state,
+                snapshot_id=f"episode-{episode_index}",
+                episode_index=episode_index,
+            ),
+            state,
+        )
+    env = BehaviorSubpoolEnv.__new__(BehaviorSubpoolEnv)
+    env.catalog = SubpoolCatalog.from_jsonl(manifest)
+    env._sampling_seed = 123
+    env._sampling_group = 1
+    env._rng = np.random.default_rng(124)
+    env._fixed_subtask_id = 1
+    env._pool_weights = {"canonical": 1.0, "recovery": 0.0}
+    env._subtask_cursor = 1
+    env._pending_outcome_collection_index = None
+    env._pending_outcome_logical_group_index = None
+    env._pending_outcome_update_index = None
+    env._outcome_snapshot_schedule = "random"
+    env._sticky_outcome_snapshot = False
+    env._active_outcome_snapshot = None
+    env._fixed_snapshot_per_env = True
+
+    first = env._sample_reset_snapshot()
+    second = env._sample_reset_snapshot()
+
+    assert first.snapshot_id == second.snapshot_id
 
 
 def test_catalog_rejects_mixed_runtime_scenes(tmp_path):
@@ -854,6 +1052,9 @@ def test_behavior_process_is_pinned_to_parent_env_node_and_gpu(monkeypatch):
     monkeypatch.setattr(ray, "get", lambda _refs: ["turning_on_radio"])
     monkeypatch.setattr(BehaviorProcess, "options", fake_options)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    monkeypatch.setenv("RLINF_NODE_RANK", "2")
+    monkeypatch.setenv("RANK", "17")
+    monkeypatch.setenv("OMNIGIBSON_APPDATA_PATH", "/shared/omnigibson-appdata")
     monkeypatch.setenv("OMNIGIBSON_DATASET_PATH", "/datasets/behavior-1k-assets")
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", "/tmp/collector-inductor-cache")
 
@@ -877,6 +1078,9 @@ def test_behavior_process_is_pinned_to_parent_env_node_and_gpu(monkeypatch):
     assert captured["runtime_env"] == {
         "env_vars": {
             "CUDA_VISIBLE_DEVICES": "3",
+            "OMNIGIBSON_APPDATA_PATH": (
+                "/shared/omnigibson-appdata/node_2/rank_17_gpu_3/process_0"
+            ),
             "OMNIGIBSON_DATASET_PATH": "/datasets/behavior-1k-assets",
             "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",

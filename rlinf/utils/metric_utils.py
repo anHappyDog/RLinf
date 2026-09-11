@@ -480,6 +480,44 @@ def compute_evaluate_metrics(eval_metrics_list):
             )
             aggregated_eval_metrics[f"{metric_prefix}/attempts"] = int(mask.sum())
 
+        snapshot_episode_key = f"{prefix}snapshot_episode_index"
+        snapshot_shards = []
+        for eval_metrics in eval_metrics_list:
+            if not all(
+                key in eval_metrics
+                for key in (snapshot_episode_key, success_key, timeout_key)
+            ):
+                continue
+            episode_indices = _normalize_metric_shard(
+                eval_metrics[snapshot_episode_key]
+            )
+            successes = _normalize_metric_shard(eval_metrics[success_key])
+            timeouts = _normalize_metric_shard(eval_metrics[timeout_key])
+            if not (episode_indices.numel() == successes.numel() == timeouts.numel()):
+                raise ValueError(
+                    "Snapshot metric shards must contain one episode index, "
+                    "success, and timeout value per trajectory."
+                )
+            snapshot_shards.append((episode_indices, successes, timeouts))
+        if snapshot_shards:
+            episode_indices = torch.cat([shard[0] for shard in snapshot_shards]).long()
+            snapshot_successes = torch.cat(
+                [shard[1] for shard in snapshot_shards]
+            ).float()
+            snapshot_timeouts = torch.cat(
+                [shard[2] for shard in snapshot_shards]
+            ).float()
+            for episode_index in torch.unique(episode_indices, sorted=True).tolist():
+                mask = episode_indices == episode_index
+                metric_prefix = f"{prefix}snapshot/episode_{episode_index}"
+                aggregated_eval_metrics[f"{metric_prefix}/success"] = (
+                    snapshot_successes[mask].mean().numpy()
+                )
+                aggregated_eval_metrics[f"{metric_prefix}/timeout"] = (
+                    snapshot_timeouts[mask].mean().numpy()
+                )
+                aggregated_eval_metrics[f"{metric_prefix}/attempts"] = int(mask.sum())
+
         subpool_id_key = f"{prefix}subpool_id"
         pool_shards = []
         for eval_metrics in eval_metrics_list:

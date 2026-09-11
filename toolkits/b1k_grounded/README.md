@@ -562,3 +562,75 @@ python toolkits/b1k_grounded/build_failure_recovery_catalog.py \
 Recovery records preserve the canonical target orientation in
 `metadata.recovery_provenance`. This is important: a tipped recovery reset must
 not redefine the tipped pose as the object's new upright reference.
+
+## Canonical train and held-out state pools
+
+Build canonical snapshots with `export_radio_pickup_init_states.sh`. The
+launcher accepts `B1K_SUBPOOL_SIDECAR`, `B1K_SUBPOOL_EPISODES`, and
+`B1K_SUBPOOL_GPUS`, so a larger audited sidecar can be exported over all local
+simulator GPUs. Export more than the final pool size because the official demo
+suffix must reproduce the selected skill predicate before a snapshot is
+eligible.
+
+Merge successful exports into a self-contained terminal-time catalog:
+
+```bash
+python toolkits/b1k_grounded/prepare_canonical_pool.py assemble \
+  --input-manifest /path/to/episodes/*/manifest.jsonl \
+  --output-manifest /new/path/candidates/manifest.jsonl \
+  --subtask-id 1 \
+  --horizon 1280
+```
+
+If the validated catalog is larger than the evaluation budget, select a fixed
+candidate set across the demonstrated suffix-duration range before measuring
+policy success:
+
+```bash
+python toolkits/b1k_grounded/prepare_canonical_pool.py select \
+  --source-manifest /path/to/all_valid/manifest.jsonl \
+  --output-manifest /new/path/candidates40/manifest.jsonl \
+  --count 40 \
+  --seed 20260911
+```
+
+Evaluate every candidate with the same frozen SFT checkpoint and the same
+number of stochastic trajectories. Store counts as
+`{"snapshots": {"<snapshot-id>": {"successes": N, "attempts": M}}}`. Then
+create paired train and held-out catalogs across the empirical success range:
+
+```bash
+python toolkits/b1k_grounded/prepare_canonical_pool.py scores \
+  --source-manifest /path/to/candidates40/manifest.jsonl \
+  --metrics /path/to/batch_*/eval_metrics.json \
+  --output /path/to/sft20k_scores.json \
+  --expected-attempts 20
+```
+
+```bash
+python toolkits/b1k_grounded/prepare_canonical_pool.py split \
+  --source-manifest /path/to/candidates/manifest.jsonl \
+  --scores /path/to/sft20k_scores.json \
+  --output-dir /new/path/success_stratified_split \
+  --split-size 20 \
+  --seed 20260911
+```
+
+For formal multi-state DAPO, set
+`subpool.outcome_snapshot_schedule=shuffled_round_robin` and
+`subpool.sticky_outcome_snapshot=true`. Every logical group is then assigned
+one state from a per-update shuffled traversal. Quota retries and auto-resets
+reuse that exact state. Set `outcome_dynamic_sampling.max_attempts_per_group`
+to a positive limit to fail explicitly with a `no-signal` state instead of
+silently replacing a repeatedly all-positive or all-negative group.
+
+`run_radio_pickup_canonical_baseline.sh` evaluates two self-contained 20-state
+partitions for 20 SFT-20K trials per state, writes exact per-state JSON metrics,
+and invokes the score and split commands above. The resulting train manifest is
+accepted by `run_radio_pickup_canonical20_rl.sh`, which uses action-level PPO
+ratios, a frozen SFT-20K KL reference, FP32 master weights with BF16 compute,
+and one shuffled logical group per canonical state. Its four-A100 actor uses
+`SHARD_GRAD_OP`, no CPU offload, no gradient checkpointing, forward/backward
+prefetch, and micro batch size 100 by default. The latter was the largest
+configuration with practical memory headroom in the matching 80-GiB profile;
+override `B1K_RL_MICRO_BATCH_SIZE` when the actor hardware changes.

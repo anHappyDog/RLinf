@@ -1,0 +1,128 @@
+defaults:
+  - env/behavior_r1pro_subpool@env.eval
+  - model/pi0_5_rlinf@rollout.model
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 3
+  component_placement:
+    rollout:
+      node_group: trainer
+      placement: 0-3
+    env:
+      node_group: trainer,behavior
+      placement: 0-3:0-11,4-11:12-19
+  node_groups:
+    - label: trainer
+      node_ranks: 0
+      env_configs:
+        - node_ranks: 0
+          env_vars:
+            - RLINF_REMOTE_COLLECTOR_TOKEN: B1K_CROSSDC_RADIO_0909_V1
+    - label: behavior
+      node_ranks: 1-2
+      env_configs:
+        - node_ranks: 1-2
+          python_interpreter_path: /mnt/public/daibo/venv/behavior_openpi/bin/python
+          env_vars:
+            - TMPDIR: /mnt/public/daibo/tmp
+            - OMNIGIBSON_DATA_PATH: /mnt/public/daibo/datasets/omni_data
+            - OMNIGIBSON_DATASET_PATH: /mnt/public/daibo/datasets/omni_data/behavior-1k-assets
+            - OMNIGIBSON_KEY_PATH: /mnt/public/daibo/datasets/omni_data/omnigibson.key
+            - OMNIGIBSON_ASSET_PATH: /mnt/public/daibo/datasets/omni_data/omnigibson-robot-assets
+            - OMNIGIBSON_APPDATA_PATH: /mnt/public/daibo/tmp/b1k_canonical20_sft_eval_appdata
+            - OMNI_KIT_ACCEPT_EULA: "YES"
+            - RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO: "0"
+            - RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES: "1"
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: ${oc.env:B1K_SUBPOOL_EVAL_OUTPUT}
+    project_name: rlinf
+    experiment_name: ${oc.env:B1K_SUBPOOL_EVAL_CELL}
+    logger_backends: [tensorboard]
+  eval_metrics_output: ${oc.env:B1K_SUBPOOL_EVAL_METRICS}
+  only_eval: true
+  max_epochs: 1
+  max_steps: 1
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+env:
+  group_name: EnvGroup
+  eval:
+    # Each rank owns one fixed snapshot for all 20 reset epochs.
+    rollout_epoch: 20
+    total_num_envs: 20
+    auto_reset: false
+    ignore_terminations: false
+    seed: 2050
+    max_episode_steps: 1280
+    max_steps_per_rollout_epoch: 1280
+    skip_intermediate_obs_in_chunk: true
+    behavior:
+      init_retry_count: 5
+      init_retry_delay: 5.0
+      init_retry_backoff: 2.0
+    num_env_subprocess: 1
+    renderer_mode: official
+    reward_coef: 1.0
+    subpool:
+      fixed_subtask_id: 1
+      outcome_group_size: 1
+      fixed_snapshot_per_env: true
+      dynamic_updates: false
+      pool_weights:
+        canonical: 1.0
+        predecessor_success: 0.0
+        recovery: 0.0
+    remote_collector:
+      enabled: true
+      auth_token_env: RLINF_REMOTE_COLLECTOR_TOKEN
+      endpoints:
+        - {env_rank: 0, ssh_host: gdb_4090_1, port: 46100, local_port: 47300, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 1, ssh_host: gdb_4090_1, port: 46101, local_port: 47301, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 2, ssh_host: gdb_4090_1, port: 46102, local_port: 47302, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 3, ssh_host: gdb_4090_1, port: 46103, local_port: 47303, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 4, ssh_host: gdb_4090_1, port: 46104, local_port: 47304, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 5, ssh_host: gdb_4090_1, port: 46105, local_port: 47305, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 6, ssh_host: gdb_4090_1, port: 46106, local_port: 47306, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 7, ssh_host: gdb_4090_1, port: 46107, local_port: 47307, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 8, ssh_host: gdb_4090_2, port: 46100, local_port: 47308, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 9, ssh_host: gdb_4090_2, port: 46101, local_port: 47309, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 10, ssh_host: gdb_4090_2, port: 46102, local_port: 47310, env_overrides: {video_cfg: {save_video: false}}}
+        - {env_rank: 11, ssh_host: gdb_4090_2, port: 46103, local_port: 47311, env_overrides: {video_cfg: {save_video: false}}}
+    video_cfg:
+      save_video: false
+      info_on_video: false
+      video_base_dir: ${runner.logger.log_path}/video
+      fps: 15
+
+rollout:
+  group_name: RolloutGroup
+  backend: huggingface
+  seed: 1234
+  enable_offload: true
+  pipeline_stage_num: 1
+  model:
+    model_path: ${oc.env:B1K_SUBPOOL_EVAL_CHECKPOINT}
+    precision: bf16
+    num_steps: 10
+    add_value_head: false
+    openpi_data:
+      norm_stats_path: ${oc.env:B1K_SUBPOOL_NORM_STATS}
+    openpi:
+      task: eval
+      noise_method: flow_sde
+      noise_level: 0.4

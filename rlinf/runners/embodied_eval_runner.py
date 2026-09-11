@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import time
 import typing
+from pathlib import Path
+
+import numpy as np
+import torch
 
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
@@ -57,8 +62,21 @@ class EmbodiedEvalRunner:
         rollout_handle = self.rollout.init_worker()
         env_handle = self.env.init_worker()
 
-        rollout_handle.wait()
-        env_handle.wait()
+        try:
+            rollout_handle.wait()
+            env_handle.wait()
+        except BaseException:
+            # ``run`` is never entered when worker initialization fails, so
+            # its normal finally block cannot release remote collector
+            # ownership or local simulator processes.
+            try:
+                self.env.close_envs().wait()
+            except Exception as cleanup_error:  # noqa: BLE001
+                self.logger.warning(
+                    "Failed to close eval environments after init error: %s",
+                    cleanup_error,
+                )
+            raise
 
     def evaluate(self):
         # Channel direction convention (names follow the receiver, not the sender):
@@ -96,6 +114,24 @@ class EmbodiedEvalRunner:
             eval_metrics = self.evaluate()
             eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
             self.logger.info(eval_metrics)
+            cfg = getattr(self, "cfg", None)
+            metrics_output = (
+                cfg.runner.get("eval_metrics_output", None) if cfg is not None else None
+            )
+            if metrics_output:
+                output_path = Path(metrics_output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            key: _jsonable_metric(value)
+                            for key, value in sorted(eval_metrics.items())
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
             self.metric_logger.log(step=0, data=eval_metrics)
             print_metrics_table(
                 step=0,
@@ -109,3 +145,14 @@ class EmbodiedEvalRunner:
                 self.metric_logger.finish()
             finally:
                 self.env.close_envs().wait()
+
+
+def _jsonable_metric(value):
+    """Convert one scalar or tensor metric to a JSON-compatible value."""
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, np.ndarray):
+        return value.item() if value.ndim == 0 else value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value

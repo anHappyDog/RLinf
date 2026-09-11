@@ -86,6 +86,9 @@ algorithm:
     parallel_groups: true
     min_successes: 1
     min_failures: 1
+    # Zero preserves unbounded legacy behavior. Formal multi-state runs set a
+    # positive bound and report the fixed snapshot as no-signal on exhaustion.
+    max_attempts_per_group: 0
     # Quota filtering keeps sampling indefinitely; warn every four rejected groups.
     attempt_warning_interval: 4
   normalize_advantages: true
@@ -113,8 +116,8 @@ env:
   train:
     rollout_epoch: 1
     total_num_envs: 8
-    subpool:
-      outcome_group_size: 4
+  subpool:
+    outcome_group_size: 4
     # The audited radio pickup suffixes are at most 989 primitive steps. A 1280
     # step cap leaves 29% slack, and its 40 action chunks keep the eight-stream
     # rollout divisible by GBS 64.

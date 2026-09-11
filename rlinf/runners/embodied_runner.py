@@ -331,11 +331,17 @@ class EmbodiedRunner:
             reward_handle.wait()
         return env_handle, rollout_handle, reward_handle, outcome_shards
 
-    def _reset_outcome_sampling_envs(self, sampling_cfg: DictConfig) -> dict[int, dict]:
+    def _reset_outcome_sampling_envs(
+        self,
+        sampling_cfg: DictConfig,
+        logical_group_indices: list[int],
+    ) -> dict[int, dict]:
         """Reset and verify all physical groups before one candidate rollout."""
         collection_index = getattr(self, "_outcome_collection_index", 0)
         metadata_shards = self.env.reset_train_envs_for_outcome_group(
-            collection_index
+            collection_index,
+            logical_group_indices,
+            self.global_step,
         ).wait()
         self._outcome_collection_index = collection_index + 1
         groups_per_update = int(sampling_cfg.get("groups_per_update", 1))
@@ -378,6 +384,7 @@ class EmbodiedRunner:
                 sampling_cfg.get("max_rollout_attempts", 0),
             )
         )
+        max_attempts_per_group = int(sampling_cfg.get("max_attempts_per_group", 0))
         env_handles = []
         rollout_handles = []
         reward_handles = []
@@ -393,7 +400,10 @@ class EmbodiedRunner:
             group_attempt = 0
             while True:
                 group_attempt += 1
-                reset_metadata = self._reset_outcome_sampling_envs(sampling_cfg)[0]
+                reset_metadata = self._reset_outcome_sampling_envs(
+                    sampling_cfg,
+                    [group_index],
+                )[0]
                 handles = self._collect_train_rollout()
                 env_handle, rollout_handle, reward_handle, outcome_shards = handles
                 total_attempts += 1
@@ -445,6 +455,17 @@ class EmbodiedRunner:
                 # result so rejected rollout metrics do not occupy Ray object-store
                 # memory for the rest of the update.
                 env_handle.wait()
+                if (
+                    max_attempts_per_group > 0
+                    and group_attempt >= max_attempts_per_group
+                ):
+                    raise RuntimeError(
+                        "Outcome sampling marked a logical group as no-signal after "
+                        f"{group_attempt} homogeneous attempts: logical_group="
+                        f"{group_index}, snapshot={reset_metadata['snapshot_id']}, "
+                        f"episode={reset_metadata['episode_index']}. The snapshot "
+                        "was not silently replaced."
+                    )
 
         self.actor.finalize_rollout_group_collection(groups_per_update).wait()
         return (
@@ -475,6 +496,7 @@ class EmbodiedRunner:
                 sampling_cfg.get("max_rollout_attempts", 0),
             )
         )
+        max_attempts_per_group = int(sampling_cfg.get("max_attempts_per_group", 0))
         pending_groups = set(range(groups_per_update))
         attempts_by_group = [0] * groups_per_update
         env_handles = []
@@ -490,7 +512,10 @@ class EmbodiedRunner:
         self.actor.begin_rollout_group_collection().wait()
         while pending_groups:
             sampling_rounds += 1
-            reset_metadata = self._reset_outcome_sampling_envs(sampling_cfg)
+            reset_metadata = self._reset_outcome_sampling_envs(
+                sampling_cfg,
+                list(range(groups_per_update)),
+            )
             env_handle, rollout_handle, reward_handle, outcome_shards = (
                 self._collect_train_rollout()
             )
@@ -518,6 +543,7 @@ class EmbodiedRunner:
                 )
 
             accepted_this_round = []
+            no_signal_groups = []
             for group_id in sorted(pending_groups):
                 attempts_by_group[group_id] += 1
                 accepted, successes, failures = outcome_group_is_trainable(
@@ -556,6 +582,25 @@ class EmbodiedRunner:
                     group_attempt,
                     successes,
                     failures,
+                )
+                if (
+                    max_attempts_per_group > 0
+                    and group_attempt >= max_attempts_per_group
+                ):
+                    no_signal_groups.append(group_id)
+
+            if no_signal_groups:
+                env_handle.wait()
+                descriptions = ", ".join(
+                    f"logical_group={group_id} "
+                    f"snapshot={reset_metadata[group_id]['snapshot_id']} "
+                    f"episode={reset_metadata[group_id]['episode_index']}"
+                    for group_id in no_signal_groups
+                )
+                raise RuntimeError(
+                    "Outcome sampling marked groups as no-signal after "
+                    f"{max_attempts_per_group} homogeneous attempts: {descriptions}. "
+                    "Snapshots were not silently replaced."
                 )
 
             if accepted_this_round:
@@ -887,8 +932,19 @@ class EmbodiedRunner:
         self.logger.info(f"Closed profiling window at step {step_idx}")
 
     def run(self):
-        if self.cfg.runner.get("use_training_pipeline", False):
-            return self.run_pipeline()
+        try:
+            if self.cfg.runner.get("use_training_pipeline", False):
+                return self.run_pipeline()
+
+            self._run_synchronous()
+        finally:
+            try:
+                self._finish_run()
+            finally:
+                self.env.close_envs().wait()
+
+    def _run_synchronous(self):
+        """Run the synchronous training loop."""
 
         start_step = self.global_step
         start_time = time.time()
@@ -958,8 +1014,6 @@ class EmbodiedRunner:
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
             )
-
-        self._finish_run()
 
     def run_pipeline(self):
         start_step = self.global_step
@@ -1038,8 +1092,6 @@ class EmbodiedRunner:
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
             )
-
-        self._finish_run()
 
     def _save_checkpoint(self):
         self.logger.info(f"Saving checkpoint at step {self.global_step}.")

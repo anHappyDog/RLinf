@@ -16,6 +16,7 @@ import gc
 import inspect
 import json
 import os
+import re
 import time
 import uuid
 from collections import deque
@@ -70,6 +71,35 @@ _BEHAVIOR_CHILD_ENV_VARS = (
     "TORCHINDUCTOR_CACHE_DIR",
     "TRITON_CACHE_DIR",
 )
+
+
+def _isolated_appdata_path(
+    base_path: str,
+    *,
+    node_id: str,
+    visible_devices: str | None,
+    process_index: int,
+) -> str:
+    """Return an OmniGibson appdata path private to one simulator process.
+
+    OmniGibson explicitly requires its appdata not to be shared by concurrent
+    simulator instances. Ray env workers can run on several nodes whose
+    ``/mnt/public`` is shared, so the configured base path alone is not a safe
+    process boundary.
+    """
+
+    def safe_component(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "unknown"
+
+    node_rank = os.environ.get("RLINF_NODE_RANK", node_id[:12])
+    worker_rank = os.environ.get("RANK", "unknown")
+    device = visible_devices or "none"
+    return os.path.join(
+        base_path,
+        f"node_{safe_component(node_rank)}",
+        f"rank_{safe_component(worker_rank)}_gpu_{safe_component(device)}",
+        f"process_{process_index}",
+    )
 
 
 def _repeat_terminal_subpool_chunk(
@@ -872,9 +902,7 @@ class BehaviorProcess:
         recovery_provenance = (self.current_snapshot_metadata or {}).get(
             "recovery_provenance", {}
         )
-        reference_orientation = recovery_provenance.get(
-            "reference_orientation_xyzw"
-        )
+        reference_orientation = recovery_provenance.get("reference_orientation_xyzw")
         if reference_orientation is None:
             reference_orientation = (
                 objects[0].get_position_orientation()[1].detach().cpu().tolist()
@@ -1291,13 +1319,24 @@ class BehaviorProcessPool:
                 visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
                 if visible_devices:
                     child_env_vars["CUDA_VISIBLE_DEVICES"] = visible_devices
-                self.env_processes = [
-                    BehaviorProcess.options(
+                appdata_base = child_env_vars.get("OMNIGIBSON_APPDATA_PATH")
+                self.env_processes = []
+                for process_index in range(self.num_env_subprocess):
+                    process_env_vars = child_env_vars.copy()
+                    if appdata_base:
+                        process_env_vars["OMNIGIBSON_APPDATA_PATH"] = (
+                            _isolated_appdata_path(
+                                appdata_base,
+                                node_id=node_id,
+                                visible_devices=visible_devices,
+                                process_index=process_index,
+                            )
+                        )
+                    process = BehaviorProcess.options(
                         scheduling_strategy=scheduling_strategy,
-                        runtime_env={"env_vars": child_env_vars},
+                        runtime_env={"env_vars": process_env_vars},
                     ).remote(self.cfg, self.num_env_shard, pipeline_stage_num)
-                    for _ in range(self.num_env_subprocess)
-                ]
+                    self.env_processes.append(process)
 
                 # Wait for all instances to initialize and fetch their activity name
                 activity_names_refs = [
@@ -1989,8 +2028,42 @@ class BehaviorSubpoolEnv(BehaviorEnv):
         self._pool_weights = OmegaConf.to_container(
             OmegaConf.select(cfg, "subpool.pool_weights", default={}), resolve=True
         )
+        self._outcome_snapshot_schedule = str(
+            OmegaConf.select(
+                cfg,
+                "subpool.outcome_snapshot_schedule",
+                default="random",
+            )
+        )
+        if self._outcome_snapshot_schedule not in {
+            "random",
+            "shuffled_round_robin",
+        }:
+            raise ValueError(
+                "subpool.outcome_snapshot_schedule must be 'random' or "
+                "'shuffled_round_robin'."
+            )
+        self._sticky_outcome_snapshot = bool(
+            OmegaConf.select(
+                cfg,
+                "subpool.sticky_outcome_snapshot",
+                default=False,
+            )
+        )
+        self._fixed_snapshot_per_env = bool(
+            OmegaConf.select(
+                cfg,
+                "subpool.fixed_snapshot_per_env",
+                default=False,
+            )
+        )
         self._subtask_cursor = self._sampling_group
         self._pending_outcome_collection_index: int | None = None
+        self._pending_outcome_logical_group_index: int | None = None
+        self._pending_outcome_update_index: int | None = None
+        self._current_outcome_logical_group_index: int | None = None
+        self._current_outcome_update_index: int | None = None
+        self._active_outcome_snapshot: SubpoolSnapshot | None = None
         self.current_snapshot = None
         super().__init__(
             cfg,
@@ -2024,15 +2097,21 @@ class BehaviorSubpoolEnv(BehaviorEnv):
             global_step,
         )
 
-    def prepare_outcome_group_reset(self, collection_index: int) -> None:
+    def prepare_outcome_group_reset(
+        self,
+        collection_index: int,
+        logical_group_index: int | None = None,
+        update_index: int | None = None,
+    ) -> None:
         """Make the next reset deterministic within an outcome-sampling group.
 
         Auto-reset advances each environment's ordinary RNG independently because
         successful and failed trajectories finish at different times.  DAPO quota
         comparisons require a stronger invariant: every member of an outcome group
         must begin each candidate rollout from exactly the same snapshot.  The
-        runner therefore supplies a collection index before the reset; group peers
-        derive the same one-shot RNG from that index and their shared group id.
+        The runner supplies both the physical collection attempt and the logical
+        group identity. A shuffled-round-robin schedule keys the snapshot only by
+        update and logical group, so DAPO retries cannot change the initial state.
         """
         collection_index = int(collection_index)
         if collection_index < 0:
@@ -2040,6 +2119,22 @@ class BehaviorSubpoolEnv(BehaviorEnv):
         if self._pending_outcome_collection_index is not None:
             raise RuntimeError("An outcome-group reset is already pending.")
         self._pending_outcome_collection_index = collection_index
+        self._pending_outcome_logical_group_index = (
+            None if logical_group_index is None else int(logical_group_index)
+        )
+        self._pending_outcome_update_index = (
+            None if update_index is None else int(update_index)
+        )
+        if (
+            self._pending_outcome_logical_group_index is not None
+            and self._pending_outcome_logical_group_index < 0
+        ):
+            raise ValueError("logical_group_index must be non-negative.")
+        if (
+            self._pending_outcome_update_index is not None
+            and self._pending_outcome_update_index < 0
+        ):
+            raise ValueError("update_index must be non-negative.")
 
     @property
     def outcome_group_reset_metadata(self) -> dict[str, int | str]:
@@ -2052,11 +2147,32 @@ class BehaviorSubpoolEnv(BehaviorEnv):
             "episode_index": int(self.current_snapshot.episode_index),
             "subtask_id": int(self.current_snapshot.subtask_id),
             "pool_type": self.current_snapshot.pool_type,
+            "logical_group_index": self._current_outcome_logical_group_index,
+            "update_index": self._current_outcome_update_index,
         }
 
     def _sample_reset_snapshot(self) -> SubpoolSnapshot:
         collection_index = self._pending_outcome_collection_index
         if collection_index is None:
+            if (
+                self._sticky_outcome_snapshot
+                and self._active_outcome_snapshot is not None
+            ):
+                return self._active_outcome_snapshot
+            if self._fixed_snapshot_per_env:
+                sampled_subtask_id = self._fixed_subtask_id
+                if sampled_subtask_id is None:
+                    subtask_ids = self.catalog.subtask_ids
+                    sampled_subtask_id = subtask_ids[
+                        self._sampling_group % len(subtask_ids)
+                    ]
+                return self.catalog.shuffled_round_robin_snapshot(
+                    seed=self._sampling_seed,
+                    update_index=0,
+                    logical_group_index=self._sampling_group,
+                    subtask_id=sampled_subtask_id,
+                    pool_weights=self._pool_weights,
+                )
             rng = self._rng
             sampled_subtask_id = self._fixed_subtask_id
             if sampled_subtask_id is None:
@@ -2066,6 +2182,27 @@ class BehaviorSubpoolEnv(BehaviorEnv):
                 ]
                 self._subtask_cursor += 1
         else:
+            logical_group_index = self._pending_outcome_logical_group_index
+            update_index = self._pending_outcome_update_index
+            if self._outcome_snapshot_schedule == "shuffled_round_robin":
+                if logical_group_index is None or update_index is None:
+                    raise RuntimeError(
+                        "shuffled_round_robin outcome resets require logical_group_index "
+                        "and update_index."
+                    )
+                sampled_subtask_id = self._fixed_subtask_id
+                if sampled_subtask_id is None:
+                    subtask_ids = self.catalog.subtask_ids
+                    sampled_subtask_id = subtask_ids[
+                        logical_group_index % len(subtask_ids)
+                    ]
+                return self.catalog.shuffled_round_robin_snapshot(
+                    seed=self._sampling_seed,
+                    update_index=update_index,
+                    logical_group_index=logical_group_index,
+                    subtask_id=sampled_subtask_id,
+                    pool_weights=self._pool_weights,
+                )
             rng = np.random.default_rng(
                 np.random.SeedSequence(
                     [self._sampling_seed, self._sampling_group, collection_index]
@@ -2128,7 +2265,15 @@ class BehaviorSubpoolEnv(BehaviorEnv):
             collection_index=collection_index,
         )
         self.current_snapshot = snapshot
+        if collection_index is not None and self._sticky_outcome_snapshot:
+            self._active_outcome_snapshot = snapshot
+        self._current_outcome_logical_group_index = (
+            self._pending_outcome_logical_group_index
+        )
+        self._current_outcome_update_index = self._pending_outcome_update_index
         self._pending_outcome_collection_index = None
+        self._pending_outcome_logical_group_index = None
+        self._pending_outcome_update_index = None
         return raw_obs, infos
 
     def chunk_step(self, chunk_actions):

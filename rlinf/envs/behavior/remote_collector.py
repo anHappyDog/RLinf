@@ -170,9 +170,19 @@ class RemoteBehaviorSubpoolEnv:
         """Remote results are materialized as CPU tensors in the EnvWorker."""
         return "cpu"
 
-    def prepare_outcome_group_reset(self, collection_index: int) -> None:
+    def prepare_outcome_group_reset(
+        self,
+        collection_index: int,
+        logical_group_index: int | None = None,
+        update_index: int | None = None,
+    ) -> None:
         response = self._client.call(
-            "prepare_outcome_group_reset", int(collection_index)
+            "prepare_outcome_group_reset",
+            {
+                "collection_index": int(collection_index),
+                "logical_group_index": logical_group_index,
+                "update_index": update_index,
+            },
         )
         self._consume_response(response)
 
@@ -286,8 +296,17 @@ class DistributedBehaviorSubpoolEnv:
     def chunk_step(self, chunk_actions):
         return self._delegate.chunk_step(chunk_actions)
 
-    def prepare_outcome_group_reset(self, collection_index: int) -> None:
-        self._delegate.prepare_outcome_group_reset(collection_index)
+    def prepare_outcome_group_reset(
+        self,
+        collection_index: int,
+        logical_group_index: int | None = None,
+        update_index: int | None = None,
+    ) -> None:
+        self._delegate.prepare_outcome_group_reset(
+            collection_index,
+            logical_group_index,
+            update_index,
+        )
 
     def set_policy_global_step(self, global_step: int) -> None:
         self._delegate.set_policy_global_step(global_step)
@@ -312,7 +331,15 @@ class BehaviorCollectorService:
                 self.env.is_start = bool(payload)
                 result = None
             elif method == "prepare_outcome_group_reset":
-                self.env.prepare_outcome_group_reset(int(payload))
+                if not isinstance(payload, dict):
+                    raise TypeError(
+                        "prepare_outcome_group_reset payload must be a dictionary."
+                    )
+                self.env.prepare_outcome_group_reset(
+                    int(payload["collection_index"]),
+                    payload.get("logical_group_index"),
+                    payload.get("update_index"),
+                )
                 result = None
             elif method == "set_policy_global_step":
                 self.env.set_policy_global_step(int(payload))

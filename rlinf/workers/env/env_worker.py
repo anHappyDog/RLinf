@@ -1154,7 +1154,10 @@ class EnvWorker(Worker):
         ]
 
     def reset_train_envs_for_outcome_group(
-        self, collection_index: int
+        self,
+        collection_index: int,
+        logical_group_indices: list[int] | None = None,
+        update_index: int | None = None,
     ) -> list[dict[str, Any]]:
         """Synchronously reset each train env for a DAPO candidate rollout."""
         if self._prefetched_train_bootstrap is not None:
@@ -1175,7 +1178,26 @@ class EnvWorker(Worker):
                     "Outcome dynamic sampling requires an environment with "
                     "prepare_outcome_group_reset()."
                 )
-            prepare_reset(collection_index)
+            group_ids = self._outcome_group_ids(stage_id)
+            if group_ids is None or group_ids.numel() != 1:
+                raise RuntimeError(
+                    "Synchronized outcome reset requires exactly one environment "
+                    "per BEHAVIOR EnvWorker stage."
+                )
+            outcome_group_id = int(group_ids.item())
+            logical_group_index = None
+            if logical_group_indices is not None:
+                if outcome_group_id >= len(logical_group_indices):
+                    raise ValueError(
+                        "Missing logical group assignment for physical outcome "
+                        f"group {outcome_group_id}."
+                    )
+                logical_group_index = int(logical_group_indices[outcome_group_id])
+            prepare_reset(
+                collection_index,
+                logical_group_index,
+                update_index,
+            )
             env.is_start = True
             extracted_obs, infos = env.reset()
             dones = torch.zeros(
@@ -1199,12 +1221,6 @@ class EnvWorker(Worker):
                 )
             )
 
-            group_ids = self._outcome_group_ids(stage_id)
-            if group_ids is None or group_ids.numel() != 1:
-                raise RuntimeError(
-                    "Synchronized outcome reset requires exactly one environment "
-                    "per BEHAVIOR EnvWorker stage."
-                )
             metadata = get_env_attr(env, "outcome_group_reset_metadata")
             if not isinstance(metadata, dict):
                 raise TypeError(
@@ -1216,7 +1232,7 @@ class EnvWorker(Worker):
                     **metadata,
                     "worker_rank": self._rank,
                     "stage_id": stage_id,
-                    "outcome_group_id": int(group_ids.item()),
+                    "outcome_group_id": outcome_group_id,
                 }
             )
 
@@ -1666,6 +1682,18 @@ class EnvWorker(Worker):
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )
+
+                    reset_metadata = get_env_attr(
+                        self.eval_env_list[stage_id],
+                        "outcome_group_reset_metadata",
+                    )
+                    if env_info and isinstance(reset_metadata, dict):
+                        trajectory_count = next(iter(env_info.values())).numel()
+                        env_info["snapshot_episode_index"] = torch.full(
+                            (trajectory_count,),
+                            int(reset_metadata["episode_index"]),
+                            dtype=torch.long,
+                        )
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)

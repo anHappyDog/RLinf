@@ -49,6 +49,55 @@ from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import _seed_rollout_sampling
 
 
+class _ImmediateHandle:
+    def __init__(self):
+        self.wait_count = 0
+
+    def wait(self):
+        self.wait_count += 1
+
+
+@pytest.mark.parametrize("use_training_pipeline", [False, True])
+def test_embodied_runner_closes_environments_after_training(use_training_pipeline):
+    runner = object.__new__(EmbodiedRunner)
+    runner.cfg = OmegaConf.create(
+        {"runner": {"use_training_pipeline": use_training_pipeline}}
+    )
+    runner._finish_run = MagicMock()
+    runner._run_synchronous = MagicMock()
+    runner.run_pipeline = MagicMock()
+    close_handle = _ImmediateHandle()
+    runner.env = MagicMock()
+    runner.env.close_envs.return_value = close_handle
+
+    runner.run()
+
+    selected_loop = (
+        runner.run_pipeline if use_training_pipeline else runner._run_synchronous
+    )
+    selected_loop.assert_called_once_with()
+    runner._finish_run.assert_called_once_with()
+    runner.env.close_envs.assert_called_once_with()
+    assert close_handle.wait_count == 1
+
+
+def test_embodied_runner_closes_environments_after_training_failure():
+    runner = object.__new__(EmbodiedRunner)
+    runner.cfg = OmegaConf.create({"runner": {"use_training_pipeline": False}})
+    runner._finish_run = MagicMock()
+    runner._run_synchronous = MagicMock(side_effect=RuntimeError("training failed"))
+    close_handle = _ImmediateHandle()
+    runner.env = MagicMock()
+    runner.env.close_envs.return_value = close_handle
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        runner.run()
+
+    runner._finish_run.assert_called_once_with()
+    runner.env.close_envs.assert_called_once_with()
+    assert close_handle.wait_count == 1
+
+
 def _dynamic_sampling_config():
     return OmegaConf.create(
         {
@@ -373,9 +422,15 @@ def test_env_worker_forces_synchronized_reset_into_next_bootstrap():
 
         def __init__(self):
             self.prepared_index = None
+            self.prepared_logical_group = None
+            self.prepared_update = None
 
-        def prepare_outcome_group_reset(self, collection_index):
+        def prepare_outcome_group_reset(
+            self, collection_index, logical_group_index, update_index
+        ):
             self.prepared_index = collection_index
+            self.prepared_logical_group = logical_group_index
+            self.prepared_update = update_index
 
         @property
         def outcome_group_reset_metadata(self):
@@ -404,9 +459,11 @@ def test_env_worker_forces_synchronized_reset_into_next_bootstrap():
     worker._prefetched_train_bootstrap = None
     worker._forced_train_bootstrap = None
 
-    metadata = worker.reset_train_envs_for_outcome_group(7)
+    metadata = worker.reset_train_envs_for_outcome_group(7, [3], 11)
 
     assert worker.env_list[0].prepared_index == 7
+    assert worker.env_list[0].prepared_logical_group == 3
+    assert worker.env_list[0].prepared_update == 11
     assert metadata[0]["snapshot_id"] == "canonical-episode-50"
     assert metadata[0]["outcome_group_id"] == 0
     assert worker._forced_train_bootstrap[0].obs["states"].eq(1).all()
@@ -513,6 +570,7 @@ def _dynamic_sampling_runner(warning_interval=2, groups_per_update=1):
     ]
     runner.env.reset_train_envs_for_outcome_group.return_value = reset_handle
     runner._outcome_collection_index = 0
+    runner.global_step = 9
     return runner
 
 
@@ -565,6 +623,10 @@ def test_runner_resamples_until_outcome_group_is_mixed():
     expected_metrics.update(_expected_snapshot_metrics(2, 2, 6, 1))
     assert metrics == expected_metrics
     assert runner.env.reset_train_envs_for_outcome_group.call_count == 2
+    assert runner.env.reset_train_envs_for_outcome_group.call_args_list == [
+        ((0, [0], 9),),
+        ((1, [0], 9),),
+    ]
 
 
 def test_runner_keeps_single_rollout_behavior_when_sampling_is_disabled():
@@ -635,6 +697,11 @@ def test_runner_collects_each_update_group_independently():
     }
     expected_metrics.update(_expected_snapshot_metrics(3, 7, 5, 2))
     assert metrics == expected_metrics
+    assert runner.env.reset_train_envs_for_outcome_group.call_args_list == [
+        ((0, [0], 9),),
+        ((1, [0], 9),),
+        ((2, [1], 9),),
+    ]
 
 
 def test_runner_continues_sampling_after_warning_interval():

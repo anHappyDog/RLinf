@@ -97,6 +97,7 @@ def _validate_outcome_dynamic_sampling(
         )
     )
     groups_per_update = int(sampling_cfg.get("groups_per_update", 1))
+    max_attempts_per_group = int(sampling_cfg.get("max_attempts_per_group", 0))
     parallel_groups = bool(sampling_cfg.get("parallel_groups", False))
     assert cfg.env.train.rollout_epoch == 1, (
         "Outcome dynamic sampling requires env.train.rollout_epoch=1."
@@ -137,6 +138,20 @@ def _validate_outcome_dynamic_sampling(
     assert groups_per_update > 0, (
         "Outcome dynamic sampling requires a positive groups_per_update."
     )
+    assert max_attempts_per_group >= 0, (
+        "Outcome dynamic sampling max_attempts_per_group must be non-negative."
+    )
+    snapshot_schedule = cfg.env.train.subpool.get("outcome_snapshot_schedule", "random")
+    assert snapshot_schedule in {"random", "shuffled_round_robin"}, (
+        "env.train.subpool.outcome_snapshot_schedule must be random or "
+        "shuffled_round_robin."
+    )
+    if snapshot_schedule == "shuffled_round_robin":
+        assert cfg.env.train.subpool.get("sticky_outcome_snapshot", False), (
+            "shuffled_round_robin outcome sampling requires "
+            "env.train.subpool.sticky_outcome_snapshot=true so auto-reset cannot "
+            "switch snapshots inside a logical group."
+        )
     rollout_seed = cfg.rollout.get("seed", None)
     assert type(rollout_seed) is int and rollout_seed >= 0, (
         "Outcome dynamic sampling requires rollout.seed so same-state rollout "

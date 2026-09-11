@@ -18,6 +18,7 @@ import math
 import pytest
 import torch
 
+from rlinf.runners.embodied_eval_runner import _jsonable_metric
 from rlinf.utils.metric_utils import (
     compute_evaluate_metrics,
     compute_gradient_clipping_metrics,
@@ -56,6 +57,11 @@ def test_compute_gradient_clipping_metrics_preserves_nonfinite_norm():
     assert math.isinf(metrics["grad_norm_before_clip"])
     assert math.isnan(metrics["grad_norm_after_clip"])
     assert math.isnan(metrics["grad_clip_coef"])
+
+
+def test_eval_metric_json_conversion_preserves_scalars_and_vectors():
+    assert _jsonable_metric(torch.tensor(3)) == 3
+    assert _jsonable_metric(torch.tensor([0.25, 0.75])) == [0.25, 0.75]
 
 
 def test_compute_evaluate_metrics_reports_interact_delay_wait_time_stats():
@@ -111,12 +117,14 @@ def test_compute_evaluate_metrics_reports_per_subtask_outcomes():
             {
                 "env/subtask_id": torch.tensor([0, 1]),
                 "env/subpool_id": torch.tensor([0, 1]),
+                "env/snapshot_episode_index": torch.tensor([50, 100]),
                 "env/success": torch.tensor([1.0, 0.0]),
                 "env/subtask_timeout": torch.tensor([0.0, 1.0]),
             },
             {
                 "env/subtask_id": torch.tensor([0, 1]),
                 "env/subpool_id": torch.tensor([2, 1]),
+                "env/snapshot_episode_index": torch.tensor([50, 100]),
                 "env/success": torch.tensor([0.0, 1.0]),
                 "env/subtask_timeout": torch.tensor([1.0, 0.0]),
             },
@@ -132,6 +140,9 @@ def test_compute_evaluate_metrics_reports_per_subtask_outcomes():
     assert float(metrics["env/subtask/0/pool/0/success"]) == pytest.approx(1.0)
     assert float(metrics["env/subtask/0/pool/2/timeout"]) == pytest.approx(1.0)
     assert metrics["env/subtask/1/pool/1/attempts"] == 2
+    assert float(metrics["env/snapshot/episode_50/success"]) == pytest.approx(0.5)
+    assert float(metrics["env/snapshot/episode_100/timeout"]) == pytest.approx(0.5)
+    assert metrics["env/snapshot/episode_50/attempts"] == 2
 
 
 def test_compute_evaluate_metrics_rejects_misaligned_subtask_metrics():

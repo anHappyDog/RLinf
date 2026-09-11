@@ -2,11 +2,11 @@
 
 set -euo pipefail
 
-VENV=/mnt/public/daibo/venv/behavior_openpi
-RLINF_ROOT=/mnt/public/daibo/timeline/0831/RLinf
-DATASET_ROOT=/mnt/public/daibo/datasets/behavior-1k/2025-challenge-demos
-SIDECAR=/mnt/public/daibo/results/b1k_grounded_control_v01/oracle_1000ep_radio_microwave_lunchbox_dense_stride8_boundarysafe_v2/data/part-00000.parquet
-TOKEN_MAPPING=/mnt/public/daibo/results/b1k_grounded_control_v01/eval/p2_step8000_radio_dense_comet_native_v1/structural_token_mapping.json
+VENV=${B1K_SUBPOOL_VENV:-/mnt/public/daibo/venv/behavior_openpi}
+RLINF_ROOT=${B1K_SUBPOOL_RLINF_ROOT:-/mnt/public/daibo/timeline/0831/RLinf}
+DATASET_ROOT=${B1K_SUBPOOL_DATASET_ROOT:-/mnt/public/daibo/datasets/behavior-1k/2025-challenge-demos}
+SIDECAR=${B1K_SUBPOOL_SIDECAR:-/mnt/public/daibo/results/b1k_grounded_control_v01/oracle_1000ep_radio_microwave_lunchbox_dense_stride8_boundarysafe_v2/data/part-00000.parquet}
+TOKEN_MAPPING=${B1K_SUBPOOL_TOKEN_MAPPING:-/mnt/public/daibo/results/b1k_grounded_control_v01/eval/p2_step8000_radio_dense_comet_native_v1/structural_token_mapping.json}
 REWARD_SPECS="$RLINF_ROOT/toolkits/b1k_grounded/radio_subpool_reward_specs.json"
 OUTPUT_ROOT=${B1K_SUBPOOL_OUTPUT_ROOT:-/mnt/public/daibo/results/b1k_grounded_control_v01/subpool/radio_pickup_init_10ep_v1}
 if [[ -n ${B1K_SUBPOOL_EPISODES:-} ]]; then
@@ -16,6 +16,15 @@ else
 fi
 if ((${#EPISODES[@]} == 0)); then
     echo "B1K_SUBPOOL_EPISODES did not contain any episode IDs." >&2
+    exit 2
+fi
+if [[ -n ${B1K_SUBPOOL_GPUS:-} ]]; then
+    read -r -a GPUS <<<"$B1K_SUBPOOL_GPUS"
+else
+    GPUS=(0 1 2 3)
+fi
+if ((${#GPUS[@]} == 0)); then
+    echo "B1K_SUBPOOL_GPUS did not contain any GPU IDs." >&2
     exit 2
 fi
 
@@ -29,13 +38,16 @@ export OMNIGIBSON_ASSET_PATH=/mnt/public/daibo/datasets/omni_data/omnigibson-rob
 export OMNI_KIT_ACCEPT_EULA=YES
 
 mkdir -p "$OUTPUT_ROOT/supervisor"
+worker_host=$(hostname -s)
+worker_host=${worker_host//[^a-zA-Z0-9_.-]/_}
 
 export_episode() {
     local gpu=$1
     local episode=$2
     local output_dir="$OUTPUT_ROOT/episodes/ep${episode}"
     local manifest="$output_dir/manifest.jsonl"
-    local appdata="$TMPDIR/b1k_radio_pickup_pool_g${gpu}_appdata"
+    local appdata="$TMPDIR/b1k_radio_pickup_pool_${worker_host}_g${gpu}_appdata"
+    local compile_cache="$TMPDIR/b1k_radio_pickup_pool_${worker_host}_g${gpu}_compile"
 
     if [[ -s $manifest ]]; then
         echo "Skipping existing manifest for episode $episode"
@@ -45,8 +57,12 @@ export_episode() {
         "$output_dir" \
         "$appdata/local" \
         "$appdata/global/cache" \
-        "$appdata/global/data"
+        "$appdata/global/data" \
+        "$compile_cache/torchinductor" \
+        "$compile_cache/triton"
     export CUDA_VISIBLE_DEVICES="$gpu"
+    export TORCHINDUCTOR_CACHE_DIR="$compile_cache/torchinductor"
+    export TRITON_CACHE_DIR="$compile_cache/triton"
     cd "$RLINF_ROOT"
     python toolkits/b1k_grounded/eval_grounded_subtasks.py \
         policy=websocket \
@@ -77,10 +93,11 @@ export_episode() {
 }
 
 lane_pids=()
-for gpu in 0 1 2 3; do
+for lane in "${!GPUS[@]}"; do
+    gpu=${GPUS[$lane]}
     (
         failed=0
-        for ((index = gpu; index < ${#EPISODES[@]}; index += 4)); do
+        for ((index = lane; index < ${#EPISODES[@]}; index += ${#GPUS[@]})); do
             episode=${EPISODES[$index]}
             log="$OUTPUT_ROOT/supervisor/ep${episode}.log"
             if ! export_episode "$gpu" "$episode" >"$log" 2>&1; then

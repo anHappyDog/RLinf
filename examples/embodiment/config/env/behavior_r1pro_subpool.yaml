@@ -36,6 +36,14 @@ subpool:
   # Set this to the dynamic-sampling group size so every group starts from the
   # same snapshot while independent rollout ranks sample different actions.
   outcome_group_size: 1
+  # Formal multi-state DAPO overrides these together. One shuffled permutation
+  # covers each canonical snapshot once per update; retries and auto-resets keep
+  # the same logical group's snapshot.
+  outcome_snapshot_schedule: random
+  sticky_outcome_snapshot: false
+  # Evaluation can assign one catalog snapshot to each environment rank and
+  # keep it across rollout epochs, enabling exact per-state baseline counts.
+  fixed_snapshot_per_env: false
   # Rank-offset round robin makes every group of skill_count env workers cover
   # every skill exactly once, independent of pool size and success rate.
   subtask_sampling: round_robin

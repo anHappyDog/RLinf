@@ -380,6 +380,34 @@ def test_remote_behavior_forwards_policy_global_step():
     assert env._client.calls == [("set_policy_global_step", 34)]
 
 
+def test_remote_behavior_forwards_logical_outcome_group_reset():
+    from rlinf.envs.behavior.remote_collector import RemoteBehaviorSubpoolEnv
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, method, payload):
+            self.calls.append((method, payload))
+            return {"result": None, "attributes": {}}
+
+    env = object.__new__(RemoteBehaviorSubpoolEnv)
+    env._client = FakeClient()
+
+    env.prepare_outcome_group_reset(12, 7, 34)
+
+    assert env._client.calls == [
+        (
+            "prepare_outcome_group_reset",
+            {
+                "collection_index": 12,
+                "logical_group_index": 7,
+                "update_index": 34,
+            },
+        )
+    ]
+
+
 def test_behavior_service_close_releases_environment():
     from rlinf.envs.behavior.remote_collector import BehaviorCollectorService
 
@@ -465,6 +493,38 @@ def test_eval_runner_closes_environments_after_success(monkeypatch):
 
     assert env.close_count == 1
     assert env.handle.wait_count == 1
+
+
+def test_eval_runner_closes_environments_after_init_failure():
+    from rlinf.runners.embodied_eval_runner import EmbodiedEvalRunner
+
+    class FakeHandle:
+        def __init__(self, error=None):
+            self.error = error
+            self.wait_count = 0
+
+        def wait(self):
+            self.wait_count += 1
+            if self.error is not None:
+                raise self.error
+
+    close_handle = FakeHandle()
+    rollout_handle = FakeHandle()
+    env_handle = FakeHandle(RuntimeError("env init failed"))
+    runner = object.__new__(EmbodiedEvalRunner)
+    runner.rollout = SimpleNamespace(init_worker=lambda: rollout_handle)
+    runner.env = SimpleNamespace(
+        init_worker=lambda: env_handle,
+        close_envs=lambda: close_handle,
+    )
+    runner.logger = SimpleNamespace(warning=lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="env init failed"):
+        runner.init_workers()
+
+    assert rollout_handle.wait_count == 1
+    assert env_handle.wait_count == 1
+    assert close_handle.wait_count == 1
 
 
 def test_eval_runner_closes_environments_after_failure():
