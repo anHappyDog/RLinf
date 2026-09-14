@@ -544,6 +544,20 @@ rsync -avzP remote-host:/path/to/experiment/failure_terminal_states/ \
   /path/to/experiment/failure_terminal_states/
 ```
 
+When a collector needs a patched BEHAVIOR-1K checkout, pass its OmniGibson
+source explicitly. This prevents the daemon from silently importing an older
+copy from the virtual environment:
+
+```bash
+python toolkits/b1k_grounded/manage_remote_collectors.py start \
+  --gpus 0,1,2,3 --ports 46100,46101,46102,46103 \
+  --python /opt/venv/openpi/bin/python3 \
+  --repo /mnt/public/daibo/timeline/0914/RLinf-vector-env \
+  --omnigibson-path \
+    /mnt/public/daibo/timeline/0914/BEHAVIOR-1K-vector-env/OmniGibson \
+  --log-dir /mnt/public/daibo/results/b1k_collectors/vector4
+```
+
 Captured states are deliberately not inserted into the recovery pool
 automatically. Only simulator-certified `eligible` records should be converted
 to recovery snapshots, followed by a restore smoke test and a short empirical
@@ -653,6 +667,77 @@ env:
 measures reset and primitive-step throughput while also recording simulator
 state, reward, termination, and camera hashes for correctness comparison. The
 cache changes neither rendering nor observation pixels.
+
+### One simulator process with multiple vector scenes
+
+BEHAVIOR 3.7.2 places all `VectorEnvironment` scenes in one PhysX stage. The
+`env_indices` argument limits Python-side controllers, callbacks, rewards, and
+observations, but a simulator step still advances the physics of every scene.
+Subpool vectorization therefore uses a synchronized lifecycle:
+
+- one `BehaviorProcess` and one `VectorEnvironment` per EnvWorker / GPU;
+- all vector slots reset and restore together at a collection boundary;
+- a completed slot is frozen logically and never resumed before the next full
+  restore;
+- terminal observations and canonical scene-zero states are captured at the
+  exact transition where the slot completed;
+- partial asynchronous resets are rejected for subpool execution.
+
+Each simulator process also receives a private appdata directory keyed by the
+stable `RLINF_NODE_RANK` (or hostname), EnvWorker rank, CUDA device, and process
+index. This prevents concurrent Isaac Sim writers from corrupting one cache
+while preserving shader-cache reuse across Ray restarts.
+
+Canonical scene states are translated into each vector scene's coordinate
+frame before loading. Active particle-system states are currently rejected
+because copying them without an equivalent frame transform would be silently
+incorrect. This restriction does not affect the radio pickup experiment, whose
+snapshots have no active particle systems.
+
+B1K's R1Pro proprioception exposes `robot_pos` in the global stage frame. RLinf
+subtracts each vector scene's translation before sending that state to the
+policy; otherwise slots 1--3 receive artificial offsets even when all four
+slots load the same canonical snapshot. Vector scenes with a non-identity
+rotation are rejected until every orientation and velocity field has an audited
+frame conversion.
+
+Set `env.train.total_num_envs` to the number of logical slots, not the number of
+EnvWorkers. For example, 20 environment GPUs with four slots each use 80 total
+environments. Keep `num_env_subprocess: 1`; the four scenes live inside that
+single process. An outcome group must contain a whole number of EnvWorkers, so
+`outcome_dynamic_sampling.group_size` must be divisible by four. Logical groups
+may outnumber physical groups: with group size 20, 80 slots collect four groups
+at once and a 20-state update takes five collection rounds.
+
+Failure-state capture and same-filesystem dynamic pool updates operate per
+vector slot. SSH collectors still require `dynamic_updates: false`, since their
+filesystems are not shared; failure artifacts can be rsynced back as described
+above. Cross-datacenter request / response payloads carry the complete local
+vector batch.
+
+Use the real simulator smoke test before increasing the slot count:
+
+```bash
+python toolkits/b1k_grounded/smoke_behavior_subpool_env.py \
+  --manifest /path/to/canonical/manifest.jsonl \
+  --token-mapping /path/to/structural_token_mapping.json \
+  --output-dir /new/path/vector-smoke \
+  --num-envs 4 --chunk-size 8 --reset-count 1 \
+  --skip-intermediate-obs --skip-official-task-termination \
+  --verify-failure-state-save --verify-dynamic-updates
+```
+
+With `--verify-dynamic-updates`, the smoke catalog uses a four-step timeout so
+each slot has an auditable lagged state. The test then verifies that one recovery
+snapshot per slot was appended, can be loaded, and matches its recorded checksum.
+
+Then compare scalar and vector throughput with identical actions and snapshots
+using `benchmark_behavior_chunk_step.py --num-envs 1` and `--num-envs 4`.
+The reports include per-slot camera hashes, canonical state hashes, reward and
+termination traces, reset time, physics-step rate, logical environment-step
+rate, and max/mean per-slot differences for policy state and camera pixels. Do
+not accept a speedup unless the smoke test passes and same-state vector slots
+remain equivalent within the audited simulator tolerances.
 
 Finite dynamic rollout batching removes the all-environment barrier at every
 action-chunk boundary. EnvWorkers place ready observations in a shared route;

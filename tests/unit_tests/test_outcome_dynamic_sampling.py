@@ -45,6 +45,7 @@ from rlinf.data.schema.embodied_types import (
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
 from rlinf.runners.embodied_runner import (
     EmbodiedRunner,
+    _AcceptedOutcomeEnvHandle,
     _validate_outcome_reset_metadata,
 )
 from rlinf.workers.actor.embodied_fsdp_actor_worker import (
@@ -236,7 +237,7 @@ def test_dynamic_sampling_config_requires_positive_groups_per_update():
         _validate_outcome_dynamic_sampling(cfg, model)
 
 
-def test_parallel_dynamic_sampling_config_requires_one_env_per_worker():
+def test_parallel_dynamic_sampling_config_supports_vector_slots_per_worker():
     cfg = _dynamic_sampling_config()
     cfg.algorithm.outcome_dynamic_sampling.groups_per_update = 2
     cfg.algorithm.outcome_dynamic_sampling.parallel_groups = True
@@ -252,16 +253,34 @@ def test_parallel_dynamic_sampling_config_requires_one_env_per_worker():
     _validate_outcome_dynamic_sampling(
         cfg,
         model,
-        env_world_size=8,
+        env_world_size=2,
         actor_world_size=4,
     )
-    with pytest.raises(AssertionError, match="one environment per EnvWorker"):
+    cfg.env.train.total_num_envs = 12
+    with pytest.raises(AssertionError, match="group_size divisible.*vector slots"):
         _validate_outcome_dynamic_sampling(
             cfg,
             model,
             env_world_size=4,
             actor_world_size=4,
         )
+
+
+def test_accepted_parallel_env_handle_filters_physical_worker_groups():
+    handle = MagicMock()
+    handle.wait.return_value = list(range(20))
+    accepted = _AcceptedOutcomeEnvHandle(
+        handle=handle,
+        group_ids=frozenset({1, 3}),
+        workers_per_group=5,
+    )
+
+    assert accepted.wait() == [
+        *(None for _ in range(5)),
+        *range(5, 10),
+        *(None for _ in range(5)),
+        *range(15, 20),
+    ]
 
 
 def test_independent_gradient_clipping_requires_both_positive_limits():
@@ -619,6 +638,44 @@ def test_env_worker_routes_parallel_groups_evenly_across_actor_ranks():
     assert torch.equal(worker._outcome_group_ids(0), torch.tensor([1]))
 
 
+def test_env_worker_routes_each_vector_slot_to_an_actor_rank():
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "algorithm": {
+                "outcome_dynamic_sampling": {
+                    "enabled": True,
+                    "parallel_groups": True,
+                    "group_size": 8,
+                }
+            }
+        }
+    )
+    worker._rank = 1
+    worker.stage_num = 1
+    worker.train_num_envs_per_stage = 4
+    worker.actor_split_num = 4
+    worker._component_placement = MagicMock()
+    worker._component_placement.get_world_size.return_value = 4
+    trajectories = [MagicMock() for _ in range(4)]
+    builder = MagicMock()
+    builder.to_splited_trajectories.return_value = trajectories
+    channel = MagicMock()
+    send_trajectories = EnvWorker.send_rollout_trajectories
+    while hasattr(send_trajectories, "__wrapped__"):
+        send_trajectories = send_trajectories.__wrapped__
+
+    asyncio.run(send_trajectories(worker, builder, channel, stage_id=0))
+
+    assert [call.kwargs["key"] for call in channel.put.call_args_list] == [
+        "outcome_actor_0",
+        "outcome_actor_1",
+        "outcome_actor_2",
+        "outcome_actor_3",
+    ]
+    assert torch.equal(worker._outcome_group_ids(0), torch.zeros(4, dtype=torch.long))
+
+
 def test_env_worker_forces_synchronized_reset_into_next_bootstrap():
     class FakeEnv:
         is_start = False
@@ -671,6 +728,57 @@ def test_env_worker_forces_synchronized_reset_into_next_bootstrap():
     assert metadata[0]["outcome_group_id"] == 0
     assert worker._forced_train_bootstrap[0].obs["states"].eq(1).all()
     assert worker.last_obs_list[0]["states"].eq(1).all()
+
+
+def test_env_worker_forces_one_snapshot_per_vector_slot():
+    class FakeVectorEnv:
+        is_start = False
+
+        def __init__(self):
+            self.logical_groups = None
+
+        def prepare_outcome_group_reset(
+            self, _collection_index, logical_group_indices, _update_index
+        ):
+            self.logical_groups = logical_group_indices
+
+        @property
+        def outcome_group_reset_metadata(self):
+            return [
+                {
+                    "sampling_group": 0,
+                    "snapshot_id": "canonical-episode-50",
+                    "episode_index": 50,
+                    "subtask_id": 1,
+                    "pool_type": "canonical",
+                }
+                for _ in range(4)
+            ]
+
+        def reset(self):
+            return {"states": torch.ones(4, 2)}, {"episode": {}}
+
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {"algorithm": {"outcome_dynamic_sampling": {"enabled": True, "group_size": 8}}}
+    )
+    worker._rank = 1
+    worker.stage_num = 1
+    worker.train_num_envs_per_stage = 4
+    worker.model_cfg = OmegaConf.create({"num_action_chunks": 32})
+    worker.env_list = [FakeVectorEnv()]
+    worker.last_obs_list = []
+    worker.last_intervened_info_list = []
+    worker._prefetched_train_bootstrap = None
+    worker._forced_train_bootstrap = None
+
+    metadata = worker.reset_train_envs_for_outcome_group(7, [3], 11)
+
+    assert worker.env_list[0].logical_groups == [3, 3, 3, 3]
+    assert len(metadata) == 4
+    assert {item["outcome_group_id"] for item in metadata} == {0}
+    assert [item["slot_id"] for item in metadata] == [0, 1, 2, 3]
+    assert worker._forced_train_bootstrap[0].obs["states"].shape == (4, 2)
 
 
 def test_env_worker_uses_unkeyed_channel_when_sampling_is_disabled():
@@ -758,6 +866,7 @@ def _dynamic_sampling_runner(warning_interval=2, groups_per_update=1):
     runner.logger = MagicMock()
     runner.actor = MagicMock()
     runner.env = MagicMock()
+    runner.env.worker_info_list = list(range(4))
     reset_handle = MagicMock()
     reset_handle.wait.return_value = [
         [
@@ -970,6 +1079,7 @@ def test_runner_continues_sampling_after_warning_interval():
 def test_runner_collects_two_outcome_groups_in_parallel():
     runner = _dynamic_sampling_runner(groups_per_update=2)
     runner.cfg.algorithm.outcome_dynamic_sampling.parallel_groups = True
+    runner.env.worker_info_list = list(range(8))
     runner.env.reset_train_envs_for_outcome_group.return_value.wait.return_value = [
         [
             {

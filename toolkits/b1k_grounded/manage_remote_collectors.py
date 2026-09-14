@@ -51,6 +51,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ports", type=_parse_csv_ints, default=[46100])
     parser.add_argument("--python", type=Path)
     parser.add_argument("--repo", type=Path)
+    parser.add_argument(
+        "--omnigibson-path",
+        type=Path,
+        help=(
+            "Patched OmniGibson source directory containing the omnigibson "
+            "package. It is prepended to PYTHONPATH for collector daemons."
+        ),
+    )
     parser.add_argument("--log-dir", type=Path)
     parser.add_argument("--session-prefix", default="rlinf_b1k_collector")
     parser.add_argument("--ray-address", default="auto")
@@ -62,6 +70,20 @@ def _session_name(prefix: str, gpu: int) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix):
         raise ValueError("session-prefix contains unsupported characters.")
     return f"{prefix}_gpu{gpu}"
+
+
+def _collector_pythonpath(
+    repo: Path,
+    omnigibson_path: Path | None,
+    inherited_pythonpath: str | None,
+) -> str:
+    """Build an ordered source path for a collector daemon."""
+    paths = [str(repo)]
+    if omnigibson_path is not None:
+        paths.append(str(omnigibson_path))
+    if inherited_pythonpath:
+        paths.append(inherited_pythonpath)
+    return os.pathsep.join(paths)
 
 
 def _tmux_session_exists(session: str) -> bool:
@@ -93,6 +115,13 @@ def _start(args: argparse.Namespace, gpu: int, port: int) -> None:
         raise FileNotFoundError(args.python)
     if not (args.repo / "rlinf").is_dir():
         raise FileNotFoundError(f"RLinf package not found below {args.repo}.")
+    if (
+        args.omnigibson_path is not None
+        and not (args.omnigibson_path / "omnigibson").is_dir()
+    ):
+        raise FileNotFoundError(
+            f"OmniGibson package not found below {args.omnigibson_path}."
+        )
 
     session = _session_name(args.session_prefix, gpu)
     if _tmux_session_exists(session):
@@ -117,7 +146,12 @@ def _start(args: argparse.Namespace, gpu: int, port: int) -> None:
         f"OMNIGIBSON_APPDATA_PATH={appdata_root}",
         f"TORCHINDUCTOR_CACHE_DIR={inductor_cache}",
         f"TRITON_CACHE_DIR={triton_cache}",
-        f"PYTHONPATH={args.repo}",
+        "PYTHONPATH="
+        + _collector_pythonpath(
+            args.repo,
+            args.omnigibson_path,
+            os.environ.get("PYTHONPATH"),
+        ),
         str(args.python),
         "-m",
         "rlinf.envs.behavior.remote_collector",

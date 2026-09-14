@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,6 +36,21 @@ from rlinf.envs.remote_collector import (
     recv_frame,
     send_frame,
 )
+from toolkits.b1k_grounded.manage_remote_collectors import _collector_pythonpath
+
+
+def test_collector_pythonpath_prefers_audited_sources():
+    result = _collector_pythonpath(
+        Path("/src/RLinf"),
+        Path("/src/BEHAVIOR-1K/OmniGibson"),
+        "/existing/modules",
+    )
+
+    assert result.split(os.pathsep) == [
+        "/src/RLinf",
+        "/src/BEHAVIOR-1K/OmniGibson",
+        "/existing/modules",
+    ]
 
 
 def _start_server(handler, token="test-token"):
@@ -319,7 +336,7 @@ def test_distributed_behavior_routes_only_assigned_rank_remotely(monkeypatch):
     env.close()
 
 
-def test_remote_collector_config_requires_one_env_per_worker():
+def test_remote_collector_config_supports_equal_vector_slots_per_worker():
     cfg = OmegaConf.create(
         {
             "total_num_envs": 8,
@@ -332,8 +349,9 @@ def test_remote_collector_config_requires_one_env_per_worker():
     )
 
     _validate_remote_behavior_collectors(cfg, env_world_size=8)
-    with pytest.raises(AssertionError, match="one logical environment"):
-        _validate_remote_behavior_collectors(cfg, env_world_size=4)
+    _validate_remote_behavior_collectors(cfg, env_world_size=4)
+    with pytest.raises(AssertionError, match="equal number"):
+        _validate_remote_behavior_collectors(cfg, env_world_size=3)
 
 
 def test_remote_collector_config_rejects_duplicate_assignments():

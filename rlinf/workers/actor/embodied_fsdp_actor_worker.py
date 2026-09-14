@@ -704,10 +704,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
         sampling_cfg = self.cfg.algorithm.get("outcome_dynamic_sampling", {})
         sampling_enabled = bool(sampling_cfg.get("enabled", False))
         parallel_groups = parallel_outcome_sampling_enabled(sampling_cfg)
+        if parallel_groups:
+            send_num = int(self.cfg.env.train.total_num_envs)
+        split_num = compute_split_num(send_num, recv_num)
         channel_key = outcome_actor_channel_key(self._rank) if parallel_groups else None
 
         recv_list = []
@@ -838,12 +840,31 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             reduce_trajectory_group_ids(candidate_group_ids),
             device=candidate_group_ids.device,
         )
+        cfg = getattr(self, "cfg", None)
+        group_size = (
+            1
+            if cfg is None
+            else int(
+                OmegaConf.select(
+                    cfg,
+                    "algorithm.outcome_dynamic_sampling.group_size",
+                    default=1,
+                )
+            )
+        )
+        actor_world_size = int(getattr(self, "_world_size", group_size))
+        expected_per_actor = group_size // actor_world_size
+        if group_size % actor_world_size != 0:
+            raise RuntimeError(
+                "Parallel outcome group_size must be divisible by actor world size."
+            )
         for group_id in group_ids:
             group_mask = reduced_group_ids == group_id
-            if group_mask.sum().item() != 1:
+            if group_mask.sum().item() != expected_per_actor:
                 raise RuntimeError(
-                    "Each actor rank must receive exactly one trajectory per outcome "
-                    f"group; group {group_id} has {group_mask.sum().item()}."
+                    "Each actor rank must receive an equal trajectory shard per "
+                    f"outcome group; group {group_id} has {group_mask.sum().item()}, "
+                    f"expected {expected_per_actor}."
                 )
             selected_batch = _select_rollout_trajectories(
                 self._candidate_rollout_batch,

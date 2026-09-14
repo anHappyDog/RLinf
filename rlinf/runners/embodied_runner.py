@@ -21,7 +21,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
-from omegaconf.dictconfig import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from rlinf.algorithms.subtask import outcome_group_is_trainable
 from rlinf.scheduler import Channel
@@ -175,12 +175,12 @@ class _AcceptedOutcomeEnvHandle:
 
     handle: Handle
     group_ids: frozenset[int]
-    group_size: int
+    workers_per_group: int
 
     def wait(self):
         results = self.handle.wait()
         return [
-            result if rank // self.group_size in self.group_ids else None
+            result if rank // self.workers_per_group in self.group_ids else None
             for rank, result in enumerate(results)
         ]
 
@@ -374,9 +374,8 @@ class EmbodiedRunner:
             self.global_step,
         ).wait()
         self._outcome_collection_index = collection_index + 1
-        groups_per_update = int(sampling_cfg.get("groups_per_update", 1))
         expected_group_ids = (
-            set(range(groups_per_update))
+            set(range(len(logical_group_indices)))
             if sampling_cfg.get("parallel_groups", False)
             else {0}
         )
@@ -548,6 +547,34 @@ class EmbodiedRunner:
         """Collect independent quota-filtered groups in concurrent env rounds."""
         groups_per_update = int(sampling_cfg.groups_per_update)
         group_size = int(sampling_cfg.group_size)
+        total_num_envs = int(
+            OmegaConf.select(
+                self.cfg,
+                "env.train.total_num_envs",
+                default=groups_per_update * group_size,
+            )
+        )
+        if total_num_envs % group_size != 0:
+            raise ValueError(
+                "Parallel outcome sampling requires total_num_envs divisible by "
+                "group_size."
+            )
+        physical_group_count = total_num_envs // group_size
+        if physical_group_count <= 0:
+            raise ValueError("Parallel outcome sampling needs a physical group.")
+        env_world_size = len(self.env.worker_info_list)
+        if total_num_envs % env_world_size != 0:
+            raise ValueError(
+                "Parallel outcome sampling requires an equal number of vector "
+                "slots per EnvWorker."
+            )
+        local_vector_size = total_num_envs // env_world_size
+        if group_size % local_vector_size != 0:
+            raise ValueError(
+                "Parallel outcome sampling cannot split one EnvWorker across "
+                "physical groups."
+            )
+        workers_per_group = group_size // local_vector_size
         warning_interval = int(
             sampling_cfg.get(
                 "attempt_warning_interval",
@@ -572,9 +599,29 @@ class EmbodiedRunner:
         self.actor.begin_rollout_group_collection().wait()
         while pending_groups:
             sampling_rounds += 1
+            active_logical_groups = sorted(pending_groups)[:physical_group_count]
+            available_physical_groups = set(range(physical_group_count))
+            physical_to_logical = {}
+            for logical_group_id in active_logical_groups:
+                preferred_group = logical_group_id % physical_group_count
+                physical_group_id = (
+                    preferred_group
+                    if preferred_group in available_physical_groups
+                    else min(available_physical_groups)
+                )
+                physical_to_logical[physical_group_id] = logical_group_id
+                available_physical_groups.remove(physical_group_id)
+            # Every shared-stage vector slot must run each round. If the final
+            # round is not full, unused physical groups duplicate a pending state
+            # and their trajectories are explicitly discarded.
+            logical_group_assignments = [
+                active_logical_groups[0]
+            ] * physical_group_count
+            for physical_group_id, logical_group_id in physical_to_logical.items():
+                logical_group_assignments[physical_group_id] = logical_group_id
             reset_metadata = self._reset_outcome_sampling_envs(
                 sampling_cfg,
-                list(range(groups_per_update)),
+                logical_group_assignments,
             )
             env_handle, rollout_handle, reward_handle, outcome_shards = (
                 self._collect_train_rollout()
@@ -594,7 +641,7 @@ class EmbodiedRunner:
                     )
                 for group_id, outcomes in actor_shard.items():
                     grouped_shards[int(group_id)].append(outcomes)
-            expected_group_ids = set(range(groups_per_update))
+            expected_group_ids = set(range(physical_group_count))
             if set(grouped_shards) != expected_group_ids:
                 raise RuntimeError(
                     "Parallel outcome sampling expected group IDs "
@@ -602,13 +649,14 @@ class EmbodiedRunner:
                     f"{sorted(grouped_shards)}."
                 )
 
-            accepted_this_round = []
+            accepted_physical_groups = []
+            accepted_logical_groups = []
             no_signal_groups = []
             actor_trainable_by_group: dict[int, bool] = {}
-            for group_id in sorted(pending_groups):
-                attempts_by_group[group_id] += 1
+            for physical_group_id, logical_group_id in physical_to_logical.items():
+                attempts_by_group[logical_group_id] += 1
                 accepted, successes, failures = outcome_group_is_trainable(
-                    grouped_shards[group_id],
+                    grouped_shards[physical_group_id],
                     expected_size=group_size,
                     min_successes=int(sampling_cfg.min_successes),
                     min_failures=int(sampling_cfg.min_failures),
@@ -622,23 +670,24 @@ class EmbodiedRunner:
                 )
                 _record_outcome_snapshot_stats(
                     snapshot_stats,
-                    reset_metadata[group_id],
+                    reset_metadata[physical_group_id],
                     successes=successes,
                     failures=failures,
                     accepted=accepted,
                     actor_trainable=actor_trainable if accepted else None,
                 )
                 if accepted:
-                    accepted_this_round.append(group_id)
+                    accepted_physical_groups.append(physical_group_id)
+                    accepted_logical_groups.append(logical_group_id)
                     accepted_successes += successes
                     accepted_failures += failures
                     if actor_trainable is not None:
-                        actor_trainable_by_group[group_id] = actor_trainable
+                        actor_trainable_by_group[physical_group_id] = actor_trainable
                         actor_trainable_groups += int(actor_trainable)
                         actor_no_signal_groups += int(not actor_trainable)
                     continue
 
-                group_attempt = attempts_by_group[group_id]
+                group_attempt = attempts_by_group[logical_group_id]
                 log_rejection = (
                     self.logger.warning
                     if group_attempt % warning_interval == 0
@@ -648,7 +697,7 @@ class EmbodiedRunner:
                     "Rejected outcome-homogeneous parallel rollout group "
                     "(group %d/%d, attempt=%d, successes=%d, failures=%d); "
                     "continuing sampling.",
-                    group_id + 1,
+                    logical_group_id + 1,
                     groups_per_update,
                     group_attempt,
                     successes,
@@ -658,15 +707,15 @@ class EmbodiedRunner:
                     max_attempts_per_group > 0
                     and group_attempt >= max_attempts_per_group
                 ):
-                    no_signal_groups.append(group_id)
+                    no_signal_groups.append((physical_group_id, logical_group_id))
 
             if no_signal_groups:
                 env_handle.wait()
                 descriptions = ", ".join(
-                    f"logical_group={group_id} "
-                    f"snapshot={reset_metadata[group_id]['snapshot_id']} "
-                    f"episode={reset_metadata[group_id]['episode_index']}"
-                    for group_id in no_signal_groups
+                    f"logical_group={logical_group_id} "
+                    f"snapshot={reset_metadata[physical_group_id]['snapshot_id']} "
+                    f"episode={reset_metadata[physical_group_id]['episode_index']}"
+                    for physical_group_id, logical_group_id in no_signal_groups
                 )
                 raise RuntimeError(
                     "Outcome sampling marked groups as no-signal after "
@@ -674,38 +723,38 @@ class EmbodiedRunner:
                     "Snapshots were not silently replaced."
                 )
 
-            if accepted_this_round:
+            if accepted_physical_groups:
                 self.actor.accept_rollout_groups(
-                    accepted_this_round,
+                    accepted_physical_groups,
                     {
-                        group_id: {
-                            "logical_group_index": int(
-                                reset_metadata[group_id].get(
-                                    "logical_group_index", group_id
-                                )
-                            ),
+                        physical_group_id: {
+                            "logical_group_index": logical_group_id,
                             "episode_index": int(
-                                reset_metadata[group_id]["episode_index"]
+                                reset_metadata[physical_group_id]["episode_index"]
                             ),
                             **(
                                 {
                                     "policy_trainable": (
-                                        actor_trainable_by_group[group_id]
+                                        actor_trainable_by_group[physical_group_id]
                                     )
                                 }
-                                if group_id in actor_trainable_by_group
+                                if physical_group_id in actor_trainable_by_group
                                 else {}
                             ),
                         }
-                        for group_id in accepted_this_round
+                        for physical_group_id, logical_group_id in zip(
+                            accepted_physical_groups,
+                            accepted_logical_groups,
+                            strict=True,
+                        )
                     },
                 ).wait()
-                pending_groups.difference_update(accepted_this_round)
+                pending_groups.difference_update(accepted_logical_groups)
                 env_handles.append(
                     _AcceptedOutcomeEnvHandle(
                         handle=env_handle,
-                        group_ids=frozenset(accepted_this_round),
-                        group_size=group_size,
+                        group_ids=frozenset(accepted_physical_groups),
+                        workers_per_group=workers_per_group,
                     )
                 )
                 rollout_handles.append(rollout_handle)

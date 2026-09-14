@@ -187,10 +187,26 @@ class EnvWorker(Worker):
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
         )
+        parallel_outcome_groups = (
+            self.enable_train
+            and parallel_outcome_sampling_enabled(
+                self.cfg.algorithm.get("outcome_dynamic_sampling", {})
+            )
+        )
+        vectorized_subpool = (
+            self.enable_train
+            and OmegaConf.select(self.cfg.env.train, "subpool.enabled", default=False)
+            and self.train_num_envs_per_stage > 1
+        )
+        if parallel_outcome_groups and vectorized_subpool:
+            # Route each logical trajectory independently. Keeping a vector
+            # batch intact would send four outcome groups to one actor key.
+            self.actor_split_num = self.train_num_envs_per_stage
         if (
             self.enable_train
             and OmegaConf.select(self.cfg.env.train, "subpool.enabled", default=False)
             and self.actor_split_num != 1
+            and not (parallel_outcome_groups and vectorized_subpool)
         ):
             env_world_size = self._component_placement.get_world_size("env")
             actor_world_size = self._component_placement.get_world_size("actor")
@@ -1196,23 +1212,36 @@ class EnvWorker(Worker):
                     "prepare_outcome_group_reset()."
                 )
             group_ids = self._outcome_group_ids(stage_id)
-            if group_ids is None or group_ids.numel() != 1:
+            if group_ids is None or group_ids.numel() != self.train_num_envs_per_stage:
                 raise RuntimeError(
-                    "Synchronized outcome reset requires exactly one environment "
-                    "per BEHAVIOR EnvWorker stage."
+                    "Synchronized outcome reset requires one group id per local "
+                    "BEHAVIOR vector slot."
                 )
-            outcome_group_id = int(group_ids.item())
-            logical_group_index = None
+            if torch.unique(group_ids).numel() != 1:
+                raise RuntimeError(
+                    "A BEHAVIOR VectorEnvironment cannot straddle outcome groups "
+                    "because all scenes share one physics timeline."
+                )
+            logical_group_assignments = None
             if logical_group_indices is not None:
-                if outcome_group_id >= len(logical_group_indices):
-                    raise ValueError(
-                        "Missing logical group assignment for physical outcome "
-                        f"group {outcome_group_id}."
+                logical_group_assignments = []
+                for outcome_group_id in group_ids.tolist():
+                    if outcome_group_id >= len(logical_group_indices):
+                        raise ValueError(
+                            "Missing logical group assignment for physical outcome "
+                            f"group {outcome_group_id}."
+                        )
+                    logical_group_assignments.append(
+                        int(logical_group_indices[outcome_group_id])
                     )
-                logical_group_index = int(logical_group_indices[outcome_group_id])
             prepare_reset(
                 collection_index,
-                logical_group_index,
+                (
+                    logical_group_assignments[0]
+                    if logical_group_assignments is not None
+                    and len(logical_group_assignments) == 1
+                    else logical_group_assignments
+                ),
                 update_index,
             )
             env.is_start = True
@@ -1239,19 +1268,27 @@ class EnvWorker(Worker):
             )
 
             metadata = get_env_attr(env, "outcome_group_reset_metadata")
-            if not isinstance(metadata, dict):
+            if isinstance(metadata, dict) and group_ids.numel() == 1:
+                metadata = [metadata]
+            if not isinstance(metadata, list) or len(metadata) != group_ids.numel():
                 raise TypeError(
-                    "Outcome dynamic sampling requires reset metadata from the "
-                    "environment."
+                    "Outcome dynamic sampling requires one reset metadata mapping "
+                    "per local vector slot."
                 )
-            reset_metadata.append(
-                {
-                    **metadata,
-                    "worker_rank": self._rank,
-                    "stage_id": stage_id,
-                    "outcome_group_id": outcome_group_id,
-                }
-            )
+            for slot_id, (slot_metadata, outcome_group_id) in enumerate(
+                zip(metadata, group_ids.tolist(), strict=True)
+            ):
+                if not isinstance(slot_metadata, dict):
+                    raise TypeError("Each outcome reset metadata item must be a dict.")
+                reset_metadata.append(
+                    {
+                        **slot_metadata,
+                        "worker_rank": self._rank,
+                        "stage_id": stage_id,
+                        "slot_id": slot_id,
+                        "outcome_group_id": outcome_group_id,
+                    }
+                )
 
         self._forced_train_bootstrap = env_outputs
         self.store_last_obs_and_intervened_info(env_outputs)
@@ -1274,14 +1311,23 @@ class EnvWorker(Worker):
             default={},
         )
         parallel_groups = parallel_outcome_sampling_enabled(sampling_cfg)
+        actor_world_size = None
+        if parallel_groups:
+            component_placement = getattr(self, "_component_placement", None)
+            actor_world_size = (
+                component_placement.get_world_size("actor")
+                if component_placement is not None
+                else int(sampling_cfg.group_size)
+            )
         for split_index, trajectory in enumerate(trajectories):
             channel_key = None
             if parallel_groups:
                 global_env_index = (
                     self._rank * self.stage_num + stage_id
                 ) * self.train_num_envs_per_stage + split_index
-                group_size = int(self.cfg.algorithm.outcome_dynamic_sampling.group_size)
-                channel_key = outcome_actor_channel_key(global_env_index % group_size)
+                channel_key = outcome_actor_channel_key(
+                    global_env_index % actor_world_size
+                )
             if channel_key is None:
                 channel.put(trajectory, async_op=True)
             else:
@@ -1722,6 +1768,21 @@ class EnvWorker(Worker):
                             int(reset_metadata["episode_index"]),
                             dtype=torch.long,
                         )
+                    elif env_info and isinstance(reset_metadata, list):
+                        episode_indices = torch.tensor(
+                            [
+                                int(metadata["episode_index"])
+                                for metadata in reset_metadata
+                            ],
+                            dtype=torch.long,
+                        )
+                        trajectory_count = next(iter(env_info.values())).numel()
+                        if episode_indices.numel() != trajectory_count:
+                            raise RuntimeError(
+                                "Vector evaluation reset metadata does not match "
+                                "the number of environment trajectories."
+                            )
+                        env_info["snapshot_episode_index"] = episode_indices
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)

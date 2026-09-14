@@ -102,17 +102,28 @@ def _validate_outcome_dynamic_sampling(
     assert cfg.env.train.rollout_epoch == 1, (
         "Outcome dynamic sampling requires env.train.rollout_epoch=1."
     )
+    total_num_envs = int(cfg.env.train.total_num_envs)
+    env_world_size = total_num_envs if env_world_size is None else env_world_size
+    if env_world_size <= 0:
+        raise ValueError("Outcome dynamic sampling requires a positive env world size.")
+    if total_num_envs % env_world_size != 0:
+        raise ValueError(
+            "Outcome dynamic sampling requires total_num_envs divisible by the "
+            "physical EnvWorker world size."
+        )
+    local_vector_size = total_num_envs // env_world_size
     if parallel_groups:
-        assert cfg.env.train.total_num_envs == group_size * groups_per_update, (
-            "Parallel outcome sampling requires total_num_envs == "
-            "group_size * groups_per_update."
+        assert total_num_envs % group_size == 0, (
+            "Parallel outcome sampling requires total_num_envs divisible by group_size."
         )
-        assert env_world_size == cfg.env.train.total_num_envs, (
-            "Parallel outcome sampling requires one environment per EnvWorker."
+        assert group_size % local_vector_size == 0, (
+            "Parallel outcome sampling requires group_size divisible by the "
+            "number of vector slots per EnvWorker so one shared-stage simulator "
+            "never straddles outcome groups."
         )
-        assert actor_world_size == group_size, (
-            "Parallel outcome sampling requires one trajectory from each group "
-            "on every actor rank: actor world size must equal group_size."
+        assert actor_world_size is not None and group_size % actor_world_size == 0, (
+            "Parallel outcome sampling requires group_size divisible by the actor "
+            "world size so every actor receives an equal shard of each group."
         )
         assert cfg.rollout.pipeline_stage_num == 1, (
             "Parallel outcome sampling requires rollout.pipeline_stage_num=1."
@@ -203,18 +214,18 @@ def _validate_remote_behavior_collectors(
     endpoints = list(remote_cfg.get("endpoints", []))
     assert endpoints, "remote_collector.endpoints must not be empty."
     total_num_envs = int(env_cfg.total_num_envs)
-    assert env_world_size == total_num_envs, (
-        "Remote BEHAVIOR collectors require exactly one logical environment per "
-        f"EnvWorker, got env world size {env_world_size} and "
+    assert total_num_envs % env_world_size == 0, (
+        "Remote BEHAVIOR collectors require an equal number of logical vector "
+        f"slots per EnvWorker, got env world size {env_world_size} and "
         f"total_num_envs {total_num_envs}."
     )
     ranks = [int(endpoint.env_rank) for endpoint in endpoints]
     assert len(ranks) == len(set(ranks)), (
         "Each remote collector endpoint must have a unique env_rank."
     )
-    assert all(0 <= rank < total_num_envs for rank in ranks), (
+    assert all(0 <= rank < env_world_size for rank in ranks), (
         "Remote collector env_rank values must be in "
-        f"[0, {total_num_envs}), got {ranks}."
+        f"[0, {env_world_size}), got {ranks}."
     )
     for endpoint in endpoints:
         port = int(endpoint.get("port", 0))
@@ -1484,17 +1495,20 @@ def validate_embodied_cfg(cfg):
             if outcome_sampling_cfg.get("enabled", False)
             else 1
         )
-        parallel_outcome_groups = bool(
-            outcome_sampling_cfg.get("enabled", False)
-            and outcome_sampling_cfg.get("parallel_groups", False)
-        )
+        alignment_total_num_envs = cfg.env.train.total_num_envs
+        alignment_groups_per_update = 1
+        if outcome_sampling_cfg.get("enabled", False):
+            # Accepted data size is defined by logical groups, independently of
+            # how many physical vector groups can be collected concurrently.
+            alignment_total_num_envs = int(outcome_sampling_cfg.group_size)
+            alignment_groups_per_update = groups_per_update
         _validate_embodied_rollout_batch_alignment(
             max_steps_per_rollout_epoch=cfg.env.train.max_steps_per_rollout_epoch,
             num_action_chunks=model_cfg.num_action_chunks,
             rollout_epoch=cfg.env.train.rollout_epoch,
-            total_num_envs=cfg.env.train.total_num_envs,
+            total_num_envs=alignment_total_num_envs,
             global_batch_size=cfg.actor.global_batch_size,
-            groups_per_update=(1 if parallel_outcome_groups else groups_per_update),
+            groups_per_update=alignment_groups_per_update,
         )
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
