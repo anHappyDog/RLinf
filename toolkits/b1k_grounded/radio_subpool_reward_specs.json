@@ -21,15 +21,15 @@
   "pick up from": {
     "potential_terms": [
       {
-        "key": "right_eef_to_obj_distance",
-        "scale": 1.0,
-        "direction": "decrease"
+        "key": "pickup_progress_score",
+        "scale": 2.0,
+        "direction": "increase"
       }
     ],
     "success_bonus": 10.0,
     "timeout_penalty": -2.0,
     "step_penalty_budget": -1.0,
-    "progress_clip": 1.0,
+    "progress_clip": 2.0,
     "max_steps_multiplier": 3.0
   },
   "press": {

@@ -140,17 +140,58 @@ def value_from_prefix(
             "RL port. Supported: 'mean_token', 'state_fusion', "
             "'state_attention'."
         )
+    pooled = pool_prefix(prefix_out, prefix_mask)
+    return value_from_cached_prefix(
+        value_head,
+        pooled,
+        state=state,
+        mode=mode,
+        prefix_out=prefix_out,
+        prefix_mask=prefix_mask,
+    )
+
+
+def pool_prefix(
+    prefix_out: torch.Tensor,
+    prefix_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return the masked mean of visual-language prefix tokens."""
     mask_f = prefix_mask.to(prefix_out.dtype).unsqueeze(-1)
     summed = (prefix_out * mask_f).sum(dim=1)
     denom = mask_f.sum(dim=1).clamp(min=1.0)
-    # Keep the pooled features in the prefix dtype so the value head's bf16/fp32
-    # weights line up; promote the scalar output to fp32 for the PPO critic loss
-    # (which assert-checks float32 alignment with returns / prev_values).
-    pooled = summed / denom
+    return summed / denom
+
+
+def value_from_cached_prefix(
+    value_head: torch.nn.Module,
+    pooled: torch.Tensor,
+    *,
+    state: torch.Tensor | None = None,
+    mode: str = "mean_token",
+    prefix_out: torch.Tensor | None = None,
+    prefix_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run a value head from cached, detached prefix features.
+
+    The cache is exact for critic-only updates because the value head receives
+    the same pooled/token inputs as :func:`value_from_prefix`; only the frozen
+    VLM prefix pass is skipped.
+    """
+    if mode not in ("mean_token", "state_fusion", "state_attention"):
+        raise NotImplementedError(
+            f"value_vlm_mode={mode!r} is not implemented in the PyTorch OpenPI "
+            "RL port. Supported: 'mean_token', 'state_fusion', "
+            "'state_attention'."
+        )
     if mode in ("state_fusion", "state_attention"):
         if state is None:
             raise ValueError(f"value_vlm_mode={mode!r} requires robot state.")
         if mode == "state_attention":
+            if prefix_out is None or prefix_mask is None:
+                raise ValueError(
+                    "value_vlm_mode='state_attention' requires cached token "
+                    "features and their mask."
+                )
             values = value_head(pooled, state, prefix_out, prefix_mask)
         else:
             values = value_head(pooled, state)

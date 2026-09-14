@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -20,7 +22,14 @@ from rlinf.models.embodiment.modules.value_head import (
     StateFusionValueHead,
     ValueHead,
 )
-from rlinf.models.embodiment.openpi_rlinf.utils.rl_sampler import value_from_prefix
+from rlinf.models.embodiment.openpi_rlinf.rl_action_model import (
+    OpenPiPytorchRLActionModel,
+)
+from rlinf.models.embodiment.openpi_rlinf.utils.rl_sampler import (
+    pool_prefix,
+    value_from_cached_prefix,
+    value_from_prefix,
+)
 
 
 def test_value_head_promotes_features_to_master_parameter_dtype():
@@ -143,3 +152,76 @@ def test_state_attention_value_head_requires_state():
             torch.ones(2, 5, dtype=torch.bool),
             mode="state_attention",
         )
+
+
+def test_state_attention_cached_prefix_matches_direct_value():
+    value_head = StateAttentionValueHead(
+        feature_dim=8,
+        state_dim=3,
+        attention_dim=4,
+        hidden_sizes=(4,),
+    )
+    prefix = torch.randn(2, 5, 8, dtype=torch.bfloat16)
+    mask = torch.tensor(
+        [[True, True, False, False, False], [True, True, True, False, False]]
+    )
+    state = torch.randn(2, 3)
+
+    direct = value_from_prefix(
+        value_head,
+        prefix,
+        mask,
+        state=state,
+        mode="state_attention",
+    )
+    cached = value_from_cached_prefix(
+        value_head,
+        pool_prefix(prefix, mask),
+        state=state,
+        mode="state_attention",
+        prefix_out=prefix,
+        prefix_mask=mask,
+    )
+
+    torch.testing.assert_close(cached, direct)
+
+
+def test_openpi_cached_critic_forward_keeps_singleton_value_dimension():
+    class _PrefixMustNotRun(torch.nn.Module):
+        def build_prefix_cache(self, observation):
+            del observation
+            raise AssertionError("cached critic forward rebuilt the VLM prefix")
+
+    model = object.__new__(OpenPiPytorchRLActionModel)
+    torch.nn.Module.__init__(model)
+    model.model = _PrefixMustNotRun()
+    model.value_head = StateAttentionValueHead(
+        feature_dim=8,
+        state_dim=3,
+        attention_dim=4,
+        hidden_sizes=(4,),
+    )
+    model.rl_cfg = SimpleNamespace(
+        joint_logprob=False,
+        add_value_head=True,
+        value_after_vlm=True,
+        value_vlm_mode="state_attention",
+        detach_critic_input=True,
+        train_expert_only=True,
+    )
+    prefix = torch.randn(2, 5, 8)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    forward_inputs = {
+        "obs_state": torch.randn(2, 3),
+        "critic_pooled_prefix": pool_prefix(prefix, mask),
+        "critic_prefix_out": prefix,
+        "critic_prefix_mask": mask,
+    }
+
+    output = model.default_forward(
+        forward_inputs,
+        compute_logprobs=False,
+        compute_values=True,
+    )
+
+    assert output["values"].shape == (2, 1)

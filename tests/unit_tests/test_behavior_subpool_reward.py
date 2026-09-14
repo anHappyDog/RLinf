@@ -44,6 +44,38 @@ def test_timeout_uses_same_failure_scale():
     assert outcome.timeout and not outcome.success
 
 
+def test_bounded_pickup_potential_rewards_change_not_occupancy():
+    tracker = SubtaskRewardTracker(
+        SubtaskRewardSpec.from_mapping(
+            {
+                "potential_terms": [
+                    {
+                        "key": "pickup_progress_score",
+                        "scale": 2.0,
+                        "direction": "increase",
+                    }
+                ],
+                "step_penalty": 0.0,
+                "progress_clip": 2.0,
+                "max_steps": 5,
+            }
+        )
+    )
+
+    approach = tracker.step({"pickup_progress_score": 0.4, "completed": False})
+    unchanged = tracker.step({"pickup_progress_score": 0.4, "completed": False})
+    lifted = tracker.step({"pickup_progress_score": 0.8, "completed": False})
+    dropped = tracker.step({"pickup_progress_score": 0.0, "completed": False})
+    success = tracker.step({"pickup_progress_score": 1.0, "completed": True})
+
+    assert approach.progress == 0.0
+    assert unchanged.progress == 0.0
+    assert lifted.progress == pytest.approx(0.8)
+    assert dropped.progress == pytest.approx(-1.6)
+    assert success.progress == pytest.approx(2.0)
+    assert success.reward == pytest.approx(12.0)
+
+
 def test_missing_potential_metric_fails_loudly():
     tracker = SubtaskRewardTracker(
         SubtaskRewardSpec.from_mapping(

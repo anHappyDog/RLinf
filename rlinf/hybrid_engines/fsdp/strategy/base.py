@@ -412,6 +412,23 @@ class FSDPStrategyBase(ABC):
             options=opts,
         )
 
+    def get_weight_swap_state(self, model: FSDPModule) -> dict:
+        """Return a CPU, rank-local snapshot suitable for temporary swapping."""
+        return self.get_model_state_dict(
+            model,
+            cpu_offload=True,
+            full_state_dict=False,
+        )
+
+    def load_weight_swap_state(self, model: FSDPModule, state_dict: dict) -> None:
+        """Load a snapshot produced by :meth:`get_weight_swap_state`."""
+        self.load_model_with_state_dict(
+            model,
+            state_dict,
+            cpu_offload=True,
+            full_state_dict=False,
+        )
+
     @abstractmethod
     def offload_optimizer(self, optimizer: Optimizer) -> None: ...
 

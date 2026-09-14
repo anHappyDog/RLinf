@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
@@ -60,7 +60,17 @@ def test_recompute_prev_logprobs_caches_frozen_reference_and_restores_actor():
     actor.cfg = OmegaConf.create({"actor": {"micro_batch_size": 1}})
     actor.kl_beta = 0.01
     actor.ref_policy_state_dict = {"scale": torch.tensor(1.0)}
-    actor.offload_model_buffer = {}
+
+    @contextmanager
+    def swap_reference(state_dict):
+        active_scale = actor.model.scale.detach().clone()
+        actor.model.load_state_dict(state_dict)
+        try:
+            yield
+        finally:
+            actor.model.load_state_dict({"scale": active_scale})
+
+    actor.swap_sharded_model_state_dict = swap_reference
     actor.rollout_batch = {
         "prev_logprobs": torch.zeros(2, 1, 1),
         "forward_inputs": {"expected_logprobs": torch.ones(2, 1, 1)},

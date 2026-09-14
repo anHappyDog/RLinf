@@ -15,6 +15,7 @@
 import math
 import os
 import warnings
+from contextlib import contextmanager
 from typing import ContextManager, Union
 
 import torch
@@ -374,6 +375,24 @@ class FSDPModelManager:
             self.model, cpu_offload, full_state_dict
         )
         return state_dict
+
+    @contextmanager
+    def swap_sharded_model_state_dict(self, state_dict: dict):
+        """Temporarily install a rank-local FSDP state dict.
+
+        Reference-policy evaluation must not call ``model.state_dict()`` on a
+        sharded model. In particular, FSDP1 ``SHARD_GRAD_OP`` may keep a
+        rank-local flat-parameter view after a value-only update; asking the
+        default full-state hook to unshard that view can make it interpret one
+        rank's shard as a full parameter. Each FSDP strategy therefore owns an
+        exact rank-local swap representation that avoids a full-policy gather.
+        """
+        active_state_dict = self._strategy.get_weight_swap_state(self.model)
+        try:
+            self._strategy.load_weight_swap_state(self.model, state_dict)
+            yield
+        finally:
+            self._strategy.load_weight_swap_state(self.model, active_state_dict)
 
     def load_checkpoint(self, load_path: str) -> None:
         """

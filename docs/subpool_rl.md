@@ -108,6 +108,33 @@ validated manifest, set `env.train.subpool.reward_overrides.step_penalty: 0.0`
 and `algorithm.gamma: 1.0`. Runtime overrides are validated before simulator
 startup; the source manifest and snapshot hashes remain unchanged.
 
+The radio pickup stage also exposes a bounded `pickup_progress_score` in
+`[0, 1]`. It separates approach and uprightness while the radio is supported
+from registered grasp, lift clearance, and continuous stable hold. A pickup is
+complete only after the radio remains registered in hand at least 4 cm above
+the table for 15 control steps (0.25 seconds at 60 Hz). The task reward uses
+only the score difference, so holding a fixed pose cannot repeatedly earn
+reward and dropping or tipping the radio loses prior progress. To combine this
+shaping with the common `+10/-2` subpool terminal scale, use:
+
+```yaml
+env:
+  train:
+    subpool:
+      reward_overrides:
+        potential_terms:
+          - key: pickup_progress_score
+            scale: 2.0
+            direction: increase
+        progress_clip: 2.0
+        step_penalty: 0.0
+```
+
+The shaping contribution telescopes and is bounded by 2 over a trajectory; it
+cannot outweigh terminal success. These metrics require the matching
+`TurningOnRadioReward` implementation in the BEHAVIOR-1K checkout used by every
+environment collector.
+
 ## Advantage and loss
 
 `subtask_gae` uses duration-aware discounts and stops recursion at termination

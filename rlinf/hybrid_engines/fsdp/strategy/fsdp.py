@@ -132,6 +132,75 @@ class FSDPStrategy(FSDPStrategyBase):
             return
         self._rebind_sharded_tensor_views(handle)
 
+    @staticmethod
+    def _flat_param_local_shard(handle) -> torch.Tensor:
+        """Return a classic-FSDP handle's rank-local flat parameter."""
+        flat_param = handle.flat_param
+        return getattr(flat_param, "_local_shard", flat_param.data)
+
+    @torch.no_grad()
+    def get_weight_swap_state(self, model: FSDP) -> dict:
+        """Snapshot raw local shards without invoking FSDP state-dict hooks.
+
+        PyTorch 2.6's FSDP1 state-dict paths are unsafe here: the default path
+        tries to all-gather a full parameter after a no-backward inference
+        forward, while the distributed-checkpoint sharded path may construct a
+        ``ShardedTensor`` with multiple local shards. A reference swap targets
+        the exact same live model and topology, so raw flat shards are the
+        minimal and lossless representation.
+        """
+        flat_parameters = tuple(
+            self._flat_param_local_shard(handle).detach().cpu().clone()
+            for handle in self._iter_fsdp_handles(model)
+        )
+        buffers = {
+            name: buffer.detach().cpu().clone()
+            for name, buffer in model.named_buffers()
+        }
+        return {
+            "format": "fsdp1_local_flat_shards_v1",
+            "flat_parameters": flat_parameters,
+            "buffers": buffers,
+        }
+
+    @torch.no_grad()
+    def load_weight_swap_state(self, model: FSDP, state_dict: dict) -> None:
+        """Restore raw local shards and rebind original-parameter views."""
+        if state_dict.get("format") != "fsdp1_local_flat_shards_v1":
+            raise ValueError("Unsupported FSDP1 weight-swap state format.")
+        handles = self._iter_fsdp_handles(model)
+        flat_parameters = state_dict["flat_parameters"]
+        if len(handles) != len(flat_parameters):
+            raise ValueError(
+                "FSDP1 weight-swap handle count changed: "
+                f"expected {len(handles)}, got {len(flat_parameters)}."
+            )
+        for handle, source in zip(handles, flat_parameters, strict=True):
+            # SHARD_GRAD_OP deliberately keeps a gathered full parameter after
+            # a no-grad forward. Drop that cached view before replacing the
+            # local shard; otherwise the next reference forward silently reads
+            # the old full parameter instead of all-gathering the replacement.
+            if handle.uses_sharded_strategy:
+                handle.reshard(free_unsharded_flat_param=True)
+            target = self._flat_param_local_shard(handle)
+            if target.numel() != source.numel():
+                raise ValueError(
+                    "FSDP1 weight-swap shard size changed: "
+                    f"expected {target.numel()}, got {source.numel()}."
+                )
+            target.copy_(source.to(device=target.device, dtype=target.dtype))
+            handle.flat_param.data = target
+            if hasattr(handle.flat_param, "_local_shard"):
+                handle.flat_param._local_shard = target
+            self._rebind_handle_views(handle)
+
+        current_buffers = dict(model.named_buffers())
+        if current_buffers.keys() != state_dict["buffers"].keys():
+            raise ValueError("FSDP1 weight-swap buffer names changed.")
+        for name, source in state_dict["buffers"].items():
+            target = current_buffers[name]
+            target.copy_(source.to(device=target.device, dtype=target.dtype))
+
     def wrap_model(self, model: nn.Module, device_mesh: DeviceMesh) -> FSDP:
         """
         Wrap the model with FSDP using the specified configuration,

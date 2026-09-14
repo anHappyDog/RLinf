@@ -216,6 +216,51 @@ def test_model_manager_reports_independent_branch_clipping():
     manager.grad_scaler.step.assert_called_once_with(optimizer=manager.optimizer)
 
 
+def test_model_manager_swaps_rank_local_state_and_restores_on_error():
+    manager = object.__new__(FSDPModelManager)
+    manager.model = object()
+    active_state = {"weight": torch.tensor([2.0])}
+    reference_state = {"weight": torch.tensor([1.0])}
+    manager._strategy = MagicMock()
+    manager._strategy.get_weight_swap_state.return_value = active_state
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        with manager.swap_sharded_model_state_dict(reference_state):
+            raise RuntimeError("forward failed")
+
+    manager._strategy.get_weight_swap_state.assert_called_once_with(manager.model)
+    assert manager._strategy.load_weight_swap_state.call_args_list == [
+        ((manager.model, reference_state), {}),
+        ((manager.model, active_state), {}),
+    ]
+
+
+def test_fsdp1_weight_swap_uses_raw_local_flat_shards():
+    strategy = object.__new__(FSDPStrategy)
+    local_shard = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    flat_param = SimpleNamespace(data=local_shard, _local_shard=local_shard)
+    handle = SimpleNamespace(
+        flat_param=flat_param,
+        uses_sharded_strategy=True,
+        reshard=MagicMock(),
+    )
+    strategy._iter_fsdp_handles = MagicMock(return_value=[handle])
+    strategy._rebind_handle_views = MagicMock()
+    model = torch.nn.Module()
+    model.register_buffer("running", torch.tensor([3.0]))
+
+    state = strategy.get_weight_swap_state(model)
+    local_shard.data.fill_(9.0)
+    model.running.fill_(8.0)
+    strategy.load_weight_swap_state(model, state)
+
+    assert state["format"] == "fsdp1_local_flat_shards_v1"
+    assert torch.equal(local_shard, torch.tensor([1.0, 2.0]))
+    assert torch.equal(model.running, torch.tensor([3.0]))
+    handle.reshard.assert_called_once_with(free_unsharded_flat_param=True)
+    strategy._rebind_handle_views.assert_called_once_with(handle)
+
+
 @pytest.mark.parametrize(
     ("world_size", "hybrid_shard_size", "node_local_world_size", "message"),
     [

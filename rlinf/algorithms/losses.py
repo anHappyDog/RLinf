@@ -342,6 +342,23 @@ def compute_ppo_critic_loss(
     Returns:
         Tuple[torch.Tensor, Dict]: (critic_loss, metrics_dict)
     """
+    if values.shape != returns.shape:
+        if values.numel() != returns.numel():
+            raise ValueError(
+                "Critic predictions and returns must contain the same number "
+                f"of elements; got {tuple(values.shape)} and "
+                f"{tuple(returns.shape)}."
+            )
+        values = values.reshape_as(returns)
+    if prev_values.shape != returns.shape:
+        if prev_values.numel() != returns.numel():
+            raise ValueError(
+                "Previous critic predictions and returns must contain the same "
+                f"number of elements; got {tuple(prev_values.shape)} and "
+                f"{tuple(returns.shape)}."
+            )
+        prev_values = prev_values.reshape_as(returns)
+
     loss_mask_ratio = None
     loss_agg_func = masked_mean
 

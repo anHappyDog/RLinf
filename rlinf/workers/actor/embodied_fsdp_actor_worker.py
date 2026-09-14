@@ -14,6 +14,7 @@
 
 import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +32,7 @@ from rlinf.algorithms.subtask import (
     reduce_trajectory_group_ids,
     reduce_trajectory_successes,
 )
-from rlinf.algorithms.utils import kl_penalty
+from rlinf.algorithms.utils import huber_loss, kl_penalty
 from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import Trajectory, convert_trajectories_to_batch
 from rlinf.data.storage.lerobot import resolve_lerobot_repo_id
@@ -65,11 +66,9 @@ from rlinf.utils.placement import (
 )
 from rlinf.utils.utils import (
     clear_memory,
-    cpu_weight_swap,
     masked_mean,
     preprocess_embodied_batch,
     reshape_entropy,
-    retrieve_model_state_dict_in_cpu,
 )
 
 
@@ -165,7 +164,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.cfg.actor.get("combine_reference_model", True)
         )
         self.ref_policy_state_dict = None
-        self.offload_model_buffer = None
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
@@ -189,6 +187,37 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             // self.cfg.actor.micro_batch_size
             // self._world_size
         )
+        critic_global_batch_size = self.cfg.actor.get("critic_global_batch_size", None)
+        self.critic_global_batch_size = int(
+            critic_global_batch_size
+            if critic_global_batch_size is not None
+            else self.cfg.actor.global_batch_size
+        )
+        if self.critic_global_batch_size % (
+            self.cfg.actor.micro_batch_size * self._world_size
+        ):
+            raise ValueError(
+                "actor.critic_global_batch_size must be divisible by "
+                "actor.micro_batch_size * actor world size; got "
+                f"{self.critic_global_batch_size}, "
+                f"{self.cfg.actor.micro_batch_size}, and {self._world_size}."
+            )
+        self.cache_critic_inputs = bool(
+            self.cfg.actor.get("cache_critic_inputs", False)
+        )
+        if self.cache_critic_inputs:
+            if (
+                SupportedModel(self.cfg.actor.model.model_type)
+                != SupportedModel.OPENPI_RLINF
+            ):
+                raise ValueError(
+                    "actor.cache_critic_inputs currently supports openpi_rlinf only."
+                )
+            if not self.cfg.actor.model.openpi.get("detach_critic_input", False):
+                raise ValueError(
+                    "actor.cache_critic_inputs requires "
+                    "actor.model.openpi.detach_critic_input=true."
+                )
         self.update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         policy_epochs = self.cfg.actor.get("policy_update_epochs", None)
         critic_epochs = self.cfg.actor.get("critic_update_epochs", None)
@@ -318,8 +347,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         restore_weight_offload = self.is_weight_offloaded
         if restore_weight_offload:
             self.load_param_and_grad(self.device)
-        self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
-        self.offload_model_buffer = {}
+        self.ref_policy_state_dict = self._strategy.get_weight_swap_state(self.model)
         if restore_weight_offload:
             self.offload_param_and_grad()
         self.log_info(
@@ -401,6 +429,197 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"critic/fixed_batch/value_loss_{suffix}": value_loss,
             f"critic/fixed_batch/explained_variance_{suffix}": explained_variance,
         }
+
+    def _phase_batch_config(self, phase: str) -> tuple[int, int, int]:
+        """Return global, per-rank, and micro-batch accumulation sizes."""
+        global_batch_size = (
+            self.critic_global_batch_size
+            if phase == "critic"
+            else int(self.cfg.actor.global_batch_size)
+        )
+        batch_size_per_rank = global_batch_size // self._world_size
+        gradient_accumulation = batch_size_per_rank // self.cfg.actor.micro_batch_size
+        return global_batch_size, batch_size_per_rank, gradient_accumulation
+
+    def _build_critic_input_cache(self) -> dict[str, float]:
+        """Cache detached VLM prefix features for repeated critic updates."""
+        forward_inputs = self.rollout_batch["forward_inputs"]
+        if "critic_pooled_prefix" in forward_inputs:
+            return {}
+
+        sample_count = int(self.rollout_batch["prev_logprobs"].shape[0])
+        num_chunks = (
+            sample_count + self.cfg.actor.micro_batch_size - 1
+        ) // self.cfg.actor.micro_batch_size
+        started = time.perf_counter()
+        cached_chunks = []
+        for micro_batch in split_dict_to_chunk(forward_inputs, num_chunks):
+            micro_batch = put_tensor_device(micro_batch, self.device)
+            with torch.no_grad(), self.amp_context:
+                output = self.model(
+                    forward_inputs=micro_batch,
+                    compute_logprobs=False,
+                    compute_entropy=False,
+                    compute_values=False,
+                    export_critic_inputs=True,
+                    use_cache=False,
+                )
+            cached_chunks.append(
+                {
+                    key: value.detach().to("cpu", copy=True)
+                    for key, value in output["critic_inputs"].items()
+                }
+            )
+        cache = cat_list_of_dict_tensor(cached_chunks)
+        # Policy updates have already completed, so the raw images, prompts,
+        # action chains, and denoise metadata are dead for this global step.
+        # Retain only the exact inputs consumed by the detached critic. Besides
+        # avoiding repeated VLM compute, this prevents every critic micro-batch
+        # from copying the much larger policy payload back to the GPU.
+        self.rollout_batch["forward_inputs"] = {
+            "obs_state": forward_inputs["obs_state"],
+            **cache,
+        }
+        cache_bytes = sum(
+            tensor.numel() * tensor.element_size() for tensor in cache.values()
+        )
+        elapsed = time.perf_counter() - started
+        self.log_info(
+            "Cached detached critic inputs for "
+            f"{sample_count} samples ({cache_bytes / 2**30:.2f} GiB) "
+            f"in {elapsed:.2f}s."
+        )
+        return {
+            "critic/cache_enabled": 1.0,
+            "critic/cache_samples": float(sample_count * self._world_size),
+            "critic/cache_gib_per_rank": cache_bytes / 2**30,
+            "critic/cache_build_seconds": elapsed,
+        }
+
+    def _critic_post_update_metrics(self) -> dict[str, float]:
+        """Evaluate the final critic once, without mixing optimizer epochs."""
+        forward_inputs = self.rollout_batch["forward_inputs"]
+        returns = self.rollout_batch["returns"]
+        loss_mask = self.rollout_batch.get("loss_mask")
+        sample_count = int(returns.shape[0])
+        num_chunks = (
+            sample_count + self.cfg.actor.micro_batch_size - 1
+        ) // self.cfg.actor.micro_batch_size
+        forward_chunks = split_dict_to_chunk(forward_inputs, num_chunks)
+        return_chunks = torch.chunk(returns, num_chunks, dim=0)
+        mask_chunks = (
+            torch.chunk(loss_mask, num_chunks, dim=0)
+            if loss_mask is not None
+            else [None] * num_chunks
+        )
+
+        local_values = []
+        local_targets = []
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                for inputs, targets, mask in zip(
+                    forward_chunks,
+                    return_chunks,
+                    mask_chunks,
+                    strict=True,
+                ):
+                    inputs = put_tensor_device(inputs, self.device)
+                    with self.amp_context:
+                        output = self.model(
+                            forward_inputs=inputs,
+                            compute_logprobs=False,
+                            compute_entropy=False,
+                            compute_values=True,
+                            use_cache=False,
+                        )
+                    values = output["values"].detach().float().cpu()
+                    targets = targets.detach().float().cpu()
+                    if values.shape != targets.shape:
+                        if values.numel() != targets.numel():
+                            raise ValueError(
+                                "Post-update critic predictions and targets have "
+                                f"incompatible shapes {tuple(values.shape)} and "
+                                f"{tuple(targets.shape)}."
+                            )
+                        values = values.reshape_as(targets)
+                    if mask is not None:
+                        mask = mask.detach().to(dtype=torch.bool, device="cpu")
+                        if mask.shape != targets.shape:
+                            mask = torch.broadcast_to(mask, targets.shape)
+                        values = values[mask]
+                        targets = targets[mask]
+                    else:
+                        values = values.reshape(-1)
+                        targets = targets.reshape(-1)
+                    local_values.append(values)
+                    local_targets.append(targets)
+        finally:
+            self.model.train(was_training)
+
+        values = torch.cat(local_values).to(self.device)
+        targets = torch.cat(local_targets).to(self.device)
+        errors = targets - values
+        count = torch.tensor(float(values.numel()), device=self.device)
+        sums = torch.stack(
+            (
+                count,
+                values.sum(),
+                (values * values).sum(),
+                targets.sum(),
+                (targets * targets).sum(),
+                errors.sum(),
+                (errors * errors).sum(),
+                errors.abs().sum(),
+            )
+        ).float()
+        torch.distributed.all_reduce(sums, op=torch.distributed.ReduceOp.SUM)
+        minima = torch.stack((values.min(), targets.min())).float()
+        maxima = torch.stack((values.max(), targets.max())).float()
+        torch.distributed.all_reduce(minima, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX)
+
+        count = sums[0].clamp_min(1.0)
+        value_mean = sums[1] / count
+        target_mean = sums[3] / count
+        error_mean = sums[5] / count
+        value_variance = (sums[2] / count - value_mean.square()).clamp_min(0.0)
+        target_variance = (sums[4] / count - target_mean.square()).clamp_min(0.0)
+        error_variance = (sums[6] / count - error_mean.square()).clamp_min(0.0)
+        mse = sums[6] / count
+        huber_delta = self.cfg.algorithm.get("huber_delta", None)
+        explained_variance = (
+            1.0 - error_variance / target_variance
+            if target_variance > 0
+            else torch.tensor(float("nan"), device=self.device)
+        )
+        metrics = {
+            CRITIC_EXPLAINED_VARIANCE_KEY: explained_variance.item(),
+            "critic/post_update/explained_variance": explained_variance.item(),
+            "critic/post_update/valid_samples": sums[0].item(),
+            "critic/post_update/value_min": minima[0].item(),
+            "critic/post_update/value_mean": value_mean.item(),
+            "critic/post_update/value_std": value_variance.sqrt().item(),
+            "critic/post_update/value_max": maxima[0].item(),
+            "critic/post_update/target_min": minima[1].item(),
+            "critic/post_update/target_mean": target_mean.item(),
+            "critic/post_update/target_std": target_variance.sqrt().item(),
+            "critic/post_update/target_max": maxima[1].item(),
+            "critic/post_update/error_mean": error_mean.item(),
+            "critic/post_update/mae": (sums[7] / count).item(),
+            "critic/post_update/mse": mse.item(),
+            "critic/post_update/rmse": mse.sqrt().item(),
+        }
+        if huber_delta is not None:
+            local_huber_sum = huber_loss(errors, float(huber_delta)).sum()
+            torch.distributed.all_reduce(
+                local_huber_sum, op=torch.distributed.ReduceOp.SUM
+            )
+            metrics["critic/post_update/huber_loss_unclipped"] = (
+                local_huber_sum / count
+            ).item()
+        return metrics
 
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
@@ -891,11 +1110,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             "Reference KL is enabled but the frozen reference "
                             "policy has not been initialized."
                         )
-                    with cpu_weight_swap(
-                        self.model,
-                        self.ref_policy_state_dict,
-                        self.offload_model_buffer,
-                    ):
+                    with self.swap_sharded_model_state_dict(self.ref_policy_state_dict):
                         ref_logprobs = compute_logprobs()
         finally:
             self.model.train(was_training)
@@ -1468,14 +1683,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         rollout_size = self.rollout_batch["prev_logprobs"].size(0)
-        batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
-        assert rollout_size % batch_size_per_rank == 0, (
-            f"{rollout_size} is not divisible by {batch_size_per_rank}"
-        )
         metrics = {}
         append_to_dict(metrics, recompute_metrics)
         diagnostics_cfg = self.cfg.actor.get("policy_gradient_diagnostics", {})
         if diagnostics_cfg.get("enabled", False):
+            batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
             if rollout_size != batch_size_per_rank:
                 raise ValueError(
                     "Policy-gradient diagnostics require the actor global batch "
@@ -1490,6 +1702,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 return diagnostic_metrics
             append_to_dict(metrics, diagnostic_metrics)
         for phase, update_epochs, update_policy, update_value in update_phases:
+            if update_epochs == 0:
+                continue
+            if phase == "critic" and self.cache_critic_inputs:
+                append_to_dict(metrics, self._build_critic_input_cache())
+            (
+                phase_global_batch_size,
+                batch_size_per_rank,
+                gradient_accumulation,
+            ) = self._phase_batch_config(phase)
+            if rollout_size % batch_size_per_rank:
+                raise ValueError(
+                    f"The per-rank rollout size {rollout_size} must be divisible "
+                    f"by the {phase} per-rank batch size "
+                    f"{batch_size_per_rank} (global batch size "
+                    f"{phase_global_batch_size})."
+                )
             fixed_batch_interval = max(1, update_epochs // 10)
             for update_index in range(update_epochs):
                 collect_epoch_metrics = (
@@ -1506,8 +1734,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     ]
                     assert (
                         train_global_batch_size
-                        == self.cfg.actor.global_batch_size
-                        // torch.distributed.get_world_size()
+                        == phase_global_batch_size // torch.distributed.get_world_size()
                     )
                     assert (
                         train_global_batch_size % self.cfg.actor.micro_batch_size == 0
@@ -1523,7 +1750,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         self.train_micro_batch(
                             micro_batch=batch,
                             metrics=epoch_metrics,
-                            is_last=(idx + 1) == self.gradient_accumulation,
+                            is_last=(idx + 1) == gradient_accumulation,
+                            gradient_accumulation=gradient_accumulation,
                             update_policy=update_policy,
                             update_value=update_value,
                         )
@@ -1577,22 +1805,25 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "critic/resume_warmup": float(resume_critic_warmup),
                 },
             )
+        post_update_critic_metrics = {}
+        if any(
+            update_value and epochs > 0 for _, epochs, _, update_value in update_phases
+        ):
+            post_update_critic_metrics = self._critic_post_update_metrics()
         # put LR scheduler step here
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
-        explained_variance_stats = pop_critic_explained_variance_stats(metrics)
+        # Per-microbatch sufficient statistics describe predictions made before
+        # many different optimizer steps. Combining them is not one coherent
+        # critic and can produce a misleading EV. The explicit post-update pass
+        # above owns the public explained-variance metric.
+        pop_critic_explained_variance_stats(metrics)
+        append_to_dict(metrics, post_update_critic_metrics)
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
-        if explained_variance_stats:
-            reduced_stats = all_reduce_dict(
-                explained_variance_stats, op=torch.distributed.ReduceOp.SUM
-            )
-            mean_metric_dict[CRITIC_EXPLAINED_VARIANCE_KEY] = (
-                compute_critic_explained_variance_from_stats(reduced_stats).item()
-            )
 
         return mean_metric_dict
 
@@ -1602,6 +1833,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         metrics: dict[str, list[float]],
         *,
         is_last: bool,
+        gradient_accumulation: int | None = None,
         update_policy: bool = True,
         update_value: bool = True,
     ) -> None:
@@ -1747,7 +1979,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.enable_sft_co_train and update_policy:
             loss = self._train_sft_epoch(metrics_data, loss)
 
-        loss /= self.gradient_accumulation
+        gradient_accumulation = (
+            self.gradient_accumulation
+            if gradient_accumulation is None
+            else gradient_accumulation
+        )
+        loss /= gradient_accumulation
         with backward_ctx:
             self.grad_scaler.scale(loss).backward()
 

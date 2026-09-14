@@ -259,6 +259,14 @@ def compute_critic_explained_variance_stats(
     """Compute sufficient statistics for critic explained variance."""
     returns = returns.detach().float()
     values = values.detach().float()
+    if values.shape != returns.shape:
+        if values.numel() != returns.numel():
+            raise ValueError(
+                "Critic predictions and returns must contain the same number "
+                f"of elements; got {tuple(values.shape)} and "
+                f"{tuple(returns.shape)}."
+            )
+        values = values.reshape_as(returns)
     if loss_mask is not None:
         mask = loss_mask.to(device=returns.device, dtype=torch.bool)
         if mask.shape != returns.shape:

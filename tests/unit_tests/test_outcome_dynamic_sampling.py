@@ -531,6 +531,18 @@ def test_resume_critic_warmup_disables_policy_for_exact_global_steps():
     assert phases == (("policy", 1, True, False), ("critic", 5, False, True))
 
 
+def test_critic_phase_uses_independent_smaller_global_batch():
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor.cfg = OmegaConf.create(
+        {"actor": {"global_batch_size": 16000, "micro_batch_size": 100}}
+    )
+    actor._world_size = 4
+    actor.critic_global_batch_size = 3200
+
+    assert actor._phase_batch_config("policy") == (16000, 4000, 40)
+    assert actor._phase_batch_config("critic") == (3200, 800, 8)
+
+
 def test_validate_resume_critic_warmup_and_bootstrap_type():
     cfg = OmegaConf.create(
         {

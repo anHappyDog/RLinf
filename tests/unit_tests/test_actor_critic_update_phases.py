@@ -90,3 +90,33 @@ def test_embodied_value_only_update_does_not_require_logprobs():
 
     assert "critic/value_loss" in metrics
     assert inputs["values"].grad is not None
+
+
+def test_critic_loss_aligns_singleton_value_dimension_without_broadcasting():
+    values = torch.tensor([0.0, 2.0], requires_grad=True)
+    loss, _ = compute_ppo_actor_critic_loss(
+        **(
+            _loss_inputs()
+            | {
+                "values": values,
+                "returns": torch.tensor([[1.0], [0.0]]),
+                "prev_values": torch.tensor([0.0, 2.0]),
+                "value_clip": 10.0,
+            }
+        ),
+        update_policy=False,
+        update_value=True,
+    )
+
+    assert loss.item() == pytest.approx(1.0)
+    loss.backward()
+    assert values.grad.shape == (2,)
+
+
+def test_critic_loss_rejects_incompatible_prediction_shape():
+    with pytest.raises(ValueError, match="same number"):
+        compute_ppo_actor_critic_loss(
+            **(_loss_inputs() | {"values": torch.zeros(3, requires_grad=True)}),
+            update_policy=False,
+            update_value=True,
+        )

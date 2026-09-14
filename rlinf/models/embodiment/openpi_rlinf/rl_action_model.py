@@ -315,41 +315,87 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
 
         compute_logprobs = kwargs.get("compute_logprobs", True)
         compute_values = kwargs.get("compute_values", True)
+        export_critic_inputs = kwargs.get("export_critic_inputs", False)
 
-        chains = forward_inputs["chains"]
-        denoise_inds = forward_inputs["denoise_inds"]
-        B = chains.shape[0]
-        device = chains.device
-
-        images: dict[str, torch.Tensor] = {}
-        image_masks: dict[str, torch.Tensor] = {}
-        for key, value in forward_inputs.items():
-            if key.startswith("obs_image__"):
-                images[key[len("obs_image__") :]] = value
-            elif key.startswith("obs_image_mask__"):
-                image_masks[key[len("obs_image_mask__") :]] = value
-        observation = Observation(
-            images=images,
-            image_masks=image_masks,
-            state=forward_inputs["obs_state"],
-            tokenized_prompt=forward_inputs["tokenized_prompt"],
-            tokenized_prompt_mask=forward_inputs["tokenized_prompt_mask"],
+        cached_pooled = forward_inputs.get("critic_pooled_prefix")
+        cached_prefix_out = forward_inputs.get("critic_prefix_out")
+        cached_prefix_mask = forward_inputs.get("critic_prefix_mask")
+        use_critic_cache = (
+            compute_values
+            and cached_pooled is not None
+            and not compute_logprobs
+            and not export_critic_inputs
         )
 
-        # Grad-enabled prefix pass — the VLM value head reads ``prefix_out``
-        # so gradients must flow through paligemma here.
-        if rl_cfg.train_expert_only:
-            with torch.no_grad():
+        observation = None
+        if use_critic_cache:
+            B = cached_pooled.shape[0]
+            device = cached_pooled.device
+            observation_state = forward_inputs["obs_state"]
+        else:
+            chains = forward_inputs["chains"]
+            denoise_inds = forward_inputs["denoise_inds"]
+            B = chains.shape[0]
+            device = chains.device
+
+            images: dict[str, torch.Tensor] = {}
+            image_masks: dict[str, torch.Tensor] = {}
+            for key, value in forward_inputs.items():
+                if key.startswith("obs_image__"):
+                    images[key[len("obs_image__") :]] = value
+                elif key.startswith("obs_image_mask__"):
+                    image_masks[key[len("obs_image_mask__") :]] = value
+            observation = Observation(
+                images=images,
+                image_masks=image_masks,
+                state=forward_inputs["obs_state"],
+                tokenized_prompt=forward_inputs["tokenized_prompt"],
+                tokenized_prompt_mask=forward_inputs["tokenized_prompt_mask"],
+            )
+            observation_state = observation.state
+
+        prefix_out = None
+        prefix_mask = None
+        kv_cache = None
+        if compute_logprobs or not use_critic_cache or export_critic_inputs:
+            # Grad-enabled prefix pass — the VLM value head reads ``prefix_out``
+            # so gradients must flow through paligemma unless it is explicitly
+            # detached/frozen for this RL configuration.
+            if rl_cfg.train_expert_only or export_critic_inputs:
+                with torch.no_grad():
+                    assert observation is not None
+                    prefix_out, prefix_mask, kv_cache = self.model.build_prefix_cache(
+                        observation
+                    )
+            else:
+                assert observation is not None
                 prefix_out, prefix_mask, kv_cache = self.model.build_prefix_cache(
                     observation
                 )
-        else:
-            prefix_out, prefix_mask, kv_cache = self.model.build_prefix_cache(
-                observation
-            )
+
+        if export_critic_inputs:
+            if not rl_cfg.detach_critic_input:
+                raise RuntimeError(
+                    "Critic input caching requires openpi.detach_critic_input=true."
+                )
+            assert prefix_out is not None and prefix_mask is not None
+            critic_inputs = {
+                "critic_pooled_prefix": rl_sampler.pool_prefix(
+                    prefix_out, prefix_mask
+                ).detach(),
+                "critic_prefix_mask": prefix_mask.detach(),
+            }
+            if rl_cfg.value_vlm_mode == "state_attention":
+                critic_inputs["critic_prefix_out"] = prefix_out.detach()
+            return {"critic_inputs": critic_inputs}
 
         log_probs = None
         if compute_logprobs:
+            assert (
+                observation is not None
+                and prefix_mask is not None
+                and kv_cache is not None
+            )
             idx0 = denoise_inds[:, 0].to(torch.long)
             arange_B = torch.arange(B, device=device)
             chains_pre = chains[arange_B, idx0]
@@ -379,18 +425,33 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
             )
 
         if compute_values and rl_cfg.add_value_head and rl_cfg.value_after_vlm:
-            critic_prefix_out = (
-                prefix_out.detach() if rl_cfg.detach_critic_input else prefix_out
-            )
-            values = rl_sampler.value_from_prefix(
-                self.value_head,
-                critic_prefix_out,
-                prefix_mask,
-                state=observation.state,
-                mode=rl_cfg.value_vlm_mode,
-            )
+            if use_critic_cache:
+                values = rl_sampler.value_from_cached_prefix(
+                    self.value_head,
+                    cached_pooled,
+                    state=observation_state,
+                    mode=rl_cfg.value_vlm_mode,
+                    prefix_out=cached_prefix_out,
+                    prefix_mask=cached_prefix_mask,
+                )
+            else:
+                assert prefix_out is not None and prefix_mask is not None
+                critic_prefix_out = (
+                    prefix_out.detach() if rl_cfg.detach_critic_input else prefix_out
+                )
+                values = rl_sampler.value_from_prefix(
+                    self.value_head,
+                    critic_prefix_out,
+                    prefix_mask,
+                    state=observation_state,
+                    mode=rl_cfg.value_vlm_mode,
+                )
+            # Critic targets are [B, 1]. Keeping the prediction explicitly in
+            # that shape prevents PyTorch from broadcasting [B] - [B, 1] into
+            # a [B, B] loss matrix.
+            values = values.unsqueeze(-1)
         else:
-            values = torch.zeros(B, device=device, dtype=torch.float32)
+            values = torch.zeros(B, 1, device=device, dtype=torch.float32)
 
         entropy = torch.zeros((B, 1), device=device, dtype=torch.float32)
         return {

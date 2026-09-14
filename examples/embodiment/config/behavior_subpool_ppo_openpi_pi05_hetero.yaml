@@ -184,6 +184,13 @@ actor:
   # preserves the accepted DAPO positive/negative mixture at optimizer-step
   # granularity and avoids within-rollout policy drift across minibatches.
   global_batch_size: 320
+  # Optional value-only optimizer batch. This may be smaller than the policy
+  # GBS when independent update epochs are enabled, yielding multiple critic
+  # optimizer steps over one fixed rollout batch.
+  critic_global_batch_size: null
+  # Reuse detached OpenPI VLM prefix features across repeated critic epochs.
+  # This requires model.openpi.detach_critic_input=true.
+  cache_critic_inputs: false
   # Set both fields to integers to update the policy and critic independently
   # on the same accepted rollout batch. Null preserves legacy joint epochs.
   policy_update_epochs: null

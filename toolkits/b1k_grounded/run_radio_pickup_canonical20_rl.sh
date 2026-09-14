@@ -22,6 +22,8 @@ max_steps=${B1K_RL_MAX_STEPS:-200}
 save_interval=${B1K_RL_SAVE_INTERVAL:-5}
 micro_batch_size=${B1K_RL_MICRO_BATCH_SIZE:-100}
 global_batch_size=${B1K_RL_GLOBAL_BATCH_SIZE:-16000}
+critic_global_batch_size=${B1K_RL_CRITIC_GLOBAL_BATCH_SIZE:-3200}
+cache_critic_inputs=${B1K_RL_CACHE_CRITIC_INPUTS:-true}
 max_attempts=${B1K_RL_MAX_ATTEMPTS_PER_STATE:-8}
 state_cache_size=${B1K_RL_STATE_CACHE_SIZE:-20}
 dynamic_batching=${B1K_RL_DYNAMIC_BATCHING:-false}
@@ -40,13 +42,13 @@ export B1K_ASSET_FINGERPRINT=b1k-2fd66d5c-radio-bc82d211
 export B1K_SUBPOOL_MODEL_PATH="$model"
 export RLINF_REMOTE_COLLECTOR_TOKEN=${RLINF_REMOTE_COLLECTOR_TOKEN:-B1K_CROSSDC_RADIO_0909_V1}
 
-"$venv/bin/python" - "$B1K_SUBPOOL_MANIFEST" "$norm_stats" "$micro_batch_size" "$global_batch_size" <<'PY'
+"$venv/bin/python" - "$B1K_SUBPOOL_MANIFEST" "$norm_stats" "$micro_batch_size" "$global_batch_size" "$critic_global_batch_size" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 manifest, norm_stats = map(Path, sys.argv[1:3])
-micro_batch_size, global_batch_size = map(int, sys.argv[3:5])
+micro_batch_size, global_batch_size, critic_global_batch_size = map(int, sys.argv[3:6])
 rows = [json.loads(line) for line in manifest.read_text().splitlines() if line]
 assert len(rows) == 20, len(rows)
 assert len({row["snapshot_id"] for row in rows}) == 20
@@ -58,7 +60,12 @@ assert all(json.loads(row["control_json"])["subgoal"] for row in rows)
 assert all((manifest.parent / row["state_path"]).is_file() for row in rows)
 assert norm_stats.is_file(), norm_stats
 assert global_batch_size % (micro_batch_size * 4) == 0
-print(f"Validated 20 canonical states; MBS={micro_batch_size}, GBS={global_batch_size}.")
+assert critic_global_batch_size % (micro_batch_size * 4) == 0
+print(
+    "Validated 20 canonical states; "
+    f"MBS={micro_batch_size}, policy GBS={global_batch_size}, "
+    f"critic GBS={critic_global_batch_size}."
+)
 PY
 
 remote_collectors='{enabled:true,auth_token_env:RLINF_REMOTE_COLLECTOR_TOKEN,response_compression:{codec:zlib,level:1,min_bytes:65536},endpoints:[{env_rank:0,ssh_host:gdb_4090_1,port:46100,local_port:47100,env_overrides:{video_cfg:{save_video:false}}},{env_rank:1,ssh_host:gdb_4090_1,port:46101,local_port:47101,env_overrides:{video_cfg:{save_video:false}}},{env_rank:2,ssh_host:gdb_4090_1,port:46102,local_port:47102,env_overrides:{video_cfg:{save_video:false}}},{env_rank:3,ssh_host:gdb_4090_1,port:46103,local_port:47103,env_overrides:{video_cfg:{save_video:false}}},{env_rank:4,ssh_host:gdb_4090_1,port:46104,local_port:47104,env_overrides:{video_cfg:{save_video:false}}},{env_rank:5,ssh_host:gdb_4090_1,port:46105,local_port:47105,env_overrides:{video_cfg:{save_video:false}}},{env_rank:6,ssh_host:gdb_4090_1,port:46106,local_port:47106,env_overrides:{video_cfg:{save_video:false}}},{env_rank:7,ssh_host:gdb_4090_1,port:46107,local_port:47107,env_overrides:{video_cfg:{save_video:false}}},{env_rank:8,ssh_host:gdb_4090_2,port:46100,local_port:47108,env_overrides:{video_cfg:{save_video:false}}},{env_rank:9,ssh_host:gdb_4090_2,port:46101,local_port:47109,env_overrides:{video_cfg:{save_video:false}}},{env_rank:10,ssh_host:gdb_4090_2,port:46102,local_port:47110,env_overrides:{video_cfg:{save_video:false}}},{env_rank:11,ssh_host:gdb_4090_2,port:46103,local_port:47111,env_overrides:{video_cfg:{save_video:false}}}]}'
@@ -115,6 +122,8 @@ command=(
   actor.model.openpi.value_vlm_mode=state_attention
   actor.micro_batch_size="$micro_batch_size"
   actor.global_batch_size="$global_batch_size"
+  actor.critic_global_batch_size="$critic_global_batch_size"
+  actor.cache_critic_inputs="$cache_critic_inputs"
   actor.policy_update_epochs=1
   actor.critic_update_epochs=5
   actor.enable_offload=false
