@@ -425,6 +425,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                         * discount
                         * qf_next_target
                     )  # [bsz, 1]
+                elif bootstrap_type == "never":
+                    target_q_values = rewards_for_bootstrap
                 else:
                     raise NotImplementedError(f"{bootstrap_type=} is not supported!")
 
@@ -461,6 +463,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     rewards_for_bootstrap
                     + (~(terminations.any(dim=-1, keepdim=True))) * discount * qf_next
                 )  # [bsz, 1]
+            elif bootstrap_type == "never":
+                target_q_values = rewards_for_bootstrap
             else:
                 raise NotImplementedError(f"{bootstrap_type=} is not supported!")
 

@@ -125,7 +125,8 @@ algorithm
      - How to aggregate token losses (e.g., ``token-mean``).
    * - ``algorithm.bootstrap_type``
      - How to bootstrap Q-values at episode boundaries: ``standard`` bootstraps
-       only on truncation; ``always`` bootstraps on truncation or termination.
+       only on truncation; ``always`` bootstraps on truncation or termination;
+       ``never`` uses terminal rewards without a bootstrap value.
    * - ``algorithm.kl_beta``
      - Weight of the KL penalty added to rewards.
    * - ``algorithm.entropy_bonus``

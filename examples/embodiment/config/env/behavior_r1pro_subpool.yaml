@@ -52,6 +52,16 @@ subpool:
     predecessor_success: 0.0
     recovery: 0.0
   dynamic_updates: false
+  # Cache validated CPU simulator states inside each env worker. Set this to the
+  # canonical pool size to avoid repeated shared-filesystem reads during reset.
+  # Cached states are still restored through the normal OmniGibson path.
+  state_cache_size: 0
+  # Optional runtime-only reward changes for controlled A/B experiments. The
+  # source manifest and state hashes remain unchanged.
+  reward_overrides: {}
+  # Subpool success/timeout can replace the much broader official whole-task
+  # BDDL termination check when the patched OmniGibson API is available.
+  skip_official_task_termination: false
   max_dynamic_per_subtask_pool: 32
   # Optionally retain every timeout's exact serialized=False simulator state
   # for later DAgger or recovery-data collection. Each simulator writes locally;

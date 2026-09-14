@@ -389,9 +389,43 @@ class FSDPModelManager:
             self.load_optimizer(self.device)
             self.is_optimizer_offloaded = False
 
+        reset_value_head = bool(self._cfg.get("reset_value_head_on_resume", False))
+        initial_value_parameters = {}
+        if reset_value_head:
+            initial_value_parameters = {
+                name: parameter.detach().clone()
+                for name, parameter in self.model.named_parameters()
+                if "value_head" in name.split(".")
+            }
+            if not initial_value_parameters:
+                raise ValueError(
+                    "actor.reset_value_head_on_resume=true requires a model "
+                    "with value_head parameters."
+                )
+
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
+
+        if reset_value_head:
+            loaded_parameters = dict(self.model.named_parameters())
+            reset_parameters = []
+            with torch.no_grad():
+                for name, initial_parameter in initial_value_parameters.items():
+                    parameter = loaded_parameters[name]
+                    parameter.copy_(initial_parameter)
+                    reset_parameters.append(parameter)
+
+            cleared_optimizer_states = 0
+            for parameter in reset_parameters:
+                if self.optimizer.state.pop(parameter, None) is not None:
+                    cleared_optimizer_states += 1
+            self._logger.info(
+                "[FSDP] Reset %d value-head parameters to their synchronized "
+                "initial weights and cleared %d optimizer states after resume.",
+                len(reset_parameters),
+                cleared_optimizer_states,
+            )
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """

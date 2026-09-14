@@ -91,10 +91,23 @@ algorithm:
     max_attempts_per_group: 0
     # Quota filtering keeps sampling indefinitely; warn every four rejected groups.
     attempt_warning_interval: 4
+    # Optional actor-only gate. No-signal groups still train the critic and do
+    # not trigger resampling; only their PPO policy weight becomes zero.
+    actor_signal_gate:
+      enabled: false
+      min_successes: 2
+      min_failures: 2
   normalize_advantages: true
   advantage_std_floor: 0.1
+  # Clip normalized advantages to bound the influence of state-level outliers.
+  advantage_clip: null
+  # Use logical_state for per-init-state centering/scaling in multi-state runs.
+  advantage_normalization_scope: subtask
   group_size: 1
   reward_type: subtask_chunk_level
+  # standard: bootstrap time-limit truncations; always: all done boundaries;
+  # never: use only observed rewards at both terminal and timeout boundaries.
+  bootstrap_type: standard
   logprob_type: chunk_level
   entropy_type: token_level
   adv_type: subtask_gae
@@ -149,6 +162,13 @@ rollout:
   seed: 1234
   enable_offload: true
   pipeline_stage_num: 1
+  # Finite dynamic batching removes the per-chunk all-env barrier while keeping
+  # the complete rollout epoch on-policy. It requires
+  # runner.enable_decoupled_mode=true and one rollout stage.
+  dynamic_batching:
+    enabled: false
+    max_batch_size: 2
+    max_wait_seconds: 0.1
   model:
     model_path: ${oc.env:B1K_SUBPOOL_MODEL_PATH}
     precision: ${actor.model.precision}
@@ -168,6 +188,21 @@ actor:
   # on the same accepted rollout batch. Null preserves legacy joint epochs.
   policy_update_epochs: null
   critic_update_epochs: null
+  # Optional resume-only value reinitialization. The reset also discards Adam
+  # moments for value_head parameters while preserving policy optimizer state.
+  reset_value_head_on_resume: false
+  # Reserve the first N global steps after resume for critic-only updates.
+  # The optional epoch/value-clip overrides apply only inside those steps.
+  resume_critic_warmup_global_steps: 0
+  resume_critic_warmup_update_epochs: 5
+  resume_critic_warmup_value_clip: null
+  # Optional no-update diagnostic for exact per-initial-state PPO gradient
+  # cosines. It requires one full-rollout global batch and disabled grad scaling.
+  policy_gradient_diagnostics:
+    enabled: false
+    only: false
+    max_states: 0
+    output_dir: null
   seed: 1234
   enable_offload: true
   model:

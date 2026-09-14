@@ -62,6 +62,14 @@ Policy- and value-optimization statistics, logged every actor update.
      - Policy entropy.
    * - ``train/loss``
      - Total training loss (actor + critic + entropy regularization).
+   * - ``train/diagnostics/policy_gradient/pairwise_negative_fraction``
+     - Fraction of off-diagonal initial-state PPO gradient pairs with a negative cosine. Available only when policy-gradient diagnostics are enabled.
+   * - ``train/diagnostics/policy_gradient/state_to_aggregate_negative_fraction``
+     - Fraction of initial-state PPO gradients opposed to the aggregate PPO gradient.
+   * - ``train/diagnostics/policy_gradient/kl_to_ppo_norm_ratio``
+     - Norm of the reference-KL gradient contribution divided by the PPO gradient norm.
+   * - ``train/diagnostics/policy_gradient/state_sum_additivity_error_ratio``
+     - Relative error between the sum of per-state PPO gradients and a directly computed full-batch PPO gradient; this should be close to zero.
 
 Rollout metrics — ``rollout/``
 ------------------------------
@@ -98,6 +106,8 @@ Keep ``env.train.rollout_epoch`` at ``1`` so quotas are checked per initial stat
      - Successful and failed trajectories retained across all accepted groups.
    * - ``rollout/dynamic_sampling/candidate_successes`` / ``candidate_failures``
      - Outcomes across accepted and rejected candidate groups.
+   * - ``rollout/dynamic_sampling/actor_trainable_groups`` / ``actor_no_signal_groups``
+     - Accepted logical states that did or did not satisfy the actor-only outcome quota.
 
 Environment metrics — ``env/``
 ------------------------------
@@ -126,6 +136,10 @@ Task-level signals from the simulator.
      - Estimated network and serialization time, computed as RPC duration minus remote handler duration.
    * - ``env/remote_collector/request_mib`` / ``response_mib``
      - Encoded request and response sizes for the latest remote environment RPC, in MiB.
+   * - ``env/remote_collector/response_raw_blob_mib``
+     - Total tensor and byte payload size before lossless response compression, in MiB.
+   * - ``env/remote_collector/response_compression_ratio``
+     - Encoded blob bytes divided by original blob bytes. ``1`` means no size reduction.
    * - ``env/remote_collector/reconnects``
      - Number of SSH-tunnel or socket reconnects needed by the latest RPC. Persistent nonzero values indicate an unstable connection.
 

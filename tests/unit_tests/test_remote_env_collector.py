@@ -80,6 +80,25 @@ def test_safe_tree_codec_round_trips_environment_payloads():
     assert decoded["bytes"] == value["bytes"]
 
 
+def test_safe_tree_codec_losslessly_compresses_large_blobs():
+    value = {
+        "images": torch.zeros((3, 256, 256, 3), dtype=torch.uint8),
+        "state": torch.arange(32, dtype=torch.float32),
+    }
+
+    encoded = encode_message(
+        value,
+        compression="zlib",
+        compression_level=1,
+        compression_min_bytes=1024,
+    )
+    decoded = decode_message(encoded)
+
+    assert len(encoded) < value["images"].numel() // 10
+    assert torch.equal(decoded["images"], value["images"])
+    assert torch.equal(decoded["state"], value["state"])
+
+
 def test_safe_tree_codec_rejects_object_arrays():
     with pytest.raises(TypeError, match="Object-dtype"):
         encode_message(np.array([object()], dtype=object))
@@ -106,6 +125,31 @@ def test_client_calls_server_sequentially():
         assert metrics["request_mib"] > 0.0
         assert metrics["response_mib"] > 0.0
         assert metrics["reconnects"] == 0.0
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+def test_client_negotiates_lossless_response_compression():
+    image = torch.zeros((3, 256, 256, 3), dtype=torch.uint8)
+    server, thread = _start_server(lambda _method, _payload: {"image": image})
+    client = RemoteCollectorClient(
+        "127.0.0.1",
+        server.bound_port,
+        auth_token="test-token",
+        response_compression="zlib",
+        response_compression_level=1,
+        response_compression_min_bytes=1024,
+    )
+    try:
+        client.call("initialize")
+        result = client.call("chunk_step")
+        metrics = client.last_call_metrics()
+
+        assert torch.equal(result["image"], image)
+        assert metrics["response_compression_ratio"] < 0.1
+        assert metrics["response_raw_blob_mib"] > metrics["response_mib"]
     finally:
         client.close()
         server.shutdown()

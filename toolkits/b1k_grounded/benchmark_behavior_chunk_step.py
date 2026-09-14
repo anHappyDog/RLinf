@@ -44,7 +44,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-offset", type=int, default=0)
     parser.add_argument("--action-seed", type=int, default=0)
     parser.add_argument("--action-scale", type=float, default=0.0)
+    parser.add_argument("--num-resets", type=int, default=1)
+    parser.add_argument("--state-cache-size", type=int, default=0)
     parser.add_argument("--skip-intermediate-obs", action="store_true")
+    parser.add_argument("--skip-official-task-termination", action="store_true")
     return parser.parse_args()
 
 
@@ -68,6 +71,10 @@ def _compose_env_cfg(args: argparse.Namespace, asset_fingerprint: str):
                 f"env.train.subpool.asset_fingerprint={asset_fingerprint}",
                 f"env.train.subpool.fixed_subtask_id={args.subtask_id}",
                 "env.train.subpool.dynamic_updates=false",
+                f"env.train.subpool.state_cache_size={args.state_cache_size}",
+                "env.train.subpool.fixed_snapshot_per_env=true",
+                "env.train.subpool.skip_official_task_termination="
+                f"{str(args.skip_official_task_termination).lower()}",
                 "env.train.auto_reset=false",
                 "env.train.skip_intermediate_obs_in_chunk="
                 f"{str(args.skip_intermediate_obs).lower()}",
@@ -89,12 +96,14 @@ def _image_digest(value: torch.Tensor) -> str:
 def main() -> None:
     """Run zero-action chunks and emit timings plus correctness fingerprints."""
     args = _parse_args()
-    if args.chunk_size <= 0 or args.num_chunks <= 0:
-        raise ValueError("chunk-size and num-chunks must be positive.")
+    if args.chunk_size <= 0 or args.num_chunks <= 0 or args.num_resets <= 0:
+        raise ValueError("chunk-size, num-chunks, and num-resets must be positive.")
     if args.seed_offset < 0:
         raise ValueError("seed-offset must be non-negative.")
     if args.action_scale < 0:
         raise ValueError("action-scale must be non-negative.")
+    if args.state_cache_size < 0:
+        raise ValueError("state-cache-size must be non-negative.")
 
     catalog = SubpoolCatalog.from_jsonl(args.manifest)
     records = [
@@ -107,7 +116,15 @@ def main() -> None:
     env_cfg = _compose_env_cfg(args, records[0].asset_fingerprint)
 
     os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-    ray.init(address="local", num_cpus=2, include_dashboard=False)
+    ray_options = {}
+    if ray_temp_dir := os.environ.get("RAY_TMPDIR"):
+        ray_options["_temp_dir"] = ray_temp_dir
+    ray.init(
+        address="local",
+        num_cpus=2,
+        include_dashboard=False,
+        **ray_options,
+    )
     env = None
     try:
         start = time.perf_counter()
@@ -120,9 +137,16 @@ def main() -> None:
         )
         init_seconds = time.perf_counter() - start
 
-        start = time.perf_counter()
-        initial_obs, _ = env.reset()
-        reset_seconds = time.perf_counter() - start
+        reset_seconds_all = []
+        reset_snapshot_ids = []
+        reset_main_image_sha256 = []
+        for _ in range(args.num_resets):
+            start = time.perf_counter()
+            initial_obs, _ = env.reset()
+            reset_seconds_all.append(time.perf_counter() - start)
+            reset_snapshot_ids.append(env.current_snapshot.snapshot_id)
+            reset_main_image_sha256.append(_image_digest(initial_obs["main_images"]))
+        reset_seconds = reset_seconds_all[-1]
         snapshot = env.current_snapshot
 
         generator = torch.Generator().manual_seed(args.action_seed)
@@ -158,8 +182,14 @@ def main() -> None:
                 break
 
         runtime_seconds = sum(chunk_seconds)
+        simulator_state = ray.get(
+            env.pool.env_processes[0].dump_serialized_state.remote()
+        )
         report = {
             "skip_intermediate_obs": args.skip_intermediate_obs,
+            "skip_official_task_termination": (args.skip_official_task_termination),
+            "state_cache_size": args.state_cache_size,
+            "state_cache_info": dict(env.catalog.state_cache_info),
             "snapshot_id": snapshot.snapshot_id,
             "episode_index": snapshot.episode_index,
             "seed_offset": args.seed_offset,
@@ -172,9 +202,15 @@ def main() -> None:
             "executed_actions": executed_actions,
             "init_seconds": init_seconds,
             "reset_seconds": reset_seconds,
+            "reset_seconds_all": reset_seconds_all,
+            "reset_snapshot_ids": reset_snapshot_ids,
+            "reset_main_image_sha256": reset_main_image_sha256,
             "chunk_seconds": chunk_seconds,
             "runtime_seconds": runtime_seconds,
             "actions_per_second": executed_actions / runtime_seconds,
+            "simulator_state": _tensor_list(simulator_state),
+            "simulator_state_shape": list(simulator_state.shape),
+            "simulator_state_sha256": _image_digest(simulator_state),
             "rewards": reward_rows,
             "terminations": termination_rows,
             "truncations": truncation_rows,

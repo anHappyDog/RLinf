@@ -87,6 +87,7 @@ def _record_outcome_snapshot_stats(
     successes: int,
     failures: int,
     accepted: bool,
+    actor_trainable: bool | None = None,
 ) -> None:
     key = (str(metadata["snapshot_id"]), int(metadata["episode_index"]))
     state_stats = stats.setdefault(
@@ -102,6 +103,26 @@ def _record_outcome_snapshot_stats(
     state_stats["candidate_successes"] += successes
     state_stats["candidate_failures"] += failures
     state_stats["accepted_groups"] += int(accepted)
+    if actor_trainable is not None:
+        state_stats.setdefault("actor_trainable_groups", 0)
+        state_stats.setdefault("actor_no_signal_groups", 0)
+        state_stats["actor_trainable_groups"] += int(actor_trainable)
+        state_stats["actor_no_signal_groups"] += int(not actor_trainable)
+
+
+def _actor_signal_is_trainable(
+    sampling_cfg: DictConfig,
+    *,
+    successes: int,
+    failures: int,
+) -> bool | None:
+    """Return the actor-only signal decision, or None when disabled."""
+    gate_cfg = sampling_cfg.get("actor_signal_gate", {})
+    if not gate_cfg.get("enabled", False):
+        return None
+    return successes >= int(gate_cfg.min_successes) and failures >= int(
+        gate_cfg.min_failures
+    )
 
 
 def _outcome_snapshot_metrics(
@@ -126,6 +147,9 @@ def _outcome_snapshot_metrics(
                 f"{prefix}/accepted_groups": state_stats["accepted_groups"],
             }
         )
+        for key in ("actor_trainable_groups", "actor_no_signal_groups"):
+            if key in state_stats:
+                metrics[f"{prefix}/{key}"] = state_stats[key]
     return metrics
 
 
@@ -289,16 +313,22 @@ class EmbodiedRunner:
         self.actor.init_worker().wait()
 
         resume_dir = self.cfg.runner.get("resume_dir", None)
-        if resume_dir is None:
-            return
+        if resume_dir is not None:
+            self.logger.info(
+                f"Resuming training from checkpoint directory {resume_dir}."
+            )
+            self.global_step = parse_global_step_from_checkpoint_path(resume_dir)
+            actor_checkpoint_path = os.path.join(resume_dir, "actor")
+            assert os.path.exists(actor_checkpoint_path), (
+                f"resume_dir {actor_checkpoint_path} does not exist."
+            )
+            self.actor.load_checkpoint(actor_checkpoint_path).wait()
 
-        self.logger.info(f"Resuming training from checkpoint directory {resume_dir}.")
-        self.global_step = parse_global_step_from_checkpoint_path(resume_dir)
-        actor_checkpoint_path = os.path.join(resume_dir, "actor")
-        assert os.path.exists(actor_checkpoint_path), (
-            f"resume_dir {actor_checkpoint_path} does not exist."
-        )
-        self.actor.load_checkpoint(actor_checkpoint_path).wait()
+        if float(self.cfg.algorithm.get("kl_beta", 0.0)) > 0:
+            # Capture only after an optional checkpoint restore. Otherwise
+            # reference KL on resumed runs silently anchors to model.model_path.
+            self.actor.set_global_step(self.global_step).wait()
+            self.actor.capture_reference_policy().wait()
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
@@ -393,6 +423,8 @@ class EmbodiedRunner:
         accepted_failures = 0
         candidate_successes = 0
         candidate_failures = 0
+        actor_trainable_groups = 0
+        actor_no_signal_groups = 0
         snapshot_stats: dict[tuple[str, int], dict[str, int]] = {}
 
         self.actor.begin_rollout_group_collection().wait()
@@ -420,15 +452,29 @@ class EmbodiedRunner:
                 )
                 candidate_successes += successes
                 candidate_failures += failures
+                actor_trainable = _actor_signal_is_trainable(
+                    sampling_cfg,
+                    successes=successes,
+                    failures=failures,
+                )
                 _record_outcome_snapshot_stats(
                     snapshot_stats,
                     reset_metadata,
                     successes=successes,
                     failures=failures,
                     accepted=accepted,
+                    actor_trainable=actor_trainable if accepted else None,
                 )
                 if accepted:
-                    self.actor.accept_rollout_group().wait()
+                    accept_kwargs = {
+                        "logical_group_index": group_index,
+                        "episode_index": int(reset_metadata["episode_index"]),
+                    }
+                    if actor_trainable is not None:
+                        accept_kwargs["policy_trainable"] = actor_trainable
+                        actor_trainable_groups += int(actor_trainable)
+                        actor_no_signal_groups += int(not actor_trainable)
+                    self.actor.accept_rollout_group(**accept_kwargs).wait()
                     env_handles.append(env_handle)
                     rollout_handles.append(rollout_handle)
                     reward_handles.append(reward_handle)
@@ -482,6 +528,18 @@ class EmbodiedRunner:
                 "dynamic_sampling/failures": accepted_failures,
                 "dynamic_sampling/candidate_successes": candidate_successes,
                 "dynamic_sampling/candidate_failures": candidate_failures,
+                **(
+                    {
+                        "dynamic_sampling/actor_trainable_groups": (
+                            actor_trainable_groups
+                        ),
+                        "dynamic_sampling/actor_no_signal_groups": (
+                            actor_no_signal_groups
+                        ),
+                    }
+                    if sampling_cfg.get("actor_signal_gate", {}).get("enabled", False)
+                    else {}
+                ),
                 **_outcome_snapshot_metrics(snapshot_stats),
             },
         )
@@ -506,6 +564,8 @@ class EmbodiedRunner:
         accepted_failures = 0
         candidate_successes = 0
         candidate_failures = 0
+        actor_trainable_groups = 0
+        actor_no_signal_groups = 0
         sampling_rounds = 0
         snapshot_stats: dict[tuple[str, int], dict[str, int]] = {}
 
@@ -544,6 +604,7 @@ class EmbodiedRunner:
 
             accepted_this_round = []
             no_signal_groups = []
+            actor_trainable_by_group: dict[int, bool] = {}
             for group_id in sorted(pending_groups):
                 attempts_by_group[group_id] += 1
                 accepted, successes, failures = outcome_group_is_trainable(
@@ -554,17 +615,27 @@ class EmbodiedRunner:
                 )
                 candidate_successes += successes
                 candidate_failures += failures
+                actor_trainable = _actor_signal_is_trainable(
+                    sampling_cfg,
+                    successes=successes,
+                    failures=failures,
+                )
                 _record_outcome_snapshot_stats(
                     snapshot_stats,
                     reset_metadata[group_id],
                     successes=successes,
                     failures=failures,
                     accepted=accepted,
+                    actor_trainable=actor_trainable if accepted else None,
                 )
                 if accepted:
                     accepted_this_round.append(group_id)
                     accepted_successes += successes
                     accepted_failures += failures
+                    if actor_trainable is not None:
+                        actor_trainable_by_group[group_id] = actor_trainable
+                        actor_trainable_groups += int(actor_trainable)
+                        actor_no_signal_groups += int(not actor_trainable)
                     continue
 
                 group_attempt = attempts_by_group[group_id]
@@ -604,7 +675,31 @@ class EmbodiedRunner:
                 )
 
             if accepted_this_round:
-                self.actor.accept_rollout_groups(accepted_this_round).wait()
+                self.actor.accept_rollout_groups(
+                    accepted_this_round,
+                    {
+                        group_id: {
+                            "logical_group_index": int(
+                                reset_metadata[group_id].get(
+                                    "logical_group_index", group_id
+                                )
+                            ),
+                            "episode_index": int(
+                                reset_metadata[group_id]["episode_index"]
+                            ),
+                            **(
+                                {
+                                    "policy_trainable": (
+                                        actor_trainable_by_group[group_id]
+                                    )
+                                }
+                                if group_id in actor_trainable_by_group
+                                else {}
+                            ),
+                        }
+                        for group_id in accepted_this_round
+                    },
+                ).wait()
                 pending_groups.difference_update(accepted_this_round)
                 env_handles.append(
                     _AcceptedOutcomeEnvHandle(
@@ -635,6 +730,18 @@ class EmbodiedRunner:
                 "dynamic_sampling/failures": accepted_failures,
                 "dynamic_sampling/candidate_successes": candidate_successes,
                 "dynamic_sampling/candidate_failures": candidate_failures,
+                **(
+                    {
+                        "dynamic_sampling/actor_trainable_groups": (
+                            actor_trainable_groups
+                        ),
+                        "dynamic_sampling/actor_no_signal_groups": (
+                            actor_no_signal_groups
+                        ),
+                    }
+                    if sampling_cfg.get("actor_signal_gate", {}).get("enabled", False)
+                    else {}
+                ),
                 **_outcome_snapshot_metrics(snapshot_stats),
             },
         )

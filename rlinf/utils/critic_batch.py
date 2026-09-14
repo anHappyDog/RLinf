@@ -40,6 +40,8 @@ _CRITIC_BATCH_KEYS = (
     "subtask_ids",
     "successes",
     "outcome_group_ids",
+    "outcome_logical_group_ids",
+    "outcome_episode_indices",
 )
 
 _CRITIC_OBSERVATION_KEYS = (

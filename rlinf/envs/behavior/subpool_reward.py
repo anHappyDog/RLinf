@@ -162,6 +162,18 @@ class SubtaskRewardTracker:
         )
 
 
+def apply_reward_overrides(
+    reward_spec: Mapping[str, Any],
+    overrides: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return a validated runtime reward spec without mutating the manifest."""
+    resolved = dict(reward_spec)
+    if overrides:
+        resolved.update(overrides)
+    SubtaskRewardSpec.from_mapping(resolved)
+    return resolved
+
+
 def resolve_demo_reward_spec(
     value: Mapping[str, Any],
     *,

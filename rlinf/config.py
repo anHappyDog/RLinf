@@ -126,8 +126,8 @@ def _validate_outcome_dynamic_sampling(
         "env.train.subpool.outcome_group_size must equal "
         "algorithm.outcome_dynamic_sampling.group_size."
     )
-    assert min_successes > 0 and min_failures > 0, (
-        "Outcome dynamic sampling requires positive min_successes and min_failures."
+    assert min_successes >= 0 and min_failures >= 0, (
+        "Outcome dynamic sampling requires non-negative min_successes and min_failures."
     )
     assert min_successes + min_failures <= group_size, (
         "Outcome dynamic sampling success/failure quotas cannot exceed group_size."
@@ -141,6 +141,24 @@ def _validate_outcome_dynamic_sampling(
     assert max_attempts_per_group >= 0, (
         "Outcome dynamic sampling max_attempts_per_group must be non-negative."
     )
+    actor_signal_cfg = sampling_cfg.get("actor_signal_gate", {})
+    if actor_signal_cfg.get("enabled", False):
+        actor_min_successes = int(actor_signal_cfg.get("min_successes", 0))
+        actor_min_failures = int(actor_signal_cfg.get("min_failures", 0))
+        assert actor_min_successes > 0 and actor_min_failures > 0, (
+            "Actor signal gating requires positive min_successes and min_failures."
+        )
+        assert actor_min_successes + actor_min_failures <= group_size, (
+            "Actor signal gating success/failure quotas cannot exceed group_size."
+        )
+        assert cfg.actor.get("policy_update_epochs", None) is not None, (
+            "Actor signal gating requires independent policy_update_epochs so its "
+            "mask cannot affect critic training."
+        )
+        assert cfg.actor.get("critic_update_epochs", None) is not None, (
+            "Actor signal gating requires independent critic_update_epochs so the "
+            "critic still trains on every trajectory."
+        )
     snapshot_schedule = cfg.env.train.subpool.get("outcome_snapshot_schedule", "random")
     assert snapshot_schedule in {"random", "shuffled_round_robin"}, (
         "env.train.subpool.outcome_snapshot_schedule must be random or "
@@ -214,6 +232,19 @@ def _validate_remote_behavior_collectors(
     assert isinstance(token_env, str) and token_env, (
         "remote_collector.auth_token_env must be a non-empty environment variable name."
     )
+    compression = remote_cfg.get("response_compression", {})
+    codec = str(compression.get("codec", "none"))
+    assert codec in ("none", "zlib"), (
+        "remote_collector.response_compression.codec must be none or zlib."
+    )
+    level = compression.get("level", 1)
+    assert type(level) is int and 0 <= level <= 9, (
+        "remote_collector.response_compression.level must be an integer in [0, 9]."
+    )
+    min_bytes = compression.get("min_bytes", 64 * 1024)
+    assert type(min_bytes) is int and min_bytes >= 0, (
+        "remote_collector.response_compression.min_bytes must be a non-negative integer."
+    )
 
 
 def _validate_independent_gradient_clipping(actor_cfg: DictConfig) -> None:
@@ -253,6 +284,50 @@ def _validate_critic_only(cfg: DictConfig) -> None:
     )
     assert not cfg.actor.get("enable_sft_co_train", False), (
         "actor.optim.critic_only cannot be combined with SFT co-training."
+    )
+
+
+def _validate_resume_critic_warmup(cfg: DictConfig) -> None:
+    """Validate value-head reset and critic-only warmup after resume."""
+    reset_value_head = bool(cfg.actor.get("reset_value_head_on_resume", False))
+    warmup_steps = int(cfg.actor.get("resume_critic_warmup_global_steps", 0))
+    warmup_epochs = int(cfg.actor.get("resume_critic_warmup_update_epochs", 0))
+    warmup_value_clip = cfg.actor.get("resume_critic_warmup_value_clip", None)
+
+    assert warmup_steps >= 0, (
+        "actor.resume_critic_warmup_global_steps must be non-negative."
+    )
+    if not reset_value_head and warmup_steps == 0:
+        return
+    assert cfg.runner.get("resume_dir", None) is not None, (
+        "Value-head reset and post-resume critic warmup require runner.resume_dir."
+    )
+    assert cfg.actor.model.get("add_value_head", False), (
+        "Value-head reset and post-resume critic warmup require "
+        "actor.model.add_value_head=true."
+    )
+    if warmup_steps > 0:
+        assert cfg.actor.get("policy_update_epochs", None) is not None, (
+            "Post-resume critic warmup requires independent policy_update_epochs."
+        )
+        assert cfg.actor.get("critic_update_epochs", None) is not None, (
+            "Post-resume critic warmup requires independent critic_update_epochs."
+        )
+        assert warmup_epochs > 0, (
+            "actor.resume_critic_warmup_update_epochs must be positive when "
+            "post-resume warmup is enabled."
+        )
+        if warmup_value_clip is not None:
+            assert float(warmup_value_clip) > 0.0, (
+                "actor.resume_critic_warmup_value_clip must be positive."
+            )
+
+
+def _validate_bootstrap_type(algorithm_cfg: DictConfig) -> None:
+    """Reject ambiguous episode-boundary bootstrap settings."""
+    bootstrap_type = algorithm_cfg.get("bootstrap_type", "standard")
+    assert bootstrap_type in {"standard", "always", "never"}, (
+        "algorithm.bootstrap_type must be one of standard, always, or never."
     )
 
 
@@ -1264,6 +1339,8 @@ def validate_embodied_cfg(cfg):
     if not only_eval:
         _validate_independent_gradient_clipping(cfg.actor)
         _validate_critic_only(cfg)
+        _validate_resume_critic_warmup(cfg)
+        _validate_bootstrap_type(cfg.algorithm)
 
     # MolmoAct2 caches an action queue per batch index inside the LeRobot policy.
     # Pipeline stages hand the same indices to different environments on
@@ -1315,6 +1392,36 @@ def validate_embodied_cfg(cfg):
     if cfg.runner.get("enable_decoupled_mode", False):
         assert stage_num == 1, (
             "enable_decoupled_mode requires rollout.pipeline_stage_num to be 1"
+        )
+    dynamic_batching_cfg = cfg.rollout.get("dynamic_batching", {})
+    if dynamic_batching_cfg.get("enabled", False):
+        rollout_world_size = component_placement.get_world_size("rollout")
+        assert not only_eval, (
+            "rollout.dynamic_batching is currently supported only for training."
+        )
+        assert cfg.runner.get("enable_decoupled_mode", False), (
+            "rollout.dynamic_batching requires runner.enable_decoupled_mode=true."
+        )
+        assert cfg.runner.get("val_check_interval", -1) <= 0, (
+            "rollout.dynamic_batching does not yet support in-process evaluation."
+        )
+        assert cfg.rollout.get("collect_final_values", True), (
+            "rollout.dynamic_batching requires rollout.collect_final_values=true."
+        )
+        assert not cfg.env.train.get("smooth_intervene", False), (
+            "rollout.dynamic_batching does not support smooth_intervene."
+        )
+        assert env_world_size % rollout_world_size == 0, (
+            "rollout.dynamic_batching requires the env worker count to be divisible "
+            "by the rollout worker count."
+        )
+        max_batch_size = int(dynamic_batching_cfg.get("max_batch_size", 1))
+        assert 0 < max_batch_size <= env_world_size // rollout_world_size, (
+            "rollout.dynamic_batching.max_batch_size must be in [1, "
+            f"{env_world_size // rollout_world_size}]."
+        )
+        assert float(dynamic_batching_cfg.get("max_wait_seconds", 0.1)) >= 0, (
+            "rollout.dynamic_batching.max_wait_seconds must be non-negative."
         )
 
     if enable_eval:
@@ -1486,8 +1593,30 @@ def validate_embodied_cfg(cfg):
                         "would selectively remove low-return subtasks."
                     )
                     assert cfg.algorithm.get("normalize_advantages", True), (
-                        "BEHAVIOR subpool RL requires taskwise advantage normalization."
+                        "BEHAVIOR subpool RL requires advantage normalization."
                     )
+                    advantage_clip = cfg.algorithm.get("advantage_clip", None)
+                    assert advantage_clip is None or advantage_clip > 0, (
+                        "algorithm.advantage_clip must be positive when configured."
+                    )
+                    advantage_normalization_scope = cfg.algorithm.get(
+                        "advantage_normalization_scope", "subtask"
+                    )
+                    assert advantage_normalization_scope in (
+                        "subtask",
+                        "logical_state",
+                    ), (
+                        "BEHAVIOR subpool RL requires "
+                        "algorithm.advantage_normalization_scope to be 'subtask' "
+                        "or 'logical_state'."
+                    )
+                    if advantage_normalization_scope == "logical_state":
+                        assert cfg.algorithm.outcome_dynamic_sampling.get(
+                            "enabled", False
+                        ), (
+                            "logical_state advantage normalization requires outcome "
+                            "group scheduling so rollout provenance is available."
+                        )
                     _validate_outcome_dynamic_sampling(
                         cfg,
                         model_cfg,

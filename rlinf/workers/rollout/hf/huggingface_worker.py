@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import copy
 import gc
 import random
-import time
+from collections import Counter
 from typing import Any, Callable, Literal, Optional
 
 import numpy as np
@@ -145,8 +144,35 @@ class MultiStepRolloutWorker(Worker):
             # The batch_router is a dictionary that maps the tag to the list of batch_index.
             self.batch_router = {
                 "rollout_results": [],
+                "rollout_bootstrap": [],
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
+        dynamic_batching_cfg = self.cfg.rollout.get("dynamic_batching", {})
+        self.dynamic_batching_enabled = bool(dynamic_batching_cfg.get("enabled", False))
+        self.dynamic_batch_max_size = int(
+            dynamic_batching_cfg.get("max_batch_size", self.rollout_queue_size or 1)
+        )
+        self.dynamic_batch_wait_seconds = float(
+            dynamic_batching_cfg.get("max_wait_seconds", 0.1)
+        )
+        if self.dynamic_batching_enabled:
+            if not self.env_decoupled_mode:
+                raise ValueError(
+                    "rollout.dynamic_batching requires "
+                    "runner.enable_decoupled_mode=true."
+                )
+            if self.dynamic_batch_max_size <= 0:
+                raise ValueError("dynamic_batching.max_batch_size must be positive.")
+            if self.dynamic_batch_wait_seconds < 0:
+                raise ValueError(
+                    "dynamic_batching.max_wait_seconds must be non-negative."
+                )
+            max_routed_items = self.placement.get_world_size("env") // self._world_size
+            if self.dynamic_batch_max_size > max_routed_items:
+                raise ValueError(
+                    "dynamic_batching.max_batch_size cannot exceed env workers per "
+                    f"rollout worker ({max_routed_items})."
+                )
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
@@ -260,9 +286,8 @@ class MultiStepRolloutWorker(Worker):
     ):
         """Receive routed batch shards and record their return routes.
 
-        This method is used in env-decoupled mode. It builds a receive plan for the
-        source worker group, receives shard messages from ``channel`` one by one, and
-        stops when all planned items are received or ``timeout_time`` is reached.
+        This method is used in env-decoupled mode. It waits for the first shard, then
+        atomically coalesces up to ``recv_queue_size`` shards during ``timeout_time``.
 
         Each received channel item must be a dict with ``batch_index`` (route
         metadata) and ``batch`` (payload shard).
@@ -288,8 +313,7 @@ class MultiStepRolloutWorker(Worker):
 
         Returns:
 
-            A merged payload and its split sizes. If only one shard is received, the
-            current implementation returns that shard directly.
+            A merged payload and its split sizes.
         """
         from rlinf.scheduler import (
             decoupled_build_recv_plan,
@@ -337,39 +361,22 @@ class MultiStepRolloutWorker(Worker):
             if merge_fn is not None:
                 return merge_fn(received_items), split_sizes
             if len(received_items) == 1:
-                return received_items[0]
+                return received_items[0], split_sizes
             return merge_batches(received_items), split_sizes
 
-        timeout_time = timeout_time + time.time()
-        get_items = None
-        max_item_num = len(plan.entries)
-        get_item_num = 0
-        received_items = []
-        while get_item_num < max_item_num:
-            # get the items
-            if get_items is None:
-                get_items = channel.get(
-                    key=plan.entries[get_item_num].key, async_op=True
-                )
-            else:
-                # Now, the worker is getting a item, sleep to wait
-                await asyncio.sleep(0.0001)
-
-            # handle the get_items finish
-            if get_items.done():
-                # save the data and init the get_items to get next data
-                received_items.append(await get_items.async_wait())
-                get_items = None
-                get_item_num = get_item_num + 1
-
-            # handle the timeout case
-            if time.time() >= timeout_time:
-                max_item_num = get_item_num
-                if get_items is not None:
-                    received_items.append(await get_items.async_wait())
-                    get_items = None
-                    get_item_num = get_item_num + 1
-
+        if not plan.entries:
+            raise RuntimeError("Dynamic receive plan is empty.")
+        keys = {entry.key for entry in plan.entries}
+        if len(keys) != 1:
+            raise RuntimeError(
+                "Dynamic receive requires all planned entries to share one queue key."
+            )
+        received_items = await channel.get_up_to(
+            key=plan.entries[0].key,
+            max_items=len(plan.entries),
+            timeout_seconds=timeout_time,
+            async_op=True,
+        ).async_wait()
         return _finalize(received_items)
 
     def send_to_recorded_batch_routes(
@@ -795,6 +802,126 @@ class MultiStepRolloutWorker(Worker):
                 split_fn=self._split_policy_output,
             )
 
+    async def _generate_dynamic_batch_phase(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        *,
+        tag: str,
+        target_rows: int,
+        bootstrap_only: bool,
+    ) -> list[int]:
+        """Process exactly one finite on-policy phase with arrival-time batching."""
+        env_world_size = self.placement.get_world_size("env")
+        rows_per_env_shard = self.total_num_train_envs // env_world_size
+        processed_rows = 0
+        batch_sizes = []
+        while processed_rows < target_rows:
+            remaining_rows = target_rows - processed_rows
+            max_items = min(
+                self.dynamic_batch_max_size,
+                remaining_rows // rows_per_env_shard,
+            )
+            if max_items <= 0:
+                raise RuntimeError(
+                    f"Dynamic phase {tag!r} has {remaining_rows} rows remaining, "
+                    f"which is not divisible by env shard size {rows_per_env_shard}."
+                )
+            (
+                env_output,
+                split_sizes,
+            ) = await self.recv_from_and_record_batch_routes_with_timeout(
+                group_name=self.cfg.env.group_name,
+                channel=input_channel,
+                tag=tag,
+                batch_size=self.train_batch_size,
+                merge_fn=self._merge_obs_batches,
+                infer_batch_size_fn=self._infer_env_batch_size,
+                timeout_time=self.dynamic_batch_wait_seconds,
+                recv_queue_size=max_items,
+            )
+            batch_rows = sum(split_sizes)
+            if processed_rows + batch_rows > target_rows:
+                raise RuntimeError(
+                    f"Dynamic phase {tag!r} received {batch_rows} rows after "
+                    f"{processed_rows}/{target_rows}; this would cross the phase boundary."
+                )
+
+            actions, result = self._predict_rollout_actions(
+                env_output["obs"],
+                final_obs=env_output.get("final_obs", None),
+                rlt_switch_flags=env_output.get("rlt_switch_flags", None),
+                intervene_requested=env_output.get("intervene_flags", None),
+            )
+            if bootstrap_only and not self.enable_opd:
+                policy_output = PolicyOutput(
+                    actions=actions,
+                    prev_values=(
+                        result["prev_values"] if self.collect_prev_infos else None
+                    ),
+                    bootstrap_values=self.get_bootstrap_values(
+                        env_output.get("final_obs", None)
+                    ),
+                    forward_inputs=(
+                        result["forward_inputs"]
+                        if self.rlt_feature_model is not None
+                        else {}
+                    ),
+                )
+            else:
+                policy_output = self._build_policy_output(
+                    actions,
+                    result,
+                    final_obs=env_output.get("final_obs", None),
+                )
+            self.send_to_recorded_batch_routes(
+                group_name=self.cfg.env.group_name,
+                channel=output_channel,
+                data=policy_output,
+                tag=tag,
+                split_fn=self._split_policy_output,
+                split_sizes=split_sizes,
+            )
+            processed_rows += batch_rows
+            batch_sizes.append(batch_rows)
+        return batch_sizes
+
+    @Worker.timer("generate_one_epoch_dynamic")
+    async def generate_one_epoch_dynamic(
+        self, input_channel: Channel, output_channel: Channel
+    ) -> None:
+        """Generate one full on-policy epoch without a per-chunk global barrier."""
+        self.update_dagger_beta()
+        rows_per_rollout_rank = self.total_num_train_envs // self._world_size
+        regular_batch_sizes = await self._generate_dynamic_batch_phase(
+            input_channel,
+            output_channel,
+            tag="rollout_results",
+            target_rows=rows_per_rollout_rank * self.n_train_chunk_steps,
+            bootstrap_only=False,
+        )
+        bootstrap_batch_sizes = await self._generate_dynamic_batch_phase(
+            input_channel,
+            output_channel,
+            tag="rollout_bootstrap",
+            target_rows=rows_per_rollout_rank,
+            bootstrap_only=True,
+        )
+        all_batch_sizes = regular_batch_sizes + bootstrap_batch_sizes
+        batch_size_histogram = dict(sorted(Counter(all_batch_sizes).items()))
+        regular_histogram = dict(sorted(Counter(regular_batch_sizes).items()))
+        bootstrap_histogram = dict(sorted(Counter(bootstrap_batch_sizes).items()))
+        self.log_info(
+            "Finite dynamic rollout batching completed: "
+            f"batches={len(all_batch_sizes)}, "
+            f"mean_batch_size={np.mean(all_batch_sizes):.2f}, "
+            f"min_batch_size={min(all_batch_sizes)}, "
+            f"max_batch_size={max(all_batch_sizes)}, "
+            f"batch_size_histogram={batch_size_histogram}, "
+            f"regular_histogram={regular_histogram}, "
+            f"bootstrap_histogram={bootstrap_histogram}."
+        )
+
     @Worker.timer("rollout/generate")
     async def generate(
         self,
@@ -809,7 +936,10 @@ class MultiStepRolloutWorker(Worker):
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            await self.generate_one_epoch(input_channel, output_channel)
+            if self.dynamic_batching_enabled:
+                await self.generate_one_epoch_dynamic(input_channel, output_channel)
+            else:
+                await self.generate_one_epoch(input_channel, output_channel)
 
         if self.enable_offload:
             self.offload_model()

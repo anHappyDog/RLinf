@@ -70,6 +70,38 @@ class PeekQueue(asyncio.Queue):
         return list(self._queue)
 
 
+async def _get_up_to(
+    queue: PeekQueue,
+    *,
+    max_items: int,
+    timeout_seconds: float,
+) -> list[Any]:
+    """Wait for one item, then coalesce additional items for a short window."""
+    if max_items <= 0:
+        raise ValueError(f"max_items must be positive, got {max_items}.")
+    if timeout_seconds < 0:
+        raise ValueError(
+            f"timeout_seconds must be non-negative, got {timeout_seconds}."
+        )
+
+    first_item: WeightedItem = await queue.get()
+    items = [first_item.item]
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while len(items) < max_items:
+        timeout = deadline - loop.time()
+        if timeout <= 0:
+            break
+        try:
+            weighted_item: WeightedItem = await asyncio.wait_for(
+                queue.get(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            break
+        items.append(weighted_item.item)
+    return items
+
+
 class LocalChannel:
     """A local channel that holds the data in the current process, which cannot be connected by other workers."""
 
@@ -485,6 +517,29 @@ class ChannelWorker(Worker):
             piggyback_payload=query_id,
         )
 
+    async def get_up_to(
+        self,
+        dst_addr: WorkerAddress,
+        query_id: int,
+        max_items: int,
+        timeout_seconds: float,
+        key: str = DEFAULT_KEY,
+    ) -> None:
+        """Return up to ``max_items`` after waiting indefinitely for the first."""
+        self.create_queue(key, self.maxsize())
+        batch = await _get_up_to(
+            self._queue_map[key],
+            max_items=max_items,
+            timeout_seconds=timeout_seconds,
+        )
+        self.send(
+            batch,
+            dst_addr.root_group_name,
+            dst_addr.rank_path,
+            async_op=True,
+            piggyback_payload=query_id,
+        )
+
     async def get_batch_via_ray(
         self, target_weight: int, key: Any = DEFAULT_KEY
     ) -> list[Any]:
@@ -509,6 +564,20 @@ class ChannelWorker(Worker):
             if current_weight >= target_weight:
                 break
         return batch
+
+    async def get_up_to_via_ray(
+        self,
+        max_items: int,
+        timeout_seconds: float,
+        key: Any = DEFAULT_KEY,
+    ) -> list[Any]:
+        """Ray-callable variant of :meth:`get_up_to`."""
+        self.create_queue(key, self.maxsize())
+        return await _get_up_to(
+            self._queue_map[key],
+            max_items=max_items,
+            timeout_seconds=timeout_seconds,
+        )
 
     def peek_all(self, key: Any = DEFAULT_KEY) -> list[Any]:
         """Get all items from the channel queue without removing them.

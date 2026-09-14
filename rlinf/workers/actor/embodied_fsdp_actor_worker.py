@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -117,6 +121,30 @@ def _masked_reference_kl(
     return (penalties * weights).sum() / weights.sum().clamp_min(1.0)
 
 
+def _gradient_cosines_from_gram(
+    gram: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return pairwise and per-state-to-aggregate gradient cosines."""
+    if gram.ndim != 2 or gram.shape[0] != gram.shape[1]:
+        raise ValueError(f"Gradient Gram matrix must be square, got {gram.shape}.")
+    norms = gram.diag().clamp_min(0).sqrt()
+    denominator = norms[:, None] * norms[None, :]
+    pairwise = torch.where(
+        denominator > 0,
+        gram / denominator.clamp_min(torch.finfo(gram.dtype).eps),
+        torch.nan,
+    )
+    aggregate_norm = gram.sum().clamp_min(0).sqrt()
+    state_to_aggregate_denominator = norms * aggregate_norm
+    state_to_aggregate = torch.where(
+        state_to_aggregate_denominator > 0,
+        gram.sum(dim=1)
+        / state_to_aggregate_denominator.clamp_min(torch.finfo(gram.dtype).eps),
+        torch.nan,
+    )
+    return pairwise, state_to_aggregate
+
+
 class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -141,6 +169,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
+        self._resume_checkpoint_loaded = False
+        self._resume_warmup_start_step: int | None = None
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
@@ -186,6 +216,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 raise ValueError(
                     "At least one policy or critic update epoch is required."
                 )
+        self.resume_critic_warmup_global_steps = int(
+            self.cfg.actor.get("resume_critic_warmup_global_steps", 0)
+        )
+        self.resume_critic_warmup_update_epochs = int(
+            self.cfg.actor.get(
+                "resume_critic_warmup_update_epochs",
+                self.critic_update_epochs
+                if self.use_independent_update_epochs
+                else self.update_epoch,
+            )
+        )
+        warmup_value_clip = self.cfg.actor.get("resume_critic_warmup_value_clip", None)
+        self.resume_critic_warmup_value_clip = (
+            float(warmup_value_clip) if warmup_value_clip is not None else None
+        )
 
         self._sync_weight_comm_options = self.weight_syncer.comm_options
 
@@ -210,16 +255,78 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "Embodied reference KL currently requires "
                     "actor.combine_reference_model=true."
                 )
-            self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
-            self.offload_model_buffer = {}
-            self.log_info(
-                "Captured the initial actor as the frozen KL reference "
-                f"(beta={self.kl_beta:g}, penalty={self.kl_penalty_type})."
-            )
 
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
+
+    def load_checkpoint(self, load_path: str) -> None:
+        """Restore training state and arm optional post-resume critic warmup."""
+        super().load_checkpoint(load_path)
+        self._resume_checkpoint_loaded = True
+
+    def _resume_critic_warmup_active(self) -> bool:
+        """Whether this global step is reserved for post-resume critic updates."""
+        if self._resume_warmup_start_step is None:
+            return False
+        return self.version < (
+            self._resume_warmup_start_step + self.resume_critic_warmup_global_steps
+        )
+
+    def _training_update_phases(
+        self,
+    ) -> tuple[bool, tuple[tuple[str, int, bool, bool], ...]]:
+        """Build effective policy/critic phases for the current global step."""
+        resume_critic_warmup = self._resume_critic_warmup_active()
+        if self.use_independent_update_epochs:
+            policy_epochs = 0 if resume_critic_warmup else self.policy_update_epochs
+            critic_epochs = (
+                self.resume_critic_warmup_update_epochs
+                if resume_critic_warmup
+                else self.critic_update_epochs
+            )
+            phases = (
+                ("policy", policy_epochs, True, False),
+                ("critic", critic_epochs, False, True),
+            )
+        else:
+            phases = (
+                (
+                    "joint",
+                    int(self.cfg.algorithm.get("update_epoch", 1)),
+                    not self.critic_only,
+                    self.cfg.algorithm.adv_type in ("gae", "subtask_gae"),
+                ),
+            )
+        return resume_critic_warmup, phases
+
+    def capture_reference_policy(self) -> None:
+        """Capture the active actor weights as the frozen reference policy.
+
+        The runner invokes this after loading an optional resume checkpoint. This
+        ordering is important: capturing during ``init_worker`` would anchor a
+        resumed run to ``actor.model.model_path`` instead of the resumed policy.
+        """
+        if self.kl_beta <= 0:
+            return
+        if not self.combine_reference_model:
+            raise NotImplementedError(
+                "Embodied reference KL currently requires "
+                "actor.combine_reference_model=true."
+            )
+
+        restore_weight_offload = self.is_weight_offloaded
+        if restore_weight_offload:
+            self.load_param_and_grad(self.device)
+        self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
+        self.offload_model_buffer = {}
+        if restore_weight_offload:
+            self.offload_param_and_grad()
+        self.log_info(
+            "Captured the active actor as the frozen KL reference "
+            f"at policy step {self.version} "
+            f"(beta={self.kl_beta:g}, penalty={self.kl_penalty_type})."
+        )
 
     def _gradient_clipping_metrics(
         self,
@@ -435,16 +542,70 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._candidate_rollout_batch = None
         self._accepted_rollout_batches = []
 
-    def accept_rollout_group(self) -> None:
+    def accept_rollout_group(
+        self,
+        logical_group_index: int | None = None,
+        episode_index: int | None = None,
+        policy_trainable: bool | None = None,
+    ) -> None:
         """Retain the most recently received candidate as a trainable group."""
         if self._accepted_rollout_batches is None:
             raise RuntimeError("Rollout group collection has not started.")
         if self._candidate_rollout_batch is None:
             raise RuntimeError("No candidate rollout group is available to accept.")
+        self._annotate_candidate_state(
+            self._candidate_rollout_batch,
+            logical_group_index=logical_group_index,
+            episode_index=episode_index,
+            policy_trainable=policy_trainable,
+        )
         self._accepted_rollout_batches.append(self._candidate_rollout_batch)
         self._candidate_rollout_batch = None
 
-    def accept_rollout_groups(self, group_ids: list[int]) -> None:
+    @staticmethod
+    def _annotate_candidate_state(
+        batch: dict[str, torch.Tensor],
+        *,
+        logical_group_index: int | None,
+        episode_index: int | None,
+        policy_trainable: bool | None = None,
+    ) -> None:
+        """Attach stable logical-state provenance to an actor rollout batch."""
+        if (
+            logical_group_index is None
+            and episode_index is None
+            and policy_trainable is None
+        ):
+            return
+        reference = batch.get("outcome_group_ids")
+        if reference is None:
+            raise RuntimeError(
+                "Logical outcome-state provenance requires outcome_group_ids."
+            )
+        if logical_group_index is not None:
+            batch["outcome_logical_group_ids"] = torch.full_like(
+                reference,
+                int(logical_group_index),
+                dtype=torch.long,
+            )
+        if episode_index is not None:
+            batch["outcome_episode_indices"] = torch.full_like(
+                reference,
+                int(episode_index),
+                dtype=torch.long,
+            )
+        if policy_trainable is not None:
+            batch["outcome_policy_trainable"] = torch.full_like(
+                reference,
+                bool(policy_trainable),
+                dtype=torch.bool,
+            )
+
+    def accept_rollout_groups(
+        self,
+        group_ids: list[int],
+        state_metadata: dict[int, dict[str, int | bool]] | None = None,
+    ) -> None:
         """Retain selected groups from one concurrently sampled candidate batch."""
         if self._accepted_rollout_batches is None:
             raise RuntimeError("Rollout group collection has not started.")
@@ -465,12 +626,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "Each actor rank must receive exactly one trajectory per outcome "
                     f"group; group {group_id} has {group_mask.sum().item()}."
                 )
-            self._accepted_rollout_batches.append(
-                _select_rollout_trajectories(
-                    self._candidate_rollout_batch,
-                    group_mask,
-                )
+            selected_batch = _select_rollout_trajectories(
+                self._candidate_rollout_batch,
+                group_mask,
             )
+            metadata = (state_metadata or {}).get(group_id, {})
+            self._annotate_candidate_state(
+                selected_batch,
+                logical_group_index=metadata.get("logical_group_index"),
+                episode_index=metadata.get("episode_index"),
+                policy_trainable=metadata.get("policy_trainable"),
+            )
+            self._accepted_rollout_batches.append(selected_batch)
         self._candidate_rollout_batch = None
 
     def finalize_rollout_group_collection(self, expected_groups: int) -> None:
@@ -532,8 +699,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "executed_action_mask", None
             ),
             "subtask_ids": self.rollout_batch.get("subtask_ids", None),
+            "outcome_logical_group_ids": self.rollout_batch.get(
+                "outcome_logical_group_ids", None
+            ),
             "advantage_mode": self.cfg.algorithm.get("advantage_mode", None),
             "advantage_std_floor": self.cfg.algorithm.get("advantage_std_floor", 0.1),
+            "advantage_clip": self.cfg.algorithm.get("advantage_clip", None),
+            "advantage_normalization_scope": self.cfg.algorithm.get(
+                "advantage_normalization_scope", "subtask"
+            ),
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
@@ -559,6 +733,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "adv_type": str(self.cfg.algorithm.adv_type),
                     "gamma": float(self.cfg.algorithm.get("gamma", 1.0)),
                     "gae_lambda": float(self.cfg.algorithm.get("gae_lambda", 1.0)),
+                    "outcome_group_size": int(
+                        self.cfg.algorithm.get("outcome_dynamic_sampling", {}).get(
+                            "group_size", 0
+                        )
+                    ),
+                    "outcome_groups_per_update": int(
+                        self.cfg.algorithm.get("outcome_dynamic_sampling", {}).get(
+                            "groups_per_update", 0
+                        )
+                    ),
+                    "outcome_parallel_groups": bool(
+                        self.cfg.algorithm.get("outcome_dynamic_sampling", {}).get(
+                            "parallel_groups", False
+                        )
+                    ),
                 },
             )
             self.logger.info(
@@ -808,6 +997,419 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
         return loss
 
+    @staticmethod
+    def _mask_batch_to_logical_state(
+        batch: dict[str, torch.Tensor], logical_state_id: int
+    ) -> dict[str, torch.Tensor]:
+        """Keep one logical state's additive contribution to the PPO loss."""
+        logical_ids = batch.get("outcome_logical_group_ids")
+        if logical_ids is None:
+            raise RuntimeError(
+                "Per-state policy diagnostics require "
+                "outcome_logical_group_ids in the actor batch."
+            )
+        selected = logical_ids.eq(logical_state_id)
+        sample_weights = batch.get("sample_weights")
+        if sample_weights is None:
+            sample_weights = torch.ones_like(selected, dtype=torch.float32)
+        selector = selected.reshape(
+            selected.shape[0], *([1] * (sample_weights.ndim - 1))
+        )
+        masked_batch = dict(batch)
+        masked_batch["sample_weights"] = sample_weights * selector.to(
+            sample_weights.dtype
+        )
+        policy_weights = batch.get("policy_sample_weights")
+        if policy_weights is not None:
+            masked_batch["policy_sample_weights"] = policy_weights * selector.to(
+                policy_weights.dtype
+            )
+        return masked_batch
+
+    def _backward_policy_diagnostic_batch(
+        self,
+        train_global_batch: dict[str, torch.Tensor],
+        *,
+        logical_state_id: int | None,
+        include_reference_kl: bool,
+        seed: int,
+    ) -> list[torch.Tensor | None]:
+        """Backpropagate one diagnostic objective without taking an optimizer step."""
+        train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
+        micro_batches = split_dict_to_chunk(
+            train_global_batch,
+            train_global_batch_size // self.cfg.actor.micro_batch_size,
+        )
+        if len(micro_batches) != self.gradient_accumulation:
+            raise ValueError(
+                "Policy-gradient diagnostics require exactly one global batch per "
+                "actor rank."
+            )
+
+        self.optimizer.zero_grad()
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        original_kl_beta = self.kl_beta
+        if not include_reference_kl:
+            self.kl_beta = 0.0
+        try:
+            ignored_metrics: dict[str, list[float]] = {}
+            for index, micro_batch in enumerate(micro_batches):
+                if logical_state_id is not None:
+                    micro_batch = self._mask_batch_to_logical_state(
+                        micro_batch, logical_state_id
+                    )
+                self.train_micro_batch(
+                    micro_batch=micro_batch,
+                    metrics=ignored_metrics,
+                    is_last=(index + 1) == len(micro_batches),
+                    update_policy=True,
+                    update_value=False,
+                )
+        finally:
+            self.kl_beta = original_kl_beta
+
+        gradients = []
+        for parameter in self._optimizer_parameters_by_role["policy"]:
+            gradient = parameter.grad
+            gradients.append(
+                None if gradient is None else gradient.detach().float().cpu().clone()
+            )
+        self.optimizer.zero_grad()
+        return gradients
+
+    @staticmethod
+    def _logical_state_metadata(
+        train_global_batch: dict[str, torch.Tensor],
+    ) -> dict[int, int]:
+        logical_ids = train_global_batch.get("outcome_logical_group_ids")
+        episode_indices = train_global_batch.get("outcome_episode_indices")
+        if logical_ids is None or episode_indices is None:
+            raise RuntimeError(
+                "Per-state policy diagnostics require logical group and episode IDs."
+            )
+        metadata = {}
+        for logical_state_id in torch.unique(logical_ids).tolist():
+            episodes = torch.unique(episode_indices[logical_ids == logical_state_id])
+            if episodes.numel() != 1:
+                raise RuntimeError(
+                    f"Logical state {logical_state_id} maps to episodes "
+                    f"{episodes.tolist()} in one actor batch."
+                )
+            metadata[int(logical_state_id)] = int(episodes.item())
+        return metadata
+
+    @staticmethod
+    def _state_signal_sufficient_statistics(
+        train_global_batch: dict[str, torch.Tensor],
+        state_ids: list[int],
+    ) -> torch.Tensor:
+        """Return count/sum/squared-sum statistics for advantages and returns."""
+        logical_ids = train_global_batch["outcome_logical_group_ids"].reshape(-1)
+        loss_mask = train_global_batch.get("loss_mask")
+        if loss_mask is None:
+            valid = torch.ones_like(logical_ids, dtype=torch.bool)
+        else:
+            valid = loss_mask.reshape(loss_mask.shape[0], -1).any(dim=-1)
+        advantages = train_global_batch["advantages"].reshape(-1).float()
+        returns = train_global_batch["returns"].reshape(-1).float()
+        rows = []
+        for state_id in state_ids:
+            selected = valid & logical_ids.eq(state_id)
+            state_advantages = advantages[selected]
+            state_returns = returns[selected]
+            rows.append(
+                torch.tensor(
+                    [
+                        float(selected.sum()),
+                        float(state_advantages.sum()),
+                        float(state_advantages.square().sum()),
+                        float((state_advantages > 0).sum()),
+                        float(state_returns.sum()),
+                        float(state_returns.square().sum()),
+                    ],
+                    dtype=torch.float64,
+                )
+            )
+        return torch.stack(rows)
+
+    def _run_policy_gradient_diagnostics(
+        self, train_global_batch: dict[str, torch.Tensor]
+    ) -> dict[str, float]:
+        """Measure exact PPO gradient conflicts among logical initial states."""
+        diagnostics_cfg = self.cfg.actor.policy_gradient_diagnostics
+        if self.grad_scaler.is_enabled():
+            raise ValueError(
+                "Policy-gradient diagnostics require actor FSDP grad_scaler=false."
+            )
+        if self.enable_sft_co_train or self.cfg.algorithm.entropy_bonus > 0:
+            raise ValueError(
+                "Policy-gradient diagnostics currently require SFT co-training "
+                "and entropy bonuses to be disabled."
+            )
+        if self.critic_only or self.critic_warmup_steps > 0:
+            raise ValueError(
+                "Policy-gradient diagnostics require an active, non-warmup policy."
+            )
+
+        local_metadata = self._logical_state_metadata(train_global_batch)
+        gathered_metadata: list[dict[int, int] | None] = [
+            None
+        ] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered_metadata, local_metadata)
+        state_metadata: dict[int, int] = {}
+        for metadata in gathered_metadata:
+            assert metadata is not None
+            for state_id, episode_index in metadata.items():
+                previous = state_metadata.setdefault(state_id, episode_index)
+                if previous != episode_index:
+                    raise RuntimeError(
+                        f"Logical state {state_id} maps to both episode {previous} "
+                        f"and episode {episode_index} across actor ranks."
+                    )
+        state_ids = sorted(state_metadata)
+        max_states = int(diagnostics_cfg.get("max_states", 0))
+        if 0 < max_states < len(state_ids):
+            raise ValueError(
+                "policy_gradient_diagnostics.max_states cannot exclude states "
+                "from the complete actor batch because that would invalidate the "
+                "aggregate-gradient and KL decomposition."
+            )
+        if len(state_ids) < 2:
+            raise ValueError(
+                "Policy-gradient conflict diagnostics require at least two states."
+            )
+
+        seed = int(diagnostics_cfg.get("seed", self.cfg.actor.seed + self.version))
+        self.log_info(
+            f"Computing exact PPO gradient conflicts for {len(state_ids)} logical "
+            "states without updating model weights."
+        )
+        state_gradients = [
+            self._backward_policy_diagnostic_batch(
+                train_global_batch,
+                logical_state_id=state_id,
+                include_reference_kl=False,
+                seed=seed,
+            )
+            for state_id in state_ids
+        ]
+        ppo_global_gradients = self._backward_policy_diagnostic_batch(
+            train_global_batch,
+            logical_state_id=None,
+            include_reference_kl=False,
+            seed=seed,
+        )
+        combined_gradients = self._backward_policy_diagnostic_batch(
+            train_global_batch,
+            logical_state_id=None,
+            include_reference_kl=True,
+            seed=seed,
+        )
+
+        gram = torch.zeros((len(state_ids), len(state_ids)), dtype=torch.float64)
+        ppo_norm_squared = 0.0
+        combined_norm_squared = 0.0
+        kl_norm_squared = 0.0
+        ppo_combined_dot = 0.0
+        ppo_kl_dot = 0.0
+        state_sum_residual_norm_squared = 0.0
+        for parameter_index, combined_gradient in enumerate(combined_gradients):
+            available = [gradients[parameter_index] for gradients in state_gradients]
+            ppo_global_gradient = ppo_global_gradients[parameter_index]
+            if (
+                combined_gradient is None
+                and ppo_global_gradient is None
+                and all(gradient is None for gradient in available)
+            ):
+                continue
+            reference = (
+                combined_gradient
+                if combined_gradient is not None
+                else (
+                    ppo_global_gradient
+                    if ppo_global_gradient is not None
+                    else next(
+                        gradient for gradient in available if gradient is not None
+                    )
+                )
+            )
+            stacked = torch.stack(
+                [
+                    torch.zeros_like(reference).reshape(-1)
+                    if gradient is None
+                    else gradient.reshape(-1)
+                    for gradient in available
+                ]
+            )
+            gram += (stacked @ stacked.T).double()
+            state_sum_gradient = stacked.sum(dim=0)
+            ppo_gradient = (
+                torch.zeros_like(state_sum_gradient)
+                if ppo_global_gradient is None
+                else ppo_global_gradient.reshape(-1)
+            )
+            if combined_gradient is None:
+                combined_flat = torch.zeros_like(ppo_gradient)
+            else:
+                combined_flat = combined_gradient.reshape(-1)
+            kl_gradient = combined_flat - ppo_gradient
+            ppo_norm_squared += float(torch.dot(ppo_gradient, ppo_gradient))
+            combined_norm_squared += float(torch.dot(combined_flat, combined_flat))
+            kl_norm_squared += float(torch.dot(kl_gradient, kl_gradient))
+            ppo_combined_dot += float(torch.dot(ppo_gradient, combined_flat))
+            ppo_kl_dot += float(torch.dot(ppo_gradient, kl_gradient))
+            state_sum_residual = state_sum_gradient - ppo_gradient
+            state_sum_residual_norm_squared += float(
+                torch.dot(state_sum_residual, state_sum_residual)
+            )
+
+        signal_stats = self._state_signal_sufficient_statistics(
+            train_global_batch, state_ids
+        )
+        packed = torch.cat(
+            [
+                gram.flatten(),
+                torch.tensor(
+                    [
+                        ppo_norm_squared,
+                        combined_norm_squared,
+                        kl_norm_squared,
+                        ppo_combined_dot,
+                        ppo_kl_dot,
+                        state_sum_residual_norm_squared,
+                    ],
+                    dtype=torch.float64,
+                ),
+                signal_stats.flatten(),
+            ]
+        ).to(self.device)
+        torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+        packed = packed.cpu()
+        gram_size = len(state_ids) ** 2
+        gram = packed[:gram_size].reshape(len(state_ids), len(state_ids))
+        gradient_scalars = packed[gram_size : gram_size + 6]
+        signal_stats = packed[gram_size + 6 :].reshape(len(state_ids), 6)
+
+        pairwise_cosines, state_to_aggregate = _gradient_cosines_from_gram(gram)
+        ppo_norm, combined_norm, kl_norm = gradient_scalars[:3].clamp_min(0).sqrt()
+        ppo_combined_cosine = gradient_scalars[3] / (
+            ppo_norm * combined_norm
+        ).clamp_min(torch.finfo(torch.float64).eps)
+        ppo_kl_cosine = gradient_scalars[4] / (ppo_norm * kl_norm).clamp_min(
+            torch.finfo(torch.float64).eps
+        )
+        off_diagonal = ~torch.eye(len(state_ids), dtype=torch.bool)
+        finite_pairwise = pairwise_cosines[off_diagonal]
+        finite_pairwise = finite_pairwise[torch.isfinite(finite_pairwise)]
+        finite_state_to_aggregate = state_to_aggregate[
+            torch.isfinite(state_to_aggregate)
+        ]
+
+        metrics = {
+            "diagnostics/policy_gradient/state_count": float(len(state_ids)),
+            "diagnostics/policy_gradient/ppo_norm": float(ppo_norm),
+            "diagnostics/policy_gradient/combined_norm": float(combined_norm),
+            "diagnostics/policy_gradient/kl_component_norm": float(kl_norm),
+            "diagnostics/policy_gradient/kl_to_ppo_norm_ratio": float(
+                kl_norm / ppo_norm.clamp_min(torch.finfo(torch.float64).eps)
+            ),
+            "diagnostics/policy_gradient/state_sum_additivity_error_ratio": float(
+                gradient_scalars[5].clamp_min(0).sqrt()
+                / ppo_norm.clamp_min(torch.finfo(torch.float64).eps)
+            ),
+            "diagnostics/policy_gradient/ppo_combined_cosine": float(
+                ppo_combined_cosine
+            ),
+            "diagnostics/policy_gradient/ppo_kl_cosine": float(ppo_kl_cosine),
+            "diagnostics/policy_gradient/pairwise_cosine_mean": float(
+                finite_pairwise.mean()
+            ),
+            "diagnostics/policy_gradient/pairwise_cosine_min": float(
+                finite_pairwise.min()
+            ),
+            "diagnostics/policy_gradient/pairwise_negative_fraction": float(
+                (finite_pairwise < 0).double().mean()
+            ),
+            "diagnostics/policy_gradient/state_to_aggregate_cosine_mean": float(
+                finite_state_to_aggregate.mean()
+            ),
+            "diagnostics/policy_gradient/state_to_aggregate_cosine_min": float(
+                finite_state_to_aggregate.min()
+            ),
+            "diagnostics/policy_gradient/state_to_aggregate_negative_fraction": float(
+                (finite_state_to_aggregate < 0).double().mean()
+            ),
+        }
+        state_records = []
+        state_norms = gram.diag().clamp_min(0).sqrt()
+        for row_index, state_id in enumerate(state_ids):
+            count, adv_sum, adv_square_sum, positive_count, return_sum, _ = (
+                signal_stats[row_index]
+            )
+            count = count.clamp_min(1)
+            advantage_mean = adv_sum / count
+            advantage_std = (
+                (adv_square_sum / count - advantage_mean.square()).clamp_min(0).sqrt()
+            )
+            episode_index = state_metadata[state_id]
+            state_prefix = f"diagnostics/state_episode_{episode_index}"
+            state_metrics = {
+                f"{state_prefix}/gradient_norm": float(state_norms[row_index]),
+                f"{state_prefix}/cosine_to_aggregate": float(
+                    state_to_aggregate[row_index]
+                ),
+                f"{state_prefix}/advantage_mean": float(advantage_mean),
+                f"{state_prefix}/advantage_std": float(advantage_std),
+                f"{state_prefix}/advantage_positive_fraction": float(
+                    positive_count / count
+                ),
+                f"{state_prefix}/return_mean": float(return_sum / count),
+            }
+            metrics.update(state_metrics)
+            state_records.append(
+                {
+                    "logical_state_id": state_id,
+                    "episode_index": episode_index,
+                    "gradient_norm": float(state_norms[row_index]),
+                    "cosine_to_aggregate": float(state_to_aggregate[row_index]),
+                    "advantage_mean": float(advantage_mean),
+                    "advantage_std": float(advantage_std),
+                    "advantage_positive_fraction": float(positive_count / count),
+                    "return_mean": float(return_sum / count),
+                    "valid_transition_count": int(signal_stats[row_index, 0]),
+                }
+            )
+
+        output_dir = diagnostics_cfg.get("output_dir", None)
+        if output_dir and self._rank == 0:
+            destination = (
+                Path(str(output_dir))
+                / f"global_step_{self.version:06d}"
+                / "policy_gradient_conflicts.json"
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            report = {
+                "global_step": self.version,
+                "objective": "PPO state gradients; combined gradient includes KL",
+                "metrics": metrics,
+                "states": state_records,
+                "state_order": state_ids,
+                "pairwise_cosine": pairwise_cosines.tolist(),
+            }
+            temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, destination)
+            self.log_info(f"Saved policy-gradient diagnostic report to {destination}.")
+
+        del state_gradients, ppo_global_gradients, combined_gradients
+        self.optimizer.zero_grad()
+        return metrics
+
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
@@ -828,8 +1430,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
 
+        resume_critic_warmup, update_phases = self._training_update_phases()
         recompute_metrics = {}
-        if self.cfg.actor.get("recompute_prev_logprobs", False):
+        if (
+            self.cfg.actor.get("recompute_prev_logprobs", False)
+            and not resume_critic_warmup
+        ):
             recompute_metrics = self.recompute_prev_logprobs()
 
         if self.cfg.algorithm.loss_type == "opd":
@@ -868,21 +1474,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         metrics = {}
         append_to_dict(metrics, recompute_metrics)
-        if self.use_independent_update_epochs:
-            update_phases = (
-                ("policy", self.policy_update_epochs, True, False),
-                ("critic", self.critic_update_epochs, False, True),
+        diagnostics_cfg = self.cfg.actor.get("policy_gradient_diagnostics", {})
+        if diagnostics_cfg.get("enabled", False):
+            if rollout_size != batch_size_per_rank:
+                raise ValueError(
+                    "Policy-gradient diagnostics require the actor global batch "
+                    "to contain the complete rollout batch."
+                )
+            diagnostic_metrics = self._run_policy_gradient_diagnostics(
+                self.rollout_batch
             )
-        else:
-            update_phases = (
-                (
-                    "joint",
-                    int(self.cfg.algorithm.get("update_epoch", 1)),
-                    not self.critic_only,
-                    self.cfg.algorithm.adv_type in ("gae", "subtask_gae"),
-                ),
-            )
-
+            if diagnostics_cfg.get("only", False):
+                self.rollout_batch = {}
+                clear_memory()
+                return diagnostic_metrics
+            append_to_dict(metrics, diagnostic_metrics)
         for phase, update_epochs, update_policy, update_value in update_phases:
             fixed_batch_interval = max(1, update_epochs // 10)
             for update_index in range(update_epochs):
@@ -961,11 +1567,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     for key, values in epoch_metrics.items():
                         metrics.setdefault(key, []).extend(values)
         if self.use_independent_update_epochs:
+            policy_update_epochs = update_phases[0][1]
+            critic_update_epochs = update_phases[1][1]
             append_to_dict(
                 metrics,
                 {
-                    "actor/policy_update_epochs": float(self.policy_update_epochs),
-                    "critic/update_epochs": float(self.critic_update_epochs),
+                    "actor/policy_update_epochs": float(policy_update_epochs),
+                    "critic/update_epochs": float(critic_update_epochs),
+                    "critic/resume_warmup": float(resume_critic_warmup),
                 },
             )
         # put LR scheduler step here
@@ -1004,6 +1613,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         prev_values = micro_batch.get("prev_values", None)
         loss_mask = micro_batch.get("loss_mask", None)
         loss_mask_sum = micro_batch.get("loss_mask_sum", None)
+        policy_loss_mask = micro_batch.get("policy_loss_mask", loss_mask)
+        policy_sample_weights = micro_batch.get(
+            "policy_sample_weights", micro_batch.get("sample_weights", None)
+        )
         forward_inputs = micro_batch.get("forward_inputs", None)
 
         kwargs = {}
@@ -1054,12 +1667,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "prev_values": prev_values,
             "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
             "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-            "value_clip": self.cfg.algorithm.get("value_clip", None),
+            "value_clip": (
+                self.resume_critic_warmup_value_clip
+                if self._resume_critic_warmup_active()
+                and self.resume_critic_warmup_value_clip is not None
+                else self.cfg.algorithm.get("value_clip", None)
+            ),
             "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-            "loss_mask": loss_mask,
+            "loss_mask": policy_loss_mask if update_policy else loss_mask,
             "loss_mask_sum": loss_mask_sum,
             "executed_action_mask": micro_batch.get("executed_action_mask", None),
-            "sample_weights": micro_batch.get("sample_weights", None),
+            "sample_weights": (
+                policy_sample_weights
+                if update_policy
+                else micro_batch.get("sample_weights", None)
+            ),
             "max_episode_steps": self.cfg.env.train.max_episode_steps,
             "task_type": self.cfg.runner.task_type,
             "critic_warmup": self.critic_only
@@ -1117,7 +1739,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 action_dim=self.cfg.actor.model.get("action_dim", 7),
                 batch_size=output_dict["logprobs"].shape[0],
             )
-            entropy_loss = masked_mean(entropy, mask=loss_mask)
+            entropy_loss = masked_mean(entropy, mask=policy_loss_mask)
             loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
         if update_policy:
             metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
@@ -1138,6 +1760,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Set the global step for the model, if needed.
         """
         self.version = global_step
+        if (
+            self._resume_checkpoint_loaded
+            and self.resume_critic_warmup_global_steps > 0
+            and self._resume_warmup_start_step is None
+        ):
+            self._resume_warmup_start_step = global_step
+            self.log_info(
+                "Reserved resumed policy steps "
+                f"[{global_step}, "
+                f"{global_step + self.resume_critic_warmup_global_steps}) for "
+                "critic-only warmup."
+            )
         if hasattr(self.model, "set_global_step"):
             self.model.set_global_step(global_step)
 

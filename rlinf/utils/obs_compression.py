@@ -28,11 +28,11 @@ compressed bytes). Decompression therefore needs no configuration and keeps no
 cross-message or cross-worker state, which keeps it robust to reordering and
 environment resets.
 
-Two backends are supported and imported lazily so they are only required when
-compression is actually enabled:
+Three backends are supported:
 
 * ``lz4`` - fastest, good ratio.
 * ``zstd`` - slightly slower, better ratio; ``level`` selects the effort.
+* ``zlib`` - dependency-free lossless compression for portable deployments.
 
 An optional XOR-delta pre-pass (:func:`_xor_encode`) computes the byte-wise
 difference between consecutive frames along the batch axis. Parallel embodied
@@ -41,6 +41,7 @@ consecutive frames share many identical bytes and the delta compresses far
 better than the raw frames.
 """
 
+import zlib
 from functools import lru_cache
 from typing import Any, Callable, Optional
 
@@ -122,8 +123,16 @@ def _get_backend(codec: str) -> Callable[..., Any]:
 
         return _compress, _decompress
 
+    if codec == "zlib":
+
+        def _compress(raw: bytes, level: int) -> bytes:
+            return zlib.compress(raw, level=level)
+
+        return _compress, zlib.decompress
+
     raise ValueError(
-        f"Unknown observation compression codec {codec!r}; expected 'lz4' or 'zstd'."
+        f"Unknown observation compression codec {codec!r}; expected 'lz4', "
+        "'zstd', or 'zlib'."
     )
 
 

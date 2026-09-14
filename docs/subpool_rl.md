@@ -103,14 +103,50 @@ definition keeps the optimization target aligned with success and completion
 time; a failed rollout cannot outrank a successful one merely by approaching or
 pushing the target object.
 
+To isolate terminal success from completion-time pressure without rewriting a
+validated manifest, set `env.train.subpool.reward_overrides.step_penalty: 0.0`
+and `algorithm.gamma: 1.0`. Runtime overrides are validated before simulator
+startup; the source manifest and snapshot hashes remain unchanged.
+
 ## Advantage and loss
 
 `subtask_gae` uses duration-aware discounts and stops recursion at termination
-or a subtask boundary. Advantages are normalized separately for each subtask.
+or a subtask boundary. By default, advantages are normalized separately for
+each subtask. Multi-state experiments can set
+`algorithm.advantage_normalization_scope: logical_state` to center and scale
+advantages independently for every scheduled initial state. This changes only
+the actor's relative weighting; the critic continues to fit unnormalized return
+targets. Logical-state normalization requires outcome-group scheduling because
+the stable state provenance is attached by that scheduler.
 Per-transition weights make every represented subtask contribute equal total
 actor and critic weight, independent of trajectory count or length. The scalar
 critic is conditioned on the P2 prompt through the VLM representation, i.e.
 `V(s, z)`.
+
+Outcome-sampled actor batches retain both the logical group id and canonical
+episode id. To test whether initial states have conflicting policy gradients,
+enable `actor.policy_gradient_diagnostics`. The diagnostic takes no optimizer
+step when `only: true`. It computes each state's exact PPO gradient, their
+pairwise cosine matrix, each state gradient's cosine with the aggregate PPO
+gradient, and the norm and direction of the reference-KL contribution. The
+complete matrix is written to
+`<output_dir>/global_step_<N>/policy_gradient_conflicts.json`; compact summary
+and per-episode statistics are also emitted as training metrics. This mode
+requires one full-rollout global batch, disabled gradient scaling, no entropy
+bonus, and no SFT co-training.
+
+The frozen reference policy is captured only after an optional resume
+checkpoint has been restored. Therefore a resumed run regularizes against its
+resume point, not silently against the original `actor.model.model_path`.
+
+```yaml
+actor:
+  policy_gradient_diagnostics:
+    enabled: true
+    only: true
+    max_states: 0
+    output_dir: /path/to/diagnostics
+```
 
 For OpenPI-RLinf, `actor.model.openpi.value_vlm_mode: state_fusion` applies
 LayerNorm to the masked-mean VLM prefix, encodes the current proprioceptive
@@ -142,6 +178,33 @@ policy-only optimizer step followed by five critic-only steps. Critic-only
 passes skip OpenPI's action-suffix/log-probability computation. Leaving either
 fields unset preserves the legacy joint `algorithm.update_epoch` behavior.
 
+When a resumed experiment changes the return definition, do not reuse a critic
+trained against the old targets. `actor.reset_value_head_on_resume: true`
+restores the checkpoint normally, then replaces only `value_head` parameters
+with their synchronized fresh initialization and discards only their optimizer
+moments. Policy weights and policy optimizer state remain intact. A bounded
+post-resume warmup can reserve complete global steps for the critic:
+
+```yaml
+algorithm:
+  bootstrap_type: never
+actor:
+  reset_value_head_on_resume: true
+  resume_critic_warmup_global_steps: 1
+  resume_critic_warmup_update_epochs: 20
+  resume_critic_warmup_value_clip: 12.0
+  policy_update_epochs: 1
+  critic_update_epochs: 5
+```
+
+During the reserved step, the actor performs zero policy optimizer steps and
+skips policy log-probability recomputation. The warmup-only value clip must be
+wide enough for a freshly initialized critic to reach the new target scale;
+normal global steps return to `algorithm.value_clip` and the regular critic
+epoch count. `algorithm.bootstrap_type: never` prevents terminal and truncated
+episodes from receiving a learned bootstrap value. Unknown bootstrap modes are
+rejected instead of silently behaving like `always`.
+
 TensorBoard reports aggregate success plus `env/subtask/<id>/success` and
 `env/subtask/<id>/timeout` for every represented skill. It also reports
 `env/subtask/<id>/pool/<pool_id>/*`, where pool ids 0, 1, and 2 mean canonical,
@@ -160,6 +223,12 @@ contains at least `min_successes` successful trajectories and `min_failures`
 failed trajectories. Homogeneous groups are discarded before advantage
 calculation, and a new snapshot is sampled with the same synchronized policy.
 No rejected trajectory is replayed after a parameter update.
+
+Set either outcome quota to `0` to disable that requirement. Setting both
+`min_successes` and `min_failures` to `0` preserves synchronized per-snapshot
+group scheduling while accepting every candidate group without conditioning on
+its outcomes. This mode is useful for unbiased rollout collection and ablation
+experiments; it is not DAPO-style filtering.
 
 Before every candidate rollout, the runner explicitly resets all group members
 with a shared collection index. Snapshot sampling is derived from
@@ -208,6 +277,37 @@ all-candidate counts. Parallel runs also report
 `rollout/dynamic_sampling/snapshot/<snapshot_id>/` record the episode index,
 candidate group and outcome counts, candidate success rate, and accepted group
 count.
+
+For multi-state runs, quota-based resampling and actor signal selection can be
+configured independently. Set the sampling quotas to zero to retain the first
+on-policy group, then enable `actor_signal_gate` to require a minimum number of
+both outcomes only for the PPO term:
+
+```yaml
+algorithm:
+  advantage_normalization_scope: logical_state
+  advantage_clip: 3.0
+  outcome_dynamic_sampling:
+    min_successes: 0
+    min_failures: 0
+    max_attempts_per_group: 1
+    actor_signal_gate:
+      enabled: true
+      min_successes: 2
+      min_failures: 2
+actor:
+  policy_update_epochs: 1
+  critic_update_epochs: 5
+```
+
+A homogeneous logical state is marked as actor no-signal instead of being
+resampled. Its PPO weight is zero, while its trajectories still train the
+critic and remain covered by reference-policy KL. Active policy weights are
+renormalized to preserve the original update scale. This mode requires
+independent policy and critic update phases. TensorBoard reports
+`rollout/dynamic_sampling/{actor_trainable_groups,actor_no_signal_groups}` and
+the corresponding per-snapshot counts. `advantage_clip` is applied after
+normalization and does not alter critic return targets.
 
 This filter cannot manufacture a positive trajectory when the policy has zero
 success probability. If warnings repeat for a long time, stop the run and first
@@ -440,6 +540,9 @@ env:
     remote_collector:
       enabled: true
       auth_token_env: RLINF_REMOTE_COLLECTOR_TOKEN
+      # Compress only large tensor blobs. Decoding is byte-exact and does not
+      # change image shape, dtype, resolution, or pixel values.
+      response_compression: {codec: zlib, level: 1, min_bytes: 65536}
       endpoints:
         - {env_rank: 1, ssh_host: collector-a, port: 46100}
         - {env_rank: 3, ssh_host: collector-a, port: 46101}
@@ -466,3 +569,22 @@ strategy before choosing which ranks are local. During training, monitor
 `env/remote_collector/reconnects`. Persistent nonzero reconnect counts indicate a
 WAN or SSH stability problem; handler time is remote simulation time, while the
 transport difference includes encoding, tunnel, and transfer latency.
+`env/remote_collector/response_raw_blob_mib` reports the original tensor bytes,
+and `env/remote_collector/response_compression_ratio` reports encoded blob bytes
+divided by original blob bytes. The response codec is negotiated per request:
+new clients remain compatible with old daemons, and old clients receive the
+legacy uncompressed format from new daemons.
+
+When `subpool.dynamic_updates` and `subpool.failure_state_capture.enabled` are
+both false, the environment does not dump periodic or terminal simulator states.
+Those snapshots are bookkeeping for dynamic/recovery pools and failure datasets;
+skipping them does not change physics, reward predicates, rendering, observations,
+or pixels. Arm-specific distance metrics are likewise evaluated only when named by
+the configured potential reward.
+
+With the corresponding OmniGibson support, subtask rollouts may set
+`subpool.skip_official_task_termination: true`. This skips the official
+whole-task BDDL termination predicates while retaining the sequential subtask
+reward used by the subpool tracker. Use it only for subpool execution: the
+subpool success/timeout remains the sole termination criterion. It does not
+change physics stepping, observations, or rendering.

@@ -23,6 +23,10 @@ save_interval=${B1K_RL_SAVE_INTERVAL:-5}
 micro_batch_size=${B1K_RL_MICRO_BATCH_SIZE:-100}
 global_batch_size=${B1K_RL_GLOBAL_BATCH_SIZE:-16000}
 max_attempts=${B1K_RL_MAX_ATTEMPTS_PER_STATE:-8}
+state_cache_size=${B1K_RL_STATE_CACHE_SIZE:-20}
+dynamic_batching=${B1K_RL_DYNAMIC_BATCHING:-false}
+dynamic_batch_size=${B1K_RL_DYNAMIC_BATCH_SIZE:-5}
+dynamic_batch_wait=${B1K_RL_DYNAMIC_BATCH_WAIT_SECONDS:-0.1}
 
 export PATH="$venv/bin:$PATH"
 export PYTHONPATH="$repo"
@@ -57,7 +61,7 @@ assert global_batch_size % (micro_batch_size * 4) == 0
 print(f"Validated 20 canonical states; MBS={micro_batch_size}, GBS={global_batch_size}.")
 PY
 
-remote_collectors='{enabled:true,auth_token_env:RLINF_REMOTE_COLLECTOR_TOKEN,endpoints:[{env_rank:0,ssh_host:gdb_4090_1,port:46100,local_port:47100,env_overrides:{video_cfg:{save_video:false}}},{env_rank:1,ssh_host:gdb_4090_1,port:46101,local_port:47101,env_overrides:{video_cfg:{save_video:false}}},{env_rank:2,ssh_host:gdb_4090_1,port:46102,local_port:47102,env_overrides:{video_cfg:{save_video:false}}},{env_rank:3,ssh_host:gdb_4090_1,port:46103,local_port:47103,env_overrides:{video_cfg:{save_video:false}}},{env_rank:4,ssh_host:gdb_4090_1,port:46104,local_port:47104,env_overrides:{video_cfg:{save_video:false}}},{env_rank:5,ssh_host:gdb_4090_1,port:46105,local_port:47105,env_overrides:{video_cfg:{save_video:false}}},{env_rank:6,ssh_host:gdb_4090_1,port:46106,local_port:47106,env_overrides:{video_cfg:{save_video:false}}},{env_rank:7,ssh_host:gdb_4090_1,port:46107,local_port:47107,env_overrides:{video_cfg:{save_video:false}}},{env_rank:8,ssh_host:gdb_4090_2,port:46100,local_port:47108,env_overrides:{video_cfg:{save_video:false}}},{env_rank:9,ssh_host:gdb_4090_2,port:46101,local_port:47109,env_overrides:{video_cfg:{save_video:false}}},{env_rank:10,ssh_host:gdb_4090_2,port:46102,local_port:47110,env_overrides:{video_cfg:{save_video:false}}},{env_rank:11,ssh_host:gdb_4090_2,port:46103,local_port:47111,env_overrides:{video_cfg:{save_video:false}}}]}'
+remote_collectors='{enabled:true,auth_token_env:RLINF_REMOTE_COLLECTOR_TOKEN,response_compression:{codec:zlib,level:1,min_bytes:65536},endpoints:[{env_rank:0,ssh_host:gdb_4090_1,port:46100,local_port:47100,env_overrides:{video_cfg:{save_video:false}}},{env_rank:1,ssh_host:gdb_4090_1,port:46101,local_port:47101,env_overrides:{video_cfg:{save_video:false}}},{env_rank:2,ssh_host:gdb_4090_1,port:46102,local_port:47102,env_overrides:{video_cfg:{save_video:false}}},{env_rank:3,ssh_host:gdb_4090_1,port:46103,local_port:47103,env_overrides:{video_cfg:{save_video:false}}},{env_rank:4,ssh_host:gdb_4090_1,port:46104,local_port:47104,env_overrides:{video_cfg:{save_video:false}}},{env_rank:5,ssh_host:gdb_4090_1,port:46105,local_port:47105,env_overrides:{video_cfg:{save_video:false}}},{env_rank:6,ssh_host:gdb_4090_1,port:46106,local_port:47106,env_overrides:{video_cfg:{save_video:false}}},{env_rank:7,ssh_host:gdb_4090_1,port:46107,local_port:47107,env_overrides:{video_cfg:{save_video:false}}},{env_rank:8,ssh_host:gdb_4090_2,port:46100,local_port:47108,env_overrides:{video_cfg:{save_video:false}}},{env_rank:9,ssh_host:gdb_4090_2,port:46101,local_port:47109,env_overrides:{video_cfg:{save_video:false}}},{env_rank:10,ssh_host:gdb_4090_2,port:46102,local_port:47110,env_overrides:{video_cfg:{save_video:false}}},{env_rank:11,ssh_host:gdb_4090_2,port:46103,local_port:47111,env_overrides:{video_cfg:{save_video:false}}}]}'
 trainer_env_config='[{node_ranks:0,env_vars:[{RLINF_REMOTE_COLLECTOR_TOKEN:B1K_CROSSDC_RADIO_0909_V1}]}]'
 
 command=(
@@ -66,6 +70,7 @@ command=(
   runner.max_steps="$max_steps"
   runner.save_interval="$save_interval"
   runner.val_check_interval=-1
+  ++runner.enable_decoupled_mode="$dynamic_batching"
   runner.logger.log_path="$B1K_SUBPOOL_RESULT_DIR"
   cluster.num_nodes=3
   cluster.component_placement.env.node_group="'trainer,behavior'"
@@ -75,6 +80,10 @@ command=(
   env.train.max_episode_steps=1280
   env.train.max_steps_per_rollout_epoch=1280
   env.train.skip_intermediate_obs_in_chunk=true
+  +env.obs_compression.enable=true
+  +env.obs_compression.codec=zlib
+  +env.obs_compression.level=1
+  +env.obs_compression.xor_delta=false
   +env.train.behavior.init_retry_count=5
   +env.train.behavior.init_retry_delay=5.0
   +env.train.behavior.init_retry_backoff=2.0
@@ -86,6 +95,8 @@ command=(
   env.train.subpool.pool_weights.predecessor_success=0.0
   env.train.subpool.pool_weights.recovery=0.0
   env.train.subpool.dynamic_updates=false
+  env.train.subpool.state_cache_size="$state_cache_size"
+  env.train.subpool.skip_official_task_termination=true
   "+env.train.remote_collector=$remote_collectors"
   env.train.video_cfg.video_base_dir="$B1K_SUBPOOL_RESULT_DIR/video/train"
   +env.train.video_cfg.fps=15
@@ -108,6 +119,9 @@ command=(
   actor.critic_update_epochs=5
   actor.enable_offload=false
   rollout.enable_offload=false
+  rollout.dynamic_batching.enabled="$dynamic_batching"
+  rollout.dynamic_batching.max_batch_size="$dynamic_batch_size"
+  rollout.dynamic_batching.max_wait_seconds="$dynamic_batch_wait"
   actor.fsdp_config.sharding_strategy=shard_grad_op
   actor.fsdp_config.gradient_checkpointing=false
   actor.fsdp_config.forward_prefetch=true
@@ -123,6 +137,7 @@ command=(
 
 cd "$repo"
 if [[ "${1:-}" == "--config-only" ]]; then
-  exec "${command[@]}" --cfg job
+  shift
+  exec "${command[@]}" "$@" --cfg job
 fi
-exec "${command[@]}"
+exec "${command[@]}" "$@"

@@ -619,6 +619,61 @@ class Channel:
             else:
                 return async_channel_work.wait()
 
+    def get_up_to(
+        self,
+        max_items: int,
+        timeout_seconds: float,
+        key: Any = DEFAULT_KEY,
+        async_op: bool = False,
+    ) -> AsyncWork | list[Any]:
+        """Wait for one item, then return up to ``max_items`` within a window.
+
+        The timeout starts after the first item arrives. Collection happens atomically
+        inside the channel worker, so multiple consumers cannot race while draining
+        the same queue.
+
+        Args:
+            max_items: Maximum number of queue items to return.
+            timeout_seconds: Time to wait for additional items after the first.
+            key: Queue routing key.
+            async_op: Return an asynchronous work handle when True.
+
+        Returns:
+            A non-empty list of at most ``max_items`` queue items, or an async handle
+            resolving to that list.
+        """
+        if self._local_channel is not None:
+            raise NotImplementedError("Local channels do not support get_up_to.")
+
+        target_rank = self._get_channel_rank_by_key(key)
+        target_actor = self._get_channel_actor(target_rank)
+        if self._current_worker is not None:
+            query_id = uuid.uuid4().int
+            target_actor.get_up_to.remote(
+                dst_addr=self._current_worker.worker_address,
+                query_id=query_id,
+                max_items=max_items,
+                timeout_seconds=timeout_seconds,
+                key=key,
+            )
+            async_comm_work = self._current_worker.recv(
+                self._channel_name, target_rank, async_op=True
+            )
+            work = AsyncChannelCommWork(
+                async_comm_work=async_comm_work,
+                query_id=query_id,
+                channel_actor=target_actor,
+            )
+        else:
+            work = AsyncRayWork(
+                target_actor.get_up_to_via_ray.remote(
+                    max_items=max_items,
+                    timeout_seconds=timeout_seconds,
+                    key=key,
+                )
+            )
+        return work if async_op else work.wait()
+
     def __str__(self, key: Any = DEFAULT_KEY) -> str:
         """Get a all the items in the channel queue as a string.
 

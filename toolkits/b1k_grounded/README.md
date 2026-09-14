@@ -634,3 +634,53 @@ and one shuffled logical group per canonical state. Its four-A100 actor uses
 prefetch, and micro batch size 100 by default. The latter was the largest
 configuration with practical memory headroom in the matching 80-GiB profile;
 override `B1K_RL_MICRO_BATCH_SIZE` when the actor hardware changes.
+
+## Subpool rollout performance
+
+Canonical snapshot files are immutable during one run, so repeated resets can
+cache their deserialized state dictionaries inside each EnvWorker. Size the LRU
+to the number of canonical states assigned to one worker; zero keeps the legacy
+uncached behavior:
+
+```yaml
+env:
+  train:
+    subpool:
+      state_cache_size: 20
+```
+
+`benchmark_behavior_chunk_step.py --num-resets 8 --state-cache-size 20`
+measures reset and primitive-step throughput while also recording simulator
+state, reward, termination, and camera hashes for correctness comparison. The
+cache changes neither rendering nor observation pixels.
+
+Finite dynamic rollout batching removes the all-environment barrier at every
+action-chunk boundary. EnvWorkers place ready observations in a shared route;
+each rollout worker waits for one shard and coalesces additional ready shards
+for a small bounded window. The epoch still ends only after every configured
+trajectory is collected, so actor training receives the same complete on-policy
+population:
+
+```yaml
+runner:
+  enable_decoupled_mode: true
+  val_check_interval: -1
+rollout:
+  pipeline_stage_num: 1
+  collect_final_values: true
+  dynamic_batching:
+    enabled: true
+    # Maximum incoming EnvWorker shards per inference call.
+    max_batch_size: 5
+    # Starts after the first shard arrives.
+    max_wait_seconds: 0.1
+```
+
+The initial implementation is training-only and requires the EnvWorker count to
+be divisible by the rollout-worker count. Bootstrap-value requests use a
+separate route so a fast environment cannot be mistaken for another
+environment's regular action request. Use
+`benchmark_openpi_rollout_batch.py` to choose `max_batch_size` from measured
+policy latency rather than assuming the largest batch is fastest. The rollout
+log reports a batch-size histogram; reduce the wait only when the histogram
+shows that requests still coalesce near `max_batch_size`.

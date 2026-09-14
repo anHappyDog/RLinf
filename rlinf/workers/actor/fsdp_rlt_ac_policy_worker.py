@@ -273,6 +273,8 @@ class RLTACLossMixin:
                 target_q_values = reward_target + bootstrap_discount * q_next
             elif bootstrap_type == "standard":
                 target_q_values = reward_target + not_done * bootstrap_discount * q_next
+            elif bootstrap_type == "never":
+                target_q_values = reward_target
             else:
                 raise NotImplementedError(f"{bootstrap_type=} is not supported!")
 

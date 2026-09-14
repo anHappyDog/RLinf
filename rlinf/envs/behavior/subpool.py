@@ -25,6 +25,7 @@ import shutil
 import socket
 import tempfile
 import uuid
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -190,11 +191,23 @@ class SubpoolSnapshot:
 class SubpoolCatalog:
     """Immutable view over a validated JSONL subpool manifest."""
 
-    def __init__(self, root: Path, records: Sequence[SubpoolSnapshot]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        records: Sequence[SubpoolSnapshot],
+        *,
+        state_cache_size: int = 0,
+    ) -> None:
         if not records:
             raise ValueError("A subpool catalog must contain at least one snapshot.")
+        if state_cache_size < 0:
+            raise ValueError("state_cache_size must be non-negative.")
         self.root = root.resolve()
         self.records = tuple(records)
+        self._state_cache_size = int(state_cache_size)
+        self._state_cache: OrderedDict[str, Mapping[str, Any]] = OrderedDict()
+        self._state_cache_hits = 0
+        self._state_cache_misses = 0
         ids = [record.snapshot_id for record in self.records]
         if len(ids) != len(set(ids)):
             raise ValueError("Subpool manifest contains duplicate snapshot_id values.")
@@ -239,12 +252,15 @@ class SubpoolCatalog:
         manifest_path: str | os.PathLike[str],
         *,
         verify_states: bool = True,
+        state_cache_size: int = 0,
     ) -> "SubpoolCatalog":
         """Load and validate a subpool manifest.
 
         Args:
             manifest_path: JSONL manifest path.
             verify_states: Verify that every state exists and matches its checksum.
+            state_cache_size: Number of validated CPU states to retain in an LRU
+                cache. Zero disables caching.
 
         Returns:
             The validated catalog.
@@ -269,7 +285,7 @@ class SubpoolCatalog:
             finally:
                 fcntl.flock(manifest_file.fileno(), fcntl.LOCK_UN)
 
-        catalog = cls(path.parent, records)
+        catalog = cls(path.parent, records, state_cache_size=state_cache_size)
         if verify_states:
             for record in catalog.records:
                 catalog.load_state(record)
@@ -305,6 +321,13 @@ class SubpoolCatalog:
 
     def load_state(self, record: SubpoolSnapshot) -> Mapping[str, Any]:
         """Load one complete simulator state after checksum validation."""
+        cached = self._state_cache.get(record.snapshot_id)
+        if cached is not None:
+            self._state_cache.move_to_end(record.snapshot_id)
+            self._state_cache_hits += 1
+            return cached
+
+        self._state_cache_misses += 1
         path = self.state_path(record)
         if not path.is_file():
             raise FileNotFoundError(
@@ -321,7 +344,22 @@ class SubpoolCatalog:
             raise ValueError(
                 f"Snapshot {record.snapshot_id!r} must contain a full mapping state."
             )
+        if self._state_cache_size:
+            self._state_cache[record.snapshot_id] = state
+            self._state_cache.move_to_end(record.snapshot_id)
+            while len(self._state_cache) > self._state_cache_size:
+                self._state_cache.popitem(last=False)
         return state
+
+    @property
+    def state_cache_info(self) -> Mapping[str, int]:
+        """Return process-local snapshot cache counters for diagnostics."""
+        return {
+            "size": len(self._state_cache),
+            "capacity": self._state_cache_size,
+            "hits": self._state_cache_hits,
+            "misses": self._state_cache_misses,
+        }
 
     def sample(
         self,
@@ -820,6 +858,13 @@ def validate_subpool_env_config(
         errors.append(
             "subpool.failure_state_capture.output_dir is required when enabled"
         )
+    if bool(select("subpool.skip_official_task_termination", False)) and not bool(
+        select("subpool.enabled", False)
+    ):
+        errors.append("skip_official_task_termination requires subpool.enabled")
+    state_cache_size = int(select("subpool.state_cache_size", 0))
+    if state_cache_size < 0:
+        errors.append("subpool.state_cache_size must be non-negative")
     if errors:
         raise ValueError(
             "Invalid correctness-first BEHAVIOR subpool config: " + "; ".join(errors)

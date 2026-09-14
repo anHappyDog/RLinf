@@ -119,7 +119,7 @@ algorithm
      - token 损失的聚合方式（例如 ``token-mean``）。
    * - ``algorithm.bootstrap_type``
      - 在 episode 边界如何对 Q 值进行自举：``standard`` 仅在截断时自举；``always`` 在
-       截断或终止时都自举。
+       截断或终止时都自举；``never`` 只使用终止奖励，不加入自举值。
    * - ``algorithm.kl_beta``
      - 加入奖励的 KL 惩罚权重。
    * - ``algorithm.entropy_bonus``

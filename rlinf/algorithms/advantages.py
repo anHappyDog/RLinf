@@ -98,9 +98,26 @@ def compute_subtask_gae_advantages_and_returns(
     gae_lambda: float = 0.95,
     normalize_advantages: bool = True,
     advantage_std_floor: float = 0.1,
+    advantage_clip: float | None = None,
+    advantage_normalization_scope: str = "subtask",
+    outcome_logical_group_ids: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute duration-aware GAE and normalize within each subtask."""
+    """Compute duration-aware GAE with configurable advantage grouping."""
+    if advantage_normalization_scope == "subtask":
+        normalization_group_ids = subtask_ids
+    elif advantage_normalization_scope == "logical_state":
+        if outcome_logical_group_ids is None:
+            raise ValueError(
+                "advantage_normalization_scope=logical_state requires "
+                "outcome_logical_group_ids in the rollout batch."
+            )
+        normalization_group_ids = outcome_logical_group_ids
+    else:
+        raise ValueError(
+            "advantage_normalization_scope must be 'subtask' or "
+            f"'logical_state', got {advantage_normalization_scope!r}."
+        )
     return compute_subtask_gae(
         rewards,
         discounts,
@@ -111,6 +128,8 @@ def compute_subtask_gae_advantages_and_returns(
         gae_lambda=gae_lambda,
         normalize_advantages=normalize_advantages,
         advantage_std_floor=advantage_std_floor,
+        normalization_group_ids=normalization_group_ids,
+        advantage_clip=advantage_clip,
     )
 
 

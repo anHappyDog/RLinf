@@ -8,6 +8,7 @@ from rlinf.algorithms.subtask import (
     balanced_subtask_weights,
     compute_subtask_gae,
     discounted_chunk_rewards,
+    gated_policy_weights,
     taskwise_normalize,
 )
 from rlinf.algorithms.utils import preprocess_loss_inputs
@@ -81,6 +82,37 @@ def test_balanced_weights_give_each_subtask_equal_total_weight():
     assert weights[~valid].eq(0).all()
 
 
+def test_policy_gate_preserves_total_weight_for_trainable_states():
+    sample_weights = torch.ones(2, 3)
+    policy_trainable = torch.tensor([[True, False, True], [True, False, True]])
+    valid = torch.tensor([[True, True, True], [True, False, True]])
+
+    weights = gated_policy_weights(sample_weights, policy_trainable, valid)
+
+    assert weights[:, 1].eq(0).all()
+    torch.testing.assert_close(weights.sum(), sample_weights[valid].sum())
+
+
+def test_advantage_clip_applies_after_normalization_without_changing_returns():
+    rewards = torch.tensor([[1.0, 3.0]])
+    valid = torch.ones_like(rewards, dtype=torch.bool)
+    advantages, returns = compute_subtask_gae(
+        rewards,
+        torch.ones_like(rewards),
+        torch.ones_like(valid),
+        torch.zeros(2, 2),
+        torch.zeros_like(rewards, dtype=torch.long),
+        valid,
+        gae_lambda=1.0,
+        normalize_advantages=True,
+        advantage_std_floor=1e-4,
+        advantage_clip=0.5,
+    )
+
+    torch.testing.assert_close(advantages, torch.tensor([[-0.5, 0.5]]))
+    torch.testing.assert_close(returns, rewards)
+
+
 @pytest.mark.parametrize("with_trailing_dim", [False, True])
 def test_align_subtask_ids_preserves_singleton_batch(with_trailing_dim):
     reference = torch.ones(3, 1, dtype=torch.bool)
@@ -151,6 +183,65 @@ def test_embodied_registry_preserves_singleton_batch_axis():
     assert result["returns"].shape == (2, 1, 1)
 
 
+def test_logical_state_advantage_normalization_separates_same_subtask_states():
+    rewards = torch.tensor(
+        [
+            [[1.0], [3.0], [100.0], [300.0]],
+            [[5.0], [7.0], [500.0], [700.0]],
+        ]
+    )
+    executed = torch.ones_like(rewards, dtype=torch.bool)
+    dones = torch.zeros(3, 4, 1, dtype=torch.bool)
+    dones[1:] = True
+    result = calculate_adv_and_returns(
+        task_type="embodied",
+        adv_type="subtask_gae",
+        reward_type="subtask_chunk_level",
+        rewards=rewards,
+        dones=dones,
+        values=torch.zeros(3, 4, 1),
+        subtask_ids=torch.zeros(2, 4, dtype=torch.long),
+        outcome_logical_group_ids=torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]]),
+        executed_action_mask=executed,
+        loss_mask=executed,
+        gamma=1.0,
+        gae_lambda=1.0,
+        normalize_advantages=True,
+        advantage_normalization_scope="logical_state",
+        advantage_std_floor=1e-4,
+    )
+
+    advantages = result["advantages"].squeeze(-1)
+    logical_group_ids = torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]])
+    for group_id in (0, 1):
+        state_advantages = advantages[logical_group_ids == group_id]
+        torch.testing.assert_close(state_advantages.mean(), torch.tensor(0.0))
+        torch.testing.assert_close(
+            state_advantages.std(unbiased=False), torch.tensor(1.0)
+        )
+    torch.testing.assert_close(result["returns"], rewards)
+
+
+def test_logical_state_advantage_normalization_requires_provenance():
+    rewards = torch.ones(1, 1, 1)
+    with pytest.raises(ValueError, match="requires outcome_logical_group_ids"):
+        calculate_adv_and_returns(
+            task_type="embodied",
+            adv_type="subtask_gae",
+            reward_type="subtask_chunk_level",
+            rewards=rewards,
+            dones=torch.zeros(2, 1, 1, dtype=torch.bool),
+            values=torch.zeros(2, 1, 1),
+            subtask_ids=torch.zeros(1, 1, dtype=torch.long),
+            executed_action_mask=torch.ones_like(rewards, dtype=torch.bool),
+            loss_mask=torch.ones_like(rewards, dtype=torch.bool),
+            gamma=1.0,
+            gae_lambda=1.0,
+            normalize_advantages=True,
+            advantage_normalization_scope="logical_state",
+        )
+
+
 def test_chunk_logprob_excludes_unexecuted_actions():
     inputs = preprocess_loss_inputs(
         logprobs=torch.ones(1, 4, 2),
@@ -207,3 +298,31 @@ def test_auto_reset_subtask_batch_masks_only_executed_actions():
     assert torch.equal(batch["loss_mask"], torch.ones(2, 1, 1, dtype=torch.bool))
     assert torch.equal(batch["loss_mask_sum"], torch.full((2, 1, 1), 2))
     assert torch.equal(batch["sample_weights"], torch.ones(2, 1, 1))
+
+
+def test_actor_signal_gate_keeps_critic_weights_and_masks_policy_only():
+    batch = preprocess_embodied_batch(
+        {
+            "rewards": torch.ones(2, 2, 1),
+            "dones": torch.zeros(3, 2, 1, dtype=torch.bool),
+            "executed_action_mask": torch.ones(2, 2, 1, dtype=torch.bool),
+            "subtask_ids": torch.zeros(2, 2, dtype=torch.long),
+            "outcome_policy_trainable": torch.tensor([[True, False], [True, False]]),
+        },
+        rollout_epoch=1,
+        auto_reset=True,
+        ignore_terminations=False,
+        reward_type="subtask_chunk_level",
+        filter_rewards=False,
+        group_size=1,
+    )
+
+    assert torch.equal(batch["sample_weights"], torch.ones(2, 2, 1))
+    assert torch.equal(
+        batch["policy_loss_mask"].squeeze(-1),
+        torch.tensor([[True, False], [True, False]]),
+    )
+    torch.testing.assert_close(
+        batch["policy_sample_weights"].squeeze(-1),
+        torch.tensor([[2.0, 0.0], [2.0, 0.0]]),
+    )

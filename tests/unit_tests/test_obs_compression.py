@@ -24,8 +24,8 @@ from rlinf.utils.obs_compression import (
     is_compression_enabled,
 )
 
-# Skip codec round-trip tests when the optional backends are not installed.
-_CODECS = []
+# zlib is always available; lz4 and zstd remain optional accelerators.
+_CODECS = ["zlib"]
 try:
     import lz4.frame  # noqa: F401
 
@@ -81,7 +81,7 @@ def _assert_payload_equal(a: dict, b: dict) -> None:
 def _cfg(**overrides):
     # A plain dict is sufficient: the codec only calls ``config.get(...)``,
     # which both ``dict`` and OmegaConf's ``DictConfig`` support identically.
-    base = {"enable": True, "codec": "lz4", "level": 1, "xor_delta": True}
+    base = {"enable": True, "codec": "zlib", "level": 1, "xor_delta": True}
     base.update(overrides)
     return base
 

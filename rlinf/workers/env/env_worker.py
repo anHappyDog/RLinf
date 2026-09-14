@@ -214,6 +214,11 @@ class EnvWorker(Worker):
                 for _ in range(self.stage_num)
             ]
         self.env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
+        self.dynamic_batching_enabled = bool(
+            OmegaConf.select(
+                self.cfg, "rollout.dynamic_batching.enabled", default=False
+            )
+        )
 
         self.smooth_intervene = SmoothInterveneController.from_cfg(
             self.cfg,
@@ -807,17 +812,29 @@ class EnvWorker(Worker):
             return adjusted_rewards
 
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
+        if bootstrap_type == "never":
+            return adjusted_rewards
         if bootstrap_type == "standard":
-            last_step_truncations = env_output.truncations[:, -1]
+            if env_output.truncations is None:
+                raise ValueError(
+                    "algorithm.bootstrap_type='standard' requires environment "
+                    "truncation signals."
+                )
+            bootstrap_mask = env_output.truncations[:, -1]
+        elif bootstrap_type == "always":
+            bootstrap_mask = env_output.dones[:, -1]
         else:
-            last_step_truncations = env_output.dones[:, -1]
+            raise ValueError(
+                "algorithm.bootstrap_type must be one of 'standard', 'always', "
+                f"or 'never', got {bootstrap_type!r}."
+            )
 
-        if not last_step_truncations.any():
+        if not bootstrap_mask.any():
             return adjusted_rewards
 
         final_values = torch.zeros_like(adjusted_rewards[:, -1], dtype=torch.float32)
-        final_values[last_step_truncations] = (
-            bootstrap_values[last_step_truncations].reshape(-1).to(torch.float32)
+        final_values[bootstrap_mask] = (
+            bootstrap_values[bootstrap_mask].reshape(-1).to(torch.float32)
         )
         adjusted_rewards[:, -1] += self.cfg.algorithm.gamma * final_values
         return adjusted_rewards
@@ -1440,13 +1457,19 @@ class EnvWorker(Worker):
                         env_output.dones,
                     )
                     if not skip_rollout_send:
+                        rollout_tag = (
+                            "rollout_bootstrap"
+                            if self.dynamic_batching_enabled
+                            and chunk_step_idx == self.n_train_chunk_steps - 1
+                            else "rollout_results"
+                        )
                         self.send_to(
                             group_name=self.cfg.rollout.group_name,
                             channel=rollout_channel,
                             data=self._build_rollout_input_data(env_batch),
                             split_fn=self._obs_split_fn,
                             mode="train",
-                            tag="rollout_results",
+                            tag=rollout_tag,
                             route_key=stage_id if not self.env_decoupled_mode else None,
                             decoupled_mode=self.env_decoupled_mode,
                         )
@@ -1513,10 +1536,15 @@ class EnvWorker(Worker):
                         curr_obs=env_output.obs,
                     )
                 else:
+                    rollout_result_tag = (
+                        "train_rollout_bootstrap"
+                        if self.dynamic_batching_enabled
+                        else "train_rollout_results"
+                    )
                     policy_output = self.recv_from(
                         group_name=self.cfg.rollout.group_name,
                         channel=input_channel,
-                        tag="train_rollout_results",
+                        tag=rollout_result_tag,
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         batch_size=self.train_batch_size,
                         merge_fn=PolicyOutput.merge,
@@ -1781,6 +1809,7 @@ class EnvWorker(Worker):
             "normalize_advantages": self.cfg.algorithm.get("normalize_advantages", True)
             and not self.use_training_pipeline,
             "advantage_std_floor": self.cfg.algorithm.get("advantage_std_floor", 0.1),
+            "advantage_clip": self.cfg.algorithm.get("advantage_clip", None),
         }
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
         rollout_batch.update(advantages_and_returns)

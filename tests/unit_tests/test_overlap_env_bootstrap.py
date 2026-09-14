@@ -96,6 +96,7 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
         self.worker.enable_offload = False
         self.worker.train_enable_offload = False
         self.worker.use_training_pipeline = False
+        self.worker.dynamic_batching_enabled = False
         self.worker.collect_transitions = False
         self.worker.enable_rlt = False
         self.worker.collect_prev_infos = True

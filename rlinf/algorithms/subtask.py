@@ -132,28 +132,38 @@ def parallel_outcome_sampling_enabled(sampling_cfg) -> bool:
     )
 
 
-def align_subtask_ids(
-    subtask_ids: torch.Tensor,
+def align_transition_ids(
+    transition_ids: torch.Tensor,
     reference: torch.Tensor,
+    *,
+    name: str = "transition_ids",
 ) -> torch.Tensor:
-    """Align transition subtask IDs with a ``[T, B]`` reference tensor.
+    """Align transition IDs with a ``[T, B]`` reference tensor.
 
     Trajectories store IDs as ``[T, B]``.  This also accepts the legacy
     ``[T, B, 1]`` representation without collapsing a singleton batch axis.
     """
-    if subtask_ids.shape == reference.shape:
-        return subtask_ids
+    if transition_ids.shape == reference.shape:
+        return transition_ids
     if (
-        subtask_ids.ndim == reference.ndim + 1
-        and subtask_ids.shape[-1] == 1
-        and subtask_ids.shape[:-1] == reference.shape
+        transition_ids.ndim == reference.ndim + 1
+        and transition_ids.shape[-1] == 1
+        and transition_ids.shape[:-1] == reference.shape
     ):
-        return subtask_ids.squeeze(-1)
+        return transition_ids.squeeze(-1)
     raise ValueError(
-        "subtask_ids must match the transition reference shape "
+        f"{name} must match the transition reference shape "
         f"{tuple(reference.shape)} or add one trailing singleton dimension; "
-        f"got {tuple(subtask_ids.shape)}."
+        f"got {tuple(transition_ids.shape)}."
     )
+
+
+def align_subtask_ids(
+    subtask_ids: torch.Tensor,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    """Align subtask IDs with a ``[T, B]`` transition tensor."""
+    return align_transition_ids(subtask_ids, reference, name="subtask_ids")
 
 
 def discounted_chunk_rewards(
@@ -206,27 +216,43 @@ def taskwise_normalize(
     std_floor: float,
 ) -> torch.Tensor:
     """Normalize valid advantages independently for each subtask."""
-    if advantages.shape != subtask_ids.shape or advantages.shape != valid_mask.shape:
-        raise ValueError("advantages, subtask_ids, and valid_mask must share a shape.")
+    return groupwise_normalize(
+        advantages,
+        subtask_ids,
+        valid_mask,
+        std_floor=std_floor,
+    )
+
+
+def groupwise_normalize(
+    advantages: torch.Tensor,
+    group_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    std_floor: float,
+) -> torch.Tensor:
+    """Normalize valid advantages independently for each grouping ID."""
+    if advantages.shape != group_ids.shape or advantages.shape != valid_mask.shape:
+        raise ValueError("advantages, group_ids, and valid_mask must share a shape.")
     if std_floor <= 0:
         raise ValueError("std_floor must be positive.")
 
     normalized = torch.zeros_like(advantages)
-    for subtask_id in torch.unique(subtask_ids[valid_mask]):
-        task_mask = valid_mask & (subtask_ids == subtask_id)
-        values = advantages[task_mask]
+    for group_id in torch.unique(group_ids[valid_mask]):
+        group_mask = valid_mask & (group_ids == group_id)
+        values = advantages[group_mask]
         mean = values.mean()
         std = values.std(unbiased=False)
         if std < std_floor:
             # A near-terminal predecessor state may yield only one valid macro
-            # transition. Mean-centering that task would erase its entire policy
+            # transition. Mean-centering that group would erase its entire policy
             # gradient, so use an RMS-like scale without centering in this
             # degenerate regime. This also preserves a shared success/failure
             # sign when every sampled return is effectively identical.
             scale = values.square().mean().sqrt().clamp_min(std_floor)
-            normalized[task_mask] = values / scale
+            normalized[group_mask] = values / scale
         else:
-            normalized[task_mask] = (values - mean) / std
+            normalized[group_mask] = (values - mean) / std
     return normalized
 
 
@@ -254,6 +280,33 @@ def balanced_subtask_weights(
     return weights
 
 
+def gated_policy_weights(
+    sample_weights: torch.Tensor,
+    policy_trainable: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Disable no-signal policy samples without changing the update scale.
+
+    The critic continues to use ``sample_weights``. The returned weights are
+    restricted to policy-trainable logical states and renormalized to preserve
+    the original total valid weight. If no state is trainable, all weights are
+    zero and the actor receives no PPO gradient for that update.
+    """
+    if not (sample_weights.shape == policy_trainable.shape == valid_mask.shape):
+        raise ValueError(
+            "sample_weights, policy_trainable, and valid_mask must share a shape."
+        )
+
+    valid_mask = valid_mask.to(torch.bool)
+    policy_mask = valid_mask & policy_trainable.to(torch.bool)
+    weights = sample_weights.to(torch.float32) * policy_mask
+    active_total = weights.sum()
+    if active_total <= 0:
+        return torch.zeros_like(weights)
+    target_total = (sample_weights.to(torch.float32) * valid_mask).sum()
+    return weights * (target_total / active_total)
+
+
 def compute_subtask_gae(
     rewards: torch.Tensor,
     discounts: torch.Tensor,
@@ -265,6 +318,8 @@ def compute_subtask_gae(
     gae_lambda: float,
     normalize_advantages: bool,
     advantage_std_floor: float,
+    normalization_group_ids: torch.Tensor | None = None,
+    advantage_clip: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute duration-aware GAE without leaking across subtask boundaries.
 
@@ -282,12 +337,19 @@ def compute_subtask_gae(
     ):
         if tensor.shape != expected_shape:
             raise ValueError(f"{name} must have shape {expected_shape}.")
+    if (
+        normalization_group_ids is not None
+        and normalization_group_ids.shape != expected_shape
+    ):
+        raise ValueError(f"normalization_group_ids must have shape {expected_shape}.")
     if values.shape != (rewards.shape[0] + 1, rewards.shape[1]):
         raise ValueError(
             f"values must have shape {(rewards.shape[0] + 1, rewards.shape[1])}."
         )
     if not 0.0 <= gae_lambda <= 1.0:
         raise ValueError(f"gae_lambda must be in [0, 1], got {gae_lambda}.")
+    if advantage_clip is not None and advantage_clip <= 0:
+        raise ValueError("advantage_clip must be positive when configured.")
 
     valid_mask = valid_mask.to(torch.bool)
     dones = dones.to(torch.bool)
@@ -310,20 +372,28 @@ def compute_subtask_gae(
 
     returns = advantages + values[:-1]
     if normalize_advantages:
-        advantages = taskwise_normalize(
+        normalization_group_ids = (
+            subtask_ids if normalization_group_ids is None else normalization_group_ids
+        )
+        advantages = groupwise_normalize(
             advantages,
-            subtask_ids,
+            normalization_group_ids,
             valid_mask,
             std_floor=advantage_std_floor,
         )
+    if advantage_clip is not None:
+        advantages = advantages.clamp(-advantage_clip, advantage_clip)
     return advantages, returns
 
 
 __all__ = [
     "align_subtask_ids",
+    "align_transition_ids",
     "balanced_subtask_weights",
     "compute_subtask_gae",
     "discounted_chunk_rewards",
+    "gated_policy_weights",
+    "groupwise_normalize",
     "outcome_actor_channel_key",
     "outcome_group_is_trainable",
     "parallel_outcome_sampling_enabled",

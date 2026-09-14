@@ -127,6 +127,10 @@ class RemoteBehaviorSubpoolEnv:
                 ),
             )
         )
+        response_compression = cfg.remote_collector.get("response_compression", {})
+        endpoint_compression = endpoint.get("response_compression", None)
+        if endpoint_compression is not None:
+            response_compression = endpoint_compression
         self._client = RemoteCollectorClient(
             host,
             client_port,
@@ -135,6 +139,11 @@ class RemoteBehaviorSubpoolEnv:
             connect_timeout=float(endpoint.get("connect_timeout", 30.0)),
             reconnect_attempts=int(endpoint.get("reconnect_attempts", 3)),
             tunnel=tunnel,
+            response_compression=str(response_compression.get("codec", "none")),
+            response_compression_level=int(response_compression.get("level", 1)),
+            response_compression_min_bytes=int(
+                response_compression.get("min_bytes", 64 * 1024)
+            ),
         )
         try:
             response = self._client.call(
@@ -213,6 +222,10 @@ class RemoteBehaviorSubpoolEnv:
             "time/remote_collector_transport": metrics["transport_seconds"],
             "remote_collector/request_mib": metrics["request_mib"],
             "remote_collector/response_mib": metrics["response_mib"],
+            "remote_collector/response_raw_blob_mib": metrics["response_raw_blob_mib"],
+            "remote_collector/response_compression_ratio": metrics[
+                "response_compression_ratio"
+            ],
             "remote_collector/reconnects": metrics["reconnects"],
         }
 

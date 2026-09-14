@@ -45,6 +45,7 @@ from rlinf.envs.behavior.subpool import (
 from rlinf.envs.behavior.subpool_reward import (
     SubtaskRewardSpec,
     SubtaskRewardTracker,
+    apply_reward_overrides,
     get_stage_info,
 )
 from rlinf.envs.behavior.utils import (
@@ -284,12 +285,35 @@ class BehaviorProcess:
             step_supports_kwargs or "render" in step_signature.parameters
         )
         self.step_supports_env_indices = "env_indices" in step_signature.parameters
+        self.step_supports_evaluate_termination = (
+            step_supports_kwargs or "evaluate_termination" in step_signature.parameters
+        )
         self.skip_intermediate_obs_in_chunk = bool(
             OmegaConf.select(cfg, "skip_intermediate_obs_in_chunk", default=False)
         )
         self.stop_chunk_on_done = bool(
             OmegaConf.select(cfg, "subpool.enabled", default=False)
         )
+        self.dynamic_pool_updates = bool(
+            OmegaConf.select(cfg, "subpool.dynamic_updates", default=True)
+        )
+        self.skip_official_task_termination = bool(
+            OmegaConf.select(
+                cfg,
+                "subpool.skip_official_task_termination",
+                default=False,
+            )
+        )
+        if self.skip_official_task_termination:
+            if not self.stop_chunk_on_done:
+                raise ValueError(
+                    "skip_official_task_termination requires subpool execution."
+                )
+            if not self.step_supports_evaluate_termination:
+                raise ValueError(
+                    "skip_official_task_termination requires an OmniGibson "
+                    "VectorEnvironment with evaluate_termination support."
+                )
         self.subtask_reward_tracker = None
         self.active_task_reward = None
         self.active_subtask_index = None
@@ -557,6 +581,8 @@ class BehaviorProcess:
             kwargs["get_obs"] = get_obs
         if self.step_supports_render:
             kwargs["render"] = render
+        if self.skip_official_task_termination:
+            kwargs["evaluate_termination"] = False
         if env_indices is not None:
             kwargs["env_indices"] = env_indices
         return self.env.step(actions, **kwargs)
@@ -724,14 +750,22 @@ class BehaviorProcess:
                     if is_done:
                         terminal_indices.append(env_index)
                         self.subpool_episode_done = True
-                        terminal_state = self._dump_subpool_state()
-                        recovery_state = None
-                        if outcome.timeout:
+                        needs_failure_state = (
+                            outcome.timeout and self.failure_state_store is not None
+                        )
+                        terminal_state = (
+                            self._dump_subpool_state()
+                            if self.dynamic_pool_updates or needs_failure_state
+                            else None
+                        )
+                        if needs_failure_state:
                             self._capture_failure_terminal_state(
                                 terminal_state,
                                 stage_info=stage_info,
                                 outcome=outcome,
                             )
+                        recovery_state = None
+                        if self.dynamic_pool_updates and outcome.timeout:
                             available_max_lag = min(
                                 self.recovery_max_lag_states,
                                 len(self.state_ring) - 1,
@@ -744,14 +778,17 @@ class BehaviorProcess:
                                     )
                                 )
                                 recovery_state = list(self.state_ring)[-(lag + 1)]
-                        self.pending_pool_candidates = {
-                            "success_state": terminal_state
-                            if outcome.success
-                            else None,
-                            "recovery_state": recovery_state,
-                        }
+                        if self.dynamic_pool_updates:
+                            self.pending_pool_candidates = {
+                                "success_state": (
+                                    terminal_state if outcome.success else None
+                                ),
+                                "recovery_state": recovery_state,
+                            }
                     elif (
-                        self.subtask_reward_tracker.steps % self.state_capture_interval
+                        self.dynamic_pool_updates
+                        and self.subtask_reward_tracker.steps
+                        % self.state_capture_interval
                         == 0
                     ):
                         self.state_ring.append(self._dump_subpool_state())
@@ -827,7 +864,25 @@ class BehaviorProcess:
 
     def _attach_arm_specific_distances(self, stage_info) -> None:
         """Expose non-minimized arm distances for grounded manipulation rewards."""
-        if self.active_task_reward is None or self.active_subtask_index is None:
+        if (
+            self.active_task_reward is None
+            or self.active_subtask_index is None
+            or self.subtask_reward_tracker is None
+        ):
+            return
+        required_metrics = {
+            term.key for term in self.subtask_reward_tracker.spec.potential_terms
+        }
+        needs_obj_distance = {
+            key for key in required_metrics if key.endswith("_eef_to_obj_distance")
+        }
+        needs_toggle_distance = {
+            key for key in required_metrics if key.endswith("_eef_to_toggle_distance")
+        }
+        needs_support_distance = (
+            "object_to_support_surface_distance" in required_metrics
+        )
+        if not (needs_obj_distance or needs_toggle_distance or needs_support_distance):
             return
         stage_defs = getattr(self.active_task_reward, "_stage_defs", ())
         if not 0 <= self.active_subtask_index < len(stage_defs):
@@ -849,30 +904,40 @@ class BehaviorProcess:
         robot = base_env.robots[0]
         target = objects[0]
         target_position = get_obj_center(target)
-        if len(objects) >= 2 and objects[1] is not None:
+        if needs_support_distance and len(objects) >= 2 and objects[1] is not None:
             stage_info["object_to_support_surface_distance"] = (
                 _support_surface_distance(target.aabb, objects[1].aabb)
             )
 
-        toggle_state = target.states.get(ToggledOn)
-        marker = None if toggle_state is None else toggle_state.visual_marker
-        if marker is None:
-            toggle_position = target_position
-            marker_radius = 0.0
-        else:
-            toggle_position = marker.get_position_orientation()[0]
-            marker_radius = float(th.min(marker.extent * toggle_state.scale).item())
+        if needs_toggle_distance:
+            toggle_state = target.states.get(ToggledOn)
+            marker = None if toggle_state is None else toggle_state.visual_marker
+            if marker is None:
+                toggle_position = target_position
+                marker_radius = 0.0
+            else:
+                toggle_position = marker.get_position_orientation()[0]
+                marker_radius = float(th.min(marker.extent * toggle_state.scale).item())
 
         for arm in robot.arm_names:
+            obj_key = f"{arm}_eef_to_obj_distance"
+            toggle_key = f"{arm}_eef_to_toggle_distance"
+            if (
+                obj_key not in needs_obj_distance
+                and toggle_key not in needs_toggle_distance
+            ):
+                continue
             eef_position = robot.get_eef_position(arm)
-            stage_info[f"{arm}_eef_to_obj_distance"] = float(
-                th.linalg.vector_norm(eef_position - target_position).item()
-            )
-            stage_info[f"{arm}_eef_to_toggle_distance"] = max(
-                float(th.linalg.vector_norm(eef_position - toggle_position).item())
-                - marker_radius,
-                0.0,
-            )
+            if obj_key in needs_obj_distance:
+                stage_info[obj_key] = float(
+                    th.linalg.vector_norm(eef_position - target_position).item()
+                )
+            if toggle_key in needs_toggle_distance:
+                stage_info[toggle_key] = max(
+                    float(th.linalg.vector_norm(eef_position - toggle_position).item())
+                    - marker_radius,
+                    0.0,
+                )
 
     def _active_stage_objects(self):
         """Return the simulator objects associated with the active stage."""
@@ -1057,6 +1122,13 @@ class BehaviorProcess:
 
         return og.sim.dump_state(serialized=False)
 
+    @staticmethod
+    def dump_serialized_state():
+        """Return the simulator's flat state for deterministic diagnostics."""
+        import omnigibson as og
+
+        return og.sim.dump_state(serialized=True)
+
     def _capture_failure_terminal_state(self, state, *, stage_info, outcome) -> None:
         """Persist the exact timeout state without adding it to a recovery pool."""
         self._capture_failure_state(
@@ -1167,7 +1239,8 @@ class BehaviorProcess:
         )
         self._prime_failure_analysis()
         self.state_ring.clear()
-        self.state_ring.append(self._dump_subpool_state())
+        if self.dynamic_pool_updates:
+            self.state_ring.append(self._dump_subpool_state())
         self.pending_pool_candidates = None
         self.subpool_episode_done = False
         self.last_subpool_obs = None
@@ -1957,10 +2030,29 @@ class BehaviorSubpoolEnv(BehaviorEnv):
         manifest_path = OmegaConf.select(cfg, "subpool.manifest_path")
         if not manifest_path:
             raise ValueError("subpool.manifest_path is required.")
-        self.catalog = SubpoolCatalog.from_jsonl(manifest_path)
+        self._state_cache_size = int(
+            OmegaConf.select(cfg, "subpool.state_cache_size", default=0)
+        )
+        self.catalog = SubpoolCatalog.from_jsonl(
+            manifest_path,
+            state_cache_size=self._state_cache_size,
+        )
+        reward_overrides = OmegaConf.select(cfg, "subpool.reward_overrides", default={})
+        self._reward_overrides = dict(
+            (
+                OmegaConf.to_container(reward_overrides, resolve=True)
+                if OmegaConf.is_config(reward_overrides)
+                else reward_overrides
+            )
+            or {}
+        )
         validate_subpool_rollout_horizons(
             [
-                int(record.metadata["reward"]["max_steps"])
+                SubtaskRewardSpec.from_mapping(
+                    apply_reward_overrides(
+                        record.metadata["reward"], self._reward_overrides
+                    )
+                ).max_steps
                 for record in self.catalog.records
             ],
             episode_horizon=int(cfg.max_episode_steps),
@@ -2224,7 +2316,10 @@ class BehaviorSubpoolEnv(BehaviorEnv):
     def env_reset(self):
         self._ensure_pool()
         if self._dynamic_updates:
-            refreshed_catalog = SubpoolCatalog.from_jsonl(self._manifest_path)
+            refreshed_catalog = SubpoolCatalog.from_jsonl(
+                self._manifest_path,
+                state_cache_size=self._state_cache_size,
+            )
             if refreshed_catalog.runtime_signature != self._runtime_signature:
                 raise ValueError(
                     "Dynamic subpool update changed the simulator runtime signature."
@@ -2257,7 +2352,9 @@ class BehaviorSubpoolEnv(BehaviorEnv):
             instance_id=int(snapshot.metadata["instance_id"]),
             subtask_id=snapshot.subtask_id,
             pool_type=snapshot.pool_type,
-            reward_spec=snapshot.metadata["reward"],
+            reward_spec=apply_reward_overrides(
+                snapshot.metadata["reward"], self._reward_overrides
+            ),
             control_json=snapshot.control_json,
             snapshot_metadata=snapshot.metadata,
             snapshot_record=snapshot.to_dict(),

@@ -16,7 +16,11 @@ from typing import Optional
 
 import torch
 
-from rlinf.algorithms.subtask import align_subtask_ids, discounted_chunk_rewards
+from rlinf.algorithms.subtask import (
+    align_subtask_ids,
+    align_transition_ids,
+    discounted_chunk_rewards,
+)
 
 
 def huber_loss(error: torch.Tensor, delta: float) -> torch.Tensor:
@@ -95,6 +99,13 @@ def preprocess_embodied_advantages_inputs(
         if loss_mask is not None:
             valid_mask &= loss_mask.any(dim=-1)
         subtask_ids = align_subtask_ids(subtask_ids, macro_rewards)
+        logical_group_ids = kwargs.get("outcome_logical_group_ids")
+        if logical_group_ids is not None:
+            logical_group_ids = align_transition_ids(
+                logical_group_ids,
+                macro_rewards,
+                name="outcome_logical_group_ids",
+            )
         if values is None:
             raise ValueError("subtask_gae requires critic values.")
         if values.shape[-1] != 1:
@@ -115,6 +126,7 @@ def preprocess_embodied_advantages_inputs(
                 "dones": macro_dones,
                 "values": values,
                 "subtask_ids": subtask_ids,
+                "outcome_logical_group_ids": logical_group_ids,
                 "loss_mask": valid_mask,
                 "loss_mask_sum": valid_mask.sum(dim=0, keepdim=True).expand_as(
                     valid_mask

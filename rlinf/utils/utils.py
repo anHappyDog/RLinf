@@ -847,7 +847,9 @@ def preprocess_embodied_batch(
     if reward_type == "subtask_chunk_level":
         from rlinf.algorithms.subtask import (
             align_subtask_ids,
+            align_transition_ids,
             balanced_subtask_weights,
+            gated_policy_weights,
         )
 
         if "subtask_ids" not in batch or "loss_mask" not in batch:
@@ -859,5 +861,19 @@ def preprocess_embodied_batch(
         batch["sample_weights"] = balanced_subtask_weights(
             subtask_ids, valid_mask
         ).unsqueeze(-1)
+        policy_trainable = batch.get("outcome_policy_trainable")
+        if policy_trainable is not None:
+            policy_trainable = align_transition_ids(
+                policy_trainable,
+                valid_mask,
+                name="outcome_policy_trainable",
+            ).to(torch.bool)
+            policy_mask = valid_mask & policy_trainable
+            batch["policy_loss_mask"] = policy_mask.unsqueeze(-1)
+            batch["policy_sample_weights"] = gated_policy_weights(
+                batch["sample_weights"].squeeze(-1),
+                policy_trainable,
+                valid_mask,
+            ).unsqueeze(-1)
 
     return batch

@@ -60,6 +60,14 @@ RLinf 通过 :doc:`MetricLogger <../guides/logger>` 在若干命名空间下记�
      - 策略熵。
    * - ``train/loss``
      - 训练总损失（actor + critic + 熵正则）。
+   * - ``train/diagnostics/policy_gradient/pairwise_negative_fraction``
+     - 初始状态两两 PPO 梯度余弦为负的比例；仅在启用 policy-gradient diagnostics 时提供。
+   * - ``train/diagnostics/policy_gradient/state_to_aggregate_negative_fraction``
+     - 与总体 PPO 梯度方向相反的初始状态梯度比例。
+   * - ``train/diagnostics/policy_gradient/kl_to_ppo_norm_ratio``
+     - reference-KL 梯度贡献的范数与 PPO 梯度范数之比。
+   * - ``train/diagnostics/policy_gradient/state_sum_additivity_error_ratio``
+     - 各状态 PPO 梯度之和与直接计算的整批 PPO 梯度之间的相对误差；该值应接近零。
 
 Rollout 指标 —— ``rollout/``
 ----------------------------
@@ -95,6 +103,8 @@ rollout 阶段收集的优势与奖励统计量。
      - 所有已接受 group 中保留的成功与失败 trajectory 数量。
    * - ``rollout/dynamic_sampling/candidate_successes`` / ``candidate_failures``
      - 所有已接受及被拒绝候选 group 的 outcome 计数。
+   * - ``rollout/dynamic_sampling/actor_trainable_groups`` / ``actor_no_signal_groups``
+     - 满足或未满足 actor-only outcome 配额的已接受 logical state 数量。
 
 环境指标 —— ``env/``
 --------------------
@@ -123,6 +133,10 @@ rollout 阶段收集的优势与奖励统计量。
      - 估算的网络与序列化耗时，计算方式为 RPC 总耗时减去远端处理耗时。
    * - ``env/remote_collector/request_mib`` / ``response_mib``
      - 最近一次远端环境 RPC 编码后的请求和响应大小，单位为 MiB。
+   * - ``env/remote_collector/response_raw_blob_mib``
+     - 无损响应压缩前 tensor 和 byte payload 的总大小，单位为 MiB。
+   * - ``env/remote_collector/response_compression_ratio``
+     - 编码后 blob 字节数除以原始 blob 字节数；``1`` 表示体积没有缩小。
    * - ``env/remote_collector/reconnects``
      - 最近一次 RPC 所需的 SSH tunnel 或 socket 重连次数；持续出现非零值意味着连接不稳定。
 

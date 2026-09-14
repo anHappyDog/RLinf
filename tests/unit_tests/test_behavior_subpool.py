@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -32,6 +33,7 @@ from rlinf.envs.behavior.subpool import (
     validate_subpool_export_request,
     validate_subpool_rollout_horizons,
 )
+from rlinf.envs.behavior.subpool_reward import apply_reward_overrides
 from rlinf.envs.behavior.utils import (
     apply_runtime_renderer_settings,
     sync_robot_after_pose_override,
@@ -78,6 +80,21 @@ def _record(state, snapshot_id="state-0", **overrides):
     if "control_json" not in overrides:
         values["control_json"] = json.dumps({"skill": values["skill"]})
     return SubpoolSnapshot(**values)
+
+
+def test_reward_overrides_do_not_mutate_manifest_spec():
+    manifest_spec = {
+        "potential_terms": [],
+        "step_penalty": -0.01,
+        "success_bonus": 10.0,
+        "timeout_penalty": -2.0,
+        "max_steps": 1280,
+    }
+
+    resolved = apply_reward_overrides(manifest_spec, {"step_penalty": 0.0})
+
+    assert resolved["step_penalty"] == 0.0
+    assert manifest_spec["step_penalty"] == -0.01
 
 
 def test_compact_policy_observation_drops_segmentation_payload():
@@ -136,6 +153,60 @@ def test_store_round_trip_and_checksum_validation(tmp_path):
     state_path.write_bytes(b"corrupt")
     with pytest.raises(ValueError, match="checksum mismatch"):
         catalog.load_state(record)
+
+
+def test_catalog_state_cache_reuses_validated_cpu_state(tmp_path):
+    state = _state()
+    manifest = tmp_path / "manifest.jsonl"
+    record = _record(state)
+    SubpoolStore(manifest).append(record, state)
+
+    catalog = SubpoolCatalog.from_jsonl(
+        manifest,
+        verify_states=False,
+        state_cache_size=1,
+    )
+    first = catalog.load_state(record)
+    state_path = tmp_path / record.state_path
+    state_path.write_bytes(b"corrupt after validated cache fill")
+    second = catalog.load_state(record)
+
+    assert second is first
+    assert catalog.state_cache_info == {
+        "size": 1,
+        "capacity": 1,
+        "hits": 1,
+        "misses": 1,
+    }
+
+
+def test_catalog_state_cache_evicts_least_recently_used_state(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    first_state = _state()
+    second_state = _state(10)
+    first_record = _record(first_state, snapshot_id="state-0")
+    second_record = _record(second_state, snapshot_id="state-1")
+    store = SubpoolStore(manifest)
+    store.append(first_record, first_state)
+    store.append(second_record, second_state)
+
+    catalog = SubpoolCatalog.from_jsonl(
+        manifest,
+        verify_states=False,
+        state_cache_size=1,
+    )
+    catalog.load_state(first_record)
+    catalog.load_state(second_record)
+
+    assert catalog.state_cache_info == {
+        "size": 1,
+        "capacity": 1,
+        "hits": 0,
+        "misses": 2,
+    }
+    (tmp_path / first_record.state_path).write_bytes(b"corrupt after eviction")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        catalog.load_state(first_record)
 
 
 def test_failure_state_store_writes_restorable_state_and_metadata(tmp_path):
@@ -772,6 +843,35 @@ def test_correctness_config_rejects_unsafe_optimizations():
     with pytest.raises(ValueError, match="renderer_mode must be official"):
         validate_subpool_env_config(non_parity, num_envs=1, pipeline_stage_num=1)
 
+    termination_without_subpool = OmegaConf.merge(
+        safe,
+        {"subpool": {"skip_official_task_termination": True}},
+    )
+    with pytest.raises(
+        ValueError,
+        match="skip_official_task_termination requires subpool.enabled",
+    ):
+        validate_subpool_env_config(
+            termination_without_subpool,
+            num_envs=1,
+            pipeline_stage_num=1,
+        )
+
+    termination_with_subpool = OmegaConf.merge(
+        safe,
+        {
+            "subpool": {
+                "enabled": True,
+                "skip_official_task_termination": True,
+            }
+        },
+    )
+    validate_subpool_env_config(
+        termination_with_subpool,
+        num_envs=1,
+        pipeline_stage_num=1,
+    )
+
     missing_capture_dir = OmegaConf.merge(
         safe,
         {"subpool": {"failure_state_capture": {"enabled": True}}},
@@ -882,6 +982,89 @@ def test_subpool_metrics_report_actual_primitive_steps():
     assert metrics["episode_length"].item() == 907
     assert metrics["episode_len"].item() == 907
     assert metrics["reward"].item() == pytest.approx(2 / 907)
+
+
+def test_single_env_observation_batching_owns_sensor_buffers():
+    env = BehaviorEnv.__new__(BehaviorEnv)
+    env.num_envs = 1
+    env.task_description = "pick up the radio"
+    main = torch.randint(0, 256, (8, 8, 3), dtype=torch.uint8)
+    wrists = torch.randint(0, 256, (2, 4, 4, 3), dtype=torch.uint8)
+    state = torch.arange(32, dtype=torch.float32)
+
+    wrapped = env._wrap_obs(
+        [
+            {
+                "main_images": main,
+                "wrist_images": wrists,
+                "state": state,
+                "task_description": "<subgoal>pick up the radio",
+            }
+        ]
+    )
+
+    assert wrapped["main_images"].shape == (1, 8, 8, 3)
+    assert wrapped["wrist_images"].shape == (1, 2, 4, 4, 3)
+    assert wrapped["states"].shape == (1, 32)
+    assert wrapped["main_images"].data_ptr() != main.data_ptr()
+    assert wrapped["wrist_images"].data_ptr() != wrists.data_ptr()
+    assert wrapped["states"].data_ptr() != state.data_ptr()
+    assert wrapped["task_descriptions"] == ["<subgoal>pick up the radio"]
+
+    main.zero_()
+    wrists.zero_()
+    state.zero_()
+    assert wrapped["main_images"].count_nonzero() > 0
+    assert wrapped["wrist_images"].count_nonzero() > 0
+    assert wrapped["states"].count_nonzero() > 0
+
+
+def test_behavior_process_dumps_flat_simulator_state(monkeypatch):
+    expected = torch.tensor([1.0, 2.0, 3.0])
+
+    class FakeSimulator:
+        def dump_state(self, *, serialized):
+            assert serialized is True
+            return expected
+
+    monkeypatch.setitem(sys.modules, "omnigibson", SimpleNamespace(sim=FakeSimulator()))
+    process_type = BehaviorProcess.__ray_metadata__.modified_class
+
+    assert process_type.dump_serialized_state() is expected
+
+
+def test_behavior_process_can_skip_official_task_termination():
+    calls = []
+
+    class FakeVectorEnv:
+        def step(self, actions, **kwargs):
+            calls.append((actions, kwargs))
+            return "result"
+
+    process_type = BehaviorProcess.__ray_metadata__.modified_class
+    process = process_type.__new__(process_type)
+    process.env = FakeVectorEnv()
+    process.step_supports_get_obs = True
+    process.step_supports_render = True
+    process.step_supports_env_indices = True
+    process.skip_official_task_termination = True
+
+    result = process._call_step(
+        [torch.zeros(2)],
+        env_indices=[0],
+        get_obs=False,
+        render=False,
+    )
+
+    assert result == "result"
+    assert len(calls) == 1
+    assert torch.equal(calls[0][0][0], torch.zeros(2))
+    assert calls[0][1] == {
+        "get_obs": False,
+        "render": False,
+        "evaluate_termination": False,
+        "env_indices": [0],
+    }
 
 
 def test_support_surface_distance_tracks_vertical_and_footprint_error():
