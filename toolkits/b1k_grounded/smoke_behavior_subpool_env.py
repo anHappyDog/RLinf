@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from dataclasses import replace
@@ -43,14 +42,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--token-mapping", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--subtask-id", type=int, default=1)
-    parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--reset-count", type=int, default=32)
     parser.add_argument("--skip-intermediate-obs", action="store_true")
-    parser.add_argument("--skip-official-task-termination", action="store_true")
     parser.add_argument("--require-all-snapshots", action="store_true")
-    parser.add_argument("--verify-failure-state-save", action="store_true")
-    parser.add_argument("--verify-dynamic-updates", action="store_true")
     return parser.parse_args()
 
 
@@ -75,9 +70,8 @@ def _make_one_step_catalog(args: argparse.Namespace):
         state = source.load_state(source_record)
         reward = dict(source_record.metadata["reward"])
         step_penalty_budget = reward["step_penalty"] * reward["max_steps"]
-        timeout_steps = 4 if args.verify_dynamic_updates else 1
-        reward["max_steps"] = timeout_steps
-        reward["step_penalty"] = step_penalty_budget / timeout_steps
+        reward["max_steps"] = 1
+        reward["step_penalty"] = step_penalty_budget
         metadata = dict(source_record.metadata)
         metadata["reward"] = reward
         metadata["smoke_only"] = True
@@ -108,31 +102,18 @@ def _compose_env_cfg(args: argparse.Namespace, manifest: Path, record):
         cfg = hydra.compose(
             "behavior_subpool_ppo_openpi_pi05",
             overrides=[
-                f"env.train.total_num_envs={args.num_envs}",
+                "env.train.total_num_envs=1",
                 f"env.train.subpool.manifest_path={manifest}",
                 f"env.train.subpool.token_mapping_path={args.token_mapping}",
                 f"env.train.subpool.asset_fingerprint={record.asset_fingerprint}",
                 f"env.train.subpool.fixed_subtask_id={record.subtask_id}",
-                f"env.train.subpool.outcome_group_size={args.num_envs}",
-                "env.train.subpool.dynamic_updates="
-                f"{str(args.verify_dynamic_updates).lower()}",
-                "env.train.subpool.state_capture_interval=1",
-                "env.train.subpool.recovery_min_lag_states=1",
-                "env.train.subpool.recovery_max_lag_states=2",
+                "env.train.subpool.dynamic_updates=false",
                 # This smoke test checks the explicit frozen-terminal contract.
                 # Training enables auto-reset, which intentionally starts a new
                 # episode on the next chunk instead of returning frozen output.
                 "env.train.auto_reset=false",
                 "env.train.skip_intermediate_obs_in_chunk="
                 f"{str(args.skip_intermediate_obs).lower()}",
-                "env.train.subpool.skip_official_task_termination="
-                f"{str(args.skip_official_task_termination).lower()}",
-                "env.train.subpool.failure_state_capture.enabled="
-                f"{str(args.verify_failure_state_save).lower()}",
-                "env.train.subpool.failure_state_capture.output_dir="
-                f"{args.output_dir / 'failure_states'}",
-                "env.train.subpool.failure_state_capture.run_id=vector-smoke",
-                "env.train.subpool.failure_state_capture.policy_global_step=0",
             ],
         )
     OmegaConf.resolve(cfg)
@@ -149,26 +130,11 @@ def _same_observation(left: dict, right: dict) -> bool:
     )
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as state_file:
-        for chunk in iter(lambda: state_file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def main() -> None:
     """Run the one-step timeout and post-terminal freeze checks."""
     args = _parse_args()
     if args.chunk_size <= 1:
         raise ValueError("chunk-size must exceed one to test prefix masking.")
-    timeout_steps = 4 if args.verify_dynamic_updates else 1
-    if args.chunk_size <= timeout_steps:
-        raise ValueError(
-            f"chunk-size must exceed the smoke timeout of {timeout_steps}."
-        )
-    if args.num_envs <= 0:
-        raise ValueError("num-envs must be positive.")
     if args.reset_count <= 0:
         raise ValueError("reset-count must be positive.")
     manifest, records = _make_one_step_catalog(args)
@@ -183,16 +149,16 @@ def main() -> None:
     try:
         env = BehaviorSubpoolEnv(
             env_cfg,
-            num_envs=args.num_envs,
+            num_envs=1,
             seed_offset=0,
             total_num_processes=1,
             worker_info=SimpleNamespace(group_world_size=1),
         )
-        actions = torch.zeros(args.num_envs, args.chunk_size, 23)
+        actions = torch.zeros(1, args.chunk_size, 23)
         reset_results = []
         for _ in range(args.reset_count):
             initial_obs, _ = env.reset()
-            if not all(initial_obs["task_descriptions"]):
+            if not initial_obs["task_descriptions"][0]:
                 raise AssertionError(
                     "Online P2 task description is empty after restore."
                 )
@@ -201,15 +167,11 @@ def main() -> None:
                 actions
             )
             first_mask = env.last_executed_action_mask.clone()
-            expected_mask = [
-                [True] * timeout_steps + [False] * (args.chunk_size - timeout_steps)
-                for _ in range(args.num_envs)
-            ]
-            if first_mask.tolist() != expected_mask:
+            if first_mask.tolist() != [[True] + [False] * (args.chunk_size - 1)]:
                 raise AssertionError(f"Unexpected terminal prefix mask: {first_mask}.")
-            if not bool((terminations | truncations)[:, timeout_steps - 1].all()):
-                raise AssertionError("Not every smoke subtask terminated on schedule.")
-            if bool((terminations | truncations)[:, timeout_steps:].any()):
+            if not bool((terminations | truncations)[0, 0]):
+                raise AssertionError("The one-step smoke subtask did not terminate.")
+            if bool((terminations | truncations)[0, 1:].any()):
                 raise AssertionError("Unexecuted chunk suffix contains terminal flags.")
 
             frozen_obs, frozen_rewards, frozen_terms, frozen_truncs, _ = env.chunk_step(
@@ -229,101 +191,41 @@ def main() -> None:
 
             reset_results.append(
                 {
-                    "snapshot_ids": [
-                        snapshot.snapshot_id for snapshot in env.current_snapshots
-                    ],
-                    "episode_indices": [
-                        snapshot.episode_index for snapshot in env.current_snapshots
-                    ],
+                    "snapshot_id": env.current_snapshot.snapshot_id,
+                    "episode_index": env.current_snapshot.episode_index,
                     "first_chunk_executed_mask": first_mask.tolist(),
                     "first_chunk_rewards": rewards.tolist(),
                     "first_chunk_terminations": terminations.tolist(),
                     "first_chunk_truncations": truncations.tolist(),
                     "frozen_chunk_executed_mask": frozen_mask.tolist(),
-                    "online_prompts": initial_obs["task_descriptions"],
+                    "online_prompt": initial_obs["task_descriptions"][0],
                 }
             )
 
         expected_snapshot_ids = {record.snapshot_id for record in records}
-        sampled_snapshot_ids = {
-            snapshot_id
-            for result in reset_results
-            for snapshot_id in result["snapshot_ids"]
-        }
+        sampled_snapshot_ids = {result["snapshot_id"] for result in reset_results}
         if args.require_all_snapshots and sampled_snapshot_ids != expected_snapshot_ids:
             missing = sorted(expected_snapshot_ids - sampled_snapshot_ids)
             raise AssertionError(
                 f"Smoke did not sample every snapshot; missing={missing}."
             )
 
-        failure_metadata = []
-        if args.verify_failure_state_save:
-            metadata_paths = sorted(
-                (args.output_dir / "failure_states").rglob("*.json")
-            )
-            expected_count = args.reset_count * args.num_envs
-            if len(metadata_paths) != expected_count:
-                raise AssertionError(
-                    f"Expected {expected_count} terminal failure states, found "
-                    f"{len(metadata_paths)}."
-                )
-            for metadata_path in metadata_paths:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                state_path = metadata_path.parent / metadata["state_path"]
-                if _file_sha256(state_path) != metadata["state_sha256"]:
-                    raise AssertionError(
-                        f"Failure state checksum mismatch for {state_path}."
-                    )
-                torch.load(state_path, map_location="cpu", weights_only=False)
-                failure_metadata.append(str(metadata_path))
-
-        dynamic_snapshot_ids = []
-        if args.verify_dynamic_updates:
-            refreshed_catalog = SubpoolCatalog.from_jsonl(manifest)
-            dynamic_records = [
-                record
-                for record in refreshed_catalog.records
-                if record.snapshot_id.startswith("online-")
-                and record.pool_type == "recovery"
-            ]
-            expected_count = args.reset_count * args.num_envs
-            if len(dynamic_records) != expected_count:
-                raise AssertionError(
-                    f"Expected {expected_count} dynamic recovery states, found "
-                    f"{len(dynamic_records)}."
-                )
-            for record in dynamic_records:
-                state_path = refreshed_catalog.state_path(record)
-                if _file_sha256(state_path) != record.state_sha256:
-                    raise AssertionError(
-                        f"Dynamic state checksum mismatch for {record.snapshot_id}."
-                    )
-                refreshed_catalog.load_state(record)
-            dynamic_snapshot_ids = [record.snapshot_id for record in dynamic_records]
-
         report = {
             "passed": True,
-            "num_envs": args.num_envs,
             "subtask_id": records[0].subtask_id,
             "skill": records[0].skill,
             "source_snapshot_count": len(records),
             "reset_count": args.reset_count,
             "skip_intermediate_obs": args.skip_intermediate_obs,
-            "skip_official_task_termination": (args.skip_official_task_termination),
             "sampled_snapshot_ids": sorted(sampled_snapshot_ids),
             "sampled_episode_indices": sorted(
                 {
-                    episode_index
+                    result["episode_index"]
                     for result in reset_results
-                    for episode_index in result["episode_indices"]
-                    if episode_index is not None
+                    if result["episode_index"] is not None
                 }
             ),
             "all_snapshots_sampled": sampled_snapshot_ids == expected_snapshot_ids,
-            "failure_state_save_verified": args.verify_failure_state_save,
-            "failure_state_metadata": failure_metadata,
-            "dynamic_updates_verified": args.verify_dynamic_updates,
-            "dynamic_snapshot_ids": dynamic_snapshot_ids,
             "reset_results": reset_results,
         }
         report_path = args.output_dir / "report.json"

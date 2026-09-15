@@ -81,8 +81,10 @@ class RemoteBehaviorSubpoolEnv:
         worker_info,
         endpoint: DictConfig,
     ) -> None:
-        if num_envs <= 0:
-            raise ValueError("A remote BEHAVIOR collector needs at least one env.")
+        if num_envs != 1:
+            raise ValueError(
+                "A remote BEHAVIOR collector owns exactly one environment."
+            )
         self.cfg = cfg
         self.num_envs = num_envs
         self.seed_offset = seed_offset
@@ -180,7 +182,7 @@ class RemoteBehaviorSubpoolEnv:
     def prepare_outcome_group_reset(
         self,
         collection_index: int,
-        logical_group_index: int | list[int | None] | None = None,
+        logical_group_index: int | None = None,
         update_index: int | None = None,
     ) -> None:
         response = self._client.call(
@@ -310,7 +312,7 @@ class DistributedBehaviorSubpoolEnv:
     def prepare_outcome_group_reset(
         self,
         collection_index: int,
-        logical_group_index: int | list[int | None] | None = None,
+        logical_group_index: int | None = None,
         update_index: int | None = None,
     ) -> None:
         self._delegate.prepare_outcome_group_reset(

@@ -3,7 +3,6 @@ import json
 import sys
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
@@ -17,12 +16,8 @@ from rlinf.envs.behavior.behavior_env import (
     BehaviorProcessPool,
     BehaviorSubpoolEnv,
     _compact_policy_observation,
-    _isolated_appdata_path,
-    _rebase_scene_state,
     _repeat_terminal_subpool_chunk,
-    _SubpoolSlotRuntime,
     _support_surface_distance,
-    _translate_proprio_position_to_scene,
 )
 from rlinf.envs.behavior.subpool import (
     FailureStateStore,
@@ -425,8 +420,7 @@ def test_behavior_process_extracts_pickup_failure_facts():
         name = "radio_89"
 
         @staticmethod
-        def get_position_orientation(frame="world"):
-            assert frame == "scene"
+        def get_position_orientation():
             return torch.tensor([1.0, 2.0, 3.0]), torch.tensor(
                 [np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)]
             )
@@ -441,23 +435,21 @@ def test_behavior_process_extracts_pickup_failure_facts():
 
     process_type = BehaviorProcess.__ray_metadata__.modified_class
     process = object.__new__(process_type)
-    slot = _SubpoolSlotRuntime(
-        control=SimpleNamespace(skill="pick up from"),
-        subtask_id=1,
-        task_reward=SimpleNamespace(
-            _stage_defs=(
-                {},
-                {"objects": (Target(), SimpleNamespace(name="coffee_table"))},
-            )
-        ),
-        failure_reference_orientation=[0.0, 0.0, 0.0, 1.0],
+    process.current_control = SimpleNamespace(skill="pick up from")
+    process.active_subtask_index = 1
+    process.active_task_reward = SimpleNamespace(
+        _stage_defs=(
+            {},
+            {"objects": (Target(), SimpleNamespace(name="coffee_table"))},
+        )
     )
+    process.failure_reference_orientation = [0.0, 0.0, 0.0, 1.0]
     process.failure_tipped_angle_deg = 45.0
     process.failure_max_linear_speed = 0.05
     process.failure_max_angular_speed = 0.2
 
     facts = process._failure_facts(
-        slot, {"completed": False, "in_hand": False, "on_support": True}
+        {"completed": False, "in_hand": False, "on_support": True}
     )
 
     assert facts["target_name"] == "radio_89"
@@ -680,31 +672,30 @@ def test_outcome_group_reset_ignores_desynchronized_auto_reset_rng():
 
     def make_env():
         env = BehaviorSubpoolEnv.__new__(BehaviorSubpoolEnv)
-        env.num_envs = 1
         env.catalog = FakeCatalog()
         env._sampling_seed = 123
-        env._sampling_groups = [0]
-        env._rngs = [np.random.default_rng(123)]
+        env._sampling_group = 0
+        env._rng = np.random.default_rng(123)
         env._fixed_subtask_id = 1
         env._pool_weights = {"canonical": 1.0}
-        env._subtask_cursors = [0]
+        env._subtask_cursor = 0
         env._pending_outcome_collection_index = None
-        env._pending_outcome_logical_group_indices = None
+        env._pending_outcome_logical_group_index = None
         env._pending_outcome_update_index = None
         env._outcome_snapshot_schedule = "random"
         env._sticky_outcome_snapshot = False
-        env._active_outcome_snapshots = [None]
+        env._active_outcome_snapshot = None
         return env
 
     early_env = make_env()
     late_env = make_env()
-    late_env._rngs[0].integers(1_000_000, size=17)
+    late_env._rng.integers(1_000_000, size=17)
     early_env.prepare_outcome_group_reset(9)
     late_env.prepare_outcome_group_reset(9)
 
     assert (
-        early_env._sample_reset_snapshot(0).snapshot_id
-        == late_env._sample_reset_snapshot(0).snapshot_id
+        early_env._sample_reset_snapshot().snapshot_id
+        == late_env._sample_reset_snapshot().snapshot_id
     )
 
 
@@ -722,180 +713,25 @@ def test_fixed_snapshot_per_env_is_stable_across_evaluation_resets(tmp_path):
             state,
         )
     env = BehaviorSubpoolEnv.__new__(BehaviorSubpoolEnv)
-    env.num_envs = 1
     env.catalog = SubpoolCatalog.from_jsonl(manifest)
     env._sampling_seed = 123
-    env._sampling_groups = [1]
-    env._rngs = [np.random.default_rng(124)]
+    env._sampling_group = 1
+    env._rng = np.random.default_rng(124)
     env._fixed_subtask_id = 1
     env._pool_weights = {"canonical": 1.0, "recovery": 0.0}
-    env._subtask_cursors = [1]
+    env._subtask_cursor = 1
     env._pending_outcome_collection_index = None
-    env._pending_outcome_logical_group_indices = None
+    env._pending_outcome_logical_group_index = None
     env._pending_outcome_update_index = None
     env._outcome_snapshot_schedule = "random"
     env._sticky_outcome_snapshot = False
-    env._active_outcome_snapshots = [None]
+    env._active_outcome_snapshot = None
     env._fixed_snapshot_per_env = True
 
-    first = env._sample_reset_snapshot(0)
-    second = env._sample_reset_snapshot(0)
+    first = env._sample_reset_snapshot()
+    second = env._sample_reset_snapshot()
 
     assert first.snapshot_id == second.snapshot_id
-
-
-def test_rebase_scene_state_preserves_object_local_pose_and_velocity():
-    state = {
-        "pos": torch.tensor([1.0, 2.0, 0.0]),
-        "ori": torch.tensor([0.0, 0.0, 0.0, 1.0]),
-        "registry": {
-            "system_registry": {},
-            "object_registry": {
-                "radio": {
-                    "root_link": {
-                        "pos": torch.tensor([2.0, 4.0, 0.5]),
-                        "ori": torch.tensor([0.0, 0.0, 0.0, 1.0]),
-                        "lin_vel": torch.tensor([1.0, 0.0, 0.0]),
-                        "ang_vel": torch.tensor([0.0, 0.0, 1.0]),
-                    }
-                }
-            },
-        },
-    }
-
-    rebased = _rebase_scene_state(
-        state,
-        target_position=torch.tensor([10.0, -1.0, 0.0]),
-        target_orientation=torch.tensor([0.0, 0.0, 0.0, 1.0]),
-    )
-
-    root = rebased["registry"]["object_registry"]["radio"]["root_link"]
-    assert torch.allclose(root["pos"], torch.tensor([11.0, 1.0, 0.5]))
-    assert torch.allclose(root["lin_vel"], torch.tensor([1.0, 0.0, 0.0]))
-    assert torch.allclose(
-        state["registry"]["object_registry"]["radio"]["root_link"]["pos"],
-        torch.tensor([2.0, 4.0, 0.5]),
-    )
-
-
-def test_vector_subpool_routes_dynamic_candidates_per_terminal_slot(monkeypatch):
-    terminations = torch.tensor([[True, False], [False, False]])
-    truncations = torch.tensor([[False, False], [True, False]])
-    base_result = (None, None, terminations, truncations, None)
-    monkeypatch.setattr(BehaviorEnv, "chunk_step", lambda *_args: base_result)
-
-    env = BehaviorSubpoolEnv.__new__(BehaviorSubpoolEnv)
-    env._dynamic_updates = True
-    env.pool = MagicMock()
-    env.pool.drain_pool_candidates.return_value = [
-        {"success_state": "slot-0"},
-        {"recovery_state": "slot-1"},
-    ]
-    env.current_snapshots = [MagicMock(), MagicMock()]
-    env._append_online_candidates = MagicMock()
-
-    assert env.chunk_step(torch.zeros(2, 2, 1)) is base_result
-    assert env._append_online_candidates.call_args_list == [
-        call(
-            {"success_state": "slot-0"},
-            snapshot=env.current_snapshots[0],
-            success=True,
-        ),
-        call(
-            {"recovery_state": "slot-1"},
-            snapshot=env.current_snapshots[1],
-            success=False,
-        ),
-    ]
-
-
-def test_vector_proprio_robot_position_is_scene_relative():
-    state = torch.arange(256, dtype=torch.float32)
-    raw_obs = {"R1Pro": {"R1Pro::proprio": state}}
-
-    result = _translate_proprio_position_to_scene(
-        raw_obs,
-        position_indices=np.s_[140:143],
-        scene_position=torch.tensor([28.0, -3.0, 0.5]),
-    )
-
-    translated = result["R1Pro"]["R1Pro::proprio"]
-    assert torch.equal(translated[140:143], torch.tensor([112.0, 144.0, 141.5]))
-    assert torch.equal(translated[:140], state[:140])
-    assert torch.equal(translated[143:], state[143:])
-    assert torch.equal(state, torch.arange(256, dtype=torch.float32))
-
-
-def test_vector_chunk_never_resumes_a_terminal_slot(monkeypatch):
-    class Tracker:
-        def __init__(self, outcomes):
-            self.outcomes = iter(outcomes)
-            self.steps = 0
-
-        def step(self, _stage_info):
-            self.steps += 1
-            success, timeout = next(self.outcomes)
-            return SimpleNamespace(
-                success=success,
-                timeout=timeout,
-                reward=float(success),
-                potential=0.0,
-                progress=0.0,
-                cumulative_progress=0.0,
-                cumulative_step_penalty=0.0,
-                cumulative_terminal_reward=float(success),
-            )
-
-    process_type = BehaviorProcess.__ray_metadata__.modified_class
-    process = object.__new__(process_type)
-    process.skip_intermediate_obs_in_chunk = True
-    process.dynamic_pool_updates = False
-    process.failure_state_store = None
-    process.state_capture_interval = 1
-    process.subpool_slots = [
-        _SubpoolSlotRuntime(
-            reward_tracker=Tracker([(True, False)]),
-            subtask_id=1,
-        ),
-        _SubpoolSlotRuntime(
-            reward_tracker=Tracker([(False, False), (False, False), (False, True)]),
-            subtask_id=1,
-        ),
-    ]
-    active_calls = []
-
-    def step_shard(_actions, env_indices, *, need_obs):
-        active_calls.append(list(env_indices))
-        return (
-            None if not need_obs else [{"slot": index} for index in env_indices],
-            torch.zeros(len(env_indices)),
-            torch.zeros(len(env_indices), dtype=torch.bool),
-            torch.zeros(len(env_indices), dtype=torch.bool),
-            [{"stage": {}} for _ in env_indices],
-        )
-
-    process._step_shard = step_shard
-    process._observe_policy = lambda indices: [{"slot": index} for index in indices]
-    process._apply_direct_navigation_predicate = lambda *_args: None
-    process._attach_arm_specific_distances = lambda *_args: None
-    process._maybe_capture_stable_recovery_event = lambda *_args: None
-    monkeypatch.setattr(
-        "rlinf.envs.behavior.behavior_env.get_stage_info",
-        lambda info, _subtask_id: info["stage"],
-    )
-
-    observations, _rewards, terms, truncs, _infos, executed = (
-        process._chunk_step_until_done(torch.zeros(2, 4, 23), [0, 1])
-    )
-
-    assert active_calls == [[0, 1], [1], [1]]
-    assert torch.stack(executed, dim=1).tolist() == [
-        [True, False, False, False],
-        [True, True, True, False],
-    ]
-    assert torch.stack(terms, dim=1).tolist()[0] == [True, False, False, False]
-    assert torch.stack(truncs, dim=1).tolist()[1] == [False, False, True, False]
-    assert observations[-1] == [{"slot": 0}, {"slot": 1}]
 
 
 def test_catalog_rejects_mixed_runtime_scenes(tmp_path):
@@ -1370,22 +1206,6 @@ def test_subpool_env_keeps_bootstrap_template_separate_from_task_instance(
     assert captured["cfg"].omni_config.task.activity_name == "turning_on_radio"
     assert captured["cfg"].omni_config.scene.scene_model == "Rs_int"
     assert record.metadata["instance_id"] == 7
-
-
-def test_isolated_appdata_path_uses_stable_node_name(monkeypatch):
-    monkeypatch.delenv("RLINF_NODE_RANK", raising=False)
-    monkeypatch.setenv("RANK", "17")
-
-    path = _isolated_appdata_path(
-        "/shared/omnigibson-appdata",
-        node_name="collector-host",
-        visible_devices="3",
-        process_index=0,
-    )
-
-    assert path == (
-        "/shared/omnigibson-appdata/node_collector-host/rank_17_gpu_3/process_0"
-    )
 
 
 def test_behavior_process_is_pinned_to_parent_env_node_and_gpu(monkeypatch):

@@ -12,17 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import gc
 import inspect
 import json
 import os
 import re
-import socket
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
 from typing import ClassVar
 
 import gymnasium as gym
@@ -77,33 +74,10 @@ _BEHAVIOR_CHILD_ENV_VARS = (
 )
 
 
-@dataclass
-class _SubpoolSlotRuntime:
-    """Episode-local state for one scene in a B1K vector environment."""
-
-    reward_tracker: SubtaskRewardTracker | None = None
-    task_reward: object | None = None
-    subtask_id: int | None = None
-    pool_type: str | None = None
-    control: object | None = None
-    snapshot_metadata: dict | None = None
-    snapshot_record: dict | None = None
-    sampling_group: int | None = None
-    collection_index: int | None = None
-    failure_reference_orientation: list[float] | None = None
-    failure_tip_stable_count: int = 0
-    failure_recovery_event_captured: bool = False
-    state_ring: deque = field(default_factory=deque)
-    pending_pool_candidates: dict | None = None
-    done: bool = False
-    last_obs: dict | None = None
-    last_info: dict | None = None
-
-
 def _isolated_appdata_path(
     base_path: str,
     *,
-    node_name: str,
+    node_id: str,
     visible_devices: str | None,
     process_index: int,
 ) -> str:
@@ -112,18 +86,18 @@ def _isolated_appdata_path(
     OmniGibson explicitly requires its appdata not to be shared by concurrent
     simulator instances. Ray env workers can run on several nodes whose
     ``/mnt/public`` is shared, so the configured base path alone is not a safe
-    process boundary. ``node_name`` must be stable across Ray restarts so shader
-    and texture caches remain reusable.
+    process boundary.
     """
 
     def safe_component(value: str) -> str:
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "unknown"
 
+    node_rank = os.environ.get("RLINF_NODE_RANK", node_id[:12])
     worker_rank = os.environ.get("RANK", "unknown")
     device = visible_devices or "none"
     return os.path.join(
         base_path,
-        f"node_{safe_component(node_name)}",
+        f"node_{safe_component(node_rank)}",
         f"rank_{safe_component(worker_rank)}_gpu_{safe_component(device)}",
         f"process_{process_index}",
     )
@@ -188,91 +162,6 @@ def _move_state_tensors(value, device):
     return value
 
 
-def _quaternion_conjugate(quaternion: torch.Tensor) -> torch.Tensor:
-    result = quaternion.clone()
-    result[:3] = -result[:3]
-    return result
-
-
-def _quaternion_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-    """Multiply two xyzw quaternions."""
-    left_xyz, left_w = left[:3], left[3]
-    right_xyz, right_w = right[:3], right[3]
-    xyz = (
-        left_w * right_xyz
-        + right_w * left_xyz
-        + torch.linalg.cross(left_xyz, right_xyz)
-    )
-    w = left_w * right_w - torch.dot(left_xyz, right_xyz)
-    return torch.cat((xyz, w.reshape(1)))
-
-
-def _rotate_vector(quaternion: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
-    pure = torch.cat((vector, torch.zeros(1, dtype=vector.dtype, device=vector.device)))
-    return _quaternion_multiply(
-        _quaternion_multiply(quaternion, pure),
-        _quaternion_conjugate(quaternion),
-    )[:3]
-
-
-def _rebase_scene_state(
-    scene_state: dict,
-    *,
-    target_position: torch.Tensor,
-    target_orientation: torch.Tensor,
-) -> dict:
-    """Move a scene dump between world frames without changing local state.
-
-    Object root poses and world-frame velocities are transformed. Particle
-    systems are rejected until their representation receives equivalent audited
-    handling; silently copying those states would produce a plausible but wrong
-    vector reset.
-    """
-    result = copy.deepcopy(scene_state)
-    source_position = torch.as_tensor(result["pos"])
-    source_orientation = torch.as_tensor(result["ori"])
-    target_position = torch.as_tensor(
-        target_position, dtype=source_position.dtype, device=source_position.device
-    )
-    target_orientation = torch.as_tensor(
-        target_orientation,
-        dtype=source_orientation.dtype,
-        device=source_orientation.device,
-    )
-    systems = result["registry"].get("system_registry", {})
-    if systems:
-        raise NotImplementedError(
-            "Vectorized subpool restore does not yet support active particle systems."
-        )
-
-    source_inverse = _quaternion_conjugate(source_orientation)
-    frame_rotation = _quaternion_multiply(target_orientation, source_inverse)
-    for object_state in result["registry"]["object_registry"].values():
-        root = object_state.get("root_link")
-        if not isinstance(root, dict):
-            continue
-        local_position = _rotate_vector(
-            source_inverse,
-            torch.as_tensor(root["pos"]) - source_position,
-        )
-        local_orientation = _quaternion_multiply(
-            source_inverse, torch.as_tensor(root["ori"])
-        )
-        root["pos"] = target_position + _rotate_vector(
-            target_orientation, local_position
-        )
-        root["ori"] = _quaternion_multiply(target_orientation, local_orientation)
-        for velocity_key in ("lin_vel", "ang_vel"):
-            if velocity_key in root:
-                root[velocity_key] = _rotate_vector(
-                    frame_rotation, torch.as_tensor(root[velocity_key])
-                )
-
-    result["pos"] = target_position
-    result["ori"] = target_orientation
-    return result
-
-
 def _compact_policy_observation(raw_obs: dict) -> dict:
     """Keep only the observation fields consumed outside BehaviorProcess.
 
@@ -322,34 +211,6 @@ def _compact_policy_observation(raw_obs: dict) -> dict:
     }
 
 
-def _translate_proprio_position_to_scene(
-    raw_obs: dict,
-    *,
-    position_indices,
-    scene_position: torch.Tensor,
-) -> dict:
-    """Remove a vector scene's translation from R1Pro proprioception."""
-    translated = False
-    for sensor_data in raw_obs.values():
-        if not isinstance(sensor_data, dict):
-            continue
-        for sensor_name, modalities in sensor_data.items():
-            if "proprio" not in sensor_name:
-                continue
-            if not isinstance(modalities, torch.Tensor):
-                raise TypeError("BEHAVIOR proprioception must be a torch.Tensor.")
-            state = modalities.clone()
-            state[position_indices] -= scene_position.to(
-                dtype=state.dtype,
-                device=state.device,
-            )
-            sensor_data[sensor_name] = state
-            translated = True
-    if not translated:
-        raise KeyError("Missing required BEHAVIOR proprio observation.")
-    return raw_obs
-
-
 def _preload_numba_llvmlite() -> None:
     # Isaac Sim's ``omni.isaac.core_archive`` ships an older numba in its
     # ``pip_prebundle`` and loads a few submodules during Kit startup,
@@ -382,7 +243,6 @@ class BehaviorProcess:
         from omnigibson.envs import VectorEnvironment
 
         self.logger = get_logger()
-        self.num_envs = int(num_envs)
         self.pipeline_stage_num = pipeline_stage_num
         is_subpool = bool(OmegaConf.select(cfg, "subpool.enabled", default=False))
         omni_cfg = setup_subpool_omni_cfg(cfg) if is_subpool else setup_omni_cfg(cfg)
@@ -454,6 +314,15 @@ class BehaviorProcess:
                     "skip_official_task_termination requires an OmniGibson "
                     "VectorEnvironment with evaluate_termination support."
                 )
+        self.subtask_reward_tracker = None
+        self.active_task_reward = None
+        self.active_subtask_index = None
+        self.active_pool_type = None
+        self.current_control = None
+        self.current_snapshot_metadata = None
+        self.current_snapshot_record = None
+        self.current_sampling_group = None
+        self.current_collection_index = None
         configured_policy_step = OmegaConf.select(
             cfg,
             "subpool.failure_state_capture.policy_global_step",
@@ -535,6 +404,9 @@ class BehaviorProcess:
             raise ValueError(
                 "failure_state_capture.max_angular_speed must be non-negative."
             )
+        self.failure_reference_orientation = None
+        self.failure_tip_stable_count = 0
+        self.failure_recovery_event_captured = False
         self.state_capture_interval = int(
             OmegaConf.select(cfg, "subpool.state_capture_interval", default=8)
         )
@@ -544,6 +416,7 @@ class BehaviorProcess:
         self.recovery_max_lag_states = int(
             OmegaConf.select(cfg, "subpool.recovery_max_lag_states", default=16)
         )
+        self.recovery_rng = __import__("numpy").random.default_rng(int(cfg.seed))
         self.state_ring_size = int(
             OmegaConf.select(cfg, "subpool.state_ring_size", default=32)
         )
@@ -554,16 +427,11 @@ class BehaviorProcess:
                 default=2,
             )
         )
-        self.subpool_slots = [
-            _SubpoolSlotRuntime(
-                state_ring=deque(maxlen=self.state_ring_size),
-            )
-            for _ in range(self.num_envs)
-        ]
-        self.recovery_rngs = [
-            np.random.default_rng(np.random.SeedSequence([int(cfg.seed), env_index]))
-            for env_index in range(self.num_envs)
-        ]
+        self.state_ring = deque(maxlen=self.state_ring_size)
+        self.pending_pool_candidates = None
+        self.subpool_episode_done = False
+        self.last_subpool_obs = None
+        self.last_subpool_info = None
         if self.stop_chunk_on_done:
             if self.state_capture_interval <= 0:
                 raise ValueError("subpool.state_capture_interval must be positive.")
@@ -623,10 +491,9 @@ class BehaviorProcess:
             mapping = ReservedTokenMapping.from_dict(json.load(mapping_file))
         self.control_serializer = ControlSerializer(mapping)
 
-    def _attach_online_grounding(self, raw_obs: dict, env_index: int) -> dict:
+    def _attach_online_grounding(self, raw_obs: dict) -> dict:
         """Recompute the P2 object and part bboxes for one observation."""
-        slot = self.subpool_slots[env_index]
-        if slot.control is None or self.control_serializer is None:
+        if self.current_control is None or self.control_serializer is None:
             raise RuntimeError("Online grounding was not primed by a subpool reset.")
 
         import numpy as np
@@ -667,7 +534,7 @@ class BehaviorProcess:
                 "instance masks."
             )
         grounded = ground_control_spec(
-            slot.control,
+            self.current_control,
             segmentations,
             EntityResolver(VisionSensor.INSTANCE_ID_REGISTRY),
             infer_missing_parts=True,
@@ -679,36 +546,10 @@ class BehaviorProcess:
         }
         return raw_obs
 
-    def _prepare_policy_observation(
-        self, raw_obs: dict, env_index: int | None = None
-    ) -> dict:
+    def _prepare_policy_observation(self, raw_obs: dict) -> dict:
         """Ground, then compact an observation before returning it through Ray."""
         if self.stop_chunk_on_done:
-            if env_index is None:
-                raise ValueError("Subpool observations require an environment index.")
-            raw_obs = self._attach_online_grounding(raw_obs, env_index)
-        if self.num_envs > 1:
-            if env_index is None:
-                raise ValueError("Vector observations require an environment index.")
-            from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
-
-            scene = self.env.envs[env_index].scene
-            scene_position, scene_orientation = scene.get_position_orientation()
-            identity = torch.tensor(
-                [0.0, 0.0, 0.0, 1.0],
-                dtype=scene_orientation.dtype,
-                device=scene_orientation.device,
-            )
-            if not torch.allclose(scene_orientation, identity, atol=1e-6, rtol=0.0):
-                raise NotImplementedError(
-                    "Vector proprio canonicalization requires translated, "
-                    "non-rotated B1K scenes."
-                )
-            raw_obs = _translate_proprio_position_to_scene(
-                raw_obs,
-                position_indices=PROPRIOCEPTION_INDICES["R1Pro"]["robot_pos"],
-                scene_position=scene_position,
-            )
+            raw_obs = self._attach_online_grounding(raw_obs)
         return _compact_policy_observation(raw_obs)
 
     def _observe_policy(self, env_indices: list[int]) -> list[dict]:
@@ -727,7 +568,7 @@ class BehaviorProcess:
         observations = []
         for index in env_indices:
             raw_obs, _obs_info = self.env.envs[index].get_obs()
-            observations.append(self._prepare_policy_observation(raw_obs, index))
+            observations.append(self._prepare_policy_observation(raw_obs))
         return observations
 
     def get_activity_name(self):
@@ -789,10 +630,7 @@ class BehaviorProcess:
 
         return (
             (
-                [
-                    self._prepare_policy_observation(obs, env_index)
-                    for obs, env_index in zip(raw_obs, env_indices, strict=True)
-                ]
+                [self._prepare_policy_observation(obs) for obs in raw_obs]
                 if need_obs
                 else None
             ),
@@ -840,24 +678,26 @@ class BehaviorProcess:
         )
 
     def _chunk_step_until_done(self, actions, env_indices):
-        """Execute valid action prefixes and freeze completed logical slots.
-
-        OmniGibson uses one shared PhysX stage for all scenes. An inactive scene
-        still advances physically whenever another slot steps, so completed slots
-        are never resumed. Their exact terminal observation, info, and state are
-        cached until the next synchronized full-vector restore.
-        """
+        """Execute only the valid action prefix and retain its exact mask."""
         _, chunk_size, _ = actions.shape
+        if self.subpool_episode_done:
+            if len(env_indices) != 1:
+                raise RuntimeError(
+                    "A frozen subpool episode requires exactly one environment."
+                )
+            if self.last_subpool_obs is None or self.last_subpool_info is None:
+                raise RuntimeError("Frozen subpool episode has no terminal cache.")
+            return _repeat_terminal_subpool_chunk(
+                self.last_subpool_obs,
+                self.last_subpool_info,
+                chunk_size,
+                skip_intermediate_obs=self.skip_intermediate_obs_in_chunk,
+            )
+
         positions = {env_index: pos for pos, env_index in enumerate(env_indices)}
-        active_indices = [
-            env_index
-            for env_index in env_indices
-            if not self.subpool_slots[env_index].done
-        ]
-        last_obs = [self.subpool_slots[index].last_obs for index in env_indices]
-        last_infos = [
-            self.subpool_slots[index].last_info or {} for index in env_indices
-        ]
+        active_indices = list(env_indices)
+        last_obs = [None] * len(env_indices)
+        last_infos = [{} for _ in env_indices]
         results = []
 
         for t in range(chunk_size):
@@ -876,28 +716,25 @@ class BehaviorProcess:
                 next_active = []
                 terminal_indices = []
                 for source_index, env_index in enumerate(active_indices):
-                    slot = self.subpool_slots[env_index]
                     pos = positions[env_index]
                     if need_obs:
                         obs_t[pos] = raw_obs[source_index]
                     info = infos[source_index]
-                    if slot.reward_tracker is None:
+                    if self.subtask_reward_tracker is None:
                         raise RuntimeError(
                             "Subpool chunk execution started before reward priming."
                         )
-                    stage_info = get_stage_info(info, slot.subtask_id)
-                    self._apply_direct_navigation_predicate(stage_info, slot, env_index)
-                    self._attach_arm_specific_distances(stage_info, slot, env_index)
-                    outcome = slot.reward_tracker.step(stage_info)
-                    self._maybe_capture_stable_recovery_event(
-                        slot, env_index, stage_info, outcome
-                    )
+                    stage_info = get_stage_info(info, self.active_subtask_index)
+                    self._apply_direct_navigation_predicate(stage_info)
+                    self._attach_arm_specific_distances(stage_info)
+                    outcome = self.subtask_reward_tracker.step(stage_info)
+                    self._maybe_capture_stable_recovery_event(stage_info, outcome)
                     info["subpool"] = {
-                        "subtask_id": slot.subtask_id,
-                        "pool_type": slot.pool_type,
+                        "subtask_id": self.active_subtask_index,
+                        "pool_type": self.active_pool_type,
                         "success": outcome.success,
                         "timeout": outcome.timeout,
-                        "elapsed_steps": slot.reward_tracker.steps,
+                        "elapsed_steps": self.subtask_reward_tracker.steps,
                         "potential": outcome.potential,
                         "progress": outcome.progress,
                         "reward_progress_return": outcome.cumulative_progress,
@@ -912,18 +749,17 @@ class BehaviorProcess:
                     is_done = outcome.success or outcome.timeout
                     if is_done:
                         terminal_indices.append(env_index)
-                        slot.done = True
+                        self.subpool_episode_done = True
                         needs_failure_state = (
                             outcome.timeout and self.failure_state_store is not None
                         )
                         terminal_state = (
-                            self._dump_subpool_state(env_index)
+                            self._dump_subpool_state()
                             if self.dynamic_pool_updates or needs_failure_state
                             else None
                         )
                         if needs_failure_state:
                             self._capture_failure_terminal_state(
-                                slot,
                                 terminal_state,
                                 stage_info=stage_info,
                                 outcome=outcome,
@@ -932,18 +768,18 @@ class BehaviorProcess:
                         if self.dynamic_pool_updates and outcome.timeout:
                             available_max_lag = min(
                                 self.recovery_max_lag_states,
-                                len(slot.state_ring) - 1,
+                                len(self.state_ring) - 1,
                             )
                             if available_max_lag >= self.recovery_min_lag_states:
                                 lag = int(
-                                    self.recovery_rngs[env_index].integers(
+                                    self.recovery_rng.integers(
                                         self.recovery_min_lag_states,
                                         available_max_lag + 1,
                                     )
                                 )
-                                recovery_state = list(slot.state_ring)[-(lag + 1)]
+                                recovery_state = list(self.state_ring)[-(lag + 1)]
                         if self.dynamic_pool_updates:
-                            slot.pending_pool_candidates = {
+                            self.pending_pool_candidates = {
                                 "success_state": (
                                     terminal_state if outcome.success else None
                                 ),
@@ -951,9 +787,11 @@ class BehaviorProcess:
                             }
                     elif (
                         self.dynamic_pool_updates
-                        and slot.reward_tracker.steps % self.state_capture_interval == 0
+                        and self.subtask_reward_tracker.steps
+                        % self.state_capture_interval
+                        == 0
                     ):
-                        slot.state_ring.append(self._dump_subpool_state(env_index))
+                        self.state_ring.append(self._dump_subpool_state())
                     if not is_done:
                         next_active.append(env_index)
                 if self.skip_intermediate_obs_in_chunk and (
@@ -965,15 +803,6 @@ class BehaviorProcess:
                         observation_indices, observations, strict=True
                     ):
                         obs_t[positions[env_index]] = observation
-                for env_index in terminal_indices:
-                    slot = self.subpool_slots[env_index]
-                    pos = positions[env_index]
-                    if obs_t[pos] is None:
-                        raise RuntimeError(
-                            f"Terminal slot {env_index} has no cached observation."
-                        )
-                    slot.last_obs = obs_t[pos]
-                    slot.last_info = infos_t[pos]
                 active_indices = next_active
 
             last_obs = obs_t
@@ -987,18 +816,16 @@ class BehaviorProcess:
                 (output_obs, rewards_t, terms_t, truncs_t, infos_t, executed_t)
             )
 
+        if self.subpool_episode_done:
+            self.last_subpool_obs = last_obs[0]
+            self.last_subpool_info = last_infos[0]
         return tuple(zip(*results))
 
-    def _apply_direct_navigation_predicate(
-        self,
-        stage_info,
-        slot: _SubpoolSlotRuntime,
-        env_index: int,
-    ) -> None:
+    def _apply_direct_navigation_predicate(self, stage_info) -> None:
         """Use the same demo-terminal base region as grounded evaluation."""
-        if slot.control is None or slot.control.skill != "move to":
+        if self.current_control is None or self.current_control.skill != "move to":
             return
-        metadata = slot.snapshot_metadata or {}
+        metadata = self.current_snapshot_metadata or {}
         target_pose = metadata.get("target_base_pose")
         if target_pose is None:
             raise KeyError("Move-to snapshot metadata is missing target_base_pose.")
@@ -1007,13 +834,11 @@ class BehaviorProcess:
 
         import omnigibson.utils.transform_utils as transform_utils
 
-        wrapped_env = self.env.envs[env_index]
+        wrapped_env = self.env.envs[0]
         base_env = wrapped_env
         while hasattr(base_env, "env"):
             base_env = base_env.env
-        position, quaternion = base_env.robots[0].get_position_orientation(
-            frame="scene"
-        )
+        position, quaternion = base_env.robots[0].get_position_orientation()
         yaw = float(transform_utils.quat2euler(quaternion)[2])
         position_error = math.hypot(
             float(position[0]) - float(target_pose[0]),
@@ -1037,21 +862,16 @@ class BehaviorProcess:
             }
         )
 
-    def _attach_arm_specific_distances(
-        self,
-        stage_info,
-        slot: _SubpoolSlotRuntime,
-        env_index: int,
-    ) -> None:
+    def _attach_arm_specific_distances(self, stage_info) -> None:
         """Expose non-minimized arm distances for grounded manipulation rewards."""
         if (
-            slot.task_reward is None
-            or slot.subtask_id is None
-            or slot.reward_tracker is None
+            self.active_task_reward is None
+            or self.active_subtask_index is None
+            or self.subtask_reward_tracker is None
         ):
             return
         required_metrics = {
-            term.key for term in slot.reward_tracker.spec.potential_terms
+            term.key for term in self.subtask_reward_tracker.spec.potential_terms
         }
         needs_obj_distance = {
             key for key in required_metrics if key.endswith("_eef_to_obj_distance")
@@ -1064,10 +884,12 @@ class BehaviorProcess:
         )
         if not (needs_obj_distance or needs_toggle_distance or needs_support_distance):
             return
-        stage_defs = getattr(slot.task_reward, "_stage_defs", ())
-        if not 0 <= slot.subtask_id < len(stage_defs):
-            raise IndexError(f"Active reward stage {slot.subtask_id} is unavailable.")
-        objects = stage_defs[slot.subtask_id].get("objects", ())
+        stage_defs = getattr(self.active_task_reward, "_stage_defs", ())
+        if not 0 <= self.active_subtask_index < len(stage_defs):
+            raise IndexError(
+                f"Active reward stage {self.active_subtask_index} is unavailable."
+            )
+        objects = stage_defs[self.active_subtask_index].get("objects", ())
         if not objects:
             return
 
@@ -1075,7 +897,7 @@ class BehaviorProcess:
         from omnigibson.object_states.toggle import ToggledOn
         from omnigibson.reward_functions.support_utils import get_obj_center
 
-        wrapped_env = self.env.envs[env_index]
+        wrapped_env = self.env.envs[0]
         base_env = wrapped_env
         while hasattr(base_env, "env"):
             base_env = base_env.env
@@ -1117,66 +939,63 @@ class BehaviorProcess:
                     0.0,
                 )
 
-    @staticmethod
-    def _active_stage_objects(slot: _SubpoolSlotRuntime):
+    def _active_stage_objects(self):
         """Return the simulator objects associated with the active stage."""
-        if slot.task_reward is None or slot.subtask_id is None:
+        if self.active_task_reward is None or self.active_subtask_index is None:
             raise RuntimeError("Subtask stage objects requested before reward priming.")
-        stage_defs = getattr(slot.task_reward, "_stage_defs", ())
-        if not 0 <= slot.subtask_id < len(stage_defs):
-            raise IndexError(f"Active reward stage {slot.subtask_id} is unavailable.")
-        return tuple(stage_defs[slot.subtask_id].get("objects", ()))
+        stage_defs = getattr(self.active_task_reward, "_stage_defs", ())
+        if not 0 <= self.active_subtask_index < len(stage_defs):
+            raise IndexError(
+                f"Active reward stage {self.active_subtask_index} is unavailable."
+            )
+        return tuple(stage_defs[self.active_subtask_index].get("objects", ()))
 
-    def _prime_failure_analysis(self, slot: _SubpoolSlotRuntime) -> None:
+    def _prime_failure_analysis(self) -> None:
         """Reset episode-local failure state and record the target reference pose."""
-        slot.failure_reference_orientation = None
-        slot.failure_tip_stable_count = 0
-        slot.failure_recovery_event_captured = False
-        if self.failure_state_store is None or slot.control is None:
+        self.failure_reference_orientation = None
+        self.failure_tip_stable_count = 0
+        self.failure_recovery_event_captured = False
+        if self.failure_state_store is None or self.current_control is None:
             return
-        if slot.control.skill.strip().lower() != "pick up from":
+        if self.current_control.skill.strip().lower() != "pick up from":
             return
-        objects = self._active_stage_objects(slot)
+        objects = self._active_stage_objects()
         if len(objects) < 2 or objects[1] is None:
             raise RuntimeError(
                 "Pickup failure analysis requires a target and original support."
             )
-        recovery_provenance = (slot.snapshot_metadata or {}).get(
+        recovery_provenance = (self.current_snapshot_metadata or {}).get(
             "recovery_provenance", {}
         )
         reference_orientation = recovery_provenance.get("reference_orientation_xyzw")
         if reference_orientation is None:
             reference_orientation = (
-                objects[0]
-                .get_position_orientation(frame="scene")[1]
-                .detach()
-                .cpu()
-                .tolist()
+                objects[0].get_position_orientation()[1].detach().cpu().tolist()
             )
         # Validate catalog-provided recovery provenance before it is used by the
         # per-step analyzer. This also returns a plain JSON-safe list.
         relative_tilt_angle_deg(reference_orientation, reference_orientation)
-        slot.failure_reference_orientation = [
+        self.failure_reference_orientation = [
             float(value) for value in reference_orientation
         ]
 
-    def _failure_facts(self, slot: _SubpoolSlotRuntime, stage_info) -> dict:
+    def _failure_facts(self, stage_info) -> dict:
         """Extract JSON-safe simulator facts for the active skill."""
         facts = {"completed": bool(stage_info.get("completed", False))}
-        if slot.control is None:
+        if self.current_control is None:
             raise RuntimeError("Failure analysis started before control priming.")
-        if slot.control.skill.strip().lower() != "pick up from":
+        if self.current_control.skill.strip().lower() != "pick up from":
             return facts
-        if slot.failure_reference_orientation is None:
+        if self.failure_reference_orientation is None:
             raise RuntimeError("Pickup failure analysis has no reference orientation.")
 
-        objects = self._active_stage_objects(slot)
+        objects = self._active_stage_objects()
         if len(objects) < 2 or objects[1] is None:
             raise RuntimeError(
                 "Pickup failure analysis requires a target and original support."
             )
         target, support = objects[:2]
-        position, orientation = target.get_position_orientation(frame="scene")
+        position, orientation = target.get_position_orientation()
         linear_speed = float(
             torch.linalg.vector_norm(target.get_linear_velocity()).item()
         )
@@ -1185,7 +1004,7 @@ class BehaviorProcess:
         )
         orientation_list = orientation.detach().cpu().tolist()
         tilt_angle = relative_tilt_angle_deg(
-            slot.failure_reference_orientation,
+            self.failure_reference_orientation,
             orientation_list,
         )
         return {
@@ -1195,7 +1014,7 @@ class BehaviorProcess:
             "support_name": str(support.name),
             "target_position": position.detach().cpu().tolist(),
             "target_orientation_xyzw": orientation_list,
-            "reference_orientation_xyzw": list(slot.failure_reference_orientation),
+            "reference_orientation_xyzw": list(self.failure_reference_orientation),
             "tilt_angle_deg": tilt_angle,
             "tipped": tilt_angle >= self.failure_tipped_angle_deg,
             "linear_speed": linear_speed,
@@ -1206,18 +1025,15 @@ class BehaviorProcess:
             ),
         }
 
-    @staticmethod
-    def _outcome_metadata(
-        slot: _SubpoolSlotRuntime, outcome, *, failure_reason: str
-    ) -> dict:
+    def _outcome_metadata(self, outcome, *, failure_reason: str) -> dict:
         """Build the common reward and termination metadata for a capture."""
-        if slot.reward_tracker is None:
+        if self.subtask_reward_tracker is None:
             raise RuntimeError("Failure capture started before reward priming.")
         return {
             "failure_reason": failure_reason,
             "success": bool(outcome.success),
             "timeout": bool(outcome.timeout),
-            "elapsed_steps": int(slot.reward_tracker.steps),
+            "elapsed_steps": int(self.subtask_reward_tracker.steps),
             "potential": float(outcome.potential),
             "last_progress": float(outcome.progress),
             "progress_return": float(outcome.cumulative_progress),
@@ -1232,7 +1048,6 @@ class BehaviorProcess:
 
     def _capture_failure_state(
         self,
-        slot: _SubpoolSlotRuntime,
         state,
         *,
         capture_kind: str,
@@ -1243,24 +1058,22 @@ class BehaviorProcess:
         """Persist one audited state with a skill-relative interpretation."""
         if self.failure_state_store is None:
             return
-        if slot.snapshot_record is None or slot.control is None:
+        if self.current_snapshot_record is None or self.current_control is None:
             raise RuntimeError("Failure capture started before a subpool reset.")
-        facts = self._failure_facts(slot, stage_info)
+        facts = self._failure_facts(stage_info)
         analysis = analyze_subtask_failure(
-            slot.control.skill,
+            self.current_control.skill,
             facts,
             termination_reason="timeout" if outcome.timeout else None,
         )
         metadata_path = self.failure_state_store.capture(
             state,
             policy_global_step=self.policy_global_step,
-            collection_index=slot.collection_index,
-            sampling_group=slot.sampling_group,
+            collection_index=self.current_collection_index,
+            sampling_group=self.current_sampling_group,
             capture_kind=capture_kind,
-            source_snapshot=slot.snapshot_record,
-            outcome=self._outcome_metadata(
-                slot, outcome, failure_reason=failure_reason
-            ),
+            source_snapshot=self.current_snapshot_record,
+            outcome=self._outcome_metadata(outcome, failure_reason=failure_reason),
             analysis=analysis.to_dict(),
         )
         self.logger.info(
@@ -1271,63 +1084,43 @@ class BehaviorProcess:
             metadata_path,
         )
 
-    def _maybe_capture_stable_recovery_event(
-        self,
-        slot: _SubpoolSlotRuntime,
-        env_index: int,
-        stage_info,
-        outcome,
-    ) -> None:
+    def _maybe_capture_stable_recovery_event(self, stage_info, outcome) -> None:
         """Capture the first stable, simulator-certified recovery state."""
         if (
             self.failure_state_store is None
-            or slot.failure_recovery_event_captured
+            or self.failure_recovery_event_captured
             or outcome.success
             or outcome.timeout
-            or slot.control is None
-            or slot.control.skill.strip().lower() != "pick up from"
+            or self.current_control is None
+            or self.current_control.skill.strip().lower() != "pick up from"
         ):
             return
-        facts = self._failure_facts(slot, stage_info)
+        facts = self._failure_facts(stage_info)
         analysis = analyze_subtask_failure(
-            slot.control.skill,
+            self.current_control.skill,
             facts,
             termination_reason=None,
         )
         if analysis.recovery_status == "eligible" and bool(facts["stable"]):
-            slot.failure_tip_stable_count += 1
+            self.failure_tip_stable_count += 1
         else:
-            slot.failure_tip_stable_count = 0
-        if slot.failure_tip_stable_count < self.failure_stable_steps:
+            self.failure_tip_stable_count = 0
+        if self.failure_tip_stable_count < self.failure_stable_steps:
             return
         self._capture_failure_state(
-            slot,
-            self._dump_subpool_state(env_index),
+            self._dump_subpool_state(),
             capture_kind="stable_recovery_event",
             stage_info=stage_info,
             outcome=outcome,
             failure_reason="target_tipped",
         )
-        slot.failure_recovery_event_captured = True
+        self.failure_recovery_event_captured = True
 
-    def _dump_subpool_state(self, env_index: int):
-        """Dump one scene in the canonical scene-zero coordinate frame."""
-        wrapped_env = self.env.envs[env_index]
-        base_env = wrapped_env
-        while hasattr(base_env, "env"):
-            base_env = base_env.env
-        scene_state = base_env.scene.dump_state(serialized=False)
-        return {
-            0: _rebase_scene_state(
-                scene_state,
-                target_position=torch.zeros_like(scene_state["pos"]),
-                target_orientation=torch.tensor(
-                    [0.0, 0.0, 0.0, 1.0],
-                    dtype=scene_state["ori"].dtype,
-                    device=scene_state["ori"].device,
-                ),
-            )
-        }
+    @staticmethod
+    def _dump_subpool_state():
+        import omnigibson as og
+
+        return og.sim.dump_state(serialized=False)
 
     @staticmethod
     def dump_serialized_state():
@@ -1336,21 +1129,9 @@ class BehaviorProcess:
 
         return og.sim.dump_state(serialized=True)
 
-    def dump_subpool_states(self):
-        """Return every vector slot in the canonical scene-zero frame."""
-        return [self._dump_subpool_state(index) for index in range(self.num_envs)]
-
-    def _capture_failure_terminal_state(
-        self,
-        slot: _SubpoolSlotRuntime,
-        state,
-        *,
-        stage_info,
-        outcome,
-    ) -> None:
+    def _capture_failure_terminal_state(self, state, *, stage_info, outcome) -> None:
         """Persist the exact timeout state without adding it to a recovery pool."""
         self._capture_failure_state(
-            slot,
             state,
             capture_kind="terminal",
             stage_info=stage_info,
@@ -1366,152 +1147,105 @@ class BehaviorProcess:
         self.policy_global_step = global_step
 
     def drain_pool_candidates(self):
-        """Return terminal/recovery candidates once for every vector slot."""
-        candidates = []
-        for slot in self.subpool_slots:
-            candidates.append(slot.pending_pool_candidates)
-            slot.pending_pool_candidates = None
+        """Return terminal/recovery candidates once, then clear them."""
+        candidates = self.pending_pool_candidates
+        self.pending_pool_candidates = None
         return candidates
 
-    def load_serialized_states(
+    def load_serialized_state(
         self,
-        states,
+        state,
         *,
-        activity_names,
-        scene_models,
-        instance_ids,
-        subtask_ids,
-        pool_types,
-        reward_specs,
-        control_jsons,
-        snapshot_metadatas,
-        snapshot_records,
-        sampling_groups,
-        collection_indices,
+        activity_name: str,
+        scene_model: str,
+        instance_id: int,
+        subtask_id: int,
+        pool_type: str,
+        reward_spec,
+        control_json: str,
+        snapshot_metadata,
+        snapshot_record,
+        sampling_group: int,
+        collection_index: int | None,
     ):
-        """Synchronously restore one canonical state into every vector scene."""
-        fields = {
-            "states": states,
-            "activity_names": activity_names,
-            "scene_models": scene_models,
-            "instance_ids": instance_ids,
-            "subtask_ids": subtask_ids,
-            "pool_types": pool_types,
-            "reward_specs": reward_specs,
-            "control_jsons": control_jsons,
-            "snapshot_metadatas": snapshot_metadatas,
-            "snapshot_records": snapshot_records,
-            "sampling_groups": sampling_groups,
-            "collection_indices": collection_indices,
-        }
-        wrong_lengths = {
-            name: len(value)
-            for name, value in fields.items()
-            if len(value) != self.num_envs
-        }
-        if wrong_lengths:
+        """Reset and restore one audited state in a single-env process."""
+        if len(self.env) != 1:
+            raise RuntimeError("Serialized subpool restore requires exactly one env.")
+        if self.instance_loader.activity_name != activity_name:
             raise ValueError(
-                f"Full-vector restore expects {self.num_envs} values per field; "
-                f"got {wrong_lengths}."
-            )
-        if any(
-            activity_name != self.instance_loader.activity_name
-            for activity_name in activity_names
-        ):
-            raise ValueError(
-                "Every snapshot activity must match runtime activity "
-                f"{self.instance_loader.activity_name!r}."
+                f"Snapshot activity {activity_name!r} does not match runtime "
+                f"activity {self.instance_loader.activity_name!r}."
             )
         import omnigibson as og
 
-        from rlinf.data.b1k_grounded import GroundedControlSpec
+        wrapped_env = self.env.envs[0]
+        base_env = wrapped_env
+        while hasattr(base_env, "env"):
+            base_env = base_env.env
+        runtime_scene_model = str(getattr(base_env.scene, "scene_model", ""))
+        if runtime_scene_model != scene_model:
+            raise ValueError(
+                f"Snapshot scene {scene_model!r} does not match runtime scene "
+                f"{runtime_scene_model!r}."
+            )
 
-        # A partial reset is physically unsafe in OmniGibson's shared stage.
-        # Reset all scenes first, then load every state before one common refresh.
         self.instance_loader.prepare_reset(self.env)
         self._call_reset(get_obs=False)
-        base_envs = []
-        for env_index, wrapped_env in enumerate(self.env.envs):
-            base_env = wrapped_env
-            while hasattr(base_env, "env"):
-                base_env = base_env.env
-            base_envs.append(base_env)
-            runtime_scene_model = str(getattr(base_env.scene, "scene_model", ""))
-            if runtime_scene_model != scene_models[env_index]:
-                raise ValueError(
-                    f"Snapshot scene {scene_models[env_index]!r} does not match "
-                    f"runtime scene {runtime_scene_model!r} for slot {env_index}."
-                )
-            state = states[env_index]
-            if set(state) != {0}:
-                raise ValueError(
-                    "Canonical subpool states must contain exactly scene key 0, "
-                    f"got {sorted(state)} for slot {env_index}."
-                )
-            target_position, target_orientation = (
-                base_env.scene.get_position_orientation()
-            )
-            scene_state = _rebase_scene_state(
-                _move_state_tensors(state[0], og.sim.device),
-                target_position=target_position,
-                target_orientation=target_orientation,
-            )
-            base_env.scene.load_state(scene_state, serialized=False)
-            # Simulator state excludes controller goals. Synchronize before the
-            # common refresh so reset targets cannot move a restored robot.
-            sync_robot_after_pose_override(base_env.robots[0])
-            base_env.task.activity_instance_id = int(instance_ids[env_index])
-
-            reward_functions = getattr(base_env.task, "_reward_functions", {})
-            task_reward = reward_functions.get("task_specific")
-            if task_reward is None or not hasattr(
-                task_reward, "set_active_stage_index"
-            ):
-                raise TypeError(
-                    "Subpool RL requires a sequential task_specific reward with "
-                    "set_active_stage_index()."
-                )
-            subtask_id = int(subtask_ids[env_index])
-            task_reward.set_active_stage_index(subtask_id)
-            pool_type = pool_types[env_index]
-            if pool_type not in SUBPOOL_TYPES:
-                raise ValueError(f"Unknown subpool type {pool_type!r}.")
-            self.subpool_slots[env_index] = _SubpoolSlotRuntime(
-                reward_tracker=SubtaskRewardTracker(
-                    SubtaskRewardSpec.from_mapping(reward_specs[env_index])
-                ),
-                task_reward=task_reward,
-                subtask_id=subtask_id,
-                pool_type=pool_type,
-                control=GroundedControlSpec.from_json(control_jsons[env_index]),
-                snapshot_metadata=dict(snapshot_metadatas[env_index]),
-                snapshot_record=dict(snapshot_records[env_index]),
-                sampling_group=int(sampling_groups[env_index]),
-                collection_index=(
-                    None
-                    if collection_indices[env_index] is None
-                    else int(collection_indices[env_index])
-                ),
-                state_ring=deque(maxlen=self.state_ring_size),
-            )
-
+        full_state = _move_state_tensors(state, og.sim.device)
+        og.sim.load_state(full_state, serialized=False)
+        # Simulator state does not include controller goals. Synchronize them
+        # before the refresh step so stale reset targets cannot move the robot
+        # away from the canonical pose.
+        sync_robot_after_pose_override(base_env.robots[0])
+        # Official B1K evaluation constructs the scene from the seed template
+        # (normally instance 0), then applies the selected challenge instance's
+        # TRO state.  Canonical snapshots are dumped after that mutation.  Keep
+        # the bootstrap template id separate from the logical task instance and
+        # restore the latter after loading the exact serialized simulator state.
+        base_env.task.activity_instance_id = instance_id
         # Object-state predicates and camera buffers are stale immediately after
-        # scene.load_state. Refresh all scenes together only after every scene is
-        # restored, then propagate transforms through Fabric for vision sensors.
+        # load_state. The simulation step refreshes physics and object states;
+        # the explicit render then propagates the restored transforms through
+        # Fabric before vision sensors read their first frame. Relying on the
+        # render embedded in step() is insufficient during concurrent Kit
+        # startup and can yield an empty segmentation tensor.
         og.sim.step()
         og.sim.render()
-        observations = []
-        infos = []
-        for env_index, (wrapped_env, slot) in enumerate(
-            zip(self.env.envs, self.subpool_slots, strict=True)
-        ):
-            self._prime_failure_analysis(slot)
-            if self.dynamic_pool_updates:
-                slot.state_ring.append(self._dump_subpool_state(env_index))
-            obs, info = wrapped_env.get_obs()
-            observations.append(self._prepare_policy_observation(obs, env_index))
-            infos.append(info)
-        return observations, infos
+        reward_functions = getattr(base_env.task, "_reward_functions", {})
+        task_reward = reward_functions.get("task_specific")
+        if task_reward is None or not hasattr(task_reward, "set_active_stage_index"):
+            raise TypeError(
+                "Subpool RL requires a sequential task_specific reward with "
+                "set_active_stage_index()."
+            )
+        task_reward.set_active_stage_index(subtask_id)
+        self.active_task_reward = task_reward
+        self.active_subtask_index = subtask_id
+        if pool_type not in SUBPOOL_TYPES:
+            raise ValueError(f"Unknown subpool type {pool_type!r}.")
+        self.active_pool_type = pool_type
+        self.subtask_reward_tracker = SubtaskRewardTracker(
+            SubtaskRewardSpec.from_mapping(reward_spec)
+        )
+        obs, info = wrapped_env.get_obs()
+        from rlinf.data.b1k_grounded import GroundedControlSpec
+
+        self.current_control = GroundedControlSpec.from_json(control_json)
+        self.current_snapshot_metadata = dict(snapshot_metadata)
+        self.current_snapshot_record = dict(snapshot_record)
+        self.current_sampling_group = int(sampling_group)
+        self.current_collection_index = (
+            None if collection_index is None else int(collection_index)
+        )
+        self._prime_failure_analysis()
+        self.state_ring.clear()
+        if self.dynamic_pool_updates:
+            self.state_ring.append(self._dump_subpool_state())
+        self.pending_pool_candidates = None
+        self.subpool_episode_done = False
+        self.last_subpool_obs = None
+        self.last_subpool_info = None
+        return [self._prepare_policy_observation(obs)], [info]
 
     def reset(self, reset_indices=None, get_obs=True):
         self.instance_loader.prepare_reset(self.env)
@@ -1523,10 +1257,7 @@ class BehaviorProcess:
             return None, None
 
         raw_obs, infos = result
-        return [
-            self._prepare_policy_observation(obs, env_index)
-            for env_index, obs in enumerate(raw_obs)
-        ], list(infos)
+        return [self._prepare_policy_observation(obs) for obs in raw_obs], list(infos)
 
     def close(self):
         if self.env is not None:
@@ -1633,7 +1364,6 @@ class BehaviorProcessPool:
                 # node, which is incorrect for heterogeneous deployments where
                 # only the env node can render OmniGibson.
                 node_id = ray.get_runtime_context().get_node_id()
-                node_name = os.environ.get("RLINF_NODE_RANK", socket.gethostname())
                 scheduling_strategy = (
                     ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
@@ -1670,7 +1400,7 @@ class BehaviorProcessPool:
                         process_env_vars["OMNIGIBSON_APPDATA_PATH"] = (
                             _isolated_appdata_path(
                                 appdata_base,
-                                node_name=node_name,
+                                node_id=node_id,
                                 visible_devices=visible_devices,
                                 process_index=process_index,
                             )
@@ -1805,56 +1535,52 @@ class BehaviorProcessPool:
             ]
         )
 
-    def load_serialized_states(
+    def load_serialized_state(
         self,
         global_start: int,
         num_envs: int,
-        states,
+        state,
         *,
-        activity_names,
-        scene_models,
-        instance_ids,
-        subtask_ids,
-        pool_types,
-        reward_specs,
-        control_jsons,
-        snapshot_metadatas,
-        snapshot_records,
-        sampling_groups,
-        collection_indices,
+        activity_name: str,
+        scene_model: str,
+        instance_id: int,
+        subtask_id: int,
+        pool_type: str,
+        reward_spec,
+        control_json: str,
+        snapshot_metadata,
+        snapshot_record,
+        sampling_group: int,
+        collection_index: int | None,
     ):
-        """Restore a complete synchronized vector through one OG process."""
-        if self.num_env_subprocess != 1:
+        """Restore a state through the only safe single-env subpool layout."""
+        if self.num_env_subprocess != 1 or self.total_num_envs != 1:
             raise RuntimeError(
-                "Vectorized subpool restore requires num_env_subprocess=1."
+                "Subpool state restore requires one process and one env."
             )
-        if global_start != 0 or num_envs != self.total_num_envs:
-            raise RuntimeError(
-                "Vectorized subpool restore requires the complete process slice."
-            )
+        if global_start != 0 or num_envs != 1:
+            raise RuntimeError("Subpool state restore requires the full one-env slice.")
         return ray.get(
-            self.env_processes[0].load_serialized_states.remote(
-                states,
-                activity_names=activity_names,
-                scene_models=scene_models,
-                instance_ids=instance_ids,
-                subtask_ids=subtask_ids,
-                pool_types=pool_types,
-                reward_specs=reward_specs,
-                control_jsons=control_jsons,
-                snapshot_metadatas=snapshot_metadatas,
-                snapshot_records=snapshot_records,
-                sampling_groups=sampling_groups,
-                collection_indices=collection_indices,
+            self.env_processes[0].load_serialized_state.remote(
+                state,
+                activity_name=activity_name,
+                scene_model=scene_model,
+                instance_id=instance_id,
+                subtask_id=subtask_id,
+                pool_type=pool_type,
+                reward_spec=reward_spec,
+                control_json=control_json,
+                snapshot_metadata=snapshot_metadata,
+                snapshot_record=snapshot_record,
+                sampling_group=sampling_group,
+                collection_index=collection_index,
             )
         )
 
     def drain_pool_candidates(self):
-        """Drain online state candidates from every vector slot."""
-        if self.num_env_subprocess != 1:
-            raise RuntimeError(
-                "Vectorized subpool candidates require num_env_subprocess=1."
-            )
+        """Drain online state candidates from the one subpool process."""
+        if self.num_env_subprocess != 1 or self.total_num_envs != 1:
+            raise RuntimeError("Subpool candidates require one process and one env.")
         return ray.get(self.env_processes[0].drain_pool_candidates.remote())
 
     def _merge_shards(
@@ -2137,8 +1863,7 @@ class BehaviorEnv(gym.Env):
             past_terminations = torch.logical_or(past_terminations, past_info_dones)
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
-        synchronized_vector_subpool = preserve_primitive_dones and self.num_envs > 1
-        if past_dones.any() and self.auto_reset and not synchronized_vector_subpool:
+        if past_dones.any() and self.auto_reset:
             obs_list[-1], infos_list[-1] = self._handle_auto_reset(
                 past_dones, obs_list[-1], infos_list[-1]
             )
@@ -2283,7 +2008,7 @@ class BehaviorEnv(gym.Env):
 
 
 class BehaviorSubpoolEnv(BehaviorEnv):
-    """BEHAVIOR adapter with synchronized, audited vector-state resets."""
+    """Single-env BEHAVIOR adapter with audited simulator-state resets."""
 
     def __init__(
         self,
@@ -2347,7 +2072,7 @@ class BehaviorSubpoolEnv(BehaviorEnv):
             )
         validate_round_robin_coverage(
             self.catalog.subtask_ids,
-            env_world_size=total_num_processes * num_envs,
+            env_world_size=total_num_processes,
             fixed_subtask_id=self._fixed_subtask_id,
         )
         # OmniGibson fixes the activity and scene when the persistent simulator
@@ -2384,31 +2109,14 @@ class BehaviorSubpoolEnv(BehaviorEnv):
         )
         if self._outcome_group_size <= 0:
             raise ValueError("subpool.outcome_group_size must be positive.")
-        if self._outcome_group_size % num_envs != 0:
+        if total_num_processes % self._outcome_group_size != 0:
             raise ValueError(
-                "subpool.outcome_group_size must be divisible by the number of "
-                "vector slots per EnvWorker so a worker never straddles two "
-                "outcome groups."
-            )
-        logical_env_world_size = total_num_processes * num_envs
-        if logical_env_world_size % self._outcome_group_size != 0:
-            raise ValueError(
-                "The number of logical BEHAVIOR environments must be divisible by "
+                "The number of BEHAVIOR processes must be divisible by "
                 "subpool.outcome_group_size."
             )
         self._sampling_seed = int(cfg.seed)
-        first_logical_env = int(seed_offset) * num_envs
-        logical_env_ids = range(first_logical_env, first_logical_env + num_envs)
-        self._sampling_groups = [
-            logical_env_id // self._outcome_group_size
-            for logical_env_id in logical_env_ids
-        ]
-        self._rngs = [
-            np.random.default_rng(
-                np.random.SeedSequence([self._sampling_seed, logical_env_id])
-            )
-            for logical_env_id in logical_env_ids
-        ]
+        self._sampling_group = int(seed_offset) // self._outcome_group_size
+        self._rng = np.random.default_rng(self._sampling_seed + self._sampling_group)
         self._pool_weights = OmegaConf.to_container(
             OmegaConf.select(cfg, "subpool.pool_weights", default={}), resolve=True
         )
@@ -2441,16 +2149,14 @@ class BehaviorSubpoolEnv(BehaviorEnv):
                 default=False,
             )
         )
-        self._subtask_cursors = list(self._sampling_groups)
+        self._subtask_cursor = self._sampling_group
         self._pending_outcome_collection_index: int | None = None
-        self._pending_outcome_logical_group_indices: list[int | None] | None = None
+        self._pending_outcome_logical_group_index: int | None = None
         self._pending_outcome_update_index: int | None = None
-        self._current_outcome_logical_group_indices: list[int | None] = [
-            None
-        ] * num_envs
+        self._current_outcome_logical_group_index: int | None = None
         self._current_outcome_update_index: int | None = None
-        self._active_outcome_snapshots: list[SubpoolSnapshot | None] = [None] * num_envs
-        self.current_snapshots: list[SubpoolSnapshot | None] = [None] * num_envs
+        self._active_outcome_snapshot: SubpoolSnapshot | None = None
+        self.current_snapshot = None
         super().__init__(
             cfg,
             num_envs,
@@ -2462,23 +2168,16 @@ class BehaviorSubpoolEnv(BehaviorEnv):
 
     @property
     def subtask_ids(self) -> torch.Tensor:
-        if any(snapshot is None for snapshot in self.current_snapshots):
+        if self.current_snapshot is None:
             raise RuntimeError("Subpool env has not been reset.")
-        return torch.tensor(
-            [snapshot.subtask_id for snapshot in self.current_snapshots],
-            dtype=torch.long,
-        )
+        return torch.tensor([self.current_snapshot.subtask_id], dtype=torch.long)
 
     @property
     def subpool_ids(self) -> torch.Tensor:
-        if any(snapshot is None for snapshot in self.current_snapshots):
+        if self.current_snapshot is None:
             raise RuntimeError("Subpool env has not been reset.")
         return torch.tensor(
-            [
-                SUBPOOL_TYPES.index(snapshot.pool_type)
-                for snapshot in self.current_snapshots
-            ],
-            dtype=torch.long,
+            [SUBPOOL_TYPES.index(self.current_snapshot.pool_type)], dtype=torch.long
         )
 
     def set_policy_global_step(self, global_step: int) -> None:
@@ -2493,7 +2192,7 @@ class BehaviorSubpoolEnv(BehaviorEnv):
     def prepare_outcome_group_reset(
         self,
         collection_index: int,
-        logical_group_index: int | list[int | None] | None = None,
+        logical_group_index: int | None = None,
         update_index: int | None = None,
     ) -> None:
         """Make the next reset deterministic within an outcome-sampling group.
@@ -2512,24 +2211,17 @@ class BehaviorSubpoolEnv(BehaviorEnv):
         if self._pending_outcome_collection_index is not None:
             raise RuntimeError("An outcome-group reset is already pending.")
         self._pending_outcome_collection_index = collection_index
-        if isinstance(logical_group_index, (list, tuple)):
-            if len(logical_group_index) != self.num_envs:
-                raise ValueError(
-                    f"Expected {self.num_envs} logical group assignments, got "
-                    f"{len(logical_group_index)}."
-                )
-            logical_group_indices = [
-                None if value is None else int(value) for value in logical_group_index
-            ]
-        else:
-            value = None if logical_group_index is None else int(logical_group_index)
-            logical_group_indices = [value] * self.num_envs
-        self._pending_outcome_logical_group_indices = logical_group_indices
+        self._pending_outcome_logical_group_index = (
+            None if logical_group_index is None else int(logical_group_index)
+        )
         self._pending_outcome_update_index = (
             None if update_index is None else int(update_index)
         )
-        if any(value is not None and value < 0 for value in logical_group_indices):
-            raise ValueError("logical_group_index values must be non-negative.")
+        if (
+            self._pending_outcome_logical_group_index is not None
+            and self._pending_outcome_logical_group_index < 0
+        ):
+            raise ValueError("logical_group_index must be non-negative.")
         if (
             self._pending_outcome_update_index is not None
             and self._pending_outcome_update_index < 0
@@ -2537,61 +2229,52 @@ class BehaviorSubpoolEnv(BehaviorEnv):
             raise ValueError("update_index must be non-negative.")
 
     @property
-    def outcome_group_reset_metadata(self) -> list[dict[str, int | str]]:
-        """Describe each snapshot loaded by the most recent vector reset."""
-        if any(snapshot is None for snapshot in self.current_snapshots):
+    def outcome_group_reset_metadata(self) -> dict[str, int | str]:
+        """Describe the snapshot loaded by the most recent reset."""
+        if self.current_snapshot is None:
             raise RuntimeError("Subpool env has not been reset.")
-        return [
-            {
-                "sampling_group": sampling_group,
-                "snapshot_id": snapshot.snapshot_id,
-                "episode_index": int(snapshot.episode_index),
-                "subtask_id": int(snapshot.subtask_id),
-                "pool_type": snapshot.pool_type,
-                "logical_group_index": logical_group_index,
-                "update_index": self._current_outcome_update_index,
-            }
-            for sampling_group, snapshot, logical_group_index in zip(
-                self._sampling_groups,
-                self.current_snapshots,
-                self._current_outcome_logical_group_indices,
-                strict=True,
-            )
-        ]
+        return {
+            "sampling_group": self._sampling_group,
+            "snapshot_id": self.current_snapshot.snapshot_id,
+            "episode_index": int(self.current_snapshot.episode_index),
+            "subtask_id": int(self.current_snapshot.subtask_id),
+            "pool_type": self.current_snapshot.pool_type,
+            "logical_group_index": self._current_outcome_logical_group_index,
+            "update_index": self._current_outcome_update_index,
+        }
 
-    def _sample_reset_snapshot(self, env_index: int) -> SubpoolSnapshot:
+    def _sample_reset_snapshot(self) -> SubpoolSnapshot:
         collection_index = self._pending_outcome_collection_index
-        sampling_group = self._sampling_groups[env_index]
         if collection_index is None:
             if (
                 self._sticky_outcome_snapshot
-                and self._active_outcome_snapshots[env_index] is not None
+                and self._active_outcome_snapshot is not None
             ):
-                return self._active_outcome_snapshots[env_index]
+                return self._active_outcome_snapshot
             if self._fixed_snapshot_per_env:
                 sampled_subtask_id = self._fixed_subtask_id
                 if sampled_subtask_id is None:
                     subtask_ids = self.catalog.subtask_ids
-                    sampled_subtask_id = subtask_ids[sampling_group % len(subtask_ids)]
+                    sampled_subtask_id = subtask_ids[
+                        self._sampling_group % len(subtask_ids)
+                    ]
                 return self.catalog.shuffled_round_robin_snapshot(
                     seed=self._sampling_seed,
                     update_index=0,
-                    logical_group_index=sampling_group,
+                    logical_group_index=self._sampling_group,
                     subtask_id=sampled_subtask_id,
                     pool_weights=self._pool_weights,
                 )
-            rng = self._rngs[env_index]
+            rng = self._rng
             sampled_subtask_id = self._fixed_subtask_id
             if sampled_subtask_id is None:
                 subtask_ids = self.catalog.subtask_ids
                 sampled_subtask_id = subtask_ids[
-                    self._subtask_cursors[env_index] % len(subtask_ids)
+                    self._subtask_cursor % len(subtask_ids)
                 ]
-                self._subtask_cursors[env_index] += 1
+                self._subtask_cursor += 1
         else:
-            if self._pending_outcome_logical_group_indices is None:
-                raise RuntimeError("Outcome logical group assignments are missing.")
-            logical_group_index = self._pending_outcome_logical_group_indices[env_index]
+            logical_group_index = self._pending_outcome_logical_group_index
             update_index = self._pending_outcome_update_index
             if self._outcome_snapshot_schedule == "shuffled_round_robin":
                 if logical_group_index is None or update_index is None:
@@ -2614,19 +2297,14 @@ class BehaviorSubpoolEnv(BehaviorEnv):
                 )
             rng = np.random.default_rng(
                 np.random.SeedSequence(
-                    [
-                        self._sampling_seed,
-                        sampling_group,
-                        collection_index,
-                        env_index,
-                    ]
+                    [self._sampling_seed, self._sampling_group, collection_index]
                 )
             )
             sampled_subtask_id = self._fixed_subtask_id
             if sampled_subtask_id is None:
                 subtask_ids = self.catalog.subtask_ids
                 sampled_subtask_id = subtask_ids[
-                    (sampling_group + collection_index) % len(subtask_ids)
+                    (self._sampling_group + collection_index) % len(subtask_ids)
                 ]
 
         return self.catalog.sample(
@@ -2648,61 +2326,50 @@ class BehaviorSubpoolEnv(BehaviorEnv):
                 )
             self.catalog = refreshed_catalog
         collection_index = self._pending_outcome_collection_index
-        snapshots = [
-            self._sample_reset_snapshot(env_index) for env_index in range(self.num_envs)
-        ]
+        snapshot = self._sample_reset_snapshot()
+        self.logger.info(
+            "Sampled subpool snapshot=%s episode=%s subtask=%d pool=%s.",
+            snapshot.snapshot_id,
+            snapshot.episode_index,
+            snapshot.subtask_id,
+            snapshot.pool_type,
+        )
         expected_fingerprint = OmegaConf.select(
             self.cfg, "subpool.asset_fingerprint", default=None
         )
-        for env_index, snapshot in enumerate(snapshots):
-            self.logger.info(
-                "Sampled vector slot=%d snapshot=%s episode=%s subtask=%d pool=%s.",
-                env_index,
-                snapshot.snapshot_id,
-                snapshot.episode_index,
-                snapshot.subtask_id,
-                snapshot.pool_type,
+        if expected_fingerprint and snapshot.asset_fingerprint != expected_fingerprint:
+            raise ValueError(
+                f"Snapshot asset_fingerprint={snapshot.asset_fingerprint!r} does not "
+                f"match configured value {expected_fingerprint!r}."
             )
-            if (
-                expected_fingerprint
-                and snapshot.asset_fingerprint != expected_fingerprint
-            ):
-                raise ValueError(
-                    f"Snapshot asset_fingerprint={snapshot.asset_fingerprint!r} "
-                    f"does not match configured value {expected_fingerprint!r}."
-                )
-        raw_obs, infos = self.pool.load_serialized_states(
+        state = self.catalog.load_state(snapshot)
+        raw_obs, infos = self.pool.load_serialized_state(
             self.pool_offset,
             self.num_envs,
-            [self.catalog.load_state(snapshot) for snapshot in snapshots],
-            activity_names=[snapshot.activity_name for snapshot in snapshots],
-            scene_models=[snapshot.scene_model for snapshot in snapshots],
-            instance_ids=[
-                int(snapshot.metadata["instance_id"]) for snapshot in snapshots
-            ],
-            subtask_ids=[snapshot.subtask_id for snapshot in snapshots],
-            pool_types=[snapshot.pool_type for snapshot in snapshots],
-            reward_specs=[
-                apply_reward_overrides(
-                    snapshot.metadata["reward"], self._reward_overrides
-                )
-                for snapshot in snapshots
-            ],
-            control_jsons=[snapshot.control_json for snapshot in snapshots],
-            snapshot_metadatas=[snapshot.metadata for snapshot in snapshots],
-            snapshot_records=[snapshot.to_dict() for snapshot in snapshots],
-            sampling_groups=self._sampling_groups,
-            collection_indices=[collection_index] * self.num_envs,
+            state,
+            activity_name=snapshot.activity_name,
+            scene_model=snapshot.scene_model,
+            instance_id=int(snapshot.metadata["instance_id"]),
+            subtask_id=snapshot.subtask_id,
+            pool_type=snapshot.pool_type,
+            reward_spec=apply_reward_overrides(
+                snapshot.metadata["reward"], self._reward_overrides
+            ),
+            control_json=snapshot.control_json,
+            snapshot_metadata=snapshot.metadata,
+            snapshot_record=snapshot.to_dict(),
+            sampling_group=self._sampling_group,
+            collection_index=collection_index,
         )
-        self.current_snapshots = snapshots
+        self.current_snapshot = snapshot
         if collection_index is not None and self._sticky_outcome_snapshot:
-            self._active_outcome_snapshots = list(snapshots)
-        self._current_outcome_logical_group_indices = list(
-            self._pending_outcome_logical_group_indices or [None] * self.num_envs
+            self._active_outcome_snapshot = snapshot
+        self._current_outcome_logical_group_index = (
+            self._pending_outcome_logical_group_index
         )
         self._current_outcome_update_index = self._pending_outcome_update_index
         self._pending_outcome_collection_index = None
-        self._pending_outcome_logical_group_indices = None
+        self._pending_outcome_logical_group_index = None
         self._pending_outcome_update_index = None
         return raw_obs, infos
 
@@ -2710,37 +2377,21 @@ class BehaviorSubpoolEnv(BehaviorEnv):
         result = super().chunk_step(chunk_actions)
         _, _, terminations, truncations, _ = result
         if self._dynamic_updates and (terminations.any() or truncations.any()):
-            candidates = self.pool.drain_pool_candidates()
-            for env_index, (slot_candidates, snapshot) in enumerate(
-                zip(candidates, self.current_snapshots, strict=True)
-            ):
-                if snapshot is None:
-                    raise RuntimeError("Subpool env has not been reset.")
-                slot_terminated = bool(terminations[env_index].any())
-                slot_truncated = bool(truncations[env_index].any())
-                if slot_terminated or slot_truncated:
-                    self._append_online_candidates(
-                        slot_candidates,
-                        snapshot=snapshot,
-                        success=slot_terminated,
-                    )
+            self._append_online_candidates(
+                self.pool.drain_pool_candidates(),
+                success=bool(terminations.any()),
+            )
         return result
 
-    def _append_online_candidates(
-        self,
-        candidates,
-        *,
-        snapshot: SubpoolSnapshot,
-        success: bool,
-    ) -> None:
-        if not candidates:
+    def _append_online_candidates(self, candidates, *, success: bool) -> None:
+        if not candidates or self.current_snapshot is None:
             return
         if success:
             state = candidates.get("success_state")
             later_subtasks = [
                 subtask_id
                 for subtask_id in self.catalog.subtask_ids
-                if subtask_id > snapshot.subtask_id
+                if subtask_id > self.current_snapshot.subtask_id
             ]
             if state is None or not later_subtasks:
                 return
@@ -2757,10 +2408,10 @@ class BehaviorSubpoolEnv(BehaviorEnv):
             if state is None:
                 self.logger.warning(
                     "No temporally lagged recovery state was available for %s.",
-                    snapshot.snapshot_id,
+                    self.current_snapshot.snapshot_id,
                 )
                 return
-            target_record = snapshot
+            target_record = self.current_snapshot
             target_subtask_id = target_record.subtask_id
             pool_type = "recovery"
 
@@ -2776,8 +2427,8 @@ class BehaviorSubpoolEnv(BehaviorEnv):
         snapshot_id = f"online-{uuid.uuid4().hex}"
         metadata = dict(target_record.metadata)
         metadata["provenance"] = {
-            "source_snapshot_id": snapshot.snapshot_id,
-            "source_subtask_id": snapshot.subtask_id,
+            "source_snapshot_id": self.current_snapshot.snapshot_id,
+            "source_subtask_id": self.current_snapshot.subtask_id,
             "source_outcome": "success" if success else "timeout",
         }
         record = SubpoolSnapshot(
@@ -2800,10 +2451,6 @@ class BehaviorSubpoolEnv(BehaviorEnv):
 
     def _wrap_obs(self, obs_list):
         obs = super()._wrap_obs(obs_list)
-        if not all(obs["task_descriptions"]):
-            if any(snapshot is None for snapshot in self.current_snapshots):
-                raise RuntimeError("Subpool env has not been reset.")
-            obs["task_descriptions"] = [
-                snapshot.task_description for snapshot in self.current_snapshots
-            ]
+        if self.current_snapshot is not None and not all(obs["task_descriptions"]):
+            obs["task_descriptions"] = [self.current_snapshot.task_description]
         return obs

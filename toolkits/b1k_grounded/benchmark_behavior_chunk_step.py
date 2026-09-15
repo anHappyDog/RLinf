@@ -30,10 +30,7 @@ import torch
 from omegaconf import OmegaConf
 
 from rlinf.envs.behavior.behavior_env import BehaviorSubpoolEnv
-from rlinf.envs.behavior.subpool import SubpoolCatalog, full_state_sha256
-
-# B1K 2025 explicitly marks this R1Pro observation field as invalid replay data.
-_R1PRO_JOINT_EFFORT_SLICE = slice(112, 140)
+from rlinf.envs.behavior.subpool import SubpoolCatalog
 
 
 def _parse_args() -> argparse.Namespace:
@@ -42,7 +39,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--token-mapping", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--subtask-id", type=int, default=1)
-    parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--chunk-size", type=int, default=32)
     parser.add_argument("--num-chunks", type=int, default=3)
     parser.add_argument("--seed-offset", type=int, default=0)
@@ -69,12 +65,11 @@ def _compose_env_cfg(args: argparse.Namespace, asset_fingerprint: str):
         cfg = hydra.compose(
             "behavior_subpool_ppo_openpi_pi05",
             overrides=[
-                f"env.train.total_num_envs={args.num_envs}",
+                "env.train.total_num_envs=1",
                 f"env.train.subpool.manifest_path={args.manifest}",
                 f"env.train.subpool.token_mapping_path={args.token_mapping}",
                 f"env.train.subpool.asset_fingerprint={asset_fingerprint}",
                 f"env.train.subpool.fixed_subtask_id={args.subtask_id}",
-                f"env.train.subpool.outcome_group_size={args.num_envs}",
                 "env.train.subpool.dynamic_updates=false",
                 f"env.train.subpool.state_cache_size={args.state_cache_size}",
                 "env.train.subpool.fixed_snapshot_per_env=true",
@@ -98,45 +93,11 @@ def _image_digest(value: torch.Tensor) -> str:
     return hashlib.sha256(array.tobytes()).hexdigest()
 
 
-def _difference_from_first(value: torch.Tensor) -> list[dict[str, float | int]]:
-    """Summarize each vector slot against slot zero without storing pixels."""
-    reference = value[0].detach().cpu().to(torch.float64)
-    summaries = []
-    for slot_index, candidate in enumerate(value):
-        difference = (candidate.detach().cpu().to(torch.float64) - reference).abs()
-        summaries.append(
-            {
-                "slot": slot_index,
-                "max_abs": float(difference.max().item()),
-                "mean_abs": float(difference.mean().item()),
-                "different_values": int(torch.count_nonzero(difference).item()),
-            }
-        )
-    return summaries
-
-
-def _without_joint_effort(value: torch.Tensor) -> torch.Tensor:
-    return torch.cat(
-        (
-            value[..., : _R1PRO_JOINT_EFFORT_SLICE.start],
-            value[..., _R1PRO_JOINT_EFFORT_SLICE.stop :],
-        ),
-        dim=-1,
-    )
-
-
 def main() -> None:
     """Run zero-action chunks and emit timings plus correctness fingerprints."""
     args = _parse_args()
-    if (
-        args.num_envs <= 0
-        or args.chunk_size <= 0
-        or args.num_chunks <= 0
-        or args.num_resets <= 0
-    ):
-        raise ValueError(
-            "num-envs, chunk-size, num-chunks, and num-resets must be positive."
-        )
+    if args.chunk_size <= 0 or args.num_chunks <= 0 or args.num_resets <= 0:
+        raise ValueError("chunk-size, num-chunks, and num-resets must be positive.")
     if args.seed_offset < 0:
         raise ValueError("seed-offset must be non-negative.")
     if args.action_scale < 0:
@@ -169,7 +130,7 @@ def main() -> None:
         start = time.perf_counter()
         env = BehaviorSubpoolEnv(
             env_cfg,
-            num_envs=args.num_envs,
+            num_envs=1,
             seed_offset=args.seed_offset,
             total_num_processes=1,
             worker_info=SimpleNamespace(group_world_size=1),
@@ -179,31 +140,20 @@ def main() -> None:
         reset_seconds_all = []
         reset_snapshot_ids = []
         reset_main_image_sha256 = []
-        reset_policy_observations = []
         for _ in range(args.num_resets):
             start = time.perf_counter()
             initial_obs, _ = env.reset()
             reset_seconds_all.append(time.perf_counter() - start)
-            reset_snapshot_ids.append(
-                [snapshot.snapshot_id for snapshot in env.current_snapshots]
-            )
-            reset_main_image_sha256.append(
-                [_image_digest(image) for image in initial_obs["main_images"]]
-            )
-            reset_policy_observations.append(
-                {
-                    key: initial_obs[key].detach().cpu().clone()
-                    for key in ("states", "main_images", "wrist_images")
-                }
-            )
+            reset_snapshot_ids.append(env.current_snapshot.snapshot_id)
+            reset_main_image_sha256.append(_image_digest(initial_obs["main_images"]))
         reset_seconds = reset_seconds_all[-1]
-        snapshots = env.current_snapshots
+        snapshot = env.current_snapshot
 
         generator = torch.Generator().manual_seed(args.action_seed)
         actions = (
             torch.rand(
                 args.num_chunks,
-                args.num_envs,
+                1,
                 args.chunk_size,
                 23,
                 generator=generator,
@@ -235,17 +185,13 @@ def main() -> None:
         simulator_state = ray.get(
             env.pool.env_processes[0].dump_serialized_state.remote()
         )
-        canonical_states = ray.get(
-            env.pool.env_processes[0].dump_subpool_states.remote()
-        )
         report = {
-            "num_envs": args.num_envs,
             "skip_intermediate_obs": args.skip_intermediate_obs,
             "skip_official_task_termination": (args.skip_official_task_termination),
             "state_cache_size": args.state_cache_size,
             "state_cache_info": dict(env.catalog.state_cache_info),
-            "snapshot_ids": [snapshot.snapshot_id for snapshot in snapshots],
-            "episode_indices": [snapshot.episode_index for snapshot in snapshots],
+            "snapshot_id": snapshot.snapshot_id,
+            "episode_index": snapshot.episode_index,
             "seed_offset": args.seed_offset,
             "action_seed": args.action_seed,
             "action_scale": args.action_scale,
@@ -259,72 +205,20 @@ def main() -> None:
             "reset_seconds_all": reset_seconds_all,
             "reset_snapshot_ids": reset_snapshot_ids,
             "reset_main_image_sha256": reset_main_image_sha256,
-            "slot_zero_reset_state_difference_from_first": _difference_from_first(
-                torch.stack([obs["states"][0] for obs in reset_policy_observations])
-            ),
-            "slot_zero_reset_main_image_difference_from_first": (
-                _difference_from_first(
-                    torch.stack(
-                        [obs["main_images"][0] for obs in reset_policy_observations]
-                    )
-                )
-            ),
-            "slot_zero_reset_wrist_image_difference_from_first": (
-                _difference_from_first(
-                    torch.stack(
-                        [obs["wrist_images"][0] for obs in reset_policy_observations]
-                    )
-                )
-            ),
-            "initial_state_difference_from_slot_zero": _difference_from_first(
-                initial_obs["states"]
-            ),
-            "initial_valid_state_difference_from_slot_zero": (
-                _difference_from_first(_without_joint_effort(initial_obs["states"]))
-            ),
-            "initial_main_image_difference_from_slot_zero": _difference_from_first(
-                initial_obs["main_images"]
-            ),
-            "initial_wrist_image_difference_from_slot_zero": _difference_from_first(
-                initial_obs["wrist_images"]
-            ),
             "chunk_seconds": chunk_seconds,
             "runtime_seconds": runtime_seconds,
             "actions_per_second": executed_actions / runtime_seconds,
-            "environment_steps_per_second": executed_actions / runtime_seconds,
-            "physics_steps_per_second": (
-                executed_actions / args.num_envs / runtime_seconds
-            ),
             "simulator_state": _tensor_list(simulator_state),
             "simulator_state_shape": list(simulator_state.shape),
             "simulator_state_sha256": _image_digest(simulator_state),
-            "canonical_state_sha256": [
-                full_state_sha256(state) for state in canonical_states
-            ],
             "rewards": reward_rows,
             "terminations": termination_rows,
             "truncations": truncation_rows,
             "final_state": _tensor_list(final_obs["states"]),
-            "final_state_difference_from_slot_zero": _difference_from_first(
-                final_obs["states"]
-            ),
-            "final_valid_state_difference_from_slot_zero": _difference_from_first(
-                _without_joint_effort(final_obs["states"])
-            ),
-            "final_main_image_difference_from_slot_zero": _difference_from_first(
-                final_obs["main_images"]
-            ),
-            "final_wrist_image_difference_from_slot_zero": _difference_from_first(
-                final_obs["wrist_images"]
-            ),
             "main_image_shape": list(final_obs["main_images"].shape),
             "wrist_image_shape": list(final_obs["wrist_images"].shape),
-            "main_image_sha256": [
-                _image_digest(image) for image in final_obs["main_images"]
-            ],
-            "wrist_image_sha256": [
-                _image_digest(image) for image in final_obs["wrist_images"]
-            ],
+            "main_image_sha256": _image_digest(final_obs["main_images"]),
+            "wrist_image_sha256": _image_digest(final_obs["wrist_images"]),
             "task_descriptions": final_obs["task_descriptions"],
         }
         args.report.parent.mkdir(parents=True, exist_ok=True)

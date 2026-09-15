@@ -842,8 +842,8 @@ def validate_subpool_env_config(
         return OmegaConf.select(cfg, key, default=default)
 
     errors = []
-    if num_envs <= 0:
-        errors.append(f"num_envs must be positive, got {num_envs}")
+    if num_envs != 1:
+        errors.append(f"num_envs must be 1, got {num_envs}")
     if int(select("num_env_subprocess", 1)) != 1:
         errors.append("num_env_subprocess must be 1")
     if pipeline_stage_num != 1:
