@@ -671,8 +671,10 @@ cache changes neither rendering nor observation pixels.
 ### One simulator process with multiple vector scenes
 
 BEHAVIOR 3.7.2 places all `VectorEnvironment` scenes in one PhysX stage. The
-`env_indices` argument limits Python-side controllers, callbacks, rewards, and
-observations, but a simulator step still advances the physics of every scene.
+`env_indices` argument limits action writes, rewards, termination checks, and
+observations, but simulator callbacks and physics still advance for every scene.
+The global scene registry must remain intact because articulation and contact
+tensor views are indexed across the complete shared stage.
 Subpool vectorization therefore uses a synchronized lifecycle:
 
 - one `BehaviorProcess` and one `VectorEnvironment` per EnvWorker / GPU;
@@ -727,6 +729,11 @@ python toolkits/b1k_grounded/smoke_behavior_subpool_env.py \
   --verify-failure-state-save --verify-dynamic-updates
 ```
 
+Run a separate subset-step regression with `--staggered-timeouts`. It assigns
+slots distinct one-to-N timeouts so one chunk exercises active subsets of size
+N, N-1, ..., 1 while R1Pro's controller and gripper-contact callbacks remain
+backed by the complete simulator scene registry.
+
 With `--verify-dynamic-updates`, the smoke catalog uses a four-step timeout so
 each slot has an auditable lagged state. The test then verifies that one recovery
 snapshot per slot was appended, can be loaded, and matches its recorded checksum.
@@ -769,3 +776,19 @@ environment's regular action request. Use
 policy latency rather than assuming the largest batch is fastest. The rollout
 log reports a batch-size histogram; reduce the wait only when the histogram
 shows that requests still coalesce near `max_batch_size`.
+
+`max_batch_size` counts incoming EnvWorker shards, not logical environments. If
+each EnvWorker hosts `V` vector slots, one shard contains `V` observations and
+the largest model batch contains `V * max_batch_size` rows. For example, with
+80 logical environments on 20 EnvWorkers and four rollout workers, each shard
+contains four rows and each rollout worker can receive at most five shards.
+`max_batch_size: 1`, `2`, and `5` therefore produce model batches of at most 4,
+8, and 20 rows, respectively. Re-benchmark this setting whenever the per-worker
+vector width changes; actor and critic batch sizes need not change when the
+total number of trajectories per update stays constant.
+
+For VectorEnvironment correctness canaries, enable
+`algorithm.outcome_dynamic_sampling.log_actor_shard_metrics`. In the standard
+parallel routing layout, each actor shard receives a stable vector-slot index,
+so `dynamic_sampling/actor_shard/*/success_rate` reveals persistent slot bias.
+Treat these as routing diagnostics rather than replacement task metrics.

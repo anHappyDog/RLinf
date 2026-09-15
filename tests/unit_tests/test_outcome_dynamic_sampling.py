@@ -603,6 +603,69 @@ def test_env_worker_extracts_terminal_outcome_across_auto_reset():
     assert torch.equal(outcomes, torch.tensor([True, False]))
 
 
+def test_env_worker_accepts_synchronized_vector_terminal_info(monkeypatch):
+    """Vector subpools terminate without Gymnasium's auto-reset final_info."""
+
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.prepare_actions",
+        lambda **kwargs: kwargs["raw_chunk_actions"],
+    )
+
+    class _SynchronizedVectorEnv:
+        last_executed_action_mask = torch.ones(2, 2, dtype=torch.bool)
+        subtask_ids = torch.ones(2, dtype=torch.long)
+        subpool_ids = torch.zeros(2, dtype=torch.long)
+
+        def chunk_step(self, chunk_actions):
+            del chunk_actions
+            observations = [{"states": torch.zeros(2, 1)}] * 2
+            rewards = torch.zeros(2, 2)
+            terminations = torch.tensor([[False, True], [False, False]])
+            truncations = torch.zeros(2, 2, dtype=torch.bool)
+            infos = {
+                "episode": {
+                    "success_once": torch.tensor([True, False]),
+                    "episode_len": torch.tensor([12, 12]),
+                },
+                "intervene_action": torch.ones(2, 2, 23),
+                "intervene_flag": torch.tensor([True, False]),
+            }
+            return observations, rewards, terminations, truncations, [infos, infos]
+
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "env": {
+                "train": {
+                    "env_type": "behavior",
+                    "auto_reset": True,
+                    "ignore_terminations": False,
+                }
+            }
+        }
+    )
+    worker.model_cfg = OmegaConf.create(
+        {
+            "model_type": "openpi_rlinf",
+            "num_action_chunks": 1,
+            "action_dim": 23,
+        }
+    )
+    worker.use_external_reward_model = False
+    worker.env_list = [_SynchronizedVectorEnv()]
+
+    env_output, env_info, _ = EnvWorker.env_interact_step.__wrapped__.__wrapped__(
+        worker,
+        torch.zeros(2, 2, 23),
+        stage_id=0,
+    )
+
+    assert torch.equal(env_info["success_once"], torch.tensor([True]))
+    assert torch.equal(env_info["episode_len"], torch.tensor([12]))
+    assert torch.equal(env_output.intervene_actions, torch.ones(2, 2, 23))
+    assert torch.equal(env_output.intervene_flags, torch.tensor([True, False]))
+
+
 def test_env_worker_routes_parallel_groups_evenly_across_actor_ranks():
     worker = object.__new__(EnvWorker)
     worker.cfg = OmegaConf.create(
@@ -1079,6 +1142,7 @@ def test_runner_continues_sampling_after_warning_interval():
 def test_runner_collects_two_outcome_groups_in_parallel():
     runner = _dynamic_sampling_runner(groups_per_update=2)
     runner.cfg.algorithm.outcome_dynamic_sampling.parallel_groups = True
+    runner.cfg.algorithm.outcome_dynamic_sampling.log_actor_shard_metrics = True
     runner.env.worker_info_list = list(range(8))
     runner.env.reset_train_envs_for_outcome_group.return_value.wait.return_value = [
         [
@@ -1150,6 +1214,26 @@ def test_runner_collects_two_outcome_groups_in_parallel():
         "dynamic_sampling/candidate_failures": 5,
     }
     expected_metrics.update(_expected_snapshot_metrics(3, 7, 5, 2))
+    expected_metrics.update(
+        {
+            "dynamic_sampling/actor_shard/0/samples": 3,
+            "dynamic_sampling/actor_shard/0/successes": 3,
+            "dynamic_sampling/actor_shard/0/failures": 0,
+            "dynamic_sampling/actor_shard/0/success_rate": 1.0,
+            "dynamic_sampling/actor_shard/1/samples": 3,
+            "dynamic_sampling/actor_shard/1/successes": 2,
+            "dynamic_sampling/actor_shard/1/failures": 1,
+            "dynamic_sampling/actor_shard/1/success_rate": 2 / 3,
+            "dynamic_sampling/actor_shard/2/samples": 3,
+            "dynamic_sampling/actor_shard/2/successes": 1,
+            "dynamic_sampling/actor_shard/2/failures": 2,
+            "dynamic_sampling/actor_shard/2/success_rate": 1 / 3,
+            "dynamic_sampling/actor_shard/3/samples": 3,
+            "dynamic_sampling/actor_shard/3/successes": 1,
+            "dynamic_sampling/actor_shard/3/failures": 2,
+            "dynamic_sampling/actor_shard/3/success_rate": 1 / 3,
+        }
+    )
     assert metrics == expected_metrics
 
 

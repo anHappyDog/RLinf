@@ -370,6 +370,25 @@ def _preload_numba_llvmlite() -> None:
             pass
 
 
+def _validate_vector_environment_contract(vector_env_cls, *, required: bool) -> None:
+    """Reject B1K builds whose subset stepping corrupts shared-stage views."""
+    if not required:
+        return
+    if getattr(
+        vector_env_cls,
+        "preserves_global_scene_registry_on_subset_step",
+        False,
+    ):
+        return
+    source = inspect.getsourcefile(vector_env_cls) or "<unknown>"
+    raise RuntimeError(
+        "Vectorized BEHAVIOR subpool execution requires a VectorEnvironment "
+        "that preserves the simulator's global scene registry during subset "
+        f"steps. The imported implementation at {source} does not advertise "
+        "that contract."
+    )
+
+
 @ray.remote(num_cpus=1)
 class BehaviorProcess:
     def __init__(
@@ -385,6 +404,10 @@ class BehaviorProcess:
         self.num_envs = int(num_envs)
         self.pipeline_stage_num = pipeline_stage_num
         is_subpool = bool(OmegaConf.select(cfg, "subpool.enabled", default=False))
+        _validate_vector_environment_contract(
+            VectorEnvironment,
+            required=is_subpool and self.num_envs > 1,
+        )
         omni_cfg = setup_subpool_omni_cfg(cfg) if is_subpool else setup_omni_cfg(cfg)
         self.instance_loader = ActivityInstanceLoader.from_omni_cfg(omni_cfg)
 

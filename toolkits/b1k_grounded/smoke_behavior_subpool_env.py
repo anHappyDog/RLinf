@@ -51,6 +51,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--require-all-snapshots", action="store_true")
     parser.add_argument("--verify-failure-state-save", action="store_true")
     parser.add_argument("--verify-dynamic-updates", action="store_true")
+    parser.add_argument("--verify-pickup-progress-reward", action="store_true")
+    parser.add_argument("--staggered-timeouts", action="store_true")
     return parser.parse_args()
 
 
@@ -69,19 +71,30 @@ def _make_one_step_catalog(args: argparse.Namespace):
     if manifest.exists() and manifest.stat().st_size:
         raise FileExistsError(f"Refusing to overwrite smoke catalog {manifest}.")
 
+    if args.staggered_timeouts:
+        selected = [selected[0]] * args.num_envs
+
     smoke_records = []
     store = SubpoolStore(manifest)
-    for source_record in selected:
+    for record_index, source_record in enumerate(selected):
         state = source.load_state(source_record)
         reward = dict(source_record.metadata["reward"])
         step_penalty_budget = reward["step_penalty"] * reward["max_steps"]
-        timeout_steps = 4 if args.verify_dynamic_updates else 1
+        timeout_steps = (
+            record_index + 1
+            if args.staggered_timeouts
+            else 4
+            if args.verify_dynamic_updates
+            else 1
+        )
         reward["max_steps"] = timeout_steps
         reward["step_penalty"] = step_penalty_budget / timeout_steps
         metadata = dict(source_record.metadata)
         metadata["reward"] = reward
         metadata["smoke_only"] = True
         snapshot_id = f"smoke-{source_record.snapshot_id}"
+        if args.staggered_timeouts:
+            snapshot_id = f"{snapshot_id}-timeout{timeout_steps:02d}"
         smoke_record = replace(
             source_record,
             snapshot_id=snapshot_id,
@@ -104,36 +117,55 @@ def _compose_env_cfg(args: argparse.Namespace, manifest: Path, record):
     os.environ.setdefault("B1K_GROUNDED_TOKEN_MAPPING", str(args.token_mapping))
     os.environ.setdefault("B1K_ASSET_FINGERPRINT", record.asset_fingerprint)
 
+    overrides = [
+        f"env.train.total_num_envs={args.num_envs}",
+        f"env.train.subpool.manifest_path={manifest}",
+        f"env.train.subpool.token_mapping_path={args.token_mapping}",
+        f"env.train.subpool.asset_fingerprint={record.asset_fingerprint}",
+        f"env.train.subpool.fixed_subtask_id={record.subtask_id}",
+        f"env.train.subpool.outcome_group_size={args.num_envs}",
+        f"env.train.subpool.dynamic_updates={str(args.verify_dynamic_updates).lower()}",
+        "env.train.subpool.state_capture_interval=1",
+        "env.train.subpool.recovery_min_lag_states=1",
+        "env.train.subpool.recovery_max_lag_states=2",
+        # This smoke test checks the explicit frozen-terminal contract.
+        # Training enables auto-reset, which intentionally starts a new
+        # episode on the next chunk instead of returning frozen output.
+        "env.train.auto_reset=false",
+        "env.train.skip_intermediate_obs_in_chunk="
+        f"{str(args.skip_intermediate_obs).lower()}",
+        "env.train.subpool.skip_official_task_termination="
+        f"{str(args.skip_official_task_termination).lower()}",
+        "env.train.subpool.failure_state_capture.enabled="
+        f"{str(args.verify_failure_state_save).lower()}",
+        "env.train.subpool.failure_state_capture.output_dir="
+        f"{args.output_dir / 'failure_states'}",
+        "env.train.subpool.failure_state_capture.run_id=vector-smoke",
+        "env.train.subpool.failure_state_capture.policy_global_step=0",
+    ]
+    if args.verify_pickup_progress_reward:
+        overrides.extend(
+            [
+                "+env.train.subpool.reward_overrides.step_penalty=0.0",
+                "+env.train.subpool.reward_overrides.potential_terms="
+                "[{key:pickup_progress_score,scale:2.0,direction:increase}]",
+                "+env.train.subpool.reward_overrides.progress_clip=2.0",
+            ]
+        )
+    if args.staggered_timeouts:
+        overrides.extend(
+            [
+                "env.train.subpool.outcome_snapshot_schedule=shuffled_round_robin",
+                "env.train.subpool.pool_weights.canonical=1.0",
+                "env.train.subpool.pool_weights.predecessor_success=0.0",
+                "env.train.subpool.pool_weights.recovery=0.0",
+            ]
+        )
+
     with hydra.initialize_config_dir(str(config_dir), version_base="1.1"):
         cfg = hydra.compose(
             "behavior_subpool_ppo_openpi_pi05",
-            overrides=[
-                f"env.train.total_num_envs={args.num_envs}",
-                f"env.train.subpool.manifest_path={manifest}",
-                f"env.train.subpool.token_mapping_path={args.token_mapping}",
-                f"env.train.subpool.asset_fingerprint={record.asset_fingerprint}",
-                f"env.train.subpool.fixed_subtask_id={record.subtask_id}",
-                f"env.train.subpool.outcome_group_size={args.num_envs}",
-                "env.train.subpool.dynamic_updates="
-                f"{str(args.verify_dynamic_updates).lower()}",
-                "env.train.subpool.state_capture_interval=1",
-                "env.train.subpool.recovery_min_lag_states=1",
-                "env.train.subpool.recovery_max_lag_states=2",
-                # This smoke test checks the explicit frozen-terminal contract.
-                # Training enables auto-reset, which intentionally starts a new
-                # episode on the next chunk instead of returning frozen output.
-                "env.train.auto_reset=false",
-                "env.train.skip_intermediate_obs_in_chunk="
-                f"{str(args.skip_intermediate_obs).lower()}",
-                "env.train.subpool.skip_official_task_termination="
-                f"{str(args.skip_official_task_termination).lower()}",
-                "env.train.subpool.failure_state_capture.enabled="
-                f"{str(args.verify_failure_state_save).lower()}",
-                "env.train.subpool.failure_state_capture.output_dir="
-                f"{args.output_dir / 'failure_states'}",
-                "env.train.subpool.failure_state_capture.run_id=vector-smoke",
-                "env.train.subpool.failure_state_capture.policy_global_step=0",
-            ],
+            overrides=overrides,
         )
     OmegaConf.resolve(cfg)
     return cfg.env.train
@@ -157,12 +189,59 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _tensor_sha256(value: torch.Tensor) -> str:
+    array = value.detach().cpu().contiguous().numpy()
+    return hashlib.sha256(array.tobytes()).hexdigest()
+
+
+def _policy_state(proprio: torch.Tensor) -> torch.Tensor:
+    """Extract the exact 23-D R1Pro state consumed by the pi0.5 policy."""
+    return torch.cat(
+        (
+            proprio[..., 253:256],
+            proprio[..., 236:240],
+            proprio[..., 158:165],
+            proprio[..., 197:204],
+            proprio[..., 193:195].sum(dim=-1, keepdim=True),
+            proprio[..., 232:234].sum(dim=-1, keepdim=True),
+        ),
+        dim=-1,
+    )
+
+
+def _difference_from_first(value: torch.Tensor) -> list[dict[str, float | int]]:
+    reference = value[0].detach().cpu().to(torch.float64)
+    summaries = []
+    for index, candidate in enumerate(value):
+        difference = (candidate.detach().cpu().to(torch.float64) - reference).abs()
+        summaries.append(
+            {
+                "index": index,
+                "max_abs": float(difference.max().item()),
+                "mean_abs": float(difference.mean().item()),
+                "different_values": int(torch.count_nonzero(difference).item()),
+            }
+        )
+    return summaries
+
+
 def main() -> None:
     """Run the one-step timeout and post-terminal freeze checks."""
     args = _parse_args()
     if args.chunk_size <= 1:
         raise ValueError("chunk-size must exceed one to test prefix masking.")
-    timeout_steps = 4 if args.verify_dynamic_updates else 1
+    if args.staggered_timeouts and args.verify_dynamic_updates:
+        raise ValueError(
+            "staggered-timeouts and verify-dynamic-updates are separate smoke "
+            "contracts and cannot be combined."
+        )
+    timeout_steps = (
+        args.num_envs
+        if args.staggered_timeouts
+        else 4
+        if args.verify_dynamic_updates
+        else 1
+    )
     if args.chunk_size <= timeout_steps:
         raise ValueError(
             f"chunk-size must exceed the smoke timeout of {timeout_steps}."
@@ -190,27 +269,47 @@ def main() -> None:
         )
         actions = torch.zeros(args.num_envs, args.chunk_size, 23)
         reset_results = []
-        for _ in range(args.reset_count):
+        reset_policy_states = []
+        for reset_index in range(args.reset_count):
+            if args.staggered_timeouts:
+                env.prepare_outcome_group_reset(
+                    reset_index,
+                    logical_group_index=list(range(args.num_envs)),
+                    update_index=reset_index,
+                )
             initial_obs, _ = env.reset()
             if not all(initial_obs["task_descriptions"]):
                 raise AssertionError(
                     "Online P2 task description is empty after restore."
                 )
+            policy_states = _policy_state(initial_obs["states"])
+            reset_policy_states.append(policy_states.detach().cpu().clone())
 
             terminal_obs, rewards, terminations, truncations, _ = env.chunk_step(
                 actions
             )
             first_mask = env.last_executed_action_mask.clone()
+            slot_timeout_steps = [
+                int(snapshot.metadata["reward"]["max_steps"])
+                for snapshot in env.current_snapshots
+            ]
             expected_mask = [
-                [True] * timeout_steps + [False] * (args.chunk_size - timeout_steps)
-                for _ in range(args.num_envs)
+                [True] * slot_steps
+                + [False] * (args.chunk_size - slot_steps)
+                for slot_steps in slot_timeout_steps
             ]
             if first_mask.tolist() != expected_mask:
                 raise AssertionError(f"Unexpected terminal prefix mask: {first_mask}.")
-            if not bool((terminations | truncations)[:, timeout_steps - 1].all()):
-                raise AssertionError("Not every smoke subtask terminated on schedule.")
-            if bool((terminations | truncations)[:, timeout_steps:].any()):
-                raise AssertionError("Unexecuted chunk suffix contains terminal flags.")
+            done_flags = terminations | truncations
+            for env_index, slot_steps in enumerate(slot_timeout_steps):
+                if not bool(done_flags[env_index, slot_steps - 1]):
+                    raise AssertionError(
+                        f"Slot {env_index} did not terminate at step {slot_steps}."
+                    )
+                if bool(done_flags[env_index, slot_steps:].any()):
+                    raise AssertionError(
+                        f"Slot {env_index} has terminal flags after its valid prefix."
+                    )
 
             frozen_obs, frozen_rewards, frozen_terms, frozen_truncs, _ = env.chunk_step(
                 actions
@@ -239,8 +338,21 @@ def main() -> None:
                     "first_chunk_rewards": rewards.tolist(),
                     "first_chunk_terminations": terminations.tolist(),
                     "first_chunk_truncations": truncations.tolist(),
+                    "slot_timeout_steps": slot_timeout_steps,
                     "frozen_chunk_executed_mask": frozen_mask.tolist(),
                     "online_prompts": initial_obs["task_descriptions"],
+                    "policy_state_sha256": [
+                        _tensor_sha256(value) for value in policy_states
+                    ],
+                    "main_image_sha256": [
+                        _tensor_sha256(value) for value in initial_obs["main_images"]
+                    ],
+                    "wrist_image_sha256": [
+                        _tensor_sha256(value) for value in initial_obs["wrist_images"]
+                    ],
+                    "policy_state_difference_from_slot_zero": (
+                        _difference_from_first(policy_states)
+                    ),
                 }
             )
 
@@ -323,7 +435,14 @@ def main() -> None:
             "failure_state_save_verified": args.verify_failure_state_save,
             "failure_state_metadata": failure_metadata,
             "dynamic_updates_verified": args.verify_dynamic_updates,
+            "pickup_progress_reward_verified": (args.verify_pickup_progress_reward),
+            "staggered_timeouts_verified": args.staggered_timeouts,
             "dynamic_snapshot_ids": dynamic_snapshot_ids,
+            "slot_zero_policy_state_difference_across_resets": (
+                _difference_from_first(
+                    torch.stack([states[0] for states in reset_policy_states])
+                )
+            ),
             "reset_results": reset_results,
         }
         report_path = args.output_dir / "report.json"
