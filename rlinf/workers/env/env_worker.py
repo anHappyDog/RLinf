@@ -596,18 +596,11 @@ class EnvWorker(Worker):
                     for key in infos["episode"]:
                         env_info[key] = infos["episode"][key].cpu()
         elif chunk_dones.any():
-            done_envs = chunk_dones.any(dim=1)
             if "final_info" in infos:
                 final_info = infos["final_info"]
+                done_envs = chunk_dones.any(dim=1)
                 for key in final_info["episode"]:
                     env_info[key] = final_info["episode"][key][done_envs].cpu()
-            elif "episode" in infos:
-                # Synchronized vector subpool rollouts reset only after the
-                # whole logical group finishes. Their terminal metrics remain
-                # in the current episode info instead of Gymnasium's
-                # auto-reset ``final_info`` wrapper.
-                for key in infos["episode"]:
-                    env_info[key] = infos["episode"][key][done_envs].cpu()
 
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
@@ -617,10 +610,9 @@ class EnvWorker(Worker):
             infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
         )
         if self.cfg.env.train.auto_reset and chunk_dones.any():
-            final_info = infos.get("final_info")
-            if isinstance(final_info, dict) and "intervene_action" in final_info:
-                intervene_actions = final_info["intervene_action"]
-                intervene_flags = final_info["intervene_flag"]
+            if "intervene_action" in infos["final_info"]:
+                intervene_actions = infos["final_info"]["intervene_action"]
+                intervene_flags = infos["final_info"]["intervene_flag"]
 
         env_output = EnvOutput(
             obs=extracted_obs,

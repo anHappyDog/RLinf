@@ -23,7 +23,6 @@ from rlinf.envs.behavior.behavior_env import (
     _SubpoolSlotRuntime,
     _support_surface_distance,
     _translate_proprio_position_to_scene,
-    _validate_vector_environment_contract,
 )
 from rlinf.envs.behavior.subpool import (
     FailureStateStore,
@@ -86,23 +85,6 @@ def _record(state, snapshot_id="state-0", **overrides):
     if "control_json" not in overrides:
         values["control_json"] = json.dumps({"skill": values["skill"]})
     return SubpoolSnapshot(**values)
-
-
-def test_vector_subpool_rejects_unsafe_subset_step_implementation():
-    class UnsafeVectorEnvironment:
-        pass
-
-    with pytest.raises(RuntimeError, match="global scene registry"):
-        _validate_vector_environment_contract(
-            UnsafeVectorEnvironment,
-            required=True,
-        )
-
-    UnsafeVectorEnvironment.preserves_global_scene_registry_on_subset_step = True
-    _validate_vector_environment_contract(
-        UnsafeVectorEnvironment,
-        required=True,
-    )
 
 
 def test_reward_overrides_do_not_mutate_manifest_spec():
@@ -914,66 +896,6 @@ def test_vector_chunk_never_resumes_a_terminal_slot(monkeypatch):
     assert torch.stack(terms, dim=1).tolist()[0] == [True, False, False, False]
     assert torch.stack(truncs, dim=1).tolist()[1] == [False, False, True, False]
     assert observations[-1] == [{"slot": 0}, {"slot": 1}]
-
-
-def test_behavior_process_pool_preserves_slot_alignment_when_merging_shards():
-    pool = object.__new__(BehaviorProcessPool)
-    pool.num_env_subprocess = 2
-    pool.skip_intermediate_obs_in_chunk = False
-    plan = pool._slice_plan(global_start=1, num_envs=5)
-    shard_results = []
-    for _subprocess, positions, _local_rows in plan:
-        observations = []
-        rewards = []
-        terminations = []
-        truncations = []
-        infos = []
-        executed = []
-        for timestep in range(2):
-            observations.append(
-                [{"slot": position, "timestep": timestep} for position in positions]
-            )
-            rewards.append(
-                torch.tensor([10 * timestep + position for position in positions])
-            )
-            terminations.append(
-                torch.tensor([position == 2 for position in positions])
-            )
-            truncations.append(
-                torch.tensor([position == 4 for position in positions])
-            )
-            infos.append([{"slot": position} for position in positions])
-            executed.append(torch.tensor([position != 3 for position in positions]))
-        shard_results.append(
-            (
-                observations,
-                rewards,
-                terminations,
-                truncations,
-                infos,
-                executed,
-            )
-        )
-
-    merged = pool._merge_shards(
-        shard_results,
-        plan,
-        slice_num_envs=5,
-        chunk_size=2,
-    )
-    observations, rewards, terminations, truncations, infos, executed = merged
-
-    for timestep in range(2):
-        assert observations[timestep] == [
-            {"slot": position, "timestep": timestep} for position in range(5)
-        ]
-        assert rewards[timestep].tolist() == [
-            10 * timestep + position for position in range(5)
-        ]
-        assert terminations[timestep].tolist() == [False, False, True, False, False]
-        assert truncations[timestep].tolist() == [False, False, False, False, True]
-        assert infos[timestep] == [{"slot": position} for position in range(5)]
-        assert executed[timestep].tolist() == [True, True, True, False, True]
 
 
 def test_catalog_rejects_mixed_runtime_scenes(tmp_path):

@@ -153,25 +153,6 @@ def _outcome_snapshot_metrics(
     return metrics
 
 
-def _outcome_actor_shard_metrics(
-    stats: dict[int, dict[str, int]],
-) -> dict[str, float | int]:
-    """Expose outcome balance per actor shard for parallel sampling audits."""
-    metrics = {}
-    for actor_rank, shard_stats in stats.items():
-        sample_count = shard_stats["successes"] + shard_stats["failures"]
-        prefix = f"dynamic_sampling/actor_shard/{actor_rank}"
-        metrics.update(
-            {
-                f"{prefix}/samples": sample_count,
-                f"{prefix}/successes": shard_stats["successes"],
-                f"{prefix}/failures": shard_stats["failures"],
-                f"{prefix}/success_rate": shard_stats["successes"] / sample_count,
-            }
-        )
-    return metrics
-
-
 if TYPE_CHECKING:
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
         AsyncEmbodiedSACFSDPPolicy,
@@ -614,10 +595,6 @@ class EmbodiedRunner:
         actor_no_signal_groups = 0
         sampling_rounds = 0
         snapshot_stats: dict[tuple[str, int], dict[str, int]] = {}
-        log_actor_shard_metrics = bool(
-            sampling_cfg.get("log_actor_shard_metrics", False)
-        )
-        actor_shard_stats: dict[int, dict[str, int]] = {}
 
         self.actor.begin_rollout_group_collection().wait()
         while pending_groups:
@@ -656,7 +633,7 @@ class EmbodiedRunner:
                 )
 
             grouped_shards: dict[int, list[list[bool]]] = defaultdict(list)
-            for actor_rank, actor_shard in enumerate(outcome_shards):
+            for actor_shard in outcome_shards:
                 if not isinstance(actor_shard, dict):
                     raise RuntimeError(
                         "Parallel outcome sampling requires actor outcomes keyed by "
@@ -664,16 +641,6 @@ class EmbodiedRunner:
                     )
                 for group_id, outcomes in actor_shard.items():
                     grouped_shards[int(group_id)].append(outcomes)
-                    if (
-                        log_actor_shard_metrics
-                        and int(group_id) in physical_to_logical
-                    ):
-                        shard_stats = actor_shard_stats.setdefault(
-                            actor_rank, {"successes": 0, "failures": 0}
-                        )
-                        successes = sum(bool(outcome) for outcome in outcomes)
-                        shard_stats["successes"] += successes
-                        shard_stats["failures"] += len(outcomes) - successes
             expected_group_ids = set(range(physical_group_count))
             if set(grouped_shards) != expected_group_ids:
                 raise RuntimeError(
@@ -825,7 +792,6 @@ class EmbodiedRunner:
                     else {}
                 ),
                 **_outcome_snapshot_metrics(snapshot_stats),
-                **_outcome_actor_shard_metrics(actor_shard_stats),
             },
         )
 
