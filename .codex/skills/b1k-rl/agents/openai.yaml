@@ -1,0 +1,4 @@
+interface:
+  display_name: "B1K RL"
+  short_description: "Launch reproducible B1K RL with remote collectors"
+  default_prompt: "Use $b1k-rl to preflight, deploy, launch, and monitor this B1K RL run."

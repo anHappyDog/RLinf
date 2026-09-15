@@ -144,6 +144,20 @@ def _gradient_cosines_from_gram(
     return pairwise, state_to_aggregate
 
 
+def _gradient_cosines_to_direction(
+    dot_products: torch.Tensor,
+    gradient_norms: torch.Tensor,
+    direction_norm: torch.Tensor,
+) -> torch.Tensor:
+    """Return gradient cosines to one shared direction."""
+    denominator = gradient_norms * direction_norm
+    return torch.where(
+        denominator > 0,
+        dot_products / denominator.clamp_min(torch.finfo(dot_products.dtype).eps),
+        torch.nan,
+    )
+
+
 class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -169,6 +183,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.version = 0
         self._resume_checkpoint_loaded = False
         self._resume_warmup_start_step: int | None = None
+        self._pending_policy_gradient_diagnostics: dict | None = None
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
@@ -1367,6 +1382,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             raise ValueError(
                 "Policy-gradient diagnostics require an active, non-warmup policy."
             )
+        measure_optimizer_update = bool(
+            diagnostics_cfg.get("measure_optimizer_update", False)
+        )
+        if measure_optimizer_update and diagnostics_cfg.get("only", False):
+            raise ValueError(
+                "Measuring the optimizer update requires "
+                "policy_gradient_diagnostics.only=false."
+            )
 
         local_metadata = self._logical_state_metadata(train_global_batch)
         gathered_metadata: list[dict[int, int] | None] = [
@@ -1401,6 +1424,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"Computing exact PPO gradient conflicts for {len(state_ids)} logical "
             "states without updating model weights."
         )
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_states = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
         state_gradients = [
             self._backward_policy_diagnostic_batch(
                 train_global_batch,
@@ -1430,6 +1457,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ppo_combined_dot = 0.0
         ppo_kl_dot = 0.0
         state_sum_residual_norm_squared = 0.0
+        state_ppo_dots = torch.zeros(len(state_ids), dtype=torch.float64)
+        state_combined_dots = torch.zeros(len(state_ids), dtype=torch.float64)
         for parameter_index, combined_gradient in enumerate(combined_gradients):
             available = [gradients[parameter_index] for gradients in state_gradients]
             ppo_global_gradient = ppo_global_gradients[parameter_index]
@@ -1475,6 +1504,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             kl_norm_squared += float(torch.dot(kl_gradient, kl_gradient))
             ppo_combined_dot += float(torch.dot(ppo_gradient, combined_flat))
             ppo_kl_dot += float(torch.dot(ppo_gradient, kl_gradient))
+            state_ppo_dots += (stacked @ ppo_gradient).double()
+            state_combined_dots += (stacked @ combined_flat).double()
             state_sum_residual = state_sum_gradient - ppo_gradient
             state_sum_residual_norm_squared += float(
                 torch.dot(state_sum_residual, state_sum_residual)
@@ -1497,6 +1528,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     ],
                     dtype=torch.float64,
                 ),
+                state_ppo_dots,
+                state_combined_dots,
                 signal_stats.flatten(),
             ]
         ).to(self.device)
@@ -1505,7 +1538,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         gram_size = len(state_ids) ** 2
         gram = packed[:gram_size].reshape(len(state_ids), len(state_ids))
         gradient_scalars = packed[gram_size : gram_size + 6]
-        signal_stats = packed[gram_size + 6 :].reshape(len(state_ids), 6)
+        offset = gram_size + 6
+        state_ppo_dots = packed[offset : offset + len(state_ids)]
+        offset += len(state_ids)
+        state_combined_dots = packed[offset : offset + len(state_ids)]
+        offset += len(state_ids)
+        signal_stats = packed[offset:].reshape(len(state_ids), 6)
 
         pairwise_cosines, state_to_aggregate = _gradient_cosines_from_gram(gram)
         ppo_norm, combined_norm, kl_norm = gradient_scalars[:3].clamp_min(0).sqrt()
@@ -1521,6 +1559,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         finite_state_to_aggregate = state_to_aggregate[
             torch.isfinite(state_to_aggregate)
         ]
+        state_norms = gram.diag().clamp_min(0).sqrt()
+        state_to_ppo = _gradient_cosines_to_direction(
+            state_ppo_dots, state_norms, ppo_norm
+        )
+        state_to_combined = _gradient_cosines_to_direction(
+            state_combined_dots, state_norms, combined_norm
+        )
+
+        def summarize_cosines(prefix: str, values: torch.Tensor) -> dict[str, float]:
+            finite = values[torch.isfinite(values)]
+            return {
+                f"{prefix}_mean": float(finite.mean()),
+                f"{prefix}_min": float(finite.min()),
+                f"{prefix}_negative_fraction": float((finite < 0).double().mean()),
+            }
 
         metrics = {
             "diagnostics/policy_gradient/state_count": float(len(state_ids)),
@@ -1557,8 +1610,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 (finite_state_to_aggregate < 0).double().mean()
             ),
         }
+        metrics.update(
+            summarize_cosines(
+                "diagnostics/policy_gradient/state_to_ppo_cosine", state_to_ppo
+            )
+        )
+        metrics.update(
+            summarize_cosines(
+                "diagnostics/policy_gradient/state_to_combined_cosine",
+                state_to_combined,
+            )
+        )
         state_records = []
-        state_norms = gram.diag().clamp_min(0).sqrt()
         for row_index, state_id in enumerate(state_ids):
             count, adv_sum, adv_square_sum, positive_count, return_sum, _ = (
                 signal_stats[row_index]
@@ -1575,6 +1638,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"{state_prefix}/cosine_to_aggregate": float(
                     state_to_aggregate[row_index]
                 ),
+                f"{state_prefix}/cosine_to_ppo": float(state_to_ppo[row_index]),
+                f"{state_prefix}/cosine_to_combined": float(
+                    state_to_combined[row_index]
+                ),
                 f"{state_prefix}/advantage_mean": float(advantage_mean),
                 f"{state_prefix}/advantage_std": float(advantage_std),
                 f"{state_prefix}/advantage_positive_fraction": float(
@@ -1589,6 +1656,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "episode_index": episode_index,
                     "gradient_norm": float(state_norms[row_index]),
                     "cosine_to_aggregate": float(state_to_aggregate[row_index]),
+                    "cosine_to_ppo": float(state_to_ppo[row_index]),
+                    "cosine_to_combined": float(state_to_combined[row_index]),
                     "advantage_mean": float(advantage_mean),
                     "advantage_std": float(advantage_std),
                     "advantage_positive_fraction": float(positive_count / count),
@@ -1597,22 +1666,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 }
             )
 
+        report = {
+            "global_step": self.version,
+            "objective": "PPO state gradients; combined gradient includes KL",
+            "metrics": metrics,
+            "states": state_records,
+            "state_order": state_ids,
+            "pairwise_cosine": pairwise_cosines.tolist(),
+        }
         output_dir = diagnostics_cfg.get("output_dir", None)
-        if output_dir and self._rank == 0:
+        destination = None
+        if output_dir:
             destination = (
                 Path(str(output_dir))
                 / f"global_step_{self.version:06d}"
                 / "policy_gradient_conflicts.json"
             )
+        if destination is not None and self._rank == 0:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            report = {
-                "global_step": self.version,
-                "objective": "PPO state gradients; combined gradient includes KL",
-                "metrics": metrics,
-                "states": state_records,
-                "state_order": state_ids,
-                "pairwise_cosine": pairwise_cosines.tolist(),
-            }
             temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
             temporary.write_text(
                 json.dumps(report, indent=2, sort_keys=True) + "\n",
@@ -1621,8 +1692,124 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             os.replace(temporary, destination)
             self.log_info(f"Saved policy-gradient diagnostic report to {destination}.")
 
-        del state_gradients, ppo_global_gradients, combined_gradients
+        if measure_optimizer_update:
+            self._pending_policy_gradient_diagnostics = {
+                "state_gradients": state_gradients,
+                "ppo_gradients": ppo_global_gradients,
+                "combined_gradients": combined_gradients,
+                "parameters_before": [
+                    parameter.detach().float().cpu().clone()
+                    for parameter in self._optimizer_parameters_by_role["policy"]
+                ],
+                "state_norms": state_norms,
+                "ppo_norm": ppo_norm,
+                "combined_norm": combined_norm,
+                "report": report,
+                "destination": destination,
+            }
+        else:
+            del state_gradients, ppo_global_gradients, combined_gradients
+        torch.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
         self.optimizer.zero_grad()
+        return metrics
+
+    def _finalize_policy_gradient_update_diagnostics(self) -> dict[str, float]:
+        """Compare diagnostic gradients with the realized optimizer update."""
+        pending = self._pending_policy_gradient_diagnostics
+        if pending is None:
+            return {}
+
+        state_gradients = pending["state_gradients"]
+        ppo_gradients = pending["ppo_gradients"]
+        combined_gradients = pending["combined_gradients"]
+        state_dots = torch.zeros(len(state_gradients), dtype=torch.float64)
+        ppo_dot = 0.0
+        combined_dot = 0.0
+        update_norm_squared = 0.0
+        parameters = self._optimizer_parameters_by_role["policy"]
+        for parameter_index, (parameter, parameter_before) in enumerate(
+            zip(parameters, pending["parameters_before"], strict=True)
+        ):
+            # Positive alignment means the realized parameter update locally
+            # decreases the corresponding loss: descent = -delta_theta.
+            descent = -(parameter.detach().float().cpu() - parameter_before).reshape(-1)
+            update_norm_squared += float(torch.dot(descent, descent))
+            for state_index, gradients in enumerate(state_gradients):
+                gradient = gradients[parameter_index]
+                if gradient is not None:
+                    state_dots[state_index] += float(
+                        torch.dot(gradient.reshape(-1), descent)
+                    )
+            ppo_gradient = ppo_gradients[parameter_index]
+            if ppo_gradient is not None:
+                ppo_dot += float(torch.dot(ppo_gradient.reshape(-1), descent))
+            combined_gradient = combined_gradients[parameter_index]
+            if combined_gradient is not None:
+                combined_dot += float(torch.dot(combined_gradient.reshape(-1), descent))
+
+        packed = torch.cat(
+            [
+                state_dots,
+                torch.tensor(
+                    [update_norm_squared, ppo_dot, combined_dot],
+                    dtype=torch.float64,
+                ),
+            ]
+        ).to(self.device)
+        torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+        packed = packed.cpu()
+        update_norm = packed[-3].clamp_min(0).sqrt()
+        state_to_update = _gradient_cosines_to_direction(
+            packed[:-3], pending["state_norms"], update_norm
+        )
+        ppo_to_update = packed[-2] / (pending["ppo_norm"] * update_norm).clamp_min(
+            torch.finfo(torch.float64).eps
+        )
+        combined_to_update = packed[-1] / (
+            pending["combined_norm"] * update_norm
+        ).clamp_min(torch.finfo(torch.float64).eps)
+        finite = state_to_update[torch.isfinite(state_to_update)]
+        metrics = {
+            "diagnostics/policy_gradient/optimizer_update_norm": float(update_norm),
+            "diagnostics/policy_gradient/ppo_to_optimizer_descent_cosine": float(
+                ppo_to_update
+            ),
+            "diagnostics/policy_gradient/combined_to_optimizer_descent_cosine": float(
+                combined_to_update
+            ),
+            "diagnostics/policy_gradient/state_to_optimizer_descent_cosine_mean": float(
+                finite.mean()
+            ),
+            "diagnostics/policy_gradient/state_to_optimizer_descent_cosine_min": float(
+                finite.min()
+            ),
+            "diagnostics/policy_gradient/state_to_optimizer_descent_negative_fraction": float(
+                (finite < 0).double().mean()
+            ),
+        }
+
+        report = pending["report"]
+        report["metrics"].update(metrics)
+        for state_record, cosine in zip(
+            report["states"], state_to_update.tolist(), strict=True
+        ):
+            state_record["cosine_to_optimizer_descent"] = cosine
+        destination = pending["destination"]
+        if destination is not None and self._rank == 0:
+            temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, destination)
+            self.log_info(
+                "Updated policy-gradient diagnostic report with realized "
+                f"optimizer alignment at {destination}."
+            )
+
+        self._pending_policy_gradient_diagnostics = None
         return metrics
 
     @Worker.timer("run_training")
@@ -1686,7 +1873,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         metrics = {}
         append_to_dict(metrics, recompute_metrics)
         diagnostics_cfg = self.cfg.actor.get("policy_gradient_diagnostics", {})
-        if diagnostics_cfg.get("enabled", False):
+        diagnostics_start_step = int(diagnostics_cfg.get("start_step", 0))
+        diagnostics_interval = int(diagnostics_cfg.get("interval", 1))
+        if diagnostics_interval <= 0:
+            raise ValueError("policy_gradient_diagnostics.interval must be positive.")
+        run_policy_diagnostics = (
+            diagnostics_cfg.get("enabled", False)
+            and self.version >= diagnostics_start_step
+            and (self.version - diagnostics_start_step) % diagnostics_interval == 0
+        )
+        if run_policy_diagnostics:
             batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
             if rollout_size != batch_size_per_rank:
                 raise ValueError(
@@ -1794,6 +1990,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         )
                     for key, values in epoch_metrics.items():
                         metrics.setdefault(key, []).extend(values)
+            if phase == "policy" and self._pending_policy_gradient_diagnostics:
+                append_to_dict(
+                    metrics,
+                    self._finalize_policy_gradient_update_diagnostics(),
+                )
         if self.use_independent_update_epochs:
             policy_update_epochs = update_phases[0][1]
             critic_update_epochs = update_phases[1][1]

@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,6 +36,30 @@ from rlinf.envs.remote_collector import (
     recv_frame,
     send_frame,
 )
+from toolkits.b1k_grounded.manage_remote_collectors import (
+    _collector_appdata_root,
+    _collector_pythonpath,
+)
+
+
+def test_collector_pythonpath_prefers_audited_sources():
+    result = _collector_pythonpath(
+        Path("/src/RLinf"),
+        Path("/src/BEHAVIOR-1K/OmniGibson"),
+        "/existing/modules",
+    )
+
+    assert result.split(os.pathsep) == [
+        "/src/RLinf",
+        "/src/BEHAVIOR-1K/OmniGibson",
+        "/existing/modules",
+    ]
+
+
+def test_collector_appdata_is_namespaced_by_host_and_gpu():
+    assert _collector_appdata_root(
+        Path("/tmp"), "radio_run", 3, hostname="gdb/node 1"
+    ) == Path("/tmp/radio_run/gdb_node_1/gpu3")
 
 
 def _start_server(handler, token="test-token"):

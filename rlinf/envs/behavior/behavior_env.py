@@ -62,6 +62,7 @@ from rlinf.utils.logging import get_logger
 __all__ = ["BehaviorEnv", "BehaviorSubpoolEnv"]
 
 _BEHAVIOR_CHILD_ENV_VARS = (
+    "PYTHONPATH",
     "TMPDIR",
     "OMNIGIBSON_DATA_PATH",
     "OMNIGIBSON_DATASET_PATH",

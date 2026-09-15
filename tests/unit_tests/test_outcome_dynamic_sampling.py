@@ -50,6 +50,7 @@ from rlinf.runners.embodied_runner import (
 from rlinf.workers.actor.embodied_fsdp_actor_worker import (
     EmbodiedFSDPActor,
     _gradient_cosines_from_gram,
+    _gradient_cosines_to_direction,
 )
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import _seed_rollout_sampling
@@ -1229,6 +1230,21 @@ def test_gradient_cosines_report_conflict_with_aggregate():
     assert pairwise[0, 1].item() == pytest.approx(-2 / np.sqrt(5))
     assert state_to_aggregate[0].item() == pytest.approx(-1 / np.sqrt(2))
     assert state_to_aggregate[1].item() == pytest.approx(3 / np.sqrt(10))
+
+
+def test_gradient_cosines_to_optimizer_descent_direction():
+    dots = torch.tensor([3.0, -4.0, 0.0], dtype=torch.float64)
+    gradient_norms = torch.tensor([3.0, 4.0, 0.0], dtype=torch.float64)
+
+    cosines = _gradient_cosines_to_direction(
+        dots,
+        gradient_norms,
+        torch.tensor(1.0, dtype=torch.float64),
+    )
+
+    assert cosines[0].item() == pytest.approx(1.0)
+    assert cosines[1].item() == pytest.approx(-1.0)
+    assert torch.isnan(cosines[2])
 
 
 def test_runner_captures_reference_after_resume_checkpoint(tmp_path):

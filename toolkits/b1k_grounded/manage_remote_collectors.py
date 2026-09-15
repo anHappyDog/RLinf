@@ -20,6 +20,7 @@ import argparse
 import os
 import re
 import shlex
+import socket
 import subprocess
 from pathlib import Path
 
@@ -51,6 +52,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ports", type=_parse_csv_ints, default=[46100])
     parser.add_argument("--python", type=Path)
     parser.add_argument("--repo", type=Path)
+    parser.add_argument(
+        "--omnigibson-path",
+        type=Path,
+        help=(
+            "Audited OmniGibson source directory containing the omnigibson "
+            "package. It is prepended to PYTHONPATH for collector daemons."
+        ),
+    )
     parser.add_argument("--log-dir", type=Path)
     parser.add_argument("--session-prefix", default="rlinf_b1k_collector")
     parser.add_argument("--ray-address", default="auto")
@@ -62,6 +71,33 @@ def _session_name(prefix: str, gpu: int) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix):
         raise ValueError("session-prefix contains unsupported characters.")
     return f"{prefix}_gpu{gpu}"
+
+
+def _collector_pythonpath(
+    repo: Path,
+    omnigibson_path: Path | None,
+    inherited_pythonpath: str | None,
+) -> str:
+    """Build an ordered source path for a collector daemon."""
+    paths = [str(repo)]
+    if omnigibson_path is not None:
+        paths.append(str(omnigibson_path))
+    if inherited_pythonpath:
+        paths.append(inherited_pythonpath)
+    return os.pathsep.join(paths)
+
+
+def _collector_appdata_root(
+    tmpdir: Path,
+    session_prefix: str,
+    gpu: int,
+    *,
+    hostname: str | None = None,
+) -> Path:
+    """Return a host-qualified cache root for one collector GPU."""
+    host = socket.gethostname() if hostname is None else hostname
+    host_namespace = re.sub(r"[^A-Za-z0-9_.-]", "_", host)
+    return tmpdir / session_prefix / host_namespace / f"gpu{gpu}"
 
 
 def _tmux_session_exists(session: str) -> bool:
@@ -93,6 +129,13 @@ def _start(args: argparse.Namespace, gpu: int, port: int) -> None:
         raise FileNotFoundError(args.python)
     if not (args.repo / "rlinf").is_dir():
         raise FileNotFoundError(f"RLinf package not found below {args.repo}.")
+    if (
+        args.omnigibson_path is not None
+        and not (args.omnigibson_path / "omnigibson").is_dir()
+    ):
+        raise FileNotFoundError(
+            f"OmniGibson package not found below {args.omnigibson_path}."
+        )
 
     session = _session_name(args.session_prefix, gpu)
     if _tmux_session_exists(session):
@@ -104,7 +147,11 @@ def _start(args: argparse.Namespace, gpu: int, port: int) -> None:
 
     args.log_dir.mkdir(parents=True, exist_ok=True)
     log_path = args.log_dir / f"collector_gpu{gpu}_port{port}.log"
-    appdata_root = Path(os.environ["TMPDIR"]) / args.session_prefix / f"gpu{gpu}"
+    appdata_root = _collector_appdata_root(
+        Path(os.environ["TMPDIR"]),
+        args.session_prefix,
+        gpu,
+    )
     appdata_root.mkdir(parents=True, exist_ok=True)
     inductor_cache = appdata_root / "torchinductor"
     triton_cache = appdata_root / "triton"
@@ -117,7 +164,12 @@ def _start(args: argparse.Namespace, gpu: int, port: int) -> None:
         f"OMNIGIBSON_APPDATA_PATH={appdata_root}",
         f"TORCHINDUCTOR_CACHE_DIR={inductor_cache}",
         f"TRITON_CACHE_DIR={triton_cache}",
-        f"PYTHONPATH={args.repo}",
+        "PYTHONPATH="
+        + _collector_pythonpath(
+            args.repo,
+            args.omnigibson_path,
+            os.environ.get("PYTHONPATH"),
+        ),
         str(args.python),
         "-m",
         "rlinf.envs.behavior.remote_collector",

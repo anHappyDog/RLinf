@@ -1,0 +1,4 @@
+interface:
+  display_name: "RLinf GPU Training Preflight"
+  short_description: "Validate RLinf GPU training before long runs"
+  default_prompt: "Use $rlinf-gpu-training-preflight to validate and plan this RLinf GPU training run."

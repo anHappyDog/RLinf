@@ -210,6 +210,12 @@ actor:
     only: false
     max_states: 0
     output_dir: null
+    # Run only on scheduled policy versions. This allows a resume-only critic
+    # warmup to finish before collecting the diagnostic update.
+    start_step: 0
+    interval: 1
+    # Compare every state gradient with the realized Adam/FSDP parameter delta.
+    measure_optimizer_update: false
   seed: 1234
   enable_offload: true
   model:

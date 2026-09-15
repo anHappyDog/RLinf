@@ -1239,6 +1239,7 @@ def test_behavior_process_is_pinned_to_parent_env_node_and_gpu(monkeypatch):
     monkeypatch.setenv("RANK", "17")
     monkeypatch.setenv("OMNIGIBSON_APPDATA_PATH", "/shared/omnigibson-appdata")
     monkeypatch.setenv("OMNIGIBSON_DATASET_PATH", "/datasets/behavior-1k-assets")
+    monkeypatch.setenv("PYTHONPATH", "/audited/omnigibson:/audited/rlinf")
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", "/tmp/collector-inductor-cache")
 
     cfg = OmegaConf.create(
@@ -1265,6 +1266,7 @@ def test_behavior_process_is_pinned_to_parent_env_node_and_gpu(monkeypatch):
                 "/shared/omnigibson-appdata/node_2/rank_17_gpu_3/process_0"
             ),
             "OMNIGIBSON_DATASET_PATH": "/datasets/behavior-1k-assets",
+            "PYTHONPATH": "/audited/omnigibson:/audited/rlinf",
             "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
             "TORCHINDUCTOR_CACHE_DIR": "/tmp/collector-inductor-cache",
