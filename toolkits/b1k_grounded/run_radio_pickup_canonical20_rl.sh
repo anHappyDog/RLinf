@@ -4,6 +4,7 @@ set -euo pipefail
 
 repo=${B1K_RL_REPO:-/mnt/public/daibo/timeline/0831/RLinf}
 venv=${B1K_RL_VENV:-/mnt/public/daibo/venv/behavior_openpi}
+omnigibson_path=${B1K_RL_OMNIGIBSON_PATH:-/mnt/public/daibo/timeline/0831/BEHAVIOR-1K-b1k-rl-singleenv/OmniGibson}
 model=${B1K_RL_MODEL:-/mnt/public/daibo/models/b1k_grounded_control_v01/pi05_official_train480_p2_sqrt_stage_step20000}
 norm_stats_input=${B1K_RL_NORM_STATS:-/mnt/public/daibo/results/b1k_grounded_control_v01/eval/p2_train480_step6000_comet_native_v1/model/assets/behavior-1k/2025-challenge-demos/norm_stats.json}
 if [[ -d $norm_stats_input ]]; then
@@ -31,7 +32,11 @@ dynamic_batch_size=${B1K_RL_DYNAMIC_BATCH_SIZE:-5}
 dynamic_batch_wait=${B1K_RL_DYNAMIC_BATCH_WAIT_SECONDS:-0.1}
 
 export PATH="$venv/bin:$PATH"
-export PYTHONPATH="$repo"
+if [[ ! -d "$omnigibson_path/omnigibson" ]]; then
+  echo "Audited OmniGibson source not found: $omnigibson_path" >&2
+  exit 1
+fi
+export PYTHONPATH="$repo:$omnigibson_path${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export EMBODIED_PATH="$repo/examples/embodiment"
