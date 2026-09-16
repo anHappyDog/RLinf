@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import os
 import signal
@@ -333,6 +334,7 @@ class BehaviorCollectorService:
 
     def __init__(self) -> None:
         self.env = None
+        self._initialization_payload = None
 
     def __call__(self, method: str, payload: Any) -> dict[str, Any]:
         if method == "initialize":
@@ -364,6 +366,7 @@ class BehaviorCollectorService:
             elif method == "close":
                 self.env.close()
                 self.env = None
+                self._initialization_payload = None
                 result = None
             else:
                 raise KeyError(f"Unknown remote BEHAVIOR method {method!r}.")
@@ -371,7 +374,12 @@ class BehaviorCollectorService:
 
     def _initialize(self, payload: Any) -> None:
         if self.env is not None:
-            raise RuntimeError("Remote BEHAVIOR environment is already initialized.")
+            if payload == self._initialization_payload:
+                return None
+            raise RuntimeError(
+                "Remote BEHAVIOR environment is already initialized with a "
+                "different configuration."
+            )
         if not isinstance(payload, dict):
             raise TypeError("Initialize payload must be a dictionary.")
         from rlinf.envs.behavior.behavior_env import BehaviorSubpoolEnv
@@ -386,6 +394,7 @@ class BehaviorCollectorService:
                 group_world_size=int(payload["group_world_size"])
             ),
         )
+        self._initialization_payload = copy.deepcopy(payload)
         return None
 
     def _attributes(self) -> dict[str, Any]:
@@ -403,6 +412,8 @@ class BehaviorCollectorService:
     def close(self) -> None:
         if self.env is not None:
             self.env.close()
+            self.env = None
+            self._initialization_payload = None
 
 
 def _parse_args() -> argparse.Namespace:

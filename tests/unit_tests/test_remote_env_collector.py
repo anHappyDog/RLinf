@@ -31,6 +31,7 @@ from rlinf.envs.remote_collector import (
     RemoteCollectorConnectionError,
     RemoteCollectorProtocolError,
     RemoteCollectorServer,
+    RemoteCollectorStateLostError,
     decode_message,
     encode_message,
     recv_frame,
@@ -295,6 +296,60 @@ def test_closed_session_releases_collector_for_next_session():
         thread.join(timeout=2)
 
 
+def test_identical_initialize_can_take_over_disconnected_session():
+    calls = []
+
+    def handler(method, payload):
+        calls.append((method, payload))
+        return payload
+
+    server, thread = _start_server(handler)
+    first_client = RemoteCollectorClient(
+        "127.0.0.1", server.bound_port, auth_token="test-token"
+    )
+    second_client = RemoteCollectorClient(
+        "127.0.0.1", server.bound_port, auth_token="test-token"
+    )
+    try:
+        assert first_client.call("initialize", {"run": 1}) == {"run": 1}
+        first_client.close()
+
+        assert second_client.call("initialize", {"run": 1}) == {"run": 1}
+        assert calls == [
+            ("initialize", {"run": 1}),
+            ("initialize", {"run": 1}),
+        ]
+    finally:
+        first_client.close()
+        second_client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+def test_changed_initialize_cannot_take_over_disconnected_session():
+    server, thread = _start_server(lambda _method, payload: payload)
+    first_client = RemoteCollectorClient(
+        "127.0.0.1", server.bound_port, auth_token="test-token"
+    )
+    second_client = RemoteCollectorClient(
+        "127.0.0.1", server.bound_port, auth_token="test-token"
+    )
+    try:
+        first_client.call("initialize", {"run": 1})
+        first_client.close()
+
+        with pytest.raises(
+            RemoteCollectorStateLostError,
+            match="already owned",
+        ):
+            second_client.call("initialize", {"run": 2})
+    finally:
+        first_client.close()
+        second_client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+
+
 def test_decode_rejects_trailing_data():
     with pytest.raises(RemoteCollectorProtocolError, match="trailing bytes"):
         decode_message(encode_message({"ok": True}) + b"unexpected")
@@ -497,6 +552,35 @@ def test_behavior_service_close_releases_environment():
     assert response == {"result": None, "attributes": {}}
     assert env.closed
     assert service.env is None
+
+
+def test_behavior_service_reuses_identical_initialized_environment():
+    from rlinf.envs.behavior.remote_collector import BehaviorCollectorService
+
+    service = BehaviorCollectorService()
+    env = object()
+    payload = {"cfg": {"seed": 7}, "num_envs": 1}
+    service.env = env
+    service._initialization_payload = payload
+
+    response = service("initialize", payload.copy())
+
+    assert response == {"result": None, "attributes": {}}
+    assert service.env is env
+
+
+def test_behavior_service_rejects_different_reinitialization():
+    from rlinf.envs.behavior.remote_collector import BehaviorCollectorService
+
+    service = BehaviorCollectorService()
+    service.env = object()
+    service._initialization_payload = {"cfg": {"seed": 7}, "num_envs": 1}
+
+    with pytest.raises(RuntimeError, match="different configuration"):
+        service(
+            "initialize",
+            {"cfg": {"seed": 8}, "num_envs": 1},
+        )
 
 
 def test_env_worker_closes_train_and_eval_environments():

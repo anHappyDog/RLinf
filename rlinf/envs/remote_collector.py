@@ -682,6 +682,7 @@ class RemoteCollectorServer:
         self.max_message_bytes = int(max_message_bytes)
         self.server_instance_id = uuid.uuid4().hex
         self._session_id: str | None = None
+        self._session_initialize_digest: bytes | None = None
         self._session_closed = False
         self._last_request_id = -1
         self._last_request_digest: bytes | None = None
@@ -758,6 +759,16 @@ class RemoteCollectorServer:
 
         method = request.get("method")
         starts_session = request_id == 0 and method == "initialize"
+        initialize_digest = None
+        if starts_session:
+            initialize_digest = hashlib.sha256(
+                encode_message(
+                    {
+                        "method": method,
+                        "payload": request.get("payload"),
+                    }
+                )
+            ).digest()
         if self._session_id is None:
             if not starts_session:
                 return encode_message(
@@ -769,8 +780,14 @@ class RemoteCollectorServer:
                     )
                 )
             self._session_id = session_id
+            self._session_initialize_digest = initialize_digest
         elif session_id != self._session_id:
-            if not self._session_closed or not starts_session:
+            resumes_initialized_session = (
+                starts_session and initialize_digest == self._session_initialize_digest
+            )
+            if not starts_session or (
+                not self._session_closed and not resumes_initialized_session
+            ):
                 return encode_message(
                     self._error_response(
                         request_id,
@@ -781,6 +798,7 @@ class RemoteCollectorServer:
                 )
             self._session_id = session_id
             self._session_closed = False
+            self._session_initialize_digest = initialize_digest
             self._last_request_id = -1
             self._last_request_digest = None
             self._last_response = None
