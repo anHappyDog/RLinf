@@ -12,6 +12,9 @@ Optimize steady-state global samples per second while preserving training semant
 - Treat read-only inspection, batch planning, and short smoke tests requested as part of a training launch as normal implementation steps.
 - Do not stop an unrelated live job, delete outputs, or overwrite a checkpoint without the user's authorization.
 - Preserve user-selected models, data, seeds, and experimental comparisons. Surface any change required for feasibility.
+- Unless the user explicitly asks the agent to launch or monitor the long job,
+  finish with a reproducible operator handoff rather than starting production
+  training. Preparing an experiment is not implicit authorization to run it.
 
 ## Choose the first MBS by estimation
 
@@ -71,9 +74,40 @@ The manifest must include, as applicable:
 
 Write `N/A` or `disabled` for inapplicable fields rather than silently omitting them. Include derived values such as accumulation and total samples explicitly so arithmetic mistakes are visible.
 
+## Prepare the user-operated launch
+
+For a long run that the user will start, create the launch manifest before
+handoff and provide syntax-checked scripts for preflight, launch, observation,
+scoped stop, and resume. The scripts must use resolved repository, config,
+checkpoint, output, Python, and Ray paths rather than depending on the caller's
+current directory. `preflight.sh` must be read-only and fail before allocating a
+long job when a source revision, data path, checkpoint, port, storage reserve,
+GPU set, or batch invariant is wrong.
+
+The final handoff must contain:
+
+- a single ordered, copyable command sequence;
+- intended values and all derived batch/sample quantities;
+- exact log, effective-config, TensorBoard, checkpoint, and tmux locations;
+- expected startup milestones and estimated time to the first useful metric;
+- exact observation, scoped stop, and resume commands;
+- explicit status: prepared, started, or healthy after a named milestone.
+
+Run `bash -n` on shell scripts and config-only validation when available. Do not
+claim a long job is healthy merely because the launch command returned or a
+tmux session exists.
+
 ## Run a bounded representative probe
 
 Use the real training entrypoint, representative maximum input shapes, and the intended precision/FSDP/checkpointing settings. Run one compile/warmup step followed by at least 10 stable optimizer steps. Exclude startup and compile time from throughput.
+
+For simulator-dominated embodied RL where one global step includes a long
+rollout, do not spend many full global steps merely to satisfy the number 10.
+Use endpoint/trajectory smoke tests plus the smallest representative actor or
+offline fixed-batch update available, and state what was not measured. If the
+real entrypoint is the only valid test, one complete rollout and optimizer
+update is the preflight health gate; longer policy-quality evidence belongs to
+the user-operated experiment.
 
 Record:
 
@@ -96,8 +130,18 @@ Before the long run:
 
 ## Launch and early monitoring gate
 
-Launch the long job only after the selected probe passes. Use a unique output directory and Ray temporary directory, preserve the exact command/config, and verify the effective logged MBS, GBS, world size, accumulation count, LR schedule, data paths, and save settings.
+When the user explicitly asks the agent to launch, do so only after the selected
+probe passes. Use a unique output directory and Ray temporary directory,
+preserve the exact command/config, and verify the effective logged MBS, GBS,
+world size, accumulation count, LR schedule, data paths, and save settings.
 
-Inspect the first 10 stable long-run steps. If throughput is materially below the probe, GPU utilization is persistently low while memory headroom is large, or the effective configuration differs from the plan, stop early when authorized, diagnose, and retune instead of allowing an hours-long inefficient run.
+Inspect the first stable health window: normally 10 optimizer steps, or the
+first complete rollout and update for simulator-dominated embodied RL. If
+throughput is materially below the probe, GPU utilization is persistently low
+while memory headroom is large, or the effective configuration differs from the
+plan, stop early when authorized, diagnose, and retune instead of allowing an
+hours-long inefficient run.
 
-Report the effective launch manifest, selected batch plan, measured throughput, peak memory/headroom, preserved sample budget, estimated completion time, output path, and checkpoint policy to the user.
+Report the effective launch manifest, selected batch plan, measured throughput,
+peak memory/headroom, preserved sample budget, estimated completion time, output
+path, checkpoint policy, and the exact observation commands to the user.
