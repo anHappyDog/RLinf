@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -70,6 +71,9 @@ class SubtaskRewardSpec:
     step_penalty: float = -0.01
     progress_clip: float = 1.0
     max_steps: int = 256
+    potential_discount: float = 1.0
+    prime_potential_at_reset: bool = False
+    zero_terminal_potential: bool = False
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "SubtaskRewardSpec":
@@ -82,6 +86,9 @@ class SubtaskRewardSpec:
             step_penalty=float(value.get("step_penalty", -0.01)),
             progress_clip=float(value.get("progress_clip", 1.0)),
             max_steps=int(value.get("max_steps", 256)),
+            potential_discount=float(value.get("potential_discount", 1.0)),
+            prime_potential_at_reset=bool(value.get("prime_potential_at_reset", False)),
+            zero_terminal_potential=bool(value.get("zero_terminal_potential", False)),
         )
         if spec.success_bonus <= 0:
             raise ValueError("success_bonus must be positive.")
@@ -93,6 +100,8 @@ class SubtaskRewardSpec:
             raise ValueError("progress_clip must be positive.")
         if spec.max_steps <= 0:
             raise ValueError("max_steps must be positive.")
+        if not 0.0 <= spec.potential_discount <= 1.0:
+            raise ValueError("potential_discount must be in [0, 1].")
         return spec
 
 
@@ -104,6 +113,7 @@ class SubtaskRewardOutcome:
     success: bool
     timeout: bool
     potential: float
+    continuation_potential: float
     progress: float
     step_penalty: float
     terminal_reward: float
@@ -119,26 +129,46 @@ class SubtaskRewardTracker:
         self.spec = spec
         self.steps = 0
         self.previous_potential: float | None = None
+        self.initial_potential = 0.0
         self.cumulative_progress = 0.0
         self.cumulative_step_penalty = 0.0
         self.cumulative_terminal_reward = 0.0
 
+    def prime(self, stage_info: Mapping[str, Any]) -> float:
+        """Record the initial state potential before the first action."""
+        if self.steps != 0 or self.previous_potential is not None:
+            raise RuntimeError("Reward potential can only be primed once at reset.")
+        self.previous_potential = self._potential(stage_info)
+        self.initial_potential = self.previous_potential
+        return self.previous_potential
+
+    def _potential(self, stage_info: Mapping[str, Any]) -> float:
+        return sum(term.value(stage_info) for term in self.spec.potential_terms)
+
     def step(self, stage_info: Mapping[str, Any]) -> SubtaskRewardOutcome:
         """Evaluate one stage-info record on a task-independent reward scale."""
         self.steps += 1
-        potential = sum(term.value(stage_info) for term in self.spec.potential_terms)
+        potential = self._potential(stage_info)
+        success = bool(stage_info.get("completed", False))
+        timeout = self.steps >= self.spec.max_steps and not success
+        continuation_potential = (
+            0.0
+            if self.spec.zero_terminal_potential and (success or timeout)
+            else potential
+        )
         if self.previous_potential is None:
             progress = 0.0
         else:
-            raw_progress = potential - self.previous_potential
+            raw_progress = (
+                self.spec.potential_discount * continuation_potential
+                - self.previous_potential
+            )
             progress = max(
                 -self.spec.progress_clip,
                 min(self.spec.progress_clip, raw_progress),
             )
         self.previous_potential = potential
 
-        success = bool(stage_info.get("completed", False))
-        timeout = self.steps >= self.spec.max_steps and not success
         terminal_reward = 0.0
         if success:
             terminal_reward = self.spec.success_bonus
@@ -153,6 +183,7 @@ class SubtaskRewardTracker:
             success=success,
             timeout=timeout,
             potential=potential,
+            continuation_potential=continuation_potential,
             progress=progress,
             step_penalty=self.spec.step_penalty,
             terminal_reward=terminal_reward,
@@ -160,6 +191,46 @@ class SubtaskRewardTracker:
             cumulative_step_penalty=self.cumulative_step_penalty,
             cumulative_terminal_reward=self.cumulative_terminal_reward,
         )
+
+
+def compute_pickup_potential_v2(
+    *,
+    eef_distance: float,
+    target_contact: bool,
+    in_hand: bool,
+    on_support: bool,
+    lift_clearance: float,
+    approach_distance: float = 0.3,
+    lift_clearance_target: float = 0.04,
+) -> dict[str, float]:
+    """Return a bounded phase-aware pickup potential and its components.
+
+    The phases are deliberately separated: approach and contact matter only
+    while the target remains on its original support, a registered grasp moves
+    to a higher potential band, and an unheld dropped target receives no
+    progress credit.
+    """
+    approach_quality = (
+        max(0.0, 1.0 - min(float(eef_distance) / approach_distance, 1.0))
+        if math.isfinite(eef_distance)
+        else 0.0
+    )
+    contact_quality = float(target_contact)
+    lift_quality = min(max(float(lift_clearance) / lift_clearance_target, 0.0), 1.0)
+
+    if in_hand:
+        potential = 1.0 if not on_support else 0.65 + 0.25 * lift_quality
+    elif on_support:
+        potential = 0.35 * approach_quality + 0.20 * contact_quality
+    else:
+        potential = 0.0
+
+    return {
+        "potential": potential,
+        "approach_quality": approach_quality,
+        "contact_quality": contact_quality,
+        "lift_quality": lift_quality,
+    }
 
 
 def apply_reward_overrides(
@@ -273,6 +344,7 @@ def get_stage_info(info: Mapping[str, Any], stage_index: int) -> Mapping[str, An
 
 __all__ = [
     "PotentialTerm",
+    "compute_pickup_potential_v2",
     "SubtaskRewardOutcome",
     "SubtaskRewardSpec",
     "SubtaskRewardTracker",

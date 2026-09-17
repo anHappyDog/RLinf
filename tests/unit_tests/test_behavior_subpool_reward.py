@@ -3,10 +3,111 @@ import pytest
 from rlinf.envs.behavior.subpool_reward import (
     SubtaskRewardSpec,
     SubtaskRewardTracker,
+    compute_pickup_potential_v2,
     get_stage_info,
     resolve_demo_reward_spec,
     validate_demo_horizon,
 )
+
+
+def test_pickup_potential_v2_has_ordered_phases_and_penalizes_drops():
+    far = compute_pickup_potential_v2(
+        eef_distance=0.3,
+        target_contact=False,
+        in_hand=False,
+        on_support=True,
+        lift_clearance=0.0,
+    )
+    contact = compute_pickup_potential_v2(
+        eef_distance=0.0,
+        target_contact=True,
+        in_hand=False,
+        on_support=True,
+        lift_clearance=0.0,
+    )
+    held = compute_pickup_potential_v2(
+        eef_distance=0.0,
+        target_contact=True,
+        in_hand=True,
+        on_support=True,
+        lift_clearance=0.02,
+    )
+    completed = compute_pickup_potential_v2(
+        eef_distance=0.1,
+        target_contact=False,
+        in_hand=True,
+        on_support=False,
+        lift_clearance=0.04,
+    )
+    dropped = compute_pickup_potential_v2(
+        eef_distance=0.1,
+        target_contact=False,
+        in_hand=False,
+        on_support=False,
+        lift_clearance=0.04,
+    )
+
+    assert far["potential"] == pytest.approx(0.0)
+    assert contact["potential"] == pytest.approx(0.55)
+    assert held["potential"] == pytest.approx(0.775)
+    assert completed["potential"] == pytest.approx(1.0)
+    assert dropped["potential"] == pytest.approx(0.0)
+
+
+def test_discounted_potential_is_primed_and_terminal_potential_is_zero():
+    tracker = SubtaskRewardTracker(
+        SubtaskRewardSpec.from_mapping(
+            {
+                "potential_terms": [{"key": "potential"}],
+                "step_penalty": 0.0,
+                "progress_clip": 1.0,
+                "max_steps": 3,
+                "potential_discount": 0.9,
+                "prime_potential_at_reset": True,
+                "zero_terminal_potential": True,
+            }
+        )
+    )
+    assert tracker.prime({"potential": 0.2}) == pytest.approx(0.2)
+
+    approach = tracker.step({"potential": 0.5, "completed": False})
+    success = tracker.step({"potential": 1.0, "completed": True})
+
+    assert approach.progress == pytest.approx(0.25)
+    assert success.progress == pytest.approx(-0.5)
+    assert success.continuation_potential == pytest.approx(0.0)
+    assert success.reward == pytest.approx(9.5)
+
+
+def test_discounted_shaping_return_is_path_independent():
+    def shaping_return(potentials):
+        tracker = SubtaskRewardTracker(
+            SubtaskRewardSpec.from_mapping(
+                {
+                    "potential_terms": [{"key": "potential"}],
+                    "step_penalty": 0.0,
+                    "progress_clip": 1.0,
+                    "max_steps": len(potentials),
+                    "potential_discount": 0.9,
+                    "prime_potential_at_reset": True,
+                    "zero_terminal_potential": True,
+                }
+            )
+        )
+        tracker.prime({"potential": 0.2})
+        rewards = [
+            tracker.step(
+                {
+                    "potential": potential,
+                    "completed": index == len(potentials) - 1,
+                }
+            ).progress
+            for index, potential in enumerate(potentials)
+        ]
+        return sum(0.9**index * reward for index, reward in enumerate(rewards))
+
+    assert shaping_return([0.3, 0.5, 1.0]) == pytest.approx(-0.2)
+    assert shaping_return([0.8, 0.1, 1.0]) == pytest.approx(-0.2)
 
 
 def test_potential_difference_has_common_bonus_and_terminal_status():

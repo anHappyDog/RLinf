@@ -46,6 +46,7 @@ from rlinf.envs.behavior.subpool_reward import (
     SubtaskRewardSpec,
     SubtaskRewardTracker,
     apply_reward_overrides,
+    compute_pickup_potential_v2,
     get_stage_info,
 )
 from rlinf.envs.behavior.utils import (
@@ -728,6 +729,7 @@ class BehaviorProcess:
                     stage_info = get_stage_info(info, self.active_subtask_index)
                     self._apply_direct_navigation_predicate(stage_info)
                     self._attach_arm_specific_distances(stage_info)
+                    self._attach_pickup_potentials(stage_info)
                     outcome = self.subtask_reward_tracker.step(stage_info)
                     self._maybe_capture_stable_recovery_event(stage_info, outcome)
                     info["subpool"] = {
@@ -737,6 +739,10 @@ class BehaviorProcess:
                         "timeout": outcome.timeout,
                         "elapsed_steps": self.subtask_reward_tracker.steps,
                         "potential": outcome.potential,
+                        "initial_potential": (
+                            self.subtask_reward_tracker.initial_potential
+                        ),
+                        "continuation_potential": outcome.continuation_potential,
                         "progress": outcome.progress,
                         "reward_progress_return": outcome.cumulative_progress,
                         "reward_step_penalty_return": (outcome.cumulative_step_penalty),
@@ -939,6 +945,76 @@ class BehaviorProcess:
                     - marker_radius,
                     0.0,
                 )
+
+    def _attach_pickup_potentials(self, stage_info) -> None:
+        """Attach bounded pickup potentials for explicitly requested arms."""
+        if self.subtask_reward_tracker is None:
+            return
+        suffix = "_pickup_potential_v2"
+        requested = {
+            term.key
+            for term in self.subtask_reward_tracker.spec.potential_terms
+            if term.key.endswith(suffix)
+        }
+        if not requested:
+            return
+
+        objects = self._active_stage_objects()
+        if len(objects) < 2 or objects[1] is None:
+            raise RuntimeError(
+                "Pickup potential requires a target and its original support."
+            )
+        target, support = objects[:2]
+
+        from omnigibson.object_states.contact_bodies import ContactBodies
+        from omnigibson.reward_functions.support_utils import (
+            get_obj_center,
+            is_same_object,
+            is_supported_by_surface,
+        )
+
+        wrapped_env = self.env.envs[0]
+        base_env = wrapped_env
+        while hasattr(base_env, "env"):
+            base_env = base_env.env
+        robot = base_env.robots[0]
+        target_position = get_obj_center(target)
+        on_support = is_supported_by_surface(target, support)
+        target_lower, _ = target.aabb
+        _, support_upper = support.aabb
+        lift_clearance = max(float(target_lower[2] - support_upper[2]), 0.0)
+        target_contact_paths = {
+            body.prim_path for body in target.states[ContactBodies].get_value()
+        }
+
+        for key in requested:
+            arm = key[: -len(suffix)]
+            if arm not in robot.arm_names:
+                raise ValueError(
+                    f"Pickup potential requested unknown arm {arm!r}; "
+                    f"available arms are {tuple(robot.arm_names)!r}."
+                )
+            eef_distance = float(
+                torch.linalg.vector_norm(
+                    robot.get_eef_position(arm) - target_position
+                ).item()
+            )
+            finger_paths = {link.prim_path for link in robot.finger_links[arm]}
+            target_contact = bool(finger_paths.intersection(target_contact_paths))
+            in_hand = is_same_object(
+                getattr(robot, "_ag_obj_in_hand", {}).get(arm), target
+            )
+            components = compute_pickup_potential_v2(
+                eef_distance=eef_distance,
+                target_contact=target_contact,
+                in_hand=in_hand,
+                on_support=on_support,
+                lift_clearance=lift_clearance,
+            )
+            stage_info[key] = components["potential"]
+            for name, value in components.items():
+                if name != "potential":
+                    stage_info[f"{arm}_pickup_{name}_v2"] = value
 
     def _active_stage_objects(self):
         """Return the simulator objects associated with the active stage."""
@@ -1228,6 +1304,11 @@ class BehaviorProcess:
         self.subtask_reward_tracker = SubtaskRewardTracker(
             SubtaskRewardSpec.from_mapping(reward_spec)
         )
+        if self.subtask_reward_tracker.spec.prime_potential_at_reset:
+            initial_stage_info = {}
+            self._attach_arm_specific_distances(initial_stage_info)
+            self._attach_pickup_potentials(initial_stage_info)
+            self.subtask_reward_tracker.prime(initial_stage_info)
         obs, info = wrapped_env.get_obs()
         from rlinf.data.b1k_grounded import GroundedControlSpec
 
@@ -1948,6 +2029,12 @@ class BehaviorEnv(gym.Env):
                         ),
                         "reward_terminal_return": float(
                             subpool_info.get("reward_terminal_return", 0.0)
+                        ),
+                        "reward_initial_potential": float(
+                            subpool_info.get("initial_potential", 0.0)
+                        ),
+                        "reward_final_potential": float(
+                            subpool_info.get("potential", 0.0)
                         ),
                     }
                 )
