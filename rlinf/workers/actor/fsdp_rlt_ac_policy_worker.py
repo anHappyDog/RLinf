@@ -483,6 +483,7 @@ class RLTACReplayMixin:
             "actions",
             "intervene_flags",
             "rewards",
+            "executed_action_mask",
             "terminations",
             "truncations",
             "dones",
@@ -493,9 +494,9 @@ class RLTACReplayMixin:
         dict_fields = ("forward_inputs",)
         replay_trajectories = []
         completed_episodes = 0
-        traj_len = int(trajectory.actions.shape[0])
+        traj_len = int(trajectory.rewards.shape[0])
         bsz = int(trajectory.actions.shape[1])
-        num_rows = int(actions.shape[0])
+        num_rows = min(int(actions.shape[0]), int(rewards.shape[0]))
         auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
 
         for env_idx in range(bsz):
@@ -504,6 +505,9 @@ class RLTACReplayMixin:
                 if idx >= num_rows:
                     break
                 if not self._flat_record_transition(flat, idx):
+                    continue
+                execution = flat.get("executed_action_mask")
+                if isinstance(execution, torch.Tensor) and not execution[idx].any():
                     continue
 
                 transition = Trajectory(
@@ -541,6 +545,10 @@ class RLTACReplayMixin:
                     else traj_len - 1,
                 )
                 for done_field in ("dones", "terminations", "truncations"):
+                    if self.cfg.actor.model.model_type == "residual_mlp_policy":
+                        # The replay flattener already removes each rollout epoch's
+                        # leading done slot. Do not shift again across epochs.
+                        continue
                     done_value = getattr(trajectory, done_field, None)
                     if (
                         isinstance(done_value, torch.Tensor)
@@ -557,7 +565,7 @@ class RLTACReplayMixin:
                     isinstance(transition.dones, torch.Tensor)
                     and transition.dones.reshape(-1).to(torch.bool).any()
                 )
-                if is_done:
+                if is_done and self.cfg.actor.model.model_type != "residual_mlp_policy":
                     next_obs = curr_obs
                 else:
                     next_obs = self._rlt_obs_from_flat_dict(flat, "next_obs", idx)
@@ -864,6 +872,10 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         actor_updates_run = 0
         for _ in range(updates_to_run):
             update_actor = int(self.update_step) % int(self.critic_actor_ratio) == 0
+            if self.cfg.actor.model.model_type == "residual_mlp_policy":
+                update_actor = update_actor and int(self.update_step) >= int(
+                    self.cfg.algorithm.residual.critic_warmup_updates
+                )
             metrics_data = self.update_one_epoch(train_actor=True)
             append_to_dict(metrics, metrics_data)
             self.update_step += 1

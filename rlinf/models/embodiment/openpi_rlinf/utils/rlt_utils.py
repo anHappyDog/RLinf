@@ -142,7 +142,9 @@ def _normalize_wrapper_state_dict(state_dict):
     return normalized
 
 
-def load_full_wrapper_weights(wrapper, weights_path, *, expect_rlt: bool) -> None:
+def load_full_wrapper_weights(
+    wrapper, weights_path, *, expect_rlt: bool, require_complete_base: bool = False
+) -> None:
     """Load an RLinf full-wrapper checkpoint into an OpenPI_RLinf wrapper."""
     import torch
 
@@ -159,6 +161,8 @@ def load_full_wrapper_weights(wrapper, weights_path, *, expect_rlt: bool) -> Non
     incompatible = wrapper.load_state_dict(state_dict, strict=False)
     unexpected = list(incompatible.unexpected_keys)
     missing = list(incompatible.missing_keys)
+    if require_complete_base and any(key.startswith("model.") for key in missing):
+        raise RuntimeError(f"Frozen VLA checkpoint is incomplete: {missing[:8]}")
     matched = len(state_dict) - len(unexpected)
     if matched <= 0:
         raise RuntimeError(

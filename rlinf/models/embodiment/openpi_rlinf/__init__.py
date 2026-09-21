@@ -146,6 +146,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             wrapper,
             full_weights_path,
             expect_rlt=bool(OmegaConf.select(model_cfg, "use_rlt", default=False)),
+            require_complete_base=bool(cfg.get("require_complete_base", False)),
         )
 
     source = full_weights_path if full_weights_path is not None else safetensors_path

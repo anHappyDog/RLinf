@@ -1,0 +1,232 @@
+# Always-on residual A. Epsilon: max(0.1 * action std, 0.001), in env units.
+defaults:
+- env/behavior_r1pro_subpool@env.train
+- env/behavior_r1pro_subpool@env.eval
+- hybrid_engines/fsdp@actor.fsdp_config
+- weight_syncer/patch_syncer@weight_syncer
+- override hydra/job_logging: stdout
+- _self_
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+  - file://${oc.env:EMBODIED_PATH}/config/
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: '0'
+    rollout: '0'
+    env: '1'
+runner:
+  task_type: embodied
+  logger:
+    log_path: ${oc.env:B1K_SUBPOOL_RESULT_DIR}
+    project_name: rlinf
+    experiment_name: behavior_residual_mlp_a
+    logger_backends:
+    - tensorboard
+  max_epochs: 1000
+  max_steps: 200
+  only_eval: false
+  weight_sync_interval: 1
+  val_check_interval: -1
+  save_interval: 5
+  resume_dir: null
+  ckpt_path: null
+algorithm:
+  update_epoch: 5
+  rlt_schedule:
+    enable: true
+    max_updates_per_train_step: 100
+    warmup_min_size: 512
+    warmup_post_collect_updates: 100
+    train_every_episodes: 0
+    train_every_transitions: 4
+  group_size: 1
+  reward_type: subtask_chunk_level
+  logprob_type: action_level
+  adv_type: rlt_td3
+  loss_type: rlt_td3
+  loss_agg_func: token-mean
+  agg_q: min
+  actor_agg_q: min
+  enable_drq: false
+  q_head_type: ${actor.model.q_head_type}
+  bootstrap_type: standard
+  gamma: 0.999686
+  tau: 0.005
+  q_weight: 1.0
+  bc_weight: 0.0
+  actor_update_action_noise: false
+  reference_dropout_prob: 0.0
+  actor_weight_schedule:
+    enable: false
+    warmup_updates: 20000
+    ramp_updates: 50000
+    warmup_bc_weight: 7.0
+    warmup_q_weight: 0.05
+    online_bc_weight: 2.8
+    online_q_weight: 0.5
+  entropy_tuning:
+    alpha_type: fixed_alpha
+    initial_alpha: 0.0
+    optim:
+      lr: 0.0003
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+  replay_buffer:
+    enable_cache: true
+    cache_size: 10000
+    sample_window_size: 50000
+    min_buffer_size: 512
+    auto_save: true
+  target_update_freq: 1
+  target_update_type: all
+  train_actor_steps: 512
+  critic_actor_ratio: 2
+  critic_subsample_size: 0
+  backup_entropy: false
+  residual:
+    base_rollout_steps: 1
+    critic_warmup_updates: 100
+    penalty: 0.01
+    target_noise_sigma: 0.1
+    target_noise_clip: 0.25
+    bootstrap_truncation: true
+env:
+  group_name: EnvGroup
+  train:
+    rollout_epoch: 1
+    total_num_envs: 1
+    auto_reset: true
+    ignore_terminations: false
+    max_episode_steps: 1280
+    max_steps_per_rollout_epoch: 1280
+    group_size: 1
+    subpool:
+      reward_overrides: {}
+      sticky_outcome_snapshot: false
+    video_cfg:
+      save_video: false
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    auto_reset: true
+    ignore_terminations: false
+    max_episode_steps: 1280
+    max_steps_per_rollout_epoch: 1280
+    group_size: 1
+    subpool:
+      reward_overrides: {}
+      sticky_outcome_snapshot: false
+      manifest_path: ${oc.env:B1K_EVAL_MANIFEST}
+    video_cfg:
+      save_video: false
+rollout:
+  group_name: RolloutGroup
+  backend: huggingface
+  enable_offload: false
+  pipeline_stage_num: 1
+  seed: 1234
+  collect_transitions: true
+  collect_prev_infos: false
+  model: ${actor.model}
+  rlt_feature_model:
+    model_type: openpi_rlinf
+    precision: bf16
+    is_lora: false
+    lora_rank: 32
+    num_action_chunks: 32
+    action_dim: 23
+    use_proprio: true
+    num_steps: 10
+    add_value_head: false
+    openpi:
+      task: eval
+      config_name: pi05_behavior
+      num_images_in_input: 3
+      action_chunk: ${..num_action_chunks}
+      num_steps: ${..num_steps}
+      action_env_dim: ${..action_dim}
+      model_action_dim: 32
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      max_token_len: 200
+    model_path: /mnt/public/daibo/results/b1k_grounded_control_v01/rl/radio_pickup_canonical20_resume_rlstep10_gaelambda1_h1280_sde_dapo_groups20x20_traj400_mbs100_gbs16000_actionratio_kl001_fp32master_stateattention_p1_c5_crossdc20_steps15_v1/behavior_subpool_ppo_pi05/checkpoints/global_step_15/actor
+    require_complete_base: true
+    openpi_data:
+      norm_stats_path: /mnt/public/daibo/results/b1k_grounded_control_v01/eval/p2_train480_step6000_comet_native_v1/model/assets/behavior-1k/2025-challenge-demos/norm_stats.json
+  enable_torch_compile: false
+  enable_cuda_graph: false
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 64
+  global_batch_size: 256
+  seed: 1234
+  enable_offload: false
+  model:
+    model_type: residual_mlp_policy
+    model_path: ''
+    precision: fp32
+    policy_setup: behavior
+    action_dim: 23
+    num_action_chunks: 32
+    z_dim: 2048
+    proprio_dim: 32
+    add_value_head: false
+    add_q_head: true
+    q_head_type: default
+    mlp_hidden_dim: 256
+    mlp_num_hidden_layers: 2
+    exploration_sigma: 0.1
+    is_lora: false
+    lora_rank: 32
+    epsilon:
+    - 0.01347877
+    - 0.00787457
+    - 0.01213128
+    - 0.04419348
+    - 0.07982396
+    - 0.04435778
+    - 0.001
+    - 0.04389106
+    - 0.01564682
+    - 0.04431942
+    - 0.05226811
+    - 0.0546678
+    - 0.05272938
+    - 0.04831236
+    - 0.09257611
+    - 0.04183771
+    - 0.01629765
+    - 0.03995306
+    - 0.05392108
+    - 0.05444272
+    - 0.05305802
+    - 0.04702192
+    - 0.09642559
+  optim:
+    clip_grad: 10.0
+    lr: 0.0001
+    lr_scheduler: torch_constant
+  critic_optim:
+    clip_grad: 10.0
+    lr: 0.0001
+    lr_scheduler: torch_constant
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    wrap_policy:
+      module_classes_to_wrap:
+      - TwinQCritic
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+    use_orig_params: true
+reward:
+  use_reward_model: false
+critic:
+  use_critic_model: false

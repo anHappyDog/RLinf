@@ -27,10 +27,16 @@ def _append_rlt_transition_obs(
     result: dict[str, Any],
     rlt_obs: dict[str, torch.Tensor],
     final_obs: dict[str, Any] | None,
+    residual: bool = False,
 ) -> None:
     transition_obs = rlt_obs
     if final_obs is not None:
-        transition_obs = feature_model.extract_rlt_obs(final_obs)
+        extract = (
+            feature_model.extract_residual_obs
+            if residual
+            else feature_model.extract_rlt_obs
+        )
+        transition_obs = extract(final_obs)
     for key in RLT_OBS_KEYS:
         result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = transition_obs[key]
 
@@ -49,10 +55,19 @@ def predict_rlt_actions(
     expert_model: Any | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     with torch.no_grad():
-        rlt_obs = feature_model.extract_rlt_obs(env_obs)
+        residual = getattr(rlt_route, "residual", False)
+        extract = (
+            feature_model.extract_residual_obs
+            if residual
+            else feature_model.extract_rlt_obs
+        )
+        rlt_obs = extract(env_obs)
+        policy_mode = mode
+        if residual and mode == "train" and version < rlt_route.base_rollout_steps:
+            policy_mode = "eval"
         actions, result = policy_model.predict_action_batch(
             env_obs=rlt_obs,
-            mode=mode,
+            mode=policy_mode,
             return_obs=True,
         )
         if isinstance(actions, np.ndarray):
@@ -79,6 +94,7 @@ def predict_rlt_actions(
             result=result,
             rlt_obs=rlt_obs,
             final_obs=final_obs,
+            residual=residual,
         )
 
     return actions, result

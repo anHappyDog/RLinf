@@ -1562,7 +1562,9 @@ class EnvWorker(Worker):
                 if (
                     OmegaConf.select(self.cfg, "algorithm.loss_type", default="")
                     == "embodied_dagger"
+                    or self.cfg.actor.model.model_type == "residual_mlp_policy"
                 ):
+                    # The final policy output only supplies the next observation.
                     final_actions = None
                     final_forward_inputs = {}
 

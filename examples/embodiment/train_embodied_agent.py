@@ -72,6 +72,12 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_rlt_td3_policy_worker import RLTTD3FSDPPolicy
 
         actor_worker_cls = RLTTD3FSDPPolicy
+        if cfg.actor.model.model_type == "residual_mlp_policy":
+            from rlinf.workers.actor.fsdp_residual_td3_policy_worker import (
+                ResidualTD3FSDPPolicy,
+            )
+
+            actor_worker_cls = ResidualTD3FSDPPolicy
     elif cfg.algorithm.loss_type == "embodied_dagger":
         if use_training_pipeline:
             raise ValueError(

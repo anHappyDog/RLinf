@@ -104,6 +104,22 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_residual_mlp_policy(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.mlp_policy.residual_mlp_policy import (
+            ResidualMLPPolicy,
+        )
+
+        return ResidualMLPPolicy(
+            z_dim=cfg.z_dim,
+            proprio_dim=cfg.proprio_dim,
+            action_dim=cfg.action_dim,
+            num_action_chunks=cfg.num_action_chunks,
+            epsilon=cfg.epsilon,
+            mlp_hidden_dim=cfg.get("mlp_hidden_dim", 256),
+            mlp_num_hidden_layers=cfg.get("mlp_num_hidden_layers", 2),
+            exploration_sigma=cfg.get("exploration_sigma", 0.1),
+        )
+
     def _build_gr00t(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.gr00t import get_model
 
@@ -243,6 +259,9 @@ def _register_builtin_models():
         _build_rlt_td3_mlp_policy,
         category="embodied",
         force=True,
+    )
+    register_model(
+        SupportedModel.RESIDUAL_MLP_POLICY.value, _build_residual_mlp_policy, force=True
     )
     register_model(
         SupportedModel.GR00T.value,

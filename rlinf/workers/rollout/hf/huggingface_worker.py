@@ -634,7 +634,7 @@ class MultiStepRolloutWorker(Worker):
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
     ) -> torch.Tensor | None:
-        if final_obs is None:
+        if self.model_cfg.model_type == "residual_mlp_policy" or final_obs is None:
             return None
         if not (
             hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head")

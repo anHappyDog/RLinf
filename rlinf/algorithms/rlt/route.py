@@ -244,7 +244,30 @@ class SimulatorRLTRoute(RLTRoute):
         return RLTRouteOutput(actions=routed_actions, result=result)
 
 
+class ResidualRoute(RLTRoute):
+    """Always-on residual after optional base-only collection warmup."""
+
+    residual = True
+
+    def __init__(self, base_rollout_steps: int):
+        self.base_rollout_steps = base_rollout_steps
+
+    def route(self, ctx: RLTRouteContext) -> RLTRouteOutput:
+        actions = ctx.student_actions
+        if ctx.mode == "train" and ctx.version < self.base_rollout_steps:
+            actions = ctx.rlt_obs["ref_chunk"][
+                :, : actions.shape[1], : actions.shape[2]
+            ]
+        ctx.result["forward_inputs"]["action"] = actions.flatten(1).detach()
+        ctx.result["forward_inputs"]["record_transition"] = torch.ones(
+            (actions.shape[0], 1), dtype=torch.bool, device=actions.device
+        )
+        return RLTRouteOutput(actions=actions, result=ctx.result)
+
+
 def build_rlt_route(cfg: Any) -> RLTRoute:
+    if cfg.actor.model.model_type == "residual_mlp_policy":
+        return ResidualRoute(int(cfg.algorithm.residual.base_rollout_steps))
     if use_simulator_transition_replay(cfg):
         schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
         return SimulatorRLTRoute(

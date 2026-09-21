@@ -25,6 +25,8 @@ RLT_TRANSITION_PREFIX = "rlt_transition_"
 
 def use_simulator_transition_replay(cfg: Any) -> bool:
     """Return True for envs that store one replay row per env step."""
+    if cfg.get("actor", {}).get("model", {}).get("model_type") == "residual_mlp_policy":
+        return True
     train_env_cfg = cfg.env.get("train", None)
     if train_env_cfg is None:
         return False

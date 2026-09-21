@@ -157,6 +157,8 @@ def _start(args: argparse.Namespace, gpu: int, port: int) -> None:
     triton_cache = appdata_root / "triton"
     inductor_cache.mkdir(parents=True, exist_ok=True)
     triton_cache.mkdir(parents=True, exist_ok=True)
+    xdg_cache = appdata_root / "xdg_cache"
+    xdg_cache.mkdir(parents=True, exist_ok=True)
     command = [
         "env",
         *(f"{name}={os.environ[name]}" for name in _REQUIRED_ENV),
@@ -164,6 +166,7 @@ def _start(args: argparse.Namespace, gpu: int, port: int) -> None:
         f"OMNIGIBSON_APPDATA_PATH={appdata_root}",
         f"TORCHINDUCTOR_CACHE_DIR={inductor_cache}",
         f"TRITON_CACHE_DIR={triton_cache}",
+        f"XDG_CACHE_HOME={xdg_cache}",
         "PYTHONPATH="
         + _collector_pythonpath(
             args.repo,

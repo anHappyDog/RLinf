@@ -387,6 +387,9 @@ SupportedModel.RLT_TD3_MLP_POLICY = SupportedModel.register(
     "rlt_td3_mlp_policy", force=True
 )
 SupportedModel.GR00T = SupportedModel.register("gr00t", force=True)
+SupportedModel.RESIDUAL_MLP_POLICY = SupportedModel.register(
+    "residual_mlp_policy", force=True
+)
 SupportedModel.DEXBOTIC_PI = SupportedModel.register("dexbotic_pi", force=True)
 SupportedModel.DEXBOTIC_DM0 = SupportedModel.register("dexbotic_dm0", force=True)
 SupportedModel.DREAMZERO = SupportedModel.register("dreamzero", force=True)
@@ -427,6 +430,7 @@ EMBODIED_MODEL = set(
         SupportedModel.MLP_POLICY,
         SupportedModel.RLT_MLP_POLICY,
         SupportedModel.RLT_TD3_MLP_POLICY,
+        SupportedModel.RESIDUAL_MLP_POLICY,
         SupportedModel.GR00T,
         SupportedModel.DEXBOTIC_PI,
         SupportedModel.DEXBOTIC_DM0,
@@ -1317,6 +1321,28 @@ def validate_embodied_cfg(cfg):
                     "max_new_token", None
                 )
 
+    if model_type == SupportedModel.RESIDUAL_MLP_POLICY:
+        assert cfg.algorithm.loss_type == "rlt_td3"
+        assert cfg.rollout.collect_transitions
+        assert not cfg.rollout.get("expert_model")
+        assert not cfg.algorithm.get("outcome_dynamic_sampling", {}).get(
+            "enabled", False
+        )
+        assert cfg.rollout.rlt_feature_model.openpi.task == "eval"
+        assert cfg.rollout.rlt_feature_model.get("require_complete_base", False)
+        assert (
+            cfg.rollout.rlt_feature_model.num_action_chunks
+            == model_cfg.num_action_chunks
+        )
+        assert cfg.rollout.rlt_feature_model.action_dim == model_cfg.action_dim
+        assert model_cfg.precision == "fp32"
+        assert cfg.algorithm.q_head_type == "default"
+        assert cfg.algorithm.residual.penalty >= 0
+        assert cfg.algorithm.residual.critic_warmup_updates >= 0
+        assert cfg.algorithm.residual.base_rollout_steps >= 0
+        assert cfg.algorithm.residual.target_noise_sigma >= 0
+        assert cfg.algorithm.residual.target_noise_clip >= 0
+
     if not only_eval and cfg.runner.get("use_training_pipeline", False):
         assert cfg.algorithm.adv_type in ("gae", "subtask_gae"), (
             "algorithm.adv_type only supports 'gae' and 'subtask_gae' now"
@@ -1488,14 +1514,20 @@ def validate_embodied_cfg(cfg):
             outcome_sampling_cfg.get("enabled", False)
             and outcome_sampling_cfg.get("parallel_groups", False)
         )
-        _validate_embodied_rollout_batch_alignment(
-            max_steps_per_rollout_epoch=cfg.env.train.max_steps_per_rollout_epoch,
-            num_action_chunks=model_cfg.num_action_chunks,
-            rollout_epoch=cfg.env.train.rollout_epoch,
-            total_num_envs=cfg.env.train.total_num_envs,
-            global_batch_size=cfg.actor.global_batch_size,
-            groups_per_update=(1 if parallel_outcome_groups else groups_per_update),
-        )
+        if model_type == SupportedModel.RESIDUAL_MLP_POLICY:
+            assert (
+                cfg.env.train.max_steps_per_rollout_epoch % model_cfg.num_action_chunks
+                == 0
+            )
+        else:
+            _validate_embodied_rollout_batch_alignment(
+                max_steps_per_rollout_epoch=cfg.env.train.max_steps_per_rollout_epoch,
+                num_action_chunks=model_cfg.num_action_chunks,
+                rollout_epoch=cfg.env.train.rollout_epoch,
+                total_num_envs=cfg.env.train.total_num_envs,
+                global_batch_size=cfg.actor.global_batch_size,
+                groups_per_update=(1 if parallel_outcome_groups else groups_per_update),
+            )
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
         assert weight_sync_interval > 0, "weight_sync_interval must be greater than 0"
@@ -1574,55 +1606,58 @@ def validate_embodied_cfg(cfg):
                         "BEHAVIOR subpool RL disables use_training_pipeline so "
                         "advantages can be normalized per subtask over the full batch."
                     )
-                    assert cfg.algorithm.adv_type == "subtask_gae", (
-                        "BEHAVIOR subpool RL requires algorithm.adv_type=subtask_gae."
-                    )
-                    assert cfg.algorithm.reward_type == "subtask_chunk_level", (
-                        "BEHAVIOR subpool RL requires "
-                        "algorithm.reward_type=subtask_chunk_level."
-                    )
-                    assert cfg.algorithm.logprob_type in (
-                        "chunk_level",
-                        "action_level",
-                    ), (
-                        "BEHAVIOR subpool RL requires algorithm.logprob_type to be "
-                        "chunk_level or action_level."
-                    )
-                    assert not cfg.algorithm.get("filter_rewards", False), (
-                        "BEHAVIOR subpool RL disables reward filtering because it "
-                        "would selectively remove low-return subtasks."
-                    )
-                    assert cfg.algorithm.get("normalize_advantages", True), (
-                        "BEHAVIOR subpool RL requires advantage normalization."
-                    )
-                    advantage_clip = cfg.algorithm.get("advantage_clip", None)
-                    assert advantage_clip is None or advantage_clip > 0, (
-                        "algorithm.advantage_clip must be positive when configured."
-                    )
-                    advantage_normalization_scope = cfg.algorithm.get(
-                        "advantage_normalization_scope", "subtask"
-                    )
-                    assert advantage_normalization_scope in (
-                        "subtask",
-                        "logical_state",
-                    ), (
-                        "BEHAVIOR subpool RL requires "
-                        "algorithm.advantage_normalization_scope to be 'subtask' "
-                        "or 'logical_state'."
-                    )
-                    if advantage_normalization_scope == "logical_state":
-                        assert cfg.algorithm.outcome_dynamic_sampling.get(
-                            "enabled", False
-                        ), (
-                            "logical_state advantage normalization requires outcome "
-                            "group scheduling so rollout provenance is available."
+                    if model_type != SupportedModel.RESIDUAL_MLP_POLICY:
+                        assert cfg.algorithm.adv_type == "subtask_gae", (
+                            "BEHAVIOR subpool RL requires algorithm.adv_type=subtask_gae."
                         )
-                    _validate_outcome_dynamic_sampling(
-                        cfg,
-                        model_cfg,
-                        env_world_size=env_world_size,
-                        actor_world_size=component_placement.get_world_size("actor"),
-                    )
+                        assert cfg.algorithm.reward_type == "subtask_chunk_level", (
+                            "BEHAVIOR subpool RL requires "
+                            "algorithm.reward_type=subtask_chunk_level."
+                        )
+                        assert cfg.algorithm.logprob_type in (
+                            "chunk_level",
+                            "action_level",
+                        ), (
+                            "BEHAVIOR subpool RL requires algorithm.logprob_type to be "
+                            "chunk_level or action_level."
+                        )
+                        assert not cfg.algorithm.get("filter_rewards", False), (
+                            "BEHAVIOR subpool RL disables reward filtering because it "
+                            "would selectively remove low-return subtasks."
+                        )
+                        assert cfg.algorithm.get("normalize_advantages", True), (
+                            "BEHAVIOR subpool RL requires advantage normalization."
+                        )
+                        advantage_clip = cfg.algorithm.get("advantage_clip", None)
+                        assert advantage_clip is None or advantage_clip > 0, (
+                            "algorithm.advantage_clip must be positive when configured."
+                        )
+                        advantage_normalization_scope = cfg.algorithm.get(
+                            "advantage_normalization_scope", "subtask"
+                        )
+                        assert advantage_normalization_scope in (
+                            "subtask",
+                            "logical_state",
+                        ), (
+                            "BEHAVIOR subpool RL requires "
+                            "algorithm.advantage_normalization_scope to be 'subtask' "
+                            "or 'logical_state'."
+                        )
+                        if advantage_normalization_scope == "logical_state":
+                            assert cfg.algorithm.outcome_dynamic_sampling.get(
+                                "enabled", False
+                            ), (
+                                "logical_state advantage normalization requires outcome "
+                                "group scheduling so rollout provenance is available."
+                            )
+                        _validate_outcome_dynamic_sampling(
+                            cfg,
+                            model_cfg,
+                            env_world_size=env_world_size,
+                            actor_world_size=component_placement.get_world_size(
+                                "actor"
+                            ),
+                        )
     return cfg
 
 

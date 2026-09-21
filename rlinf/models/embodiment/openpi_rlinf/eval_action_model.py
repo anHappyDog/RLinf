@@ -355,6 +355,38 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         return actions, result
 
     @torch.no_grad()
+    def extract_residual_obs(self, env_obs, *, noise=None, rng=None):
+        """Cache frozen masked VLM features and the ordinary eval reference.
+
+        No RLT weights or trainable projection are used. Proprio is the same
+        normalized, padded state consumed by the frozen VLA.
+        """
+        repacked = self._repack_env_obs(env_obs)
+        processed = self.input_transform(repacked, transpose=False)
+        observation = self._observation_dict_to_device(processed)
+        prepared = pi0_model_module.preprocess_observation(observation, train=False)
+        hidden, mask, cache = self.model.build_prefix_cache(prepared)
+        weights = mask.to(torch.float32).unsqueeze(-1)
+        features = (hidden.float() * weights).sum(1) / weights.sum(1).clamp_min(1)
+        model_actions = self._sample_actions_from_prefix_cache(
+            prepared,
+            mask,
+            cache,
+            noise=noise,
+            rng=rng,
+        )
+        reference = self.output_transform(
+            {"actions": model_actions, "state": observation.state}
+        )["actions"]
+        return {
+            "z_rl": features.detach(),
+            "proprio": observation.state.float().detach(),
+            "ref_chunk": reference.to(
+                device=features.device, dtype=torch.float32
+            ).detach(),
+        }
+
+    @torch.no_grad()
     def extract_rlt_obs(self, env_obs: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Extract the frozen Stage1 features consumed by the Stage2 RLT head."""
         self._require_rlt()
