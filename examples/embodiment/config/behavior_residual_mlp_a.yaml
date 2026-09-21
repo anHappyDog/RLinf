@@ -220,6 +220,7 @@ actor:
     sharding_strategy: no_shard
     wrap_policy:
       module_classes_to_wrap:
+      - BoundedResidualActor
       - TwinQCritic
     mixed_precision:
       param_dtype: ${actor.model.precision}

@@ -1336,6 +1336,10 @@ def validate_embodied_cfg(cfg):
         )
         assert cfg.rollout.rlt_feature_model.action_dim == model_cfg.action_dim
         assert model_cfg.precision == "fp32"
+        if cfg.actor.fsdp_config.strategy == "fsdp":
+            assert {"BoundedResidualActor", "TwinQCritic"}.issubset(
+                cfg.actor.fsdp_config.wrap_policy.module_classes_to_wrap
+            ), "Residual TD3 requires separate FSDP actor and critic units."
         assert cfg.algorithm.q_head_type == "default"
         assert cfg.algorithm.residual.penalty >= 0
         assert cfg.algorithm.residual.critic_warmup_updates >= 0

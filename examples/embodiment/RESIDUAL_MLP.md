@@ -143,6 +143,16 @@ to zero residual with the same VLA sampler and state/noise seeds.
 
 ## Verification / 验证范围
 
+FSDP must wrap `BoundedResidualActor` and `TwinQCritic` separately. A critic-only
+backward with an unwrapped actor at the root can leave its original parameters
+temporarily unregistered, breaking target EMA. The GPU regression test executes
+100 critic-only updates followed by 20 delayed-actor updates (10 actor steps),
+including target EMA throughout. Run it with
+`python -m pytest tests/unit_tests/test_residual_mlp_fsdp.py -q -s` on one free GPU.
+
+FSDP 必须分别包装 actor 和 twin-Q。GPU 回归测试覆盖 100 次 critic-only 更新及后续
+20 次延迟 actor 更新（actor 实际更新 10 次），每步都检查 target EMA。
+
 CPU tests cover full-action zero parity/bounds, masked feature pooling, synthetic
 reference sampler parity, losses and parameter updates, timeout/final-observation
 replay, storage sampling, strict checkpoint rejection and config/model factory loading.
