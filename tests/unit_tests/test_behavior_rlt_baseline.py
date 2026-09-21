@@ -130,3 +130,49 @@ def test_execution_aware_critic_bootstraps_at_actual_prefix():
         True,
     )
     torch.testing.assert_close(loss, target.square().mean())
+
+
+@pytest.mark.parametrize("residual,expected_actor_updates", [(False, 2), (True, 1)])
+def test_schedule_does_not_confuse_replay_semantics_with_actor_warmup(
+    monkeypatch, residual, expected_actor_updates
+):
+    from types import SimpleNamespace
+
+    from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACFSDPPolicy
+
+    cfg = OmegaConf.create(
+        {
+            "actor": {
+                "global_batch_size": 4,
+                "micro_batch_size": 2,
+                "model": {
+                    "model_type": "residual_mlp_policy"
+                    if residual
+                    else "rlt_td3_mlp_policy"
+                },
+            },
+            "algorithm": {"rlt_execution_aware": not residual},
+        }
+    )
+    if residual:
+        cfg.algorithm.residual = {"critic_warmup_updates": 2}
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    updates = []
+    worker = SimpleNamespace(
+        cfg=cfg,
+        use_rlt_schedule=True,
+        _world_size=1,
+        update_step=0,
+        critic_actor_ratio=2,
+        pending_update_budget=4,
+        model=SimpleNamespace(train=lambda: None),
+        _rlt_updates_to_run=lambda: (4, {}),
+        update_one_epoch=lambda **kw: updates.append(kw) or {},
+        process_train_metrics=lambda metrics: metrics,
+    )
+    metrics = RLTACFSDPPolicy.run_training(worker)
+    assert len(updates) == 4 and worker.update_step == 4
+    assert metrics["rlt/critic_updates_run"] == [4.0]
+    assert metrics["rlt/actor_updates_run"] == [float(expected_actor_updates)]

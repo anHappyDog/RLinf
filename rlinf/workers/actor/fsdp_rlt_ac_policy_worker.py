@@ -886,7 +886,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         actor_updates_run = 0
         for _ in range(updates_to_run):
             update_actor = int(self.update_step) % int(self.critic_actor_ratio) == 0
-            if use_execution_aware_replay(self.cfg):
+            if self.cfg.actor.model.model_type == "residual_mlp_policy":
                 update_actor = update_actor and int(self.update_step) >= int(
                     self.cfg.algorithm.residual.critic_warmup_updates
                 )
