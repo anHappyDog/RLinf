@@ -65,6 +65,7 @@ __all__ = ["BehaviorEnv", "BehaviorSubpoolEnv"]
 _BEHAVIOR_CHILD_ENV_VARS = (
     "PYTHONPATH",
     "TMPDIR",
+    "XDG_CACHE_HOME",
     "OMNIGIBSON_DATA_PATH",
     "OMNIGIBSON_DATASET_PATH",
     "OMNIGIBSON_KEY_PATH",
