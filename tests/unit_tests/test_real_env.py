@@ -205,7 +205,9 @@ def test_franka_depth_reaches_the_observation_only_when_asked_for():
 
     from rlinf.scheduler import AcceleratorType, AcceleratorUtil
 
-    if AcceleratorUtil.get_accelerator_type() is AcceleratorType.MUSA_GPU:
+    # get_accelerator_type returns the type as a plain string, so compare by
+    # value; `is` against the enum member is never true.
+    if AcceleratorUtil.get_accelerator_type() == AcceleratorType.MUSA_GPU:
         # This test builds a second rig after closing the first, and MUSA
         # reserves so much address space per process that the second placement
         # cannot allocate its worker. The unit-test workflow already runs
