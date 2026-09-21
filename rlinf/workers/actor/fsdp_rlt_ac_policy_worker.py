@@ -17,7 +17,11 @@ import queue
 import torch
 import torch.nn.functional as F
 
-from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.algorithms.residual import chunk_target
+from rlinf.algorithms.rlt.transition import (
+    use_execution_aware_replay,
+    use_simulator_transition_replay,
+)
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
@@ -269,7 +273,17 @@ class RLTACLossMixin:
             reward_target = self._discounted_chunk_rewards(rewards)
             reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
             bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
-            if bootstrap_type == "always":
+            if use_execution_aware_replay(self.cfg):
+                target_q_values = chunk_target(
+                    rewards,
+                    batch["executed_action_mask"],
+                    batch["terminations"],
+                    batch["truncations"],
+                    q_next,
+                    self.cfg.algorithm.gamma,
+                    self.cfg.algorithm.get("bootstrap_truncation", False),
+                )
+            elif bootstrap_type == "always":
                 target_q_values = reward_target + bootstrap_discount * q_next
             elif bootstrap_type == "standard":
                 target_q_values = reward_target + not_done * bootstrap_discount * q_next
@@ -545,7 +559,7 @@ class RLTACReplayMixin:
                     else traj_len - 1,
                 )
                 for done_field in ("dones", "terminations", "truncations"):
-                    if self.cfg.actor.model.model_type == "residual_mlp_policy":
+                    if use_execution_aware_replay(self.cfg):
                         # The replay flattener already removes each rollout epoch's
                         # leading done slot. Do not shift again across epochs.
                         continue
@@ -565,7 +579,7 @@ class RLTACReplayMixin:
                     isinstance(transition.dones, torch.Tensor)
                     and transition.dones.reshape(-1).to(torch.bool).any()
                 )
-                if is_done and self.cfg.actor.model.model_type != "residual_mlp_policy":
+                if is_done and not use_execution_aware_replay(self.cfg):
                     next_obs = curr_obs
                 else:
                     next_obs = self._rlt_obs_from_flat_dict(flat, "next_obs", idx)
@@ -872,7 +886,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         actor_updates_run = 0
         for _ in range(updates_to_run):
             update_actor = int(self.update_step) % int(self.critic_actor_ratio) == 0
-            if self.cfg.actor.model.model_type == "residual_mlp_policy":
+            if use_execution_aware_replay(self.cfg):
                 update_actor = update_actor and int(self.update_step) >= int(
                     self.cfg.algorithm.residual.critic_warmup_updates
                 )

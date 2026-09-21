@@ -1,0 +1,285 @@
+defaults:
+- env/behavior_r1pro_subpool@env.train
+- env/behavior_r1pro_subpool@env.eval
+- hybrid_engines/fsdp@actor.fsdp_config
+- weight_syncer/patch_syncer@weight_syncer
+- override hydra/job_logging: stdout
+- _self_
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+  - file://${oc.env:EMBODIED_PATH}/config/
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: '0'
+    rollout: '0'
+    env: '1'
+runner:
+  task_type: embodied
+  logger:
+    log_path: ${oc.env:B1K_RLT_RESULT_DIR}
+    project_name: rlinf
+    experiment_name: behavior_rlt_stage2
+    logger_backends:
+    - tensorboard
+  max_epochs: 1000
+  max_steps: 200
+  only_eval: false
+  weight_sync_interval: 1
+  val_check_interval: 5
+  save_interval: 5
+  resume_dir: null
+  ckpt_path: null
+algorithm:
+  update_epoch: 5
+  rlt_schedule:
+    enable: true
+    max_updates_per_train_step: 100
+    warmup_min_size: 1024
+    warmup_post_collect_updates: 2000
+    train_every_episodes: 0
+    train_every_transitions: 5
+  group_size: 1
+  adv_type: rlt_td3
+  loss_type: rlt_td3
+  loss_agg_func: token-mean
+  agg_q: min
+  actor_agg_q: min
+  enable_drq: false
+  q_head_type: ${actor.model.q_head_type}
+  bootstrap_type: standard
+  gamma: 0.999686
+  tau: 0.005
+  q_weight: 1.0
+  bc_weight: 1.0
+  actor_update_action_noise: true
+  reference_dropout_prob: 0.5
+  actor_weight_schedule:
+    enable: true
+    warmup_updates: 2000
+    ramp_updates: 5000
+    warmup_bc_weight: 7.0
+    warmup_q_weight: 0.05
+    online_bc_weight: 2.8
+    online_q_weight: 0.5
+  entropy_tuning:
+    alpha_type: fixed_alpha
+    initial_alpha: 0.0
+    optim:
+      lr: 0.0003
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+  replay_buffer:
+    enable_cache: true
+    cache_size: 10000
+    sample_window_size: 50000
+    max_num_samples: 50000
+    min_buffer_size: 1024
+    auto_save: true
+  target_update_freq: 1
+  target_update_type: all
+  train_actor_steps: 1000
+  critic_actor_ratio: 2
+  critic_subsample_size: 0
+  backup_entropy: false
+  rlt_execution_aware: true
+  rlt_actor_scope: full_task
+  bootstrap_truncation: false
+  reward_type: subtask_chunk_level
+  logprob_type: action_level
+env:
+  group_name: EnvGroup
+  train:
+    rollout_epoch: 1
+    total_num_envs: 1
+    auto_reset: true
+    ignore_terminations: false
+    max_episode_steps: 1280
+    max_steps_per_rollout_epoch: 1280
+    group_size: 1
+    subpool:
+      reward_overrides: {}
+      sticky_outcome_snapshot: false
+      fixed_subtask_id: 1
+    video_cfg:
+      save_video: false
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    auto_reset: true
+    ignore_terminations: false
+    max_episode_steps: 1280
+    max_steps_per_rollout_epoch: 1280
+    group_size: 1
+    subpool:
+      reward_overrides: {}
+      sticky_outcome_snapshot: false
+      manifest_path: ${oc.env:B1K_EVAL_MANIFEST}
+      fixed_subtask_id: 1
+    video_cfg:
+      save_video: false
+rollout:
+  group_name: RolloutGroup
+  backend: huggingface
+  enable_offload: false
+  pipeline_stage_num: 1
+  seed: 1234
+  collect_transitions: true
+  collect_prev_infos: false
+  model:
+    model_type: ${actor.model.model_type}
+    model_path: ''
+    precision: ${actor.model.precision}
+    policy_setup: ${actor.model.policy_setup}
+    action_dim: ${actor.model.action_dim}
+    num_action_chunks: ${actor.model.num_action_chunks}
+    ref_num_action_chunks: ${actor.model.ref_num_action_chunks}
+    z_dim: ${actor.model.z_dim}
+    proprio_dim: ${actor.model.proprio_dim}
+    add_q_head: ${actor.model.add_q_head}
+    q_head_type: ${actor.model.q_head_type}
+    mlp_hidden_dim: ${actor.model.mlp_hidden_dim}
+    mlp_num_hidden_layers: ${actor.model.mlp_num_hidden_layers}
+    actor_noise_sigma: ${actor.model.actor_noise_sigma}
+    is_lora: false
+    lora_rank: 32
+    action_offset: ${actor.model.action_offset}
+    action_scale: ${actor.model.action_scale}
+    action_clip: ${actor.model.action_clip}
+  rlt_feature_model:
+    model_type: openpi_rlinf
+    precision: bf16
+    is_lora: false
+    lora_rank: 32
+    num_action_chunks: 32
+    action_dim: 23
+    use_proprio: true
+    num_steps: 10
+    add_value_head: false
+    openpi:
+      task: eval
+      config_name: pi05_behavior
+      num_images_in_input: 3
+      action_chunk: 32
+      num_steps: 10
+      action_env_dim: 23
+      model_action_dim: 32
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      max_token_len: 512
+      use_rlt: true
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      rlt_prefix_seq_len: 1280
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_image_only: false
+      rlt_use_mask: true
+    model_path: ${oc.env:B1K_RLT_STAGE1_CHECKPOINT}
+    require_complete_base: true
+    openpi_data:
+      norm_stats_path: /mnt/public/daibo/results/b1k_grounded_control_v01/eval/p2_train480_step6000_comet_native_v1/model/assets/behavior-1k/2025-challenge-demos/norm_stats.json
+  enable_torch_compile: false
+  enable_cuda_graph: false
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 64
+  global_batch_size: 256
+  seed: 1234
+  enable_offload: false
+  model:
+    model_type: rlt_td3_mlp_policy
+    precision: fp32
+    policy_setup: behavior
+    action_dim: 23
+    num_action_chunks: 32
+    ref_num_action_chunks: 32
+    z_dim: 2048
+    proprio_dim: 32
+    add_value_head: false
+    add_q_head: true
+    q_head_type: default
+    mlp_hidden_dim: 256
+    mlp_num_hidden_layers: 2
+    actor_noise_sigma: 0.1
+    is_lora: false
+    lora_rank: 32
+    action_clip: null
+    action_offset:
+    - 0.04893109266375809
+    - 0.0006245477533399661
+    - -0.0011740326839283477
+    - 0.9310451754144458
+    - -1.2729174177854237
+    - -0.49817541274017557
+    - 0.0
+    - -0.4161416368262307
+    - 0.04028842801120399
+    - -0.07512601234020208
+    - -0.5943173639491
+    - 0.32049573491580646
+    - 0.11449833148934463
+    - -0.055707589426407134
+    - 0.37810974451379986
+    - -0.46734652490351297
+    - -0.05252230497908911
+    - 0.057440953368954065
+    - -0.6319079902279605
+    - -0.19209668236034977
+    - 0.1400963262097964
+    - 0.04803503401809413
+    - 0.26497314649715065
+    action_scale:
+    - 0.13478765489848302
+    - 0.07874567256492745
+    - 0.12131280149054482
+    - 0.4419347796935527
+    - 0.798239592324256
+    - 0.44357783906871456
+    - 0.001
+    - 0.4389106302489066
+    - 0.15646820569544165
+    - 0.44319416228404
+    - 0.5226811432028959
+    - 0.5466780423732988
+    - 0.5272938230878158
+    - 0.4831235608098808
+    - 0.9257610744303914
+    - 0.4183771095337573
+    - 0.16297654493115837
+    - 0.39953061767050524
+    - 0.5392108370671137
+    - 0.5444271798241045
+    - 0.5305801543217454
+    - 0.47021922602431293
+    - 0.9642559210645204
+  optim:
+    clip_grad: 10.0
+    lr: 0.0001
+    lr_scheduler: torch_constant
+  critic_optim:
+    clip_grad: 10.0
+    lr: 0.0001
+    lr_scheduler: torch_constant
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    wrap_policy:
+      module_classes_to_wrap:
+      - DirectGaussianActor
+      - TwinQCritic
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+    use_orig_params: true
+reward:
+  use_reward_model: false
+critic:
+  use_critic_model: false

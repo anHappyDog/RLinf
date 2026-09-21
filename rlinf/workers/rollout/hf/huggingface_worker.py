@@ -28,6 +28,7 @@ from rlinf.algorithms.rlt import (
     build_rlt_route,
     predict_rlt_actions,
 )
+from rlinf.algorithms.rlt.transition import use_execution_aware_replay
 from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import PolicyOutput
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
@@ -634,7 +635,7 @@ class MultiStepRolloutWorker(Worker):
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
     ) -> torch.Tensor | None:
-        if self.model_cfg.model_type == "residual_mlp_policy" or final_obs is None:
+        if use_execution_aware_replay(self.cfg) or final_obs is None:
             return None
         if not (
             hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head")

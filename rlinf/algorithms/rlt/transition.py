@@ -23,9 +23,20 @@ RLT_OBS_KEYS = ("z_rl", "proprio", "ref_chunk")
 RLT_TRANSITION_PREFIX = "rlt_transition_"
 
 
+def use_execution_aware_replay(cfg: Any) -> bool:
+    """Use primitive execution masks and pre-reset final observations."""
+    return cfg.actor.model.model_type == "residual_mlp_policy" or bool(
+        cfg.algorithm.get("rlt_execution_aware", False)
+    )
+
+
 def use_simulator_transition_replay(cfg: Any) -> bool:
     """Return True for envs that store one replay row per env step."""
-    if cfg.get("actor", {}).get("model", {}).get("model_type") == "residual_mlp_policy":
+    if cfg.get("actor", {}).get("model", {}).get(
+        "model_type"
+    ) == "residual_mlp_policy" or cfg.get("algorithm", {}).get(
+        "rlt_execution_aware", False
+    ):
         return True
     train_env_cfg = cfg.env.get("train", None)
     if train_env_cfg is None:

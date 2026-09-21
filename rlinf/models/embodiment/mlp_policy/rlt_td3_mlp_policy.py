@@ -52,10 +52,35 @@ class DirectGaussianActor(nn.Module):
         num_hidden_layers: int = 2,
         sigma: float = 0.1,
         ref_dropout: float = 0.0,
+        action_offset=None,
+        action_scale=None,
+        action_clip: float | None = 1.0,
     ) -> None:
         super().__init__()
         self.sigma = float(sigma)
         self.ref_dropout = float(ref_dropout)
+        self.action_clip = action_clip
+        if (action_offset is None) != (action_scale is None):
+            raise ValueError("action_offset and action_scale must be supplied together")
+        offset = scale = None
+        if action_scale is not None:
+            offset = torch.as_tensor(action_offset, dtype=torch.float32).flatten()
+            scale = torch.as_tensor(action_scale, dtype=torch.float32).flatten()
+            if (
+                offset.shape != scale.shape
+                or scale.numel() == 0
+                or action_chunk_dim % scale.numel() != 0
+                or not torch.isfinite(offset).all()
+                or not torch.isfinite(scale).all()
+                or (scale <= 0).any()
+            ):
+                raise ValueError(
+                    "action affine statistics must be finite, positive and match action dimensions"
+                )
+            repeat = action_chunk_dim // scale.numel()
+            offset, scale = offset.repeat(repeat), scale.repeat(repeat)
+        self.register_buffer("action_offset", offset)
+        self.register_buffer("action_scale", scale)
         self.mlp = _make_td3_mlp(
             input_dim=int(state_dim) + int(action_chunk_dim),
             output_dim=int(action_chunk_dim),
@@ -89,6 +114,8 @@ class DirectGaussianActor(nn.Module):
         if apply_action_noise is None:
             apply_action_noise = not deterministic
 
+        if self.action_scale is not None:
+            a_tilde = (a_tilde - self.action_offset) / self.action_scale
         reference = (
             self._drop_reference(a_tilde, ref_dropout=ref_dropout)
             if apply_ref_dropout
@@ -97,7 +124,11 @@ class DirectGaussianActor(nn.Module):
         action = self.mlp(torch.cat([x, reference], dim=-1))
         if apply_action_noise and self.sigma > 0.0:
             action = action + torch.randn_like(action) * self.sigma
-        return action.clamp(-1.0, 1.0)
+        if self.action_clip is not None:
+            action = action.clamp(-self.action_clip, self.action_clip)
+        if self.action_scale is not None:
+            action = action * self.action_scale + self.action_offset
+        return action
 
 
 class QNetwork(nn.Module):
@@ -171,6 +202,9 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         mlp_num_hidden_layers: int = 2,
         actor_noise_sigma: float = 0.1,
         ref_action_dropout: float = 0.0,
+        action_offset=None,
+        action_scale=None,
+        action_clip: float | None = 1.0,
     ) -> None:
         super().__init__()
         if not add_q_head:
@@ -209,6 +243,9 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
             num_hidden_layers=mlp_num_hidden_layers,
             sigma=actor_noise_sigma,
             ref_dropout=ref_action_dropout,
+            action_offset=action_offset,
+            action_scale=action_scale,
+            action_clip=action_clip,
         )
         # Name this q_head so existing SAC/RLT optimizer filtering keeps actor
         # and critic optimizers separate.
@@ -310,7 +347,10 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         state = self._state(obs)
         if detach_encoder:
             state = state.detach()
-        return self.q_head(state, self._flatten_batch(actions))
+        actions = self._flatten_batch(actions)
+        if self.actor.action_scale is not None:
+            actions = (actions - self.actor.action_offset) / self.actor.action_scale
+        return self.q_head(state, actions)
 
     def crossq_q_forward(
         self,

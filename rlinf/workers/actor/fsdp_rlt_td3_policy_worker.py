@@ -64,6 +64,13 @@ class RLTTD3LossMixin(RLTACLossMixin):
         action_chunk = self._flatten_chunk(actions).reshape(-1, chunk_len, action_dim)
         ref_chunk = self._flatten_chunk(ref_chunk).reshape(-1, chunk_len, action_dim)
 
+        scale = self.cfg.actor.model.get("action_scale")
+        if scale is not None:
+            scale = torch.as_tensor(scale, device=pi.device, dtype=pi.dtype)
+            pi_chunk = pi_chunk / scale
+            action_chunk = action_chunk / scale
+            ref_chunk = ref_chunk / scale
+
         human_mask = self._human_mask(
             intervene_flags,
             batch_size=pi_chunk.shape[0],

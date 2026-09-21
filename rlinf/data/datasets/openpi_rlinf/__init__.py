@@ -70,7 +70,9 @@ def build_openpi_rlinf_sft_dataloader(
     eval_dataset: bool = False,
 ) -> tuple[Any, Any]:
     """Build the environment-specific openpi_rlinf SFT dataloader."""
-    if bool(cfg.actor.model.openpi.get("use_rlt", False)):
+    if bool(cfg.actor.model.openpi.get("use_rlt", False)) and "behavior" not in str(
+        cfg.actor.model.openpi.config_name
+    ):
         return _load_official_openpi_sft_dataloader()(
             cfg, world_size, rank, data_paths, eval_dataset
         )

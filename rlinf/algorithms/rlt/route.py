@@ -147,9 +147,12 @@ class RealworldRLTRoute(RLTRoute):
 class SimulatorRLTRoute(RLTRoute):
     """Actor/ref/expert routing for ManiSkill RLT with schedule warmup."""
 
-    def __init__(self, *, use_schedule: bool, warmup_updates: int):
+    def __init__(
+        self, *, use_schedule: bool, warmup_updates: int, full_task: bool = False
+    ):
         self.use_schedule = use_schedule
         self.warmup_updates = warmup_updates
+        self.full_task = full_task
 
     def _ready_for_online(self, version: int) -> bool:
         return not self.use_schedule or int(version) >= self.warmup_updates
@@ -161,10 +164,10 @@ class SimulatorRLTRoute(RLTRoute):
         ready_for_online = self._ready_for_online(ctx.version)
 
         critical_phase = _last_info_bool(
-            ctx.rlt_switch_flags,
+            None if self.full_task else ctx.rlt_switch_flags,
             batch_size=batch_size,
             device=actions.device,
-            default=False,
+            default=self.full_task,
         )
         actor_switch = critical_phase
         if self.use_schedule:
@@ -273,5 +276,6 @@ def build_rlt_route(cfg: Any) -> RLTRoute:
         return SimulatorRLTRoute(
             use_schedule=bool(schedule_cfg.get("enable", False)),
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
+            full_task=cfg.algorithm.get("rlt_actor_scope", "env_switch") == "full_task",
         )
     return RealworldRLTRoute()

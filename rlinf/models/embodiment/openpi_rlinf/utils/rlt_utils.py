@@ -170,7 +170,9 @@ def load_full_wrapper_weights(
             "This usually means the checkpoint is still in the legacy official "
             "OpenPI PyTorch key layout."
         )
-    if expect_rlt and any(key.startswith("rlt_module.") for key in missing):
+    if (expect_rlt or any(key.startswith("rlt_module.") for key in state_dict)) and any(
+        key.startswith("rlt_module.") for key in missing
+    ):
         raise RuntimeError(
             f"RLT checkpoint {weights_path} did not load all rlt_module weights; "
             f"missing={missing[:8]}"

@@ -1321,6 +1321,19 @@ def validate_embodied_cfg(cfg):
                     "max_new_token", None
                 )
 
+    if cfg.algorithm.get("rlt_execution_aware", False):
+        assert model_type == SupportedModel.RLT_TD3_MLP_POLICY
+        assert cfg.algorithm.loss_type == "rlt_td3"
+        assert cfg.rollout.collect_transitions
+        assert cfg.rollout.rlt_feature_model.openpi.use_rlt
+        assert cfg.rollout.rlt_feature_model.get("require_complete_base", False)
+        assert cfg.algorithm.rlt_actor_scope in ("full_task", "env_switch")
+        assert cfg.algorithm.q_head_type == "default"
+        if cfg.actor.fsdp_config.strategy == "fsdp":
+            assert {"DirectGaussianActor", "TwinQCritic"}.issubset(
+                cfg.actor.fsdp_config.wrap_policy.module_classes_to_wrap
+            )
+
     if model_type == SupportedModel.RESIDUAL_MLP_POLICY:
         assert cfg.algorithm.loss_type == "rlt_td3"
         assert cfg.rollout.collect_transitions
@@ -1518,7 +1531,9 @@ def validate_embodied_cfg(cfg):
             outcome_sampling_cfg.get("enabled", False)
             and outcome_sampling_cfg.get("parallel_groups", False)
         )
-        if model_type == SupportedModel.RESIDUAL_MLP_POLICY:
+        if model_type == SupportedModel.RESIDUAL_MLP_POLICY or cfg.algorithm.get(
+            "rlt_execution_aware", False
+        ):
             assert (
                 cfg.env.train.max_steps_per_rollout_epoch % model_cfg.num_action_chunks
                 == 0
@@ -1610,7 +1625,10 @@ def validate_embodied_cfg(cfg):
                         "BEHAVIOR subpool RL disables use_training_pipeline so "
                         "advantages can be normalized per subtask over the full batch."
                     )
-                    if model_type != SupportedModel.RESIDUAL_MLP_POLICY:
+                    if model_type not in (
+                        SupportedModel.RESIDUAL_MLP_POLICY,
+                        SupportedModel.RLT_TD3_MLP_POLICY,
+                    ):
                         assert cfg.algorithm.adv_type == "subtask_gae", (
                             "BEHAVIOR subpool RL requires algorithm.adv_type=subtask_gae."
                         )

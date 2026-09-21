@@ -554,7 +554,9 @@ def build_behavior_sft_dataloader(
     assets_dir = model_cfg.openpi.assets_dir
     asset_id = model_cfg.openpi.asset_id
     config_name = str(model_cfg.openpi.config_name)
-    data_kwargs = OmegaConf.select(cfg.actor, "openpi_data", default=None)
+    data_kwargs = OmegaConf.select(model_cfg, "openpi_data", default=None)
+    if data_kwargs is None:
+        data_kwargs = OmegaConf.select(cfg.actor, "openpi_data", default=None)
     if data_kwargs is not None:
         data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
     grounded_sidecar_path = OmegaConf.select(

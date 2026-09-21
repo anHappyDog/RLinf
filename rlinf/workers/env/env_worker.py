@@ -22,7 +22,10 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
-from rlinf.algorithms.rlt.transition import update_rlt_transitions
+from rlinf.algorithms.rlt.transition import (
+    update_rlt_transitions,
+    use_execution_aware_replay,
+)
 from rlinf.algorithms.subtask import (
     outcome_actor_channel_key,
     parallel_outcome_sampling_enabled,
@@ -1559,11 +1562,9 @@ class EnvWorker(Worker):
                 )
                 final_actions = policy_output.forward_inputs.get("action", None)
                 final_forward_inputs = policy_output.forward_inputs
-                if (
-                    OmegaConf.select(self.cfg, "algorithm.loss_type", default="")
-                    == "embodied_dagger"
-                    or self.cfg.actor.model.model_type == "residual_mlp_policy"
-                ):
+                if OmegaConf.select(
+                    self.cfg, "algorithm.loss_type", default=""
+                ) == "embodied_dagger" or use_execution_aware_replay(self.cfg):
                     # The final policy output only supplies the next observation.
                     final_actions = None
                     final_forward_inputs = {}

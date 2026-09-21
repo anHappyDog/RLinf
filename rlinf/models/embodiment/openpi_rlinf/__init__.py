@@ -107,6 +107,14 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             "'eval' to pick the concrete OpenPI PyTorch model variant."
         )
     task = str(task).lower()
+    if (
+        task != "sft"
+        and bool(model_cfg.get("use_rlt", False))
+        and full_weights_path is None
+    ):
+        raise ValueError(
+            "RLT evaluation requires a complete Stage1 full-wrapper checkpoint"
+        )
 
     if task == "eval":
         wrapper = _build_eval_model(
@@ -145,7 +153,10 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
         load_full_wrapper_weights(
             wrapper,
             full_weights_path,
-            expect_rlt=bool(OmegaConf.select(model_cfg, "use_rlt", default=False)),
+            expect_rlt=(
+                task != "sft"
+                and bool(OmegaConf.select(model_cfg, "use_rlt", default=False))
+            ),
             require_complete_base=bool(cfg.get("require_complete_base", False)),
         )
 

@@ -424,6 +424,8 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
                 else np.asarray(raw_proprio).shape[-1]
             )
             proprio = observation.state[..., :state_dim]
+        elif "behavior" in self.config_name.lower():
+            proprio = observation.state
         else:
             proprio = raw_proprio
         if not torch.is_tensor(proprio):
