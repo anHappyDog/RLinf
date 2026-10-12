@@ -207,8 +207,9 @@ def validate_adamw_mixed_precision(
                         f"FSDP parameter {path}.{name} has dtype {param.dtype}, but "
                         f"keep_low_precision_grads=True retains {grad_dtype} gradients. "
                         "Native AdamW requires matching parameter and gradient dtypes. "
-                        "Set actor.optim.use_fp32_master_params=true or "
-                        "keep_low_precision_grads=false in this wrapper's MP policy."
+                        "Set keep_low_precision_grads=false in this wrapper's MP policy, "
+                        "or use FSDP1 NO_SHARD with "
+                        "actor.optim.use_fp32_master_params=true."
                     )
         for name, child in module.named_children():
             validate_module(child, f"{path}.{name}" if path else name, policy)

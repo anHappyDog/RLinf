@@ -102,31 +102,32 @@ The BEHAVIOR / dual-Franka streaming SFT loaders currently still use
 ``num_action_chunks`` as the data window, so those recipes keep it equal to
 the official horizon.
 
-Precision and FSDP:
+Keep original parameters and optimizer updates in FP32 with
+``actor.model.precision: fp32``. Configure FSDP separately: BF16 parameters
+for forward/backward computation, FP32 gradient reduction, and FP32 buffers.
+The shared model templates use ``precision: null`` for OpenPI's selective
+BF16/FP32 parameter dtypes. BEHAVIOR, RoboTwin, dual-Franka, and RLT Stage 1
+SFT recipes set ``precision: fp32``.
 
-- ``actor.model.precision: null`` (OpenPI default: Gemma / SigLIP in bf16,
-  action head in fp32).
-- ``actor.fsdp_config.sharding_strategy`` **must** be ``no_shard``
-  (``full_shard`` / ``shard_grad_op`` fail at startup). Each rank holds full
-  parameters, gradients, and optimizer state.
-- Bind FSDP dtypes to ``actor.model.precision``. BEHAVIOR / RoboTwin recipes
-  also set ``gradient_checkpointing: True`` and
-  ``actor.optim.lr_scheduler: openpi_cosine`` (warmup from
-  ``peak / (warmup + 1)``, then cosine decay to ``min_lr``).
+Use ``no_shard`` and ``use_orig_params: true`` for OpenPI. Each rank holds
+complete parameters, gradients, and optimizer states. BEHAVIOR / RoboTwin
+recipes enable gradient checkpointing and use the ``openpi_cosine`` learning
+rate schedule.
 
 .. code:: yaml
 
    actor:
      model:
-       precision: null
+       precision: fp32
        openpi:
          task: sft
      fsdp_config:
        sharding_strategy: no_shard
+       use_orig_params: true
        mixed_precision:
-         param_dtype: ${actor.model.precision}
-         reduce_dtype: ${actor.model.precision}
-         buffer_dtype: ${actor.model.precision}
+         param_dtype: bf16
+         reduce_dtype: fp32
+         buffer_dtype: fp32
 
 The tokenizer is loaded by OpenPI's ``ModelTransformFactory`` from the base
 model; the SFT YAML does not need a SentencePiece path.

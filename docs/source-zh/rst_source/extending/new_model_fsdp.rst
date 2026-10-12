@@ -334,24 +334,26 @@ timestep，将全局 ``cast_root_forward_inputs`` 设为 ``false``，避免输�
 FSDP 将归约后的梯度转回参数的原始 dtype，供优化器更新。设为 ``true``
 会保留归约 dtype；当该 dtype 占用的字节数更少时，可以减少梯度存储。
 
-保留的梯度与原始参数 dtype 不同时，原生 AdamW 无法更新。
-在设置策略的同时，启用 actor 的 FP32 优化器：
+使用 FSDP1 的 ``no_shard`` 和 ``FP32MasterAdamW``，可以用保留的不同 dtype
+梯度更新参数。为整个 actor 选择该优化器：
 
 .. code-block:: yaml
 
    actor:
+     model:
+       precision: fp32
      optim:
        use_fp32_master_params: true
      fsdp_config:
+       strategy: fsdp
+       sharding_strategy: no_shard
        mixed_precision:
          param_dtype: bf16
          reduce_dtype: bf16
          buffer_dtype: fp32
          keep_low_precision_grads: true
 
-也可以在 ``mixed_precision_policies`` 中为单独的 wrapper 设置该选项。
-``actor.optim.use_fp32_master_params`` 为整个 actor 选择 ``FP32MasterAdamW``，
-沿用参数分组和优化器配置。它在更新时将梯度转为 FP32，保持 FP32 优化器状态，
-并为 BF16/FP16 参数维护 FP32 master weights，因此会增加低精度参数的优化器内存。
-不兼容的策略会在优化器初始化时报错，提示启用此优化器或关闭梯度保留。
-对于原始 FP32 参数，``reduce_dtype: fp32`` 时保留梯度不会减少存储。
+在 ``mixed_precision_policies`` 中设置 ``keep_low_precision_grads``，可以为指定
+wrapper 保留梯度。优化器沿用参数分组和优化器配置，在更新时将梯度转为 FP32，
+并保持 FP32 优化器状态。原始 BF16/FP16 参数还会有一份 FP32 master weights。
+使用原生 AdamW 时，保持默认的 ``keep_low_precision_grads: false``。

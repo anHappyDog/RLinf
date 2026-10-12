@@ -85,25 +85,29 @@ OpenPI 监督微调
 
 BEHAVIOR / dual-Franka 的流式 SFT 加载器目前仍用 ``num_action_chunks`` 当数据窗口，这两份配方里才需要把它设成和官方 horizon 一样。
 
-精度与 FSDP：
+设置 ``actor.model.precision: fp32``，让原始参数和优化器更新使用 FP32。
+单独配置 FSDP：前向和反向计算使用 BF16 参数，梯度归约和 buffer 使用 FP32。
+共享模型模板使用 ``precision: null``，采用 OpenPI 的选择性 BF16/FP32 参数 dtype。
+BEHAVIOR、RoboTwin、dual-Franka 和 RLT Stage 1 SFT 配方设置 ``precision: fp32``。
 
-- ``actor.model.precision: null``\ （OpenPI 默认：Gemma / SigLIP 为 bf16，action head 为 fp32）。
-- ``actor.fsdp_config.sharding_strategy`` **必须** 为 ``no_shard``\ （``full_shard`` / ``shard_grad_op`` 会在启动时失败）。每个 rank 持有完整参数、梯度和 optimizer state。
-- FSDP dtype 绑到 ``actor.model.precision``。BEHAVIOR / RoboTwin 配方还会打开 ``gradient_checkpointing: True``，并用 ``actor.optim.lr_scheduler: openpi_cosine``\ （warmup 从 ``peak / (warmup + 1)`` 开始，再余弦衰减到 ``min_lr``）。
+OpenPI 使用 ``no_shard`` 和 ``use_orig_params: true``，每个 rank 持有完整参数、
+梯度和优化器状态。BEHAVIOR / RoboTwin 配方启用 gradient checkpointing，
+并使用 ``openpi_cosine`` 学习率调度。
 
 .. code:: yaml
 
    actor:
      model:
-       precision: null
+       precision: fp32
        openpi:
          task: sft
      fsdp_config:
        sharding_strategy: no_shard
+       use_orig_params: true
        mixed_precision:
-         param_dtype: ${actor.model.precision}
-         reduce_dtype: ${actor.model.precision}
-         buffer_dtype: ${actor.model.precision}
+         param_dtype: bf16
+         reduce_dtype: fp32
+         buffer_dtype: fp32
 
 Tokenizer 由 OpenPI 的 ``ModelTransformFactory`` 按基础模型加载，YAML 里不用单独写 SentencePiece 路径。
 

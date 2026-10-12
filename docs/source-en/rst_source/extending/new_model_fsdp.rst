@@ -379,27 +379,27 @@ and named policies. FSDP converts reduced gradients back to the parameters'
 original dtype for the optimizer. Set it to ``true`` to retain the reduction
 dtype and reduce gradient storage when that dtype uses fewer bytes.
 
-When retained gradients differ from the original parameter dtype, native AdamW
-cannot update them. Enable the actor's FP32 optimizer alongside the policy:
+Use ``FP32MasterAdamW`` with FSDP1 and ``no_shard`` to update parameters
+from retained gradients of a different dtype. Select it for the whole actor:
 
 .. code-block:: yaml
 
    actor:
+     model:
+       precision: fp32
      optim:
        use_fp32_master_params: true
      fsdp_config:
+       strategy: fsdp
+       sharding_strategy: no_shard
        mixed_precision:
          param_dtype: bf16
          reduce_dtype: bf16
          buffer_dtype: fp32
          keep_low_precision_grads: true
 
-The same flag is available in ``mixed_precision_policies`` for individual
-wrappers. ``actor.optim.use_fp32_master_params`` selects ``FP32MasterAdamW``
-for the whole actor, preserving its parameter groups and optimizer settings.
-It converts gradients to FP32 during updates, keeps FP32 optimizer states, and
-maintains FP32 master weights for BF16/FP16 parameters. This adds optimizer
-memory for low-precision parameters. Incompatible policies fail during optimizer
-initialization with instructions to enable this optimizer or disable gradient
-retention. With ``reduce_dtype: fp32``, gradient retention does not reduce
-storage for originally FP32 parameters.
+Set ``keep_low_precision_grads`` in ``mixed_precision_policies`` to retain
+gradients for specific wrappers. The optimizer preserves parameter groups and
+optimizer settings, converts gradients to FP32 during updates, and keeps FP32
+optimizer states. BF16/FP16 original parameters also have an FP32 master copy.
+Use the default ``keep_low_precision_grads: false`` with native AdamW.
