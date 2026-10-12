@@ -53,6 +53,7 @@ actor:
       repo_id: "realworld_peg_insertion_rlt_stage1"
 
     openpi:
+      embed_dtype: bf16
       task: sft
       config_name: "pi05_franka_state"
       num_images_in_input: 1

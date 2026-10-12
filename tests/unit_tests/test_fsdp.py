@@ -933,3 +933,67 @@ def test_sharded_retained_gradient_dtype(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+@pytest.mark.parametrize("embed_precision", [None, "bf16"])
+def test_openpi_factory_separates_parameter_and_activation_dtypes(
+    tmp_path, monkeypatch, embed_precision
+):
+    from rlinf.models import get_model
+    from rlinf.models.embodiment.openpi.modules import gemma, siglip, utils
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+    from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
+
+    monkeypatch.setattr(gemma, "PALIGEMMA_VOCAB_SIZE", 32)
+    monkeypatch.setattr(utils, "_torch_compile_enabled", False)
+    monkeypatch.setattr(
+        siglip,
+        "_decode_variant",
+        lambda variant: {
+            "width": 32,
+            "depth": 1,
+            "num_heads": 4,
+            "mlp_dim": 64,
+            "patch_size": (14, 14),
+        },
+    )
+    source = Pi0(
+        Pi0Config(
+            pi05=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            action_horizon=2,
+            max_token_len=4,
+        )
+    )
+    torch.save(source.state_dict(), tmp_path / "full_weights.pt")
+    cfg = OmegaConf.create(
+        {
+            "model_type": "openpi",
+            "model_path": str(tmp_path),
+            "precision": "fp32",
+            "is_lora": False,
+            "load_to_device": False,
+            "action_dim": 32,
+            "num_action_chunks": 2,
+            "num_steps": 1,
+            "openpi": {
+                "task": "sft",
+                "torch_compile": False,
+                "model_action_dim": 32,
+                "action_horizon": 2,
+                "paligemma_variant": "dummy",
+                "action_expert_variant": "dummy",
+                "max_token_len": 4,
+            },
+        }
+    )
+    if embed_precision is not None:
+        cfg.openpi.embed_dtype = embed_precision
+
+    model = get_model(cfg)
+
+    expected = torch.bfloat16 if embed_precision == "bf16" else torch.float32
+    assert model.embed_dtype == model.llm.embed_dtype == model.img.dtype_mm == expected
+    assert {param.dtype for param in model.parameters()} == {torch.float32}
+    torch.testing.assert_close(model.img.stem.weight, source.img.stem.weight)

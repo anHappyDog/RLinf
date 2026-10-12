@@ -313,6 +313,9 @@ Use ``mixed_precision`` as the global default MP policy. Select wrappers in
 the names in ``mixed_precision_rules`` to override that default. This Pi05
 example keeps sensitive modules in FP32 while using BF16 elsewhere:
 
+For OpenPI, set ``actor.model.precision: fp32`` for original parameters and
+``actor.model.openpi.embed_dtype: bf16`` for backbone activations and residuals.
+
 .. code-block:: yaml
 
    fsdp_config:

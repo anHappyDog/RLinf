@@ -270,6 +270,9 @@ RL 逻辑保持在模型内部。
 将两者的名称配对，覆盖对应 wrapper 的全局默认策略。下面的 Pi05 示例让
 精度敏感模块使用 FP32，其他部分使用 BF16：
 
+OpenPI 设置 ``actor.model.precision: fp32``，让原始参数使用 FP32；
+设置 ``actor.model.openpi.embed_dtype: bf16``，让主干激活和残差使用 BF16。
+
 .. code-block:: yaml
 
    fsdp_config:

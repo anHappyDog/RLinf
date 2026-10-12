@@ -73,6 +73,7 @@ actor:
     # New-format fp32 base checkpoint (exactly what the reference trainer loads).
     model_path: /path/to/pi05_base_pytorch_new
     openpi:
+      embed_dtype: bf16
       task: sft
     openpi_data:
       # Existing {assets}/{asset_id}/norm_stats.json (the SFT base checkpoint

@@ -62,6 +62,7 @@ actor:
     precision: fp32
     model_path: /workspace/dataset/ci_behavior/base_model
     openpi:
+      embed_dtype: bf16
       task: sft
     openpi_data:
       norm_stats_path: /workspace/dataset/ci_behavior/assets/behavior-1k/2025-challenge-demos/norm_stats.json

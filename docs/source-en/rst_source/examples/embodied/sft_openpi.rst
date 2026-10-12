@@ -103,7 +103,10 @@ The BEHAVIOR / dual-Franka streaming SFT loaders currently still use
 the official horizon.
 
 Keep original parameters and optimizer updates in FP32 with
-``actor.model.precision: fp32``. Configure FSDP separately: BF16 parameters
+``actor.model.precision: fp32``. Set ``actor.model.openpi.embed_dtype: bf16``
+for BF16 backbone activations and residuals. If omitted or null,
+``embed_dtype`` follows ``model.precision``; ``precision: null`` selects BF16
+activations. Configure FSDP separately: BF16 parameters
 for forward/backward computation, FP32 gradient reduction, and FP32 buffers.
 The shared model templates use ``precision: null`` for OpenPI's selective
 BF16/FP32 parameter dtypes. BEHAVIOR, RoboTwin, dual-Franka, and RLT Stage 1
@@ -130,6 +133,7 @@ recipes use the ``openpi_cosine`` learning rate schedule.
        precision: fp32
        openpi:
          task: sft
+         embed_dtype: bf16
      fsdp_config:
        sharding_strategy: no_shard
        use_orig_params: true
@@ -296,6 +300,7 @@ Typical overrides:
        is_lora: False                # set True and lora_rank for LoRA
        openpi:
          task: sft
+         embed_dtype: bf16
          config_name: "pi0_libero"   # use pi0_realworld for Franka
 
 Launch:
@@ -344,6 +349,7 @@ The streaming loader reads only ``data:`` (no hidden defaults). Change at least:
        model_path: /path/to/pi05_base_pytorch_new   # new-format fp32 base weights
        openpi:
          task: sft
+         embed_dtype: bf16
        openpi_data:
          norm_stats_path: /path/to/assets/behavior-1k/2025-challenge-demos/norm_stats.json
 
@@ -378,6 +384,7 @@ matching HF SFT weights:
        action_dim: 14
        openpi:
          task: sft
+         embed_dtype: bf16
          config_name: "pi0_aloha_robotwin"
          num_images_in_input: 3
        openpi_data:

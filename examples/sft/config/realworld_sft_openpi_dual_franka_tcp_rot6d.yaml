@@ -66,6 +66,7 @@ actor:
     num_action_chunks: 20
     action_dim: 20
     openpi:
+      embed_dtype: bf16
       task: sft
       config_name: "pi05_dualfranka_tcp_rot6d"
       # Network prediction horizon (Pi0Config.action_horizon). Matches official
