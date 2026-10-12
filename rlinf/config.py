@@ -17,7 +17,7 @@ import importlib.util
 import logging
 import os
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Union
+from typing import TYPE_CHECKING, Callable, ClassVar, Optional
 
 import torch
 import torch.nn.functional as F
@@ -28,10 +28,14 @@ from omegaconf.dictconfig import DictConfig
 import rlinf.robotics.robots  # noqa: F401
 from rlinf.envs import SupportedEnvType
 from rlinf.scheduler.cluster import Cluster
+from rlinf.utils.fsdp_config import validate_fsdp_wrapper_config
 from rlinf.utils.placement import (
     HybridComponentPlacement,
     ModelParallelComponentPlacement,
     PlacementMode,
+)
+from rlinf.utils.precision import (
+    torch_dtype_from_precision as torch_dtype_from_precision,
 )
 
 if TYPE_CHECKING:
@@ -175,23 +179,6 @@ SUPPORTED_TASK_TYPE = [
 ]
 SUPPORTED_TRAINING_BACKENDS = ["megatron", "fsdp"]
 __all__ = ["build_config"]
-
-
-def torch_dtype_from_precision(
-    precision: Union[int, str, None],
-) -> Optional[torch.dtype]:
-    if precision in ["bf16", "bf16-mixed"]:
-        return torch.bfloat16
-    elif precision in [16, "16", "fp16", "16-mixed"]:
-        return torch.float16
-    elif precision in [32, "32", "fp32", "32-true"]:
-        return torch.float32
-    elif precision in [None, "null"]:
-        return None
-    else:
-        raise ValueError(
-            f"Could not parse the precision of `{precision}` to a valid torch.dtype"
-        )
 
 
 @torch.jit.script
@@ -612,11 +599,19 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
             "buffer_dtype", None
         )
         cfg.fsdp_config = validate_amp_cfg(cfg.fsdp_config)
-        from rlinf.hybrid_engines.fsdp.mixed_precision import (
-            validate_fsdp_wrapper_config,
-        )
-
         validate_fsdp_wrapper_config(cfg.fsdp_config)
+
+        if model_type is not None and str(model_type) == SupportedModel.OPENPI.value:
+            low_precision = any(
+                torch_dtype_from_precision(mixed_precision_config[field])
+                not in (None, torch.float32)
+                for field in ("param_dtype", "reduce_dtype", "buffer_dtype")
+            )
+            if low_precision and not cfg.fsdp_config.get("mixed_precision_rules"):
+                raise ValueError(
+                    "OpenPI low-precision FSDP policies require mixed_precision_rules "
+                    "for its FP32 modules."
+                )
 
         if cfg.get("optim", {}).get("use_fp32_master_params", False):
             validate_fp32_master_adamw_config(

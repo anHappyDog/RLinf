@@ -109,12 +109,21 @@ The shared model templates use ``precision: null`` for OpenPI's selective
 BF16/FP32 parameter dtypes. BEHAVIOR, RoboTwin, dual-Franka, and RLT Stage 1
 SFT recipes set ``precision: fp32``.
 
+Select ``hybrid_engines/openpi_fsdp`` to keep projections, RMSNorm weights,
+and vision embeddings in FP32. The profile preserves FP32 action/time inputs
+and adaptive-norm conditioning while the backbone computes in BF16.
+RLT Stage 1 recipes also keep ``rlt_module`` in FP32.
+
 Use ``no_shard`` and ``use_orig_params: true`` for OpenPI. Each rank holds
 complete parameters, gradients, and optimizer states. BEHAVIOR / RoboTwin
-recipes enable gradient checkpointing and use the ``openpi_cosine`` learning
-rate schedule.
+recipes use the ``openpi_cosine`` learning rate schedule.
 
 .. code:: yaml
+
+   defaults:
+     - model/pi0_5@actor.model
+     - hybrid_engines/openpi_fsdp@actor.fsdp_config
+     - _self_
 
    actor:
      model:

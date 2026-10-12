@@ -90,11 +90,19 @@ BEHAVIOR / dual-Franka 的流式 SFT 加载器目前仍用 ``num_action_chunks``
 共享模型模板使用 ``precision: null``，采用 OpenPI 的选择性 BF16/FP32 参数 dtype。
 BEHAVIOR、RoboTwin、dual-Franka 和 RLT Stage 1 SFT 配方设置 ``precision: fp32``。
 
+选择 ``hybrid_engines/openpi_fsdp``，让 projection、RMSNorm 权重和视觉 embedding
+使用 FP32。该配方保留 FP32 的 action/time 输入及自适应 norm 条件，主干使用 BF16 计算。
+RLT Stage 1 配方还让 ``rlt_module`` 使用 FP32。
+
 OpenPI 使用 ``no_shard`` 和 ``use_orig_params: true``，每个 rank 持有完整参数、
-梯度和优化器状态。BEHAVIOR / RoboTwin 配方启用 gradient checkpointing，
-并使用 ``openpi_cosine`` 学习率调度。
+梯度和优化器状态。BEHAVIOR / RoboTwin 配方使用 ``openpi_cosine`` 学习率调度。
 
 .. code:: yaml
+
+   defaults:
+     - model/pi0_5@actor.model
+     - hybrid_engines/openpi_fsdp@actor.fsdp_config
+     - _self_
 
    actor:
      model:

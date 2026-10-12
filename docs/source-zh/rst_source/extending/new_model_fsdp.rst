@@ -280,14 +280,15 @@ RL 逻辑保持在模型内部。
        param_dtype: bf16
        reduce_dtype: fp32
        buffer_dtype: fp32
+       cast_forward_inputs: false
        cast_root_forward_inputs: false
      wrappers:
        projections:
          wrap_names: [action_in_proj, action_out_proj, time_mlp_in, time_mlp_out]
-       norms_and_embedding:
-         module_classes:
-           - rlinf.models.embodiment.openpi.modules.gemma.RMSNorm
-           - torch.nn.modules.conv.Conv2d
+       norms:
+         module_classes: [RMSNorm]
+       vision_embedding:
+         module_names: [img, img.stem]
        vision_mlps:
          module_names: ["img.encoder.layers.*.mlp"]
          wrap_mode: subtree
@@ -297,15 +298,22 @@ RL 逻辑保持在模型内部。
          reduce_dtype: fp32
          buffer_dtype: fp32
          cast_forward_inputs: true
+       fp32_preserve_inputs:
+         param_dtype: fp32
+         reduce_dtype: fp32
+         buffer_dtype: fp32
+         cast_forward_inputs: false
      mixed_precision_rules:
        projections: fp32
-       norms_and_embedding: fp32
+       norms: fp32_preserve_inputs
+       vision_embedding: fp32_preserve_inputs
        vision_mlps: fp32
      amp_autocast:
        enabled: false
 
 每个 wrapper 选择一种匹配方式：``module_names`` 支持完整模块路径和
-``img.encoder.layers.*.mlp`` 等 glob；``module_classes`` 匹配 Python 类的完整限定名；
+``img.encoder.layers.*.mlp`` 等 glob；``module_classes`` 支持短类名和完整限定名，
+与 ``wrap_policy.module_classes_to_wrap`` 共用解析规则；
 ``wrap_names`` 匹配已有的 ``_fsdp_wrap_name`` 标签。Pi05 在模型初始化时
 为 projection 模块设置这些标签。
 
@@ -322,8 +330,8 @@ RL 逻辑保持在模型内部。
 显式选择的 wrapper 重叠。
 
 命名策略必须填写三个 dtype 字段。未绑定规则的 wrapper 使用全局策略，
-嵌套 wrapper 保留各自策略。设置 ``cast_forward_inputs: true``，在 FP32
-wrapper 边界转换输入。输入需要保留 FP32 精度时，例如 Pi05 的 action 和
+嵌套 wrapper 保留各自策略。全局和命名策略的 ``cast_forward_inputs`` 默认均为
+``true``。模块自行处理输入转换时，例如 OpenPI RMSNorm，将其设为 ``false``。输入需要保留 FP32 精度时，例如 Pi05 的 action 和
 timestep，将全局 ``cast_root_forward_inputs`` 设为 ``false``，避免输入到达
 该 wrapper 前已被舍入到 BF16。
 
@@ -331,8 +339,9 @@ timestep，将全局 ``cast_root_forward_inputs`` 设为 ``false``，避免输�
 ~~~~~~~~~~~~~~~~
 
 全局策略和命名策略中的 ``keep_low_precision_grads`` 默认均为 ``false``。
-FSDP 将归约后的梯度转回参数的原始 dtype，供优化器更新。设为 ``true``
-会保留归约 dtype；当该 dtype 占用的字节数更少时，可以减少梯度存储。
+FSDP 将梯度转回参数的原始 dtype，供优化器更新。设为 ``true`` 时，分片策略和
+FSDP CPU 参数 offload 使用计算 dtype 准备梯度（``param_dtype``，未设置时为原始 dtype）；
+不使用 CPU offload 的 ``no_shard`` 保留实际归约 dtype。保留较小的 dtype 可以减少梯度存储。
 
 使用 FSDP1 的 ``no_shard`` 和 ``FP32MasterAdamW``，可以用保留的不同 dtype
 梯度更新参数。为整个 actor 选择该优化器：

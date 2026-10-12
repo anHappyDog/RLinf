@@ -323,14 +323,15 @@ example keeps sensitive modules in FP32 while using BF16 elsewhere:
        param_dtype: bf16
        reduce_dtype: fp32
        buffer_dtype: fp32
+       cast_forward_inputs: false
        cast_root_forward_inputs: false
      wrappers:
        projections:
          wrap_names: [action_in_proj, action_out_proj, time_mlp_in, time_mlp_out]
-       norms_and_embedding:
-         module_classes:
-           - rlinf.models.embodiment.openpi.modules.gemma.RMSNorm
-           - torch.nn.modules.conv.Conv2d
+       norms:
+         module_classes: [RMSNorm]
+       vision_embedding:
+         module_names: [img, img.stem]
        vision_mlps:
          module_names: ["img.encoder.layers.*.mlp"]
          wrap_mode: subtree
@@ -340,16 +341,22 @@ example keeps sensitive modules in FP32 while using BF16 elsewhere:
          reduce_dtype: fp32
          buffer_dtype: fp32
          cast_forward_inputs: true
+       fp32_preserve_inputs:
+         param_dtype: fp32
+         reduce_dtype: fp32
+         buffer_dtype: fp32
+         cast_forward_inputs: false
      mixed_precision_rules:
        projections: fp32
-       norms_and_embedding: fp32
+       norms: fp32_preserve_inputs
+       vision_embedding: fp32_preserve_inputs
        vision_mlps: fp32
      amp_autocast:
        enabled: false
 
 Choose one selector per wrapper: ``module_names`` matches exact module paths
-or globs such as ``img.encoder.layers.*.mlp``; ``module_classes`` matches qualified Python
-class names; ``wrap_names`` matches existing ``_fsdp_wrap_name`` tags. Pi05 assigns
+or globs such as ``img.encoder.layers.*.mlp``; ``module_classes`` accepts short or qualified Python
+class names, using the same resolver as ``wrap_policy.module_classes_to_wrap``; ``wrap_names`` matches existing ``_fsdp_wrap_name`` tags. Pi05 assigns
 these tags to its projection modules during model initialization.
 
 Set ``wrap_mode`` to control the boundaries:
@@ -365,8 +372,9 @@ Each wrapper's managed parameters must share their original dtype. Mixed
 boundaries must not overlap other explicitly selected wrappers.
 
 Specify all three dtype fields in each named policy. Wrappers without a binding
-use the global policy; nested wrappers retain their own policies. Set
-``cast_forward_inputs: true`` to convert inputs at an FP32 wrapper boundary.
+use the global policy; nested wrappers retain their own policies. Both global
+and named policies default to ``cast_forward_inputs: true``. Set it to ``false``
+when the module handles input casting itself, as OpenPI RMSNorm does.
 When inputs must retain FP32 precision, as with Pi05 actions and timesteps,
 set global ``cast_root_forward_inputs: false`` to avoid rounding them to BF16
 before they reach that wrapper.
@@ -375,9 +383,11 @@ Retaining Low-Precision Gradients
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``keep_low_precision_grads`` defaults to ``false`` in both the global policy
-and named policies. FSDP converts reduced gradients back to the parameters'
-original dtype for the optimizer. Set it to ``true`` to retain the reduction
-dtype and reduce gradient storage when that dtype uses fewer bytes.
+and named policies. FSDP converts gradients back to the parameters' original dtype for the
+optimizer. With ``true``, sharded strategies and FSDP CPU parameter offload prepare
+gradients in the compute dtype (``param_dtype``, or the original dtype when
+unset); ``no_shard`` without CPU offload retains the effective reduction dtype.
+Retaining a smaller dtype reduces gradient storage.
 
 Use ``FP32MasterAdamW`` with FSDP1 and ``no_shard`` to update parameters
 from retained gradients of a different dtype. Select it for the whole actor:
