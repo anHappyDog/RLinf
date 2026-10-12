@@ -59,6 +59,7 @@ actor:
   seed: 0
 
   model:
+    precision: fp32
     model_path: /path/to/pi05_base_pytorch_new
     # Dual-Franka tcp_rot6d: 20-dim env actions
     # [L_xyz, L_rot6d, L_grip, R_xyz, R_rot6d, R_grip], 20-step env/SFT window.
@@ -97,9 +98,9 @@ actor:
     use_orig_params: True
     gradient_checkpointing: False
     mixed_precision:
-      param_dtype: ${actor.model.precision}
-      reduce_dtype: ${actor.model.precision}
-      buffer_dtype: ${actor.model.precision}
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
 
 reward:
   use_reward_model: False
