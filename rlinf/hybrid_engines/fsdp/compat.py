@@ -24,6 +24,7 @@ from torch.distributed.fsdp import (
     ShardingStrategy,
     StateDictType,
 )
+from torch.distributed.fsdp._common_utils import clean_tensor_name
 from torch.distributed.fsdp._runtime_utils import (
     _cast_buffers_to_dtype_and_device,
     _get_buffers_and_dtypes_for_computation,
@@ -61,9 +62,15 @@ def apply_buffer_dtype_compatibility(model: FSDP) -> None:
             and model.sharding_strategy != ShardingStrategy.NO_SHARD
         ):
             return
-        for name, dtype in model._buffer_name_to_orig_dtype.items():
-            if name in model._ignored_buffer_names:
+        buffers, dtypes = _get_buffers_and_dtypes_for_computation(model, model)
+        mixed_precision_buffers = {
+            id(buffer) for buffer, dtype in zip(buffers, dtypes) if dtype is not None
+        }
+        for name, buffer in model.named_buffers():
+            if id(buffer) not in mixed_precision_buffers:
                 continue
+            name = clean_tensor_name(name)
+            dtype = model._buffer_name_to_orig_dtype[name]
             key = prefix + name
             buffer = state_dict.get(key)
             if (
@@ -76,4 +83,4 @@ def apply_buffer_dtype_compatibility(model: FSDP) -> None:
     if version.parse(torch.__version__) < version.parse("2.7.0"):
         # The wrapped module's hook runs after FSDP's native root pre-forward.
         model.module.register_forward_pre_hook(restore_buffer_dtypes, prepend=True)
-    model.register_state_dict_post_hook(restore_checkpoint_dtypes)
+    model._register_state_dict_hook(restore_checkpoint_dtypes)
