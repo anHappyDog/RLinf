@@ -382,6 +382,11 @@ When inputs must retain FP32 precision, as with Pi05 actions and timesteps,
 set global ``cast_root_forward_inputs: false`` to avoid rounding them to BF16
 before they reach that wrapper.
 
+``buffer_dtype`` controls floating-point buffers during computation. FSDP saves
+buffers in their original dtype in full and sharded model checkpoints;
+``LOCAL_STATE_DICT`` does not restore their dtype. ``summon_full_params()``
+restores parameter precision and does not restore buffer precision.
+
 Retaining Low-Precision Gradients
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

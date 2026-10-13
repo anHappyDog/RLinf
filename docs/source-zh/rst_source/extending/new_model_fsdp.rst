@@ -338,6 +338,10 @@ OpenPI 设置 ``actor.model.precision: fp32``，让原始参数使用 FP32；
 timestep，将全局 ``cast_root_forward_inputs`` 设为 ``false``，避免输入到达
 该 wrapper 前已被舍入到 BF16。
 
+``buffer_dtype`` 控制浮点 buffer 的计算 dtype。FSDP 在完整和分片模型
+checkpoint 中按原始 dtype 保存 buffer；``LOCAL_STATE_DICT`` 不做该 dtype 恢复。
+``summon_full_params()`` 恢复参数精度，不恢复 buffer 精度。
+
 保留低精度梯度
 ~~~~~~~~~~~~~~~~
 

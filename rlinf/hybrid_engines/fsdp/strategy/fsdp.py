@@ -25,6 +25,7 @@ from torch.distributed.fsdp import (
 from torch.optim import Optimizer
 
 from rlinf.hybrid_engines.fsdp import FSDP, CPUOffload
+from rlinf.hybrid_engines.fsdp.compat import apply_buffer_dtype_compatibility
 from rlinf.hybrid_engines.fsdp.mixed_precision import (
     build_mixed_precision,
     get_mixed_precision_wrap_policy,
@@ -193,6 +194,7 @@ class FSDPStrategy(FSDPStrategyBase):
             use_orig_params=self.cfg.fsdp_config.use_orig_params,
             cpu_offload=cpu_offload,
         )
+        apply_buffer_dtype_compatibility(fsdp_model)
         return fsdp_model
 
     @classmethod

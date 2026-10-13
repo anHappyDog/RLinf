@@ -33,6 +33,7 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 
 from rlinf.config import validate_fsdp_cfg
+from rlinf.hybrid_engines.fsdp.compat import apply_buffer_dtype_compatibility
 from rlinf.hybrid_engines.fsdp.mixed_precision import (
     build_mixed_precision,
     get_mixed_precision_wrap_policy,
@@ -333,8 +334,15 @@ def test_strategy_passes_wrapper_overrides_and_root_cast_options(
     )
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setattr(strategy_module, "FSDP", lambda **kwargs: kwargs)
+    compatibility_targets = []
+    monkeypatch.setattr(
+        strategy_module,
+        "apply_buffer_dtype_compatibility",
+        compatibility_targets.append,
+    )
     model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
     kwargs = strategy_module.FSDPStrategy(actor, 1).wrap_model(model, object())
+    assert compatibility_targets == [kwargs]
     assert kwargs["mixed_precision"].cast_root_forward_inputs is root_cast
     assert kwargs["mixed_precision"].cast_forward_inputs
     plan = kwargs["auto_wrap_policy"]._run_policy(model, set(), kwargs)
@@ -519,13 +527,17 @@ def test_invalid_policy_schema_fails_during_yaml_validation(changes, message):
         validate_fsdp_cfg(OmegaConf.create({"fsdp_config": cfg}))
 
 
-def test_actual_fsdp_wrappers_forward_backward_and_buffers(tmp_path):
+@pytest.mark.parametrize("full_precision_eval", [False, True])
+def test_actual_fsdp_wrappers_forward_backward_and_buffers(
+    tmp_path, monkeypatch, full_precision_eval
+):
     """Exercise native FSDP1 hooks rather than only inspecting policy kwargs."""
     import torch.distributed as dist
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
     if dist.is_initialized():
         pytest.skip("Test requires its own single-rank process group")
+    monkeypatch.setenv("FSDP_USE_FULL_PREC_IN_EVAL", str(int(full_precision_eval)))
     device = (
         torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
     )
@@ -540,11 +552,18 @@ def test_actual_fsdp_wrappers_forward_backward_and_buffers(tmp_path):
             self.seen_dtype = (x.dtype, self.weight.dtype, self.offset.dtype)
             return super().forward(x) + self.offset
 
+    class RootWithBuffer(nn.Sequential):
+        def __init__(self):
+            super().__init__(LinearWithBuffer(), LinearWithBuffer())
+            self.register_buffer("offset", torch.ones(2))
+
+        def forward(self, x):
+            return super().forward(x) + self.offset
+
     dist.init_process_group(
         "gloo", init_method=f"file://{tmp_path / 'init'}", rank=0, world_size=1
     )
     try:
-        model = nn.Sequential(LinearWithBuffer(), LinearWithBuffer()).to(device)
         default = MixedPrecision(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
@@ -556,15 +575,49 @@ def test_actual_fsdp_wrappers_forward_backward_and_buffers(tmp_path):
         def base(module, recurse, nonwrapped_numel):
             return recurse or isinstance(module, LinearWithBuffer)
 
-        policy = get_mixed_precision_wrap_policy(model, cfg, base, default)
-        wrapped = FSDP(
-            model, auto_wrap_policy=policy, mixed_precision=default, device_id=device
-        )
-        loss = wrapped(torch.randn(2, 2, device=device)).sum()
-        loss.backward()
-        assert wrapped[0].module.seen_dtype == (torch.bfloat16,) * 3
-        assert wrapped[1].module.seen_dtype == (torch.float32,) * 3
-        assert all(p.grad.dtype == torch.float32 for p in wrapped.parameters())
+        def wrap_model():
+            model = RootWithBuffer().to(device)
+            policy = get_mixed_precision_wrap_policy(model, cfg, base, default)
+            wrapped = FSDP(
+                model,
+                auto_wrap_policy=policy,
+                mixed_precision=default,
+                device_id=device,
+            )
+            apply_buffer_dtype_compatibility(wrapped)
+            return wrapped
+
+        wrapped = wrap_model()
+        assert wrapped._handle is None
+        inputs = torch.randn(2, 2, device=device)
+        for training in (True, False, True):
+            wrapped.train(training)
+            wrapped.zero_grad(set_to_none=True)
+            wrapped(inputs).sum().backward()
+            dtype = (
+                torch.float32
+                if not training and full_precision_eval
+                else torch.bfloat16
+            )
+            assert wrapped[0].module.seen_dtype == (dtype,) * 3
+            assert wrapped[1].module.seen_dtype == (torch.float32,) * 3
+            assert wrapped.module.offset.dtype == dtype
+            assert all(p.grad.dtype == torch.float32 for p in wrapped.parameters())
+
+        with FSDP.summon_full_params(wrapped):
+            assert wrapped[0].module.weight.dtype == torch.float32
+            assert wrapped[0].module.offset.dtype == torch.bfloat16
+
+        expected = wrapped(inputs).detach()
+        state = wrapped.state_dict()
+        assert state["0.offset"].dtype == torch.float32
+        assert state["1.offset"].dtype == torch.float32
+        assert state["offset"].dtype == torch.float32
+        restored = wrap_model()
+        restored.load_state_dict(state)
+        assert torch.equal(restored(inputs), expected)
+        assert restored[0].module.seen_dtype == (torch.bfloat16,) * 3
+        assert restored[1].module.seen_dtype == (torch.float32,) * 3
     finally:
         dist.destroy_process_group()
 
