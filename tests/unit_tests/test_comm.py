@@ -2157,6 +2157,87 @@ def _run_isolated(script: str, *args: str, timeout: float) -> None:
 class TestMultiChannelProcessGroupCreation:
     """Tests that comm-queue threads can create process groups concurrently."""
 
+    @pytest.mark.parametrize("use_libuv", [False, True], ids=["legacy", "libuv"])
+    def test_reuses_bound_tcpstore(self, tmp_path, use_libuv) -> None:
+        """A bound store stays reserved and interoperates with TCP rendezvous peers."""
+        script = tmp_path / "tcpstore_peer.py"
+        script.write_text(
+            """
+import errno
+import logging
+import socket
+import subprocess
+import sys
+from datetime import timedelta
+from types import SimpleNamespace
+
+import torch
+import torch.distributed as dist
+from rlinf.scheduler.collective.multi_channel_pg import MultiChannelProcessGroup
+from rlinf.scheduler.hardware import AcceleratorType
+
+rank, port, use_libuv = map(int, sys.argv[1:])
+worker = SimpleNamespace(
+    accelerator_type=AcceleratorType.NO_ACCEL, accelerator_model="cpu",
+)
+group = MultiChannelProcessGroup(
+    rank, 2, SimpleNamespace(workers=[worker, worker]),
+    logger=logging.getLogger("test-tcpstore"),
+)
+store = None
+peer = None
+if rank == 0:
+    store = dist.TCPStore(
+        "127.0.0.1", 0, 2, True, timeout=timedelta(seconds=20),
+        wait_for_workers=False, use_libuv=bool(use_libuv),
+    )
+    port = store.port
+    with socket.socket() as competitor:
+        try:
+            competitor.bind(("127.0.0.1", port))
+        except OSError as error:
+            assert error.errno == errno.EADDRINUSE
+        else:
+            raise AssertionError("The advertised store port must remain bound")
+    peer = subprocess.Popen(
+        [sys.executable, __file__, "1", str(port), str(use_libuv)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+try:
+    group.init(
+        init_method=None if rank == 0 else f"tcp://127.0.0.1:{port}",
+        store=store, world_size=2, rank=rank, group_name="tcpstore-reuse",
+    )
+    del store
+    for channel in range(2):
+        tensor = torch.arange(8) + channel
+        if rank == 0:
+            group.send(tensor, "cpu", channel)
+            group.recv(tensor, "cpu", channel)
+            assert torch.equal(tensor, torch.arange(8) + channel + 1)
+        else:
+            received = torch.empty_like(tensor)
+            group.recv(received, "cpu", channel)
+            assert torch.equal(received, tensor)
+            group.send(received + 1, "cpu", channel)
+    if peer is not None:
+        output, _ = peer.communicate(timeout=30)
+        assert peer.returncode == 0, output
+finally:
+    if peer is not None and peer.poll() is None:
+        peer.kill()
+        peer.communicate()
+"""
+        )
+        _run_isolated(
+            "import runpy, sys; path = sys.argv.pop(1); runpy.run_path(path)",
+            str(script),
+            "0",
+            "0",
+            str(int(use_libuv)),
+            timeout=60,
+        )
+
     @pytest.mark.skipif(
         dist.is_backend_available("mccl"), reason="uses a fake MCCL backend"
     )
@@ -3398,7 +3479,7 @@ if __name__ == "__main__":
     pytest.main(["-v", __file__])
 
 
-pytestmark = pytest.mark.skipif(
+requires_accelerator_staging = pytest.mark.skipif(
     not accelerator_is_available(),
     reason="GLOO host staging only runs for accelerator tensors",
 )
@@ -3441,6 +3522,7 @@ def fake_gloo_transfer(staged: torch.Tensor, recv_buffer: torch.Tensor):
     flat_recv.copy_(staged.reshape(-1))
 
 
+@requires_accelerator_staging
 @pytest.mark.parametrize("layout", ["contiguous", "transposed"])
 def test_staged_send_buffer_is_pinned_and_contiguous(layout):
     """The send-side staging buffer is pinned, contiguous and in wire order."""
@@ -3464,6 +3546,7 @@ def new_recv_buffer(tensor: torch.Tensor) -> torch.Tensor:
     return torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
 
 
+@requires_accelerator_staging
 def test_empty_like_recv_buffer_scrambles():
     """Show why the recv sites allocate with ``empty`` rather than ``empty_like``.
 
@@ -3487,6 +3570,7 @@ def test_empty_like_recv_buffer_scrambles():
     assert not torch.equal(dst, src)
 
 
+@requires_accelerator_staging
 @pytest.mark.parametrize("layout", ["contiguous", "transposed"])
 def test_host_staging_round_trip_preserves_values(layout):
     """A tensor survives stage -> wire -> unstage with its layout restored."""
