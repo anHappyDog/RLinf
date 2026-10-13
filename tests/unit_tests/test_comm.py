@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import asyncio
+import errno
 import gc
 import inspect
 import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -26,6 +28,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
+import ray
 import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
@@ -65,6 +68,7 @@ from rlinf.scheduler.collective.tensor_compression import (
     ZstdCodecProvider,
     ZstdCompressionConfig,
 )
+from rlinf.scheduler.manager import CollectiveManager
 
 SENDER_GROUP_NAME = "sender_worker_group"
 RECEIVER_GROUP_NAME = "receiver_worker_group"
@@ -159,6 +163,18 @@ def make_non_contiguous_tensor(device):
 
 
 # --- Worker Definitions ---
+class StorePublicationWorker(Worker):
+    """Exchange a CPU tensor through a fresh collective group."""
+
+    def send_payload(self, peer_name: str) -> None:
+        """Send the CPU test payload to a peer."""
+        self.send(torch.arange(8), peer_name, 0)
+
+    def receive_payload(self, peer_name: str) -> torch.Tensor:
+        """Receive the CPU test payload from a peer."""
+        return self.recv(peer_name, 0)
+
+
 class SenderWorker(Worker):
     """Worker responsible for sending data in tests."""
 
@@ -2156,6 +2172,68 @@ def _run_isolated(script: str, *args: str, timeout: float) -> None:
 
 class TestMultiChannelProcessGroupCreation:
     """Tests that comm-queue threads can create process groups concurrently."""
+
+    @pytest.mark.placement
+    def test_publishes_bound_tcpstore(self, cluster: Cluster) -> None:
+        """The store port is already bound when the real manager publishes it."""
+        manager = CollectiveManager.get_proxy()._manager
+
+        def observe_publication(instance):
+            code = inspect.unwrap(CollectiveManager.set_master_port_info).__code__
+            instance._publication_previous_profile = sys.getprofile()
+            instance._bound_port_publications = []
+
+            def record(frame, event, _arg):
+                if event != "call" or frame.f_code is not code:
+                    return
+                group_name = frame.f_locals["group_name"]
+                port = frame.f_locals["master_port"]
+                address = instance.get_collective_group(group_name).master_addr
+                with socket.socket() as competitor:
+                    try:
+                        competitor.bind((address, port))
+                    except OSError as error:
+                        if error.errno != errno.EADDRINUSE:
+                            raise
+                        bound = True
+                    else:
+                        bound = False
+                instance._bound_port_publications.append(bound)
+
+            sys.setprofile(record)
+
+        def restore_publication(instance):
+            sys.setprofile(instance._publication_previous_profile)
+            del instance._publication_previous_profile
+            del instance._bound_port_publications
+
+        placement = NodePlacementStrategy([0])
+        sender_name = "tcpstore-publication-sender"
+        receiver_name = "tcpstore-publication-receiver"
+        sender = StorePublicationWorker.create_group().launch(
+            cluster=cluster, placement_strategy=placement, name=sender_name
+        )
+        receiver = StorePublicationWorker.create_group().launch(
+            cluster=cluster, placement_strategy=placement, name=receiver_name
+        )
+        ray.get(manager.__ray_call__.remote(observe_publication))
+        try:
+            sent = sender.send_payload(receiver_name)
+            received = receiver.receive_payload(sender_name)
+            sent.wait()
+            assert torch.equal(received.wait()[0], torch.arange(8))
+            bound_ports = ray.get(
+                manager.__ray_call__.remote(
+                    lambda instance: instance._bound_port_publications
+                )
+            )
+            assert bound_ports and all(bound_ports), (
+                "The store port was published before its listener was bound"
+            )
+        finally:
+            ray.get(manager.__ray_call__.remote(restore_publication))
+            sender._close()
+            receiver._close()
 
     @pytest.mark.parametrize("use_libuv", [False, True], ids=["legacy", "libuv"])
     def test_reuses_bound_tcpstore(self, tmp_path, use_libuv) -> None:
