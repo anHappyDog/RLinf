@@ -3,6 +3,15 @@ VLA / WAM 模型监督微调
 
 监督微调（SFT）是具身强化学习的标准冷启动步骤：一个良好的 SFT 检查点能显著缩短 RL 探索时间并提升最终策略效果。本类示例汇总了 RLinf 在 VLA / WAM 模型上的全量与 LoRA SFT 配方，以及面向多模态后训练的 VLM SFT。
 
+.. grid:: 1
+   :gutter: 2
+
+   .. grid-item-card:: Franka Pickup
+      :link: embodied/sft_franka_pickup
+      :link-type: doc
+
+      选择真机与仿真来源，保留原生控制格式与采样频率，训练同一个 policy。
+
 完成本节的 SFT 后，可继续阅读 :doc:`vla_wam_index`\ （以模型为主线的 RL 微调）或 :doc:`simulators_index`\ （以基准为主线的 RL 微调）以进一步用 RL 提升所得检查点。
 
 .. raw:: html
@@ -83,6 +92,7 @@ VLA / WAM 模型监督微调
    :maxdepth: 2
 
    OpenPI <embodied/sft_openpi>
+   Franka Pickup <embodied/sft_franka_pickup>
    DreamZero <embodied/sft_dreamzero>
    FastWAM <embodied/sft_fastwam>
    Cosmos3 <embodied/sft_cosmos3>

@@ -70,6 +70,13 @@ def build_openpi_sft_dataloader(
     eval_dataset: bool = False,
 ) -> tuple[Any, Any]:
     """Build the environment-specific openpi SFT dataloader."""
+    if cfg.data.get("type") == "mixture":
+        from rlinf.data.datasets.openpi.mixture import build_mixture_sft_dataloader
+
+        return build_mixture_sft_dataloader(
+            cfg, world_size, rank, data_paths, eval_dataset
+        )
+
     if bool(cfg.actor.model.openpi.get("use_rlt", False)):
         return _load_official_openpi_sft_dataloader()(
             cfg, world_size, rank, data_paths, eval_dataset

@@ -15,6 +15,7 @@
 """Datasets, batching, and the on-the-wire shapes they produce."""
 
 import asyncio
+import contextlib
 import copy
 import importlib.util
 import inspect
@@ -93,6 +94,378 @@ from rlinf.workers.rollout.hf.async_huggingface_worker import (
     AsyncMultiStepRolloutWorker,
 )
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+
+
+def _write_native_mixture_fixture(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    catalog = tmp_path / "collection"
+    (catalog / "catalog").mkdir(parents=True)
+    records = []
+    sources = []
+    for schema in ("arm_a", "arm_b"):
+        root = catalog / schema
+        (root / "meta/episodes/chunk-000").mkdir(parents=True)
+        (root / "data/chunk-000").mkdir(parents=True)
+        (root / "meta/info.json").write_text(
+            json.dumps(
+                {
+                    "codebase_version": "v3.0",
+                    "fps": 15.15,
+                    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+                    "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+                }
+            )
+        )
+        data, episodes, provenance = [], [], []
+        for episode in range(12):
+            start = len(data)
+            for frame in range(5):
+                data.append(
+                    {
+                        "action": [episode * 100.0 + frame, 7.0],
+                        "observation.state": [episode * 10.0 + frame, 2.0],
+                        "source.extra.supervision_mask": frame != 2,
+                    }
+                )
+            episodes.append(
+                {
+                    "episode_index": episode,
+                    "length": 5,
+                    "dataset_from_index": start,
+                    "dataset_to_index": start + 5,
+                    "data/chunk_index": 0,
+                    "data/file_index": 0,
+                    "videos/observation.images.front/chunk_index": 0,
+                    "videos/observation.images.front/file_index": episode,
+                    "videos/observation.images.front/from_timestamp": 2.5,
+                }
+            )
+            provenance.append(
+                {
+                    "episode_index": episode,
+                    "provenance": {
+                        "semantic_core_status": "UNKNOWN" if episode == 10 else "known",
+                        "supervision_mask_feature": "source.extra.supervision_mask",
+                    },
+                }
+            )
+            records.append(
+                {
+                    "catalog_id": f"{schema}:{episode}",
+                    "partition": schema,
+                    "provenance_file": f"{schema}/meta/clip_provenance.jsonl",
+                    "source_dataset": schema,
+                    "domain": "real",
+                    "episode_index": episode,
+                    "source_group_id": f"{schema}:{episode // 2}",
+                    "scene_id": f"scene_{episode // 2}",
+                    "split": "development_only" if episode == 9 else "unassigned",
+                    "quality_tier": "controller_motion_candidate"
+                    if episode == 11
+                    else "native_source_success",
+                    "core_range_in_export": [1, 4],
+                    "frames": 5,
+                    "fps": 15.15,
+                    "control_mode": f"{schema}_native",
+                    "task": "pick up the object",
+                }
+            )
+        pq.write_table(
+            pa.Table.from_pylist(data), root / "data/chunk-000/file-000.parquet"
+        )
+        pq.write_table(
+            pa.Table.from_pylist(episodes),
+            root / "meta/episodes/chunk-000/file-000.parquet",
+        )
+        (root / "meta/clip_provenance.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in provenance)
+        )
+        sources.append(
+            {
+                "name": schema,
+                "source_dataset": schema,
+                "weight": 1 if schema == "arm_a" else 3,
+                "cameras": {"base_0_rgb": "observation.images.front"},
+            }
+        )
+    (catalog / "catalog/episodes.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in records)
+    )
+    return catalog, sources
+
+
+def test_native_mixture_group_splits_and_training_only_statistics(tmp_path):
+    from rlinf.data.datasets.openpi.mixture import NumericEpisodeCache, prepare_mixture
+
+    catalog, sources = _write_native_mixture_fixture(tmp_path)
+    prepared = tmp_path / "prepared"
+    summary = prepare_mixture(
+        catalog, prepared, sources, val_fraction=0.5, seed=3, allow_development=True
+    )
+    train = [
+        json.loads(line) for line in (prepared / "train.jsonl").read_text().splitlines()
+    ]
+    val = [
+        json.loads(line) for line in (prepared / "val.jsonl").read_text().splitlines()
+    ]
+    assert train and val
+    assert not (
+        {row["source_group_id"] for row in train}
+        & {row["source_group_id"] for row in val}
+    )
+    assert not (
+        {row["split_group"] for row in train} & {row["split_group"] for row in val}
+    )
+    assert not any(row["development_only"] for row in val)
+    assert summary["excluded"]["quality"] == 2
+    assert summary["excluded"]["unknown_core"] == 2
+    stats = json.loads((prepared / "normalization.json").read_text())["schemas"]
+    cache = NumericEpisodeCache()
+    for schema in stats:
+        rows = [row for row in train if row["schema_id"] == schema]
+        values = [cache.read(row) for row in rows]
+        action = np.concatenate([a[mask] for a, _, mask in values])
+        state = np.concatenate([s[mask] for _, s, mask in values])
+        np.testing.assert_allclose(stats[schema]["action"]["mean"], action.mean(axis=0))
+        np.testing.assert_allclose(stats[schema]["state"]["mean"], state.mean(axis=0))
+        assert stats[schema]["action"]["count"] == len(action)
+        assert stats[schema]["action"]["std"][1] == 1
+        assert stats[schema]["action"]["transform"] == "mean_std"
+        assert stats[schema]["state"]["transform"] == "tanh_mean_std"
+        assert set(stats[schema]["train_catalog_ids"]) == {
+            row["catalog_id"] for row in rows
+        }
+    limited = tmp_path / "limited"
+    prepare_mixture(
+        catalog,
+        limited,
+        sources,
+        val_fraction=0.5,
+        seed=3,
+        allow_development=True,
+        max_train_episodes=1,
+        max_val_episodes=1,
+    )
+    for split, originals in (("train", train), ("val", val)):
+        rows = [
+            json.loads(line)
+            for line in (limited / f"{split}.jsonl").read_text().splitlines()
+        ]
+        assert len(rows) == 2
+        assert {row["catalog_id"] for row in rows} <= {
+            row["catalog_id"] for row in originals
+        }
+
+
+def test_native_mixture_core_tail_dimension_and_fractional_clock(tmp_path):
+    from rlinf.data.datasets.openpi.mixture import MixtureSftDataset, prepare_mixture
+
+    catalog, sources = _write_native_mixture_fixture(tmp_path)
+    prepared = tmp_path / "prepared"
+    prepare_mixture(catalog, prepared, sources, val_fraction=0, seed=3)
+    dataset = MixtureSftDataset(prepared, action_horizon=4, action_dim=4)
+    row, frame, state, actions, mask = dataset.numeric_item(0)
+    assert frame == 1 and row["fps"] == 15.15
+    assert row["videos"]["base_0_rgb"]["from_timestamp"] == 2.5
+    assert 2.5 + frame / row["fps"] == pytest.approx(2.56600660066)
+    np.testing.assert_array_equal(
+        mask, [[1, 1, 0, 0], [0, 0, 0, 0], [1, 1, 0, 0], [0, 0, 0, 0]]
+    )
+    np.testing.assert_array_equal(state[2:], 0)
+    assert np.all((-1 <= state) & (state <= 1))
+    schema = dataset.schemas[row["schema_id"]]
+    raw_state = np.asarray([row["episode_index"] * 10.0 + frame, 2.0])
+    np.testing.assert_allclose(
+        state[:2],
+        np.tanh((raw_state - schema["state"]["mean"]) / schema["state"]["std"]),
+        atol=1e-7,
+    )
+    _, frame, _, actions, mask = dataset.numeric_item(1)
+    assert frame == 3
+    np.testing.assert_array_equal(
+        mask, [[1, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    )
+    np.testing.assert_array_equal(actions[1], actions[2])
+    np.testing.assert_array_equal(actions[2], actions[3])
+    with pytest.raises(ValueError, match="exceeds model dimension"):
+        MixtureSftDataset(prepared, action_dim=1)
+    evaluation = MixtureSftDataset(prepared, max_samples=17, sample_multiple=4)
+    assert len(evaluation) == 16
+    assert evaluation.alignment_dropped == 1
+    assert {row["schema_id"] for row in evaluation.episodes} == {"arm_a", "arm_b"}
+    assert (
+        sum(
+            len(row["anchor_indices"])
+            for row in evaluation.episodes
+            if row["schema_id"] == "arm_a"
+        )
+        == 8
+    )
+    with pytest.raises(ValueError, match="at least 4 anchors"):
+        MixtureSftDataset(prepared, max_samples=3, sample_multiple=4)
+
+
+def test_native_mixture_bounded_state_uses_official_discrete_tokenizer():
+    tokenizer_module = pytest.importorskip("openpi.models.tokenizer")
+    tokenizer = tokenizer_module.PaligemmaTokenizer.__new__(
+        tokenizer_module.PaligemmaTokenizer
+    )
+    tokenizer._max_len = 200
+    encoded = {}
+
+    def encode(text, add_bos):
+        encoded["text"] = text
+        return [1]
+
+    tokenizer._tokenizer = SimpleNamespace(encode=encode)
+    state = np.tanh(np.arange(-2, 3, dtype=np.float32))
+    tokenizer.tokenize("pick up", state)
+    values = encoded["text"].split("State: ")[1].split(";")[0]
+    discrete = np.asarray([int(value) for value in values.split()])
+    assert len(np.unique(discrete)) == 5
+    assert discrete.min() > 0 and discrete.max() < 255
+
+
+def test_native_mixture_weighted_sampler_and_loader_resume(tmp_path):
+    from torchdata.stateful_dataloader import StatefulDataLoader
+
+    from rlinf.data.datasets.openpi.mixture import (
+        MixtureSampler,
+        MixtureSftDataset,
+        prepare_mixture,
+    )
+
+    catalog, sources = _write_native_mixture_fixture(tmp_path)
+    prepared = tmp_path / "prepared"
+    prepare_mixture(catalog, prepared, sources, val_fraction=0, seed=3)
+    dataset = MixtureSftDataset(prepared, action_horizon=4, action_dim=4)
+    sampler = MixtureSampler(dataset, batch_size=2, seed=19, samples_per_epoch=40)
+    boundary = sum(
+        len(row["anchor_indices"])
+        for row in dataset.episodes
+        if row["schema_id"] == "arm_a"
+    )
+    assert sampler.weights[:boundary].sum() == pytest.approx(1)
+    assert sampler.weights[boundary:].sum() == pytest.approx(3)
+    first = list(sampler)
+    sampler.set_epoch(1)
+    assert first != list(sampler)
+    sampler.load_state_dict({"epoch": 0, "position": 0})
+    assert first == list(sampler)
+    rank0 = MixtureSampler(
+        dataset, batch_size=2, seed=19, world_size=2, rank=0, samples_per_epoch=40
+    )
+    rank1 = MixtureSampler(
+        dataset, batch_size=2, seed=19, world_size=2, rank=1, samples_per_epoch=40
+    )
+    assert [index for pair in zip(list(rank0), list(rank1)) for index in pair] == first
+    sampler.set_epoch(0)
+    loader = StatefulDataLoader(
+        list(range(len(dataset))), batch_size=2, sampler=sampler, num_workers=0
+    )
+    iterator = iter(loader)
+    next(iterator)
+    next(iterator)
+    checkpoint = copy.deepcopy(loader.state_dict())
+    expected = list(iterator)
+    restored_sampler = MixtureSampler(
+        dataset, batch_size=2, seed=19, samples_per_epoch=40
+    )
+    restored = StatefulDataLoader(
+        list(range(len(dataset))), batch_size=2, sampler=restored_sampler, num_workers=0
+    )
+    restored.load_state_dict(checkpoint)
+    actual = list(restored)
+    assert len(expected) == len(actual)
+    for left, right in zip(expected, actual):
+        torch.testing.assert_close(left, right)
+    evaluation = MixtureSampler(
+        dataset, batch_size=3, shuffle=False, world_size=2, rank=1
+    )
+    assert list(evaluation) == list(range(1, len(dataset), 2))
+
+
+def test_native_mixture_worker_checkpoint_restores_epoch(tmp_path, monkeypatch):
+    from torchdata.stateful_dataloader import StatefulDataLoader
+
+    from rlinf.data.datasets.openpi.mixture import (
+        MixtureSampler,
+        MixtureSftDataset,
+        prepare_mixture,
+    )
+    from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
+    from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+    catalog, sources = _write_native_mixture_fixture(tmp_path)
+    prepared = tmp_path / "prepared"
+    prepare_mixture(catalog, prepared, sources, val_fraction=0)
+    dataset = MixtureSftDataset(prepared, action_horizon=4, action_dim=4)
+
+    def make_loader():
+        return StatefulDataLoader(
+            list(range(len(dataset))),
+            batch_size=2,
+            sampler=MixtureSampler(dataset, batch_size=2, samples_per_epoch=20),
+            num_workers=0,
+        )
+
+    original = make_loader()
+    original.sampler.set_epoch(3)
+    iterator = iter(original)
+    next(iterator)
+    torch.save([copy.deepcopy(original.state_dict())], tmp_path / "data.pt")
+    expected = list(iterator)
+    worker = object.__new__(FSDPVlaSftWorker)
+    worker.cfg = OmegaConf.create({"data": {"type": "mixture"}})
+    worker._rank = 0
+    worker._data_epoch = 0
+    worker.data_loader = make_loader()
+    monkeypatch.setattr(FSDPSftWorker, "load_checkpoint", lambda self, path: None)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    worker.load_checkpoint(str(tmp_path))
+    assert worker._data_epoch == 3
+    actual = list(worker.data_iter)
+    assert len(actual) == len(expected)
+    for left, right in zip(actual, expected):
+        torch.testing.assert_close(left, right)
+
+
+def test_native_mixture_evaluation_records_time_and_restores_rng(monkeypatch):
+    from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+    class FlowLoss(torch.nn.Module):
+        def forward(self, *, forward_type, data, train):
+            assert not train and not self.training
+            return data["actions"].square().mean() + torch.rand(())
+
+    timer_calls = []
+
+    @contextlib.contextmanager
+    def timer():
+        timer_calls.append("enter")
+        yield
+        timer_calls.append("exit")
+
+    worker = object.__new__(FSDPVlaSftWorker)
+    worker.cfg = OmegaConf.create({"data": {"type": "mixture"}, "actor": {"seed": 0}})
+    worker._rank = 0
+    worker.device = torch.device("cpu")
+    worker.model = FlowLoss()
+    worker.amp_context = contextlib.nullcontext()
+    worker.worker_timer = timer
+    worker.eval_data_loader = torch.utils.data.DataLoader(
+        [{"actions": torch.ones(2, 3)}, {"actions": torch.full((2, 3), 2.0)}],
+        batch_size=1,
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor: None)
+    rng = torch.get_rng_state().clone()
+    first = worker.run_eval()
+    assert worker.model.training
+    torch.testing.assert_close(torch.get_rng_state(), rng)
+    assert first == worker.run_eval()
+    assert timer_calls == ["enter", "exit", "enter", "exit"]
 
 
 def _scalar_trajectory(value: float) -> Trajectory:

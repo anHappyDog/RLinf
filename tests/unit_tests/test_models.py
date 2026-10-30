@@ -74,6 +74,132 @@ class _DummyFSDPModel(torch.nn.Module):
         self.head._fsdp_wrap_name = "custom_head"
 
 
+@pytest.fixture
+def openpi_sft_reducer():
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+
+    policy = Pi0.__new__(Pi0)
+    torch.nn.Module.__init__(policy)
+    policy.action_chunk = 2
+    policy.action_env_dim = 3
+    return policy._reduce_sft_loss
+
+
+def test_openpi_sft_mask_excludes_padding_context_and_tail(openpi_sft_reducer):
+    losses = torch.arange(24, dtype=torch.float32).reshape(1, 4, 6)
+    mask = torch.zeros_like(losses, dtype=torch.bool)
+    mask[:, 1:3, :3] = True
+    changed = losses.clone().masked_fill(~mask, 1e6).requires_grad_()
+
+    actual = openpi_sft_reducer(changed, False, mask)
+
+    torch.testing.assert_close(actual, losses[mask].mean())
+    torch.testing.assert_close(actual, openpi_sft_reducer(losses, False, mask))
+    actual.backward()
+    torch.testing.assert_close(
+        changed.grad[~mask], torch.zeros_like(changed.grad[~mask])
+    )
+    torch.testing.assert_close(changed.grad[mask], torch.full((6,), 1 / 6))
+
+
+def test_openpi_sft_mask_gives_different_valid_dims_and_lengths_equal_weight(
+    openpi_sft_reducer,
+):
+    losses = torch.zeros(2, 4, 14)
+    mask = torch.zeros_like(losses, dtype=torch.bool)
+    losses[0, :1, :8] = 2
+    losses[1, :3, :14] = 6
+    mask[0, :1, :8] = True
+    mask[1, :3, :14] = True
+
+    actual = openpi_sft_reducer(losses, False, mask)
+
+    torch.testing.assert_close(actual, torch.tensor(4.0))
+
+
+@pytest.mark.parametrize("use_action_chunk_loss", [False, True])
+def test_openpi_sft_without_mask_retains_original_mean(
+    openpi_sft_reducer, use_action_chunk_loss
+):
+    losses = torch.arange(48, dtype=torch.float32).reshape(2, 4, 6)
+    expected = losses[:, :2, :3] if use_action_chunk_loss else losses
+
+    actual = openpi_sft_reducer(losses, use_action_chunk_loss)
+
+    torch.testing.assert_close(actual, expected.mean())
+
+
+def test_openpi_sft_chunk_slices_the_supervision_mask(openpi_sft_reducer):
+    losses = torch.full((2, 4, 6), 1000.0)
+    mask = torch.ones_like(losses, dtype=torch.bool)
+    mask[0, 0, :2] = False
+    losses[0, :2, :3] = 2
+    losses[1, :2, :3] = 6
+
+    actual = openpi_sft_reducer(losses, True, mask.to(torch.int32))
+
+    torch.testing.assert_close(actual, torch.tensor(4.0))
+
+
+@pytest.mark.parametrize("mask_shape", [(2, 4), (2, 4, 1), (1, 4, 6)])
+def test_openpi_sft_mask_requires_exact_loss_shape(openpi_sft_reducer, mask_shape):
+    with pytest.raises(ValueError, match="action_loss_mask must match"):
+        openpi_sft_reducer(
+            torch.ones(2, 4, 6), False, torch.ones(mask_shape, dtype=torch.bool)
+        )
+
+
+@pytest.mark.parametrize("use_action_chunk_loss", [False, True])
+def test_openpi_sft_mask_rejects_a_sample_without_supervision(
+    openpi_sft_reducer, use_action_chunk_loss
+):
+    mask = torch.ones(2, 4, 6, dtype=torch.bool)
+    mask[1] = False
+    if use_action_chunk_loss:
+        mask[1, 2:, :] = True
+
+    with pytest.raises(ValueError, match="every SFT sample"):
+        openpi_sft_reducer(torch.ones(2, 4, 6), use_action_chunk_loss, mask)
+
+
+@pytest.mark.parametrize("forward_kwargs", [{}, {"train": False}])
+def test_openpi_sft_dict_routes_mask_and_training_mode(
+    openpi_sft_reducer, forward_kwargs
+):
+    from rlinf.models.embodiment.base_policy import ForwardType
+    from rlinf.models.embodiment.openpi.modules.model import Observation
+
+    policy = openpi_sft_reducer.__self__
+    policy.register_parameter("anchor", torch.nn.Parameter(torch.zeros(())))
+    policy.action_dim = 6
+    policy.rlt_cfg = SimpleNamespace(use_rlt=False)
+    losses = torch.arange(48, dtype=torch.float32).reshape(2, 4, 6)
+    policy.compute_loss = MagicMock(return_value=losses)
+    mask = torch.zeros_like(losses, dtype=torch.bool)
+    mask[0, 1, :2] = True
+    mask[1, 1:3, :3] = True
+    actions = torch.zeros_like(losses)
+    batch = {
+        "observation": {
+            "image": {"base_0_rgb": torch.zeros(2, 8, 8, 3)},
+            "image_mask": {"base_0_rgb": torch.ones(2, dtype=torch.bool)},
+            "state": torch.zeros(2, 6),
+        },
+        "actions": actions,
+        "action_loss_mask": mask,
+    }
+
+    actual = policy(forward_type=ForwardType.SFT, data=batch, **forward_kwargs)
+
+    expected = torch.stack([losses[i][mask[i]].mean() for i in range(2)]).mean()
+    torch.testing.assert_close(actual, expected)
+    policy.compute_loss.assert_called_once()
+    call = policy.compute_loss.call_args
+    assert isinstance(call.args[0], Observation)
+    torch.testing.assert_close(call.args[1], actions)
+    assert call.kwargs == {"train": forward_kwargs.get("train", True)}
+
+
 def test_custom_model_registration_smoke():
     model_type = f"custom_model_smoke_{int(time.time() * 1000)}"
     received = {"torch_dtype": None}

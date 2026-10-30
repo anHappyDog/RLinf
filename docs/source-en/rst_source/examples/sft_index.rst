@@ -3,6 +3,15 @@ SFT for VLA / WAM Models
 
 Supervised fine-tuning (SFT) is the standard cold-start step before embodied RL: a strong SFT checkpoint dramatically reduces RL exploration time and improves final policy quality. This category lists RLinf's recipes for full-parameter and LoRA SFT on VLA / WAM models, plus VLM SFT for multimodal post-training.
 
+.. grid:: 1
+   :gutter: 2
+
+   .. grid-item-card:: Franka Pickup
+      :link: embodied/sft_franka_pickup
+      :link-type: doc
+
+      Train on selected real and simulated sources while preserving native controllers and sampling rates.
+
 After running SFT here, continue to :doc:`vla_wam_index` (model-centric RL) or :doc:`simulators_index` (benchmark-centric RL) to fine-tune the resulting checkpoint with RL.
 
 .. raw:: html
@@ -83,6 +92,7 @@ After running SFT here, continue to :doc:`vla_wam_index` (model-centric RL) or :
    :maxdepth: 2
 
    OpenPI <embodied/sft_openpi>
+   Franka Pickup <embodied/sft_franka_pickup>
    DreamZero <embodied/sft_dreamzero>
    FastWAM <embodied/sft_fastwam>
    Cosmos3 <embodied/sft_cosmos3>

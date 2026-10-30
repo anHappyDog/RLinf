@@ -1,0 +1,49 @@
+# Each schema keeps its native controller, rate, views, and training statistics.
+sources:
+  - name: molmobot
+    source_dataset: molmobot
+    weight: 4.0
+    cameras:
+      base_0_rgb: observation.images.primary
+      left_wrist_0_rgb: observation.images.wrist
+  - name: habit
+    source_dataset: habit
+    weight: 4.0
+    cameras:
+      base_0_rgb: observation.images.front_view
+      left_wrist_0_rgb: observation.images.left_wrist_view
+      right_wrist_0_rgb: observation.images.right_wrist_view
+  - name: fmb
+    source_dataset: fmb
+    weight: 1.0
+    cameras:
+      base_0_rgb: observation.images.primary
+      left_wrist_0_rgb: observation.images.wrist
+  - name: droid
+    source_dataset: droid
+    weight: 1.0
+    cameras:
+      base_0_rgb: observation.images.exterior_1_left
+  - name: duobench_real
+    source_dataset: duobench
+    domain: real
+    weight: 1.0
+    cameras:
+      base_0_rgb: observation.images.head
+      left_wrist_0_rgb: observation.images.left_wrist
+      right_wrist_0_rgb: observation.images.right_wrist
+  - name: duobench_sim
+    source_dataset: duobench
+    domain: sim
+    weight: 1.0
+    cameras:
+      base_0_rgb: observation.images.head
+      left_wrist_0_rgb: observation.images.left_wrist
+      right_wrist_0_rgb: observation.images.right_wrist
+  - name: gr00t_transport
+    source_dataset: gr00t_transport
+    weight: 1.0
+    cameras:
+      base_0_rgb: observation.images.front_view
+      left_wrist_0_rgb: observation.images.left_wrist_view
+      right_wrist_0_rgb: observation.images.right_wrist_view

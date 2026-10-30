@@ -752,14 +752,28 @@ class Pi0(model.BaseModel):
         )
 
     def _reduce_sft_loss(
-        self, per_element_loss: torch.Tensor, use_action_chunk_loss: bool
+        self,
+        per_element_loss: torch.Tensor,
+        use_action_chunk_loss: bool,
+        action_loss_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Mean flow-matching MSE, optionally restricted to the env action chunk.
+        """Reduce flow-matching MSE, giving masked samples equal weight.
 
         ``per_element_loss`` is ``[B, action_horizon, action_dim]``. DAgger
         matches the old OpenPI wrapper by dropping padded action dims and
-        unexecuted horizon steps before the mean.
+        unexecuted horizon steps before the mean. An optional mask selects
+        supervised elements within each sample.
         """
+        if action_loss_mask is not None:
+            action_loss_mask = torch.as_tensor(
+                action_loss_mask, device=per_element_loss.device, dtype=torch.bool
+            )
+            if action_loss_mask.shape != per_element_loss.shape:
+                raise ValueError(
+                    "action_loss_mask must match per-element SFT loss shape "
+                    f"{tuple(per_element_loss.shape)}; "
+                    f"got {tuple(action_loss_mask.shape)}."
+                )
         if use_action_chunk_loss:
             horizon = (
                 self.action_chunk
@@ -772,18 +786,34 @@ class Pi0(model.BaseModel):
                 else per_element_loss.shape[-1]
             )
             per_element_loss = per_element_loss[:, :horizon, :env_dim]
+            if action_loss_mask is not None:
+                action_loss_mask = action_loss_mask[:, :horizon, :env_dim]
+        if action_loss_mask is not None:
+            valid_counts = action_loss_mask.sum(dim=(1, 2))
+            if torch.any(valid_counts == 0):
+                raise ValueError(
+                    "action_loss_mask must retain at least one supervised "
+                    "element in every SFT sample."
+                )
+            sample_losses = (
+                per_element_loss.masked_fill(~action_loss_mask, 0.0).sum(dim=(1, 2))
+                / valid_counts
+            )
+            return sample_losses.mean()
         return per_element_loss.mean()
 
     def _sft_forward_with_rlt_prefix(
         self,
         observation: model.Observation,
         actions: torch.Tensor,
+        *,
+        train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute VLA loss while retaining the prefix hidden states for RLT."""
         batch_size = actions.shape[0]
         device = actions.device
 
-        observation = model.preprocess_observation(observation, train=True)
+        observation = model.preprocess_observation(observation, train=train)
         observation = model._observation_to_dtype(observation, self.embed_dtype)
         actions = actions.to(dtype=torch.float32)
         dtype = actions.dtype
@@ -824,21 +854,32 @@ class Pi0(model.BaseModel):
         return loss, prefix_out, prefix_mask
 
     def sft_forward(
-        self, data: Any, use_action_chunk_loss: bool = False, **kwargs
+        self,
+        data: Any,
+        use_action_chunk_loss: bool = False,
+        train: bool = True,
+        **kwargs,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Flow-matching SFT loss. Shared by SFT, DAgger, and PPO co-train."""
         del kwargs
         observation, actions = self._unpack_sft_batch(data)
+        action_loss_mask = (
+            data.get("action_loss_mask") if isinstance(data, dict) else None
+        )
         observation = self._observation_to_device(observation)
         actions = self._actions_to_device(actions)
         if not self.rlt_cfg.use_rlt:
-            per_element_loss = self.compute_loss(observation, actions, train=True)
-            return self._reduce_sft_loss(per_element_loss, use_action_chunk_loss)
+            per_element_loss = self.compute_loss(observation, actions, train=train)
+            return self._reduce_sft_loss(
+                per_element_loss, use_action_chunk_loss, action_loss_mask
+            )
 
         per_element_loss, prefix_output, prefix_mask = (
-            self._sft_forward_with_rlt_prefix(observation, actions)
+            self._sft_forward_with_rlt_prefix(observation, actions, train=train)
         )
-        vla_loss = self._reduce_sft_loss(per_element_loss, use_action_chunk_loss)
+        vla_loss = self._reduce_sft_loss(
+            per_element_loss, use_action_chunk_loss, action_loss_mask
+        )
         rlt_loss, _ = self._rlt_forward(prefix_output, prefix_mask)
         return {
             "loss": rlt_loss + self.rlt_cfg.rlt_alpha * vla_loss,

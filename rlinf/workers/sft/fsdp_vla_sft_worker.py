@@ -19,6 +19,7 @@ from omegaconf import DictConfig
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.config import SupportedModel
+from rlinf.data.datasets.common.epoch import forward_set_epoch
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.utils.utils import get_rng_state, seed_everything, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
@@ -89,6 +90,39 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         # now the eval is not supported for embodied sft
         raise NotImplementedError("eval is not supported for embodied sft right now.")
 
+    @torch.no_grad()
+    def run_eval(self):
+        """Measure deterministic flow loss for the opt-in native mixture."""
+        if self.cfg.data.get("type") != "mixture":
+            return super().run_eval()
+
+        with self.worker_timer():
+            rng_state = get_rng_state()
+            was_training = self.model.training
+            self.model.eval()
+            totals = torch.zeros(2, device=self.device, dtype=torch.float64)
+            try:
+                forward_set_epoch(self.eval_data_loader, 0)
+                seed_everything(self.cfg.actor.seed + self._rank)
+                for batch in self.eval_data_loader:
+                    with self.amp_context:
+                        output = self.model(
+                            forward_type=ForwardType.SFT, data=batch, train=False
+                        )
+                        loss = (
+                            output
+                            if isinstance(output, torch.Tensor)
+                            else output["loss"]
+                        )
+                    count = batch["actions"].shape[0]
+                    totals[0] += loss.detach().double() * count
+                    totals[1] += count
+            finally:
+                set_rng_state(rng_state)
+                self.model.train(was_training)
+            torch.distributed.all_reduce(totals)
+            return {"loss": (totals[0] / totals[1]).item()}
+
     def get_train_model_output(self, batch: Any) -> tuple[torch.Tensor, dict[str, Any]]:
         with self.amp_context:
             output = self.model(forward_type=ForwardType.SFT, data=batch)
@@ -142,6 +176,8 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             state = all_states[self._rank]
             self.data_loader.load_state_dict(state)
             self.data_iter = iter(self.data_loader)
+            if self.cfg.data.get("type") == "mixture":
+                self._data_epoch = self.data_loader.sampler.epoch
 
             rng_path = os.path.join(load_path, "rng.pt")
             if os.path.exists(rng_path):
