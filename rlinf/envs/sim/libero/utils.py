@@ -149,6 +149,11 @@ def get_benchmark_overridden(benchmark_name) -> Benchmark:
         Benchmark class
     """
     name = str(benchmark_name).lower()
+    if name == "libero_mem" and name not in benchmark.BENCHMARK_MAPPING:
+        raise ImportError(
+            "task_suite_name='libero_mem' requires the LIBERO-Mem fork "
+            "installed as libero.libero in the environment's Python environment."
+        )
     if name != "libero_130":
         return benchmark.get_benchmark(benchmark_name)
 
@@ -224,6 +229,8 @@ def record_completed_episode_task_stats(
     eval_seen_trials: set[tuple[int, int]],
     task_success_stats: dict[int, dict[str, int]],
     logger=None,
+    *,
+    success_key: str = "success_once",
 ) -> np.ndarray:
     """Record per-task eval stats and return which envs count toward metrics.
 
@@ -235,10 +242,10 @@ def record_completed_episode_task_stats(
     count_mask = np.zeros(num_envs, dtype=bool)
 
     episode = final_info.get("episode")
-    if not episode or "success_once" not in episode:
+    if not episode or success_key not in episode:
         return count_mask
 
-    success = episode["success_once"]
+    success = episode[success_key]
     if isinstance(success, torch.Tensor):
         success = success.cpu().numpy()
     else:
