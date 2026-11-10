@@ -196,6 +196,316 @@ def _write_native_mixture_fixture(tmp_path):
     return catalog, sources
 
 
+def _write_adapted_mixture_fixture(tmp_path):
+    catalog, sources = _write_native_mixture_fixture(tmp_path)
+    path = catalog / "catalog/episodes.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows = [row for row in rows if row["episode_index"] < 6]
+    for row in rows:
+        row["assigned_split"] = ("train", "val", "test")[row["episode_index"] // 2]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    for source in sources:
+        source["adapter"] = {
+            "kind": "joint_relative",
+            "joint_action_indices": [0],
+            "joint_state_indices": [0],
+            "gripper_action_indices": [1],
+            "gripper_open": 7.0,
+            "gripper_closed": -1.0,
+        }
+        source["normalization"] = {"transform": "quantile"}
+    return catalog, sources
+
+
+def test_native_control_adapter_shared_anchor_and_reversible_grippers():
+    from rlinf.data.datasets.openpi.control_schema import (
+        ControlAdapter,
+        normalize,
+        unnormalize,
+    )
+
+    adapter = ControlAdapter.from_config(
+        {
+            "kind": "joint_relative",
+            "joint_action_indices": [0, 2],
+            "joint_state_indices": [1, 3],
+            "gripper_action_indices": [1],
+            "gripper_state_indices": [0],
+            "gripper_open": 1.0,
+            "gripper_closed": -1.0,
+        }
+    )
+    actions = np.asarray(
+        [[[1, 1, 3], [2, 0, 4], [5, -1, 6]], [[8, -1, 3], [4, 0, 4], [3, 1, 6]]],
+        dtype=np.float32,
+    )
+    anchor = np.asarray([[1, 2, 0, 3], [-1, 5, 0, 2]], dtype=np.float32)
+    original_actions, original_anchor = actions.copy(), anchor.copy()
+    encoded = adapter.encode_actions(actions, anchor)
+    np.testing.assert_allclose(encoded[..., 0], actions[..., 0] - anchor[:, None, 1])
+    np.testing.assert_allclose(encoded[..., 2], actions[..., 2] - anchor[:, None, 3])
+    np.testing.assert_allclose(encoded[..., 1], [[0, 0.5, 1], [1, 0.5, 0]])
+    np.testing.assert_allclose(adapter.encode_state(anchor)[..., 0], [0, 1])
+    np.testing.assert_allclose(adapter.decode_actions(encoded, anchor), actions)
+    np.testing.assert_allclose(
+        adapter.decode_actions(adapter.encode_actions(actions, anchor[0]), anchor[0]),
+        actions,
+    )
+    np.testing.assert_array_equal(actions, original_actions)
+    np.testing.assert_array_equal(anchor, original_anchor)
+    np.testing.assert_array_equal(
+        ControlAdapter.from_config(None).encode_actions(actions, anchor), actions
+    )
+    stats = {
+        "transform": "quantile",
+        "q01": [-1, 0, 2],
+        "q99": [1, 1, 2],
+        "passthrough_indices": [1],
+    }
+    values = np.asarray([[4, 1, 2], [-4, 0, 2]], dtype=np.float32)
+    normalized = normalize(values, stats)
+    assert normalized[0, 0] > 1 and normalized[1, 0] < -1
+    np.testing.assert_array_equal(normalized[:, 1:], values[:, 1:] - [0, 2])
+    np.testing.assert_allclose(unnormalize(normalized, stats), values)
+    with pytest.raises(ValueError, match="nonoverlapping"):
+        ControlAdapter.from_config(
+            {
+                "kind": "joint_relative",
+                "joint_action_indices": [0],
+                "joint_state_indices": [0],
+                "gripper_action_indices": [0],
+            }
+        )
+
+
+def test_native_mixture_adapted_statistics_and_fixed_holdout(tmp_path):
+    from rlinf.data.datasets.openpi.mixture import (
+        MixtureSftDataset,
+        NumericEpisodeCache,
+        prepare_mixture,
+    )
+
+    catalog, sources = _write_adapted_mixture_fixture(tmp_path)
+    prepared = tmp_path / "prepared"
+    summary = prepare_mixture(
+        catalog,
+        prepared,
+        sources,
+        val_fraction=0,
+        action_horizon=3,
+        action_dim=4,
+        sampling_unit="episode",
+    )
+    splits = {
+        split: [
+            json.loads(line)
+            for line in (prepared / f"{split}.jsonl").read_text().splitlines()
+        ]
+        for split in ("train", "val", "test")
+    }
+    assert all(summary[split]["episodes"] == 4 for split in splits)
+    assert all(row["episode_index"] < 2 for row in splits["train"])
+    assert all(2 <= row["episode_index"] < 4 for row in splits["val"])
+    assert all(row["episode_index"] >= 4 for row in splits["test"])
+    stats = json.loads((prepared / "normalization.json").read_text())["schemas"]
+    cache = NumericEpisodeCache()
+    for schema, schema_stats in stats.items():
+        rows = [row for row in splits["train"] if row["schema_id"] == schema]
+        expected = []
+        for row in rows:
+            actions, states, supervised = cache.read(row)
+            for frame in row["anchor_indices"]:
+                for future in range(frame, min(frame + 3, len(actions))):
+                    if supervised[future]:
+                        expected.append([actions[future, 0] - states[frame, 0], 0])
+        expected = np.asarray(expected)
+        np.testing.assert_allclose(schema_stats["action"]["mean"], expected.mean(0))
+        np.testing.assert_allclose(
+            schema_stats["action"]["q01"], np.quantile(expected, 0.01, axis=0)
+        )
+        np.testing.assert_allclose(
+            schema_stats["action"]["q99"], np.quantile(expected, 0.99, axis=0)
+        )
+        assert schema_stats["action"]["count"] == len(expected)
+        assert schema_stats["action"]["passthrough_indices"] == [1]
+        assert set(schema_stats["train_catalog_ids"]) == {
+            row["catalog_id"] for row in rows
+        }
+    dataset = MixtureSftDataset(prepared, action_horizon=3, action_dim=4)
+    row, frame, _, normalized_actions, mask = dataset.numeric_item(0)
+    from rlinf.data.datasets.openpi.control_schema import unnormalize
+
+    native, state, _ = cache.read(row)
+    encoded = unnormalize(normalized_actions[:, :2], stats[row["schema_id"]]["action"])
+    assert encoded[0, 0] == pytest.approx(native[frame, 0] - state[frame, 0])
+    np.testing.assert_array_equal(normalized_actions[:, 1], 0)
+    np.testing.assert_array_equal(mask[:, 2:], False)
+
+
+def test_native_mixture_episode_sampling_balances_original_groups(tmp_path):
+    from rlinf.data.datasets.openpi.mixture import (
+        MixtureSampler,
+        MixtureSftDataset,
+        prepare_mixture,
+    )
+
+    catalog, sources = _write_native_mixture_fixture(tmp_path)
+    path = catalog / "catalog/episodes.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    duplicate = dict(rows[0], catalog_id="arm_a:extra_slice")
+    rows.append(duplicate)
+    rows[0]["core_range_in_export"] = [1, 2]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    prepared = tmp_path / "prepared"
+    prepare_mixture(catalog, prepared, sources, val_fraction=0, sampling_unit="episode")
+    dataset = MixtureSftDataset(prepared, action_horizon=3, action_dim=4)
+    sampler = MixtureSampler(dataset, batch_size=2)
+    totals, sizes, clips = {}, {}, {}
+    offset = 0
+    for row in dataset.episodes:
+        key = (row["schema_id"], row["source_group_id"])
+        count = len(row["anchor_indices"])
+        totals[key] = (
+            totals.get(key, 0) + sampler.weights[offset : offset + count].sum()
+        )
+        sizes[key] = sizes.get(key, 0) + count
+        clips[key] = clips.get(key, 0) + 1
+        offset += count
+    assert len(set(sizes.values())) > 1 and len(set(clips.values())) > 1
+    for source in sources:
+        values = [
+            float(value)
+            for (name, _), value in totals.items()
+            if name == source["name"]
+        ]
+        np.testing.assert_allclose(values, source["weight"] / len(values))
+
+
+def test_native_mixture_contract_and_sampler_resume_identity(tmp_path):
+    from rlinf.data.datasets.openpi.mixture import (
+        MixtureSampler,
+        MixtureSftDataset,
+        prepare_mixture,
+    )
+
+    catalog, sources = _write_adapted_mixture_fixture(tmp_path)
+    prepared = tmp_path / "prepared"
+    prepare_mixture(catalog, prepared, sources, action_horizon=3, action_dim=4)
+    for kwargs in (
+        {"action_horizon": 4, "action_dim": 4},
+        {"action_horizon": 3, "action_dim": 5},
+    ):
+        with pytest.raises(ValueError):
+            MixtureSftDataset(prepared, **kwargs)
+    dataset = MixtureSftDataset(prepared, action_horizon=3, action_dim=4)
+    sampler = MixtureSampler(dataset, batch_size=2, seed=19, samples_per_epoch=20)
+    iterator = iter(sampler)
+    next(iterator)
+    next(iterator)
+    saved = sampler.state_dict()
+    expected = list(iterator)
+    restored = MixtureSampler(dataset, batch_size=2, seed=19, samples_per_epoch=20)
+    with pytest.raises(ValueError):
+        restored.load_state_dict({"epoch": 0, "position": 2})
+    restored.load_state_dict(saved)
+    assert list(restored) == expected
+    for world_size, rank in ((2, 0), (2, 1)):
+        changed = MixtureSampler(
+            dataset,
+            batch_size=2,
+            seed=19,
+            samples_per_epoch=20,
+            world_size=world_size,
+            rank=rank,
+        )
+        with pytest.raises(ValueError, match="topology"):
+            changed.load_state_dict(saved)
+    for seed, budget in ((20, 20), (19, 24)):
+        changed = MixtureSampler(
+            dataset, batch_size=2, seed=seed, samples_per_epoch=budget
+        )
+        with pytest.raises(ValueError):
+            changed.load_state_dict(saved)
+    changed_sources = copy.deepcopy(sources)
+    changed_sources[0]["weight"] = 2
+    other = tmp_path / "other"
+    prepare_mixture(catalog, other, changed_sources, action_horizon=3, action_dim=4)
+    changed_dataset = MixtureSftDataset(other, action_horizon=3, action_dim=4)
+    changed = MixtureSampler(
+        changed_dataset, batch_size=2, seed=19, samples_per_epoch=20
+    )
+    with pytest.raises(ValueError):
+        changed.load_state_dict(saved)
+    for filename in ("train.jsonl", "normalization.json"):
+        tampered = tmp_path / filename.replace(".", "_")
+        shutil.copytree(prepared, tampered)
+        target = tampered / filename
+        target.write_text(target.read_text() + "\n")
+        with pytest.raises(ValueError):
+            MixtureSftDataset(tampered, action_horizon=3, action_dim=4)
+
+
+def test_native_mixture_sample_cache_preserves_inputs_without_source_media(tmp_path):
+    import gzip
+    import pickle
+
+    from rlinf.data.datasets.openpi.mixture import (
+        MixtureSampler,
+        MixtureSftDataset,
+        prepare_mixture,
+    )
+
+    catalog, sources = _write_adapted_mixture_fixture(tmp_path)
+    prepared = tmp_path / "prepared"
+    prepare_mixture(catalog, prepared, sources, action_horizon=3, action_dim=4)
+    dataset = MixtureSftDataset(prepared, action_horizon=3, action_dim=4)
+    row, _, state, actions, mask = dataset.numeric_item(0)
+    sample = {
+        "observation": {
+            "state": state,
+            "image": np.random.default_rng(0)
+            .uniform(-1, 1, (224, 224, 3))
+            .astype(np.float32),
+        },
+        "actions": actions,
+        "action_loss_mask": mask,
+        "sample_schema": row["schema_id"],
+        "sample_group": row["source_group_id"],
+    }
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    with gzip.open(cache / "0.pkl.gz", "wb") as stream:
+        pickle.dump(sample, stream, protocol=5)
+    (cache / "metadata.json").write_text(
+        json.dumps({"contract": dataset.sample_cache_contract(), "indices": [0]})
+    )
+    shutil.rmtree(catalog)
+    cached = MixtureSftDataset(
+        prepared, action_horizon=3, action_dim=4, sample_cache_dir=cache
+    )
+    actual = cached[0]
+    for key in ("state", "image"):
+        np.testing.assert_array_equal(
+            actual["observation"][key], sample["observation"][key]
+        )
+    for key in ("actions", "action_loss_mask"):
+        np.testing.assert_array_equal(actual[key], sample[key])
+    assert actual["sample_group"] == sample["sample_group"]
+    assert list(MixtureSampler(dataset, batch_size=1, samples_per_epoch=20)) == list(
+        MixtureSampler(cached, batch_size=1, samples_per_epoch=20)
+    )
+    with pytest.raises(FileNotFoundError):
+        cached[1]
+    with pytest.raises(ValueError, match="Sample cache requires identical"):
+        MixtureSftDataset(
+            prepared,
+            action_horizon=3,
+            action_dim=4,
+            max_token_len=201,
+            sample_cache_dir=cache,
+        )
+
+
 def test_native_mixture_group_splits_and_training_only_statistics(tmp_path):
     from rlinf.data.datasets.openpi.mixture import NumericEpisodeCache, prepare_mixture
 
@@ -295,6 +605,7 @@ def test_native_mixture_core_tail_dimension_and_fractional_clock(tmp_path):
     assert len(evaluation) == 16
     assert evaluation.alignment_dropped == 1
     assert {row["schema_id"] for row in evaluation.episodes} == {"arm_a", "arm_b"}
+    assert len(evaluation.episodes) == 16
     assert (
         sum(
             len(row["anchor_indices"])
@@ -385,6 +696,50 @@ def test_native_mixture_weighted_sampler_and_loader_resume(tmp_path):
         dataset, batch_size=3, shuffle=False, world_size=2, rank=1
     )
     assert list(evaluation) == list(range(1, len(dataset), 2))
+
+
+def test_native_mixture_sampler_above_multinomial_category_limit():
+    from rlinf.data.datasets.openpi.mixture import MixtureSampler
+
+    boundary = 2**24
+    dataset = SimpleNamespace(
+        episodes=[
+            {
+                "schema_id": "large",
+                "source_group_id": "a",
+                "anchor_indices": range(boundary),
+            },
+            {"schema_id": "tail", "source_group_id": "b", "anchor_indices": range(1)},
+        ],
+        schemas={"large": {"weight": 1.0}, "tail": {"weight": 1.0}},
+        sampling_unit="frame",
+        manifest_fingerprint="large-mixture",
+        requires_contract=True,
+    )
+    sampler = MixtureSampler(dataset, batch_size=1, samples_per_epoch=2048, seed=19)
+    global_draws = list(sampler)
+    assert all(0 <= index <= boundary for index in global_draws)
+    assert 0.45 < global_draws.count(boundary) / len(global_draws) < 0.55
+
+    ranks = [copy.copy(sampler) for _ in range(2)]
+    for rank, local in enumerate(ranks):
+        local.rank = rank
+        local.world_size = 2
+        local.num_samples = 1024
+        local.set_epoch(0)
+    assert [index for pair in zip(*map(list, ranks)) for index in pair] == global_draws
+
+    local = ranks[1]
+    local.set_epoch(3)
+    iterator = iter(local)
+    next(iterator)
+    next(iterator)
+    saved = local.state_dict()
+    remainder = list(iterator)
+    restored = copy.copy(local)
+    restored.load_state_dict(saved)
+    assert list(restored) == remainder
+    assert global_draws[1::2][2:] != remainder
 
 
 def test_native_mixture_worker_checkpoint_restores_epoch(tmp_path, monkeypatch):
@@ -3983,3 +4338,669 @@ def test_reward_loaders_accept_one_batch_per_rank(tmp_path):
 
     assert len(train_loader) == 1
     assert len(val_loader) == 1
+
+
+def _write_official_mixture_fixture(
+    tmp_path,
+    name,
+    schema,
+    offset=0.0,
+    *,
+    control_mode="native_molmobot_arm7_gripper1_command_unscaled",
+    state_dim=9,
+):
+    import hashlib
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root = tmp_path / name
+    root.mkdir()
+    assets = root / "checkpoint/assets/molmobot"
+    assets.mkdir(parents=True)
+    (assets / "norm_stats.json").write_text("{}")
+    (assets.parent / "train_config.pkl").write_bytes(b"numeric fixture config")
+    actions = np.arange(56, dtype=np.float32).reshape(7, 8) / 10 + offset
+    actions[:, 7] = np.linspace(0, 1, 7) if state_dim == 8 else np.arange(7) * 20
+    states = np.arange(7 * state_dim, dtype=np.float32).reshape(7, state_dim) / 100
+    supervised = np.array([True, True, True, False, True, True, True])
+    data = root / "episode.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "action": actions.tolist(),
+                "observation.state": states.tolist(),
+                "supervised": supervised,
+            }
+        ),
+        data,
+    )
+    row = {
+        "catalog_id": name,
+        "schema_id": schema,
+        "data_file": str(data),
+        "row_offset": 0,
+        "frames": 7,
+        "core_range": [0, 7],
+        "supervision_mask_feature": "supervised",
+        "anchor_indices": list(range(7)),
+        "source_group_id": f"group_{name}",
+        "task": "Pick up the egg",
+    }
+    for split in ("train", "val", "test"):
+        (root / f"{split}.jsonl").write_text(json.dumps(row) + "\n")
+    (root / "normalization.json").write_text(
+        json.dumps(
+            {
+                "schemas": {
+                    schema: {
+                        "weight": 1.0,
+                        "native_control_mode": control_mode,
+                    }
+                }
+            }
+        )
+    )
+    (root / "contract.json").write_text(
+        json.dumps(
+            {
+                "files": {
+                    file: hashlib.sha256((root / file).read_bytes()).hexdigest()
+                    for file in (
+                        "train.jsonl",
+                        "val.jsonl",
+                        "test.jsonl",
+                        "normalization.json",
+                    )
+                }
+            }
+        )
+    )
+    return root, actions, states
+
+
+def test_official_mixture_preserves_native_targets_and_excludes_partial_chunks(
+    tmp_path,
+):
+    from rlinf.data.datasets.openpi_official import OfficialMixtureDataset
+
+    root, actions, states = _write_official_mixture_fixture(tmp_path, "native", "molmo")
+    dataset = OfficialMixtureDataset(
+        root, model_path=root / "checkpoint", action_horizon=3
+    )
+    assert len(dataset) == 2
+    assert dataset.available_samples == 7
+    assert dataset.incomplete_chunk_dropped == 5
+    for index, expected_frame in enumerate((0, 4)):
+        _, frame, sample = dataset.numeric_item(index)
+        assert frame == expected_frame
+        np.testing.assert_array_equal(sample["actions"], actions[frame : frame + 3])
+        np.testing.assert_array_equal(
+            sample["observation/joint_position"], states[frame, :7]
+        )
+        np.testing.assert_array_equal(
+            sample["observation/gripper_position"], states[frame, 7:]
+        )
+        assert "action_loss_mask" not in sample
+
+
+def test_official_mixture_preserves_droid_native8_and_rejects_incorrect_state_dim(
+    tmp_path,
+):
+    from rlinf.data.datasets.openpi_official import OfficialMixtureDataset
+
+    control = "droid_absolute_joint_position_and_normalized_closure"
+    root, actions, states = _write_official_mixture_fixture(
+        tmp_path, "droid", "droid", control_mode=control, state_dim=8
+    )
+    dataset = OfficialMixtureDataset(
+        root, model_path=root / "checkpoint", action_horizon=3
+    )
+    assert len(dataset) == 2
+    _, frame, raw = dataset.numeric_item(1)
+    np.testing.assert_array_equal(raw["actions"], actions[frame : frame + 3])
+    np.testing.assert_array_equal(raw["observation/joint_position"], states[frame, :7])
+    np.testing.assert_array_equal(
+        raw["observation/gripper_position"], states[frame, 7:]
+    )
+    invalid, _, _ = _write_official_mixture_fixture(
+        tmp_path, "invalid_droid", "droid", control_mode=control
+    )
+    with pytest.raises(ValueError, match="requires native action8/state8"):
+        OfficialMixtureDataset(
+            invalid, model_path=invalid / "checkpoint", action_horizon=3
+        )
+
+
+@pytest.mark.parametrize("first_source", ["molmo", "droid"])
+def test_official_mixture_keeps_closure_units_across_source_order(
+    tmp_path, first_source
+):
+    transforms = pytest.importorskip("openpi.transforms")
+    dataset_openpi = pytest.importorskip("molmobot_pi0.dataset_openpi")
+    from openpi.models.pi0_config import Pi0Config
+    from openpi.training.config import TrainConfig
+
+    from rlinf.data.datasets.openpi_official import OfficialMixtureDataset
+
+    second_source = "droid" if first_source == "molmo" else "molmo"
+    fixtures = {
+        "molmo": _write_official_mixture_fixture(tmp_path, "molmo", "molmo"),
+        "droid": _write_official_mixture_fixture(
+            tmp_path,
+            "droid",
+            "droid",
+            control_mode="droid_absolute_joint_position_and_normalized_closure",
+            state_dim=8,
+        ),
+    }
+    model_path = fixtures["molmo"][0] / "checkpoint"
+    config = TrainConfig(
+        name="native_units",
+        model=Pi0Config(action_dim=8, action_horizon=3),
+        data=dataset_openpi.MlSpacesDatasetConfigFactory(repo_id=str(tmp_path)),
+    )
+    (model_path / "assets/train_config.pkl").write_bytes(pickle.dumps(config))
+    stats = {
+        "mean": np.arange(8, dtype=np.float32) / 10,
+        "std": np.linspace(0.5, 1.2, 8, dtype=np.float32),
+    }
+    norm_stats = {key: transforms.NormStats(**stats) for key in ("state", "actions")}
+    import openpi.shared.normalize as normalize
+
+    normalize.save(model_path / "assets/molmobot", norm_stats)
+    for root, _, _ in fixtures.values():
+        for split in ("train", "val", "test"):
+            path = root / f"{split}.jsonl"
+            row = json.loads(path.read_text())
+            row.update(
+                fps=15,
+                videos={
+                    slot: {"path": f"{slot}.mp4", "from_timestamp": 1.0}
+                    for slot in ("base_0_rgb", "left_wrist_0_rgb")
+                },
+            )
+            path.write_text(json.dumps(row) + "\n")
+        contract_path = root / "contract.json"
+        contract = json.loads(contract_path.read_text())
+        import hashlib
+
+        for filename in contract["files"]:
+            contract["files"][filename] = hashlib.sha256(
+                (root / filename).read_bytes()
+            ).hexdigest()
+        contract_path.write_text(json.dumps(contract))
+    dataset = OfficialMixtureDataset(
+        {name: str(fixtures[name][0]) for name in (first_source, second_source)},
+        model_path=model_path,
+        action_horizon=3,
+    )
+    # External tokenization and video decoding need neither downloads nor assets.
+    with (
+        mock.patch("openpi.models.tokenizer.PaligemmaTokenizer") as tokenizer,
+        mock.patch(
+            "lerobot.common.datasets.video_utils.decode_video_frames",
+            return_value=torch.zeros(1, 3, 16, 16),
+        ),
+    ):
+        tokenizer.return_value.tokenize.return_value = (
+            np.zeros(4, dtype=np.int32),
+            np.ones(4, dtype=bool),
+        )
+        for index in (1, 3, 0, 2, 1, 3):
+            source = first_source if index < 2 else second_source
+            _, actions, states = fixtures[source]
+            frame = 4 if index % 2 else 0
+            expected_state = states[frame, :8].copy()
+            expected_actions = actions[frame : frame + 3].copy()
+            if source == "molmo":
+                expected_state[7] = np.clip(expected_state[7] / 0.824033, 0, 1)
+                expected_actions[:, 7] /= 255
+            sample = dataset[index]
+            np.testing.assert_allclose(
+                sample["observation"]["state"],
+                (expected_state - stats["mean"]) / (stats["std"] + 1e-6),
+                rtol=1e-6,
+                atol=1e-6,
+            )
+            np.testing.assert_allclose(
+                sample["actions"],
+                (expected_actions - stats["mean"]) / (stats["std"] + 1e-6),
+                rtol=1e-6,
+                atol=1e-6,
+            )
+            assert sample["observation"]["image_mask"] == {
+                "base_0_rgb": True,
+                "left_wrist_0_rgb": True,
+                "right_wrist_0_rgb": False,
+            }
+        restored = pickle.loads(pickle.dumps(dataset))
+        for index in (0, 2):
+            expected, actual = dataset[index], restored[index]
+            np.testing.assert_array_equal(actual["actions"], expected["actions"])
+            np.testing.assert_array_equal(
+                actual["observation"]["state"], expected["observation"]["state"]
+            )
+
+
+def test_official_mixture_target_exposure_preserves_stream_and_resume(tmp_path):
+    from rlinf.data.datasets.openpi_official import (
+        ExposureMatchedSampler,
+        OfficialMixtureDataset,
+    )
+
+    target, _, _ = _write_official_mixture_fixture(tmp_path, "target", "molmo")
+    auxiliary, _, _ = _write_official_mixture_fixture(
+        tmp_path, "auxiliary", "molmo", 1.0
+    )
+    single = OfficialMixtureDataset(
+        {"target": target}, model_path=target / "checkpoint", action_horizon=3
+    )
+    mixture = OfficialMixtureDataset(
+        {"target": target, "aux": auxiliary},
+        model_path=target / "checkpoint",
+        action_horizon=3,
+    )
+    base = {
+        "target_schemas": ["target/molmo"],
+        "target_samples_per_epoch": 16,
+        "global_batch_size": 4,
+        "seed": 31,
+    }
+    for rank in (0, 1):
+        pure = ExposureMatchedSampler(
+            single, auxiliary_samples_per_epoch=0, world_size=2, rank=rank, **base
+        )
+        mixed = ExposureMatchedSampler(
+            mixture, auxiliary_samples_per_epoch=12, world_size=2, rank=rank, **base
+        )
+        pure_sequence = [single.numeric_item(i)[1] for i in pure]
+        mixed_indices = list(mixed)
+        target_sequence = [
+            mixture.numeric_item(i)[1]
+            for i in mixed_indices
+            if mixture.numeric_item(i)[0]["schema_id"] == "target/molmo"
+        ]
+        assert target_sequence == pure_sequence
+        assert len(target_sequence) == 8
+        assert len(mixed_indices) == 14
+        mixed.set_epoch(1)
+        iterator = iter(mixed)
+        next(iterator)
+        next(iterator)
+        saved = mixed.state_dict()
+        remaining = list(iterator)
+        restored = ExposureMatchedSampler(
+            mixture, auxiliary_samples_per_epoch=12, world_size=2, rank=rank, **base
+        )
+        restored.load_state_dict(saved)
+        assert list(restored) == remaining
+        changed = ExposureMatchedSampler(
+            mixture, auxiliary_samples_per_epoch=8, world_size=2, rank=rank, **base
+        )
+        with pytest.raises(ValueError, match="exposure plan"):
+            changed.load_state_dict(saved)
+
+
+def test_native_mixture_final_export_relocation_and_original_episode_groups(tmp_path):
+    from rlinf.data.datasets.openpi.mixture import MixtureSftDataset, prepare_mixture
+
+    catalog, sources = _write_native_mixture_fixture(tmp_path)
+    source = {**sources[0], "arms": 1}
+    root = catalog / source["name"]
+    records = [
+        row
+        for row in map(
+            json.loads, (catalog / "catalog/episodes.jsonl").read_text().splitlines()
+        )
+        if row["source_dataset"] == source["name"]
+    ][:4]
+    (root / "meta/partition.json").write_text(
+        json.dumps({"metadata": {"arms": 1, "domain": "real"}})
+    )
+    provenance = []
+    final_rows = []
+    for row in records:
+        index = row["episode_index"]
+        provenance.append(
+            {
+                "episode_index": index,
+                "provenance": {
+                    "core_range_in_export": [1, 4],
+                    "supervision_mask_feature": "source.extra.supervision_mask",
+                },
+            }
+        )
+        final_rows.append(
+            {
+                **row,
+                "clip_id": f"clip_{index}",
+                "partition": "/removed/export",
+                "source_revision": "fixed",
+                "source_episode_id": str(index // 2),
+                "source_group_id": "publisher_shard",
+                "quality_tier": "unannotated",
+                "visual_review_status": "accepted",
+                "visual_pickup_confirmed": True,
+            }
+        )
+    for row in final_rows:
+        row.pop("scene_id")
+    (root / "meta/collection_index.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in final_rows)
+    )
+    (root / "meta/clip_provenance.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in provenance)
+    )
+    output = tmp_path / "prepared_final"
+    summary = prepare_mixture(
+        root, output, [source], val_fraction=0, sampling_unit="episode"
+    )
+    dataset = MixtureSftDataset(output, action_horizon=3, action_dim=4)
+    assert summary["train"]["episodes"] == 4
+    assert {row["split_group"] for row in dataset.episodes} == {"arm_a:publisher_shard"}
+    assert len({row["source_group_id"] for row in dataset.episodes}) == 2
+    assert all(row["data_file"].startswith(str(root)) for row in dataset.episodes)
+    row, frame, _, _, mask = dataset.numeric_item(0)
+    assert row["row_offset"] == row["episode_index"] * 5
+    assert frame == 1
+    assert mask[:, 0].tolist() == [True, False, True]
+
+
+def test_realized_joint_trajectory_uses_future_measured_states_and_time_masks(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from rlinf.data.datasets.openpi.mixture import NumericEpisodeCache
+    from rlinf.data.datasets.openpi.realized_trajectory import (
+        RECIPE,
+        RealizedTrajectoryCache,
+    )
+
+    times = np.array([3.0, 3.1, 3.3, 3.5, 3.8])
+    rows = [
+        {
+            "observation.state": [float(t - 3)] * 7 + [0.0],
+            "action": [999.0] * 7 + [g],
+            "source.timestamp": float(t),
+            "mask": True,
+        }
+        for t, g in zip(times, [0.0, 255.0, 0.0, 255.0, 255.0])
+    ]
+    path = tmp_path / "packed.parquet"
+    pq.write_table(pa.Table.from_pylist(rows + rows), path)
+    row = {
+        "catalog_id": "second_episode",
+        "data_file": str(path),
+        "row_offset": 5,
+        "frames": 5,
+        "core_range": [0, 5],
+        "supervision_mask_feature": "mask",
+        "target_recipe": {
+            **RECIPE,
+            "gripper_target": {
+                "feature": "action",
+                "index": 7,
+                "open": 0.0,
+                "closed": 255.0,
+            },
+            "gripper_state": None,
+        },
+    }
+    trajectory_cache = RealizedTrajectoryCache(NumericEpisodeCache())
+    sample = trajectory_cache.sample(row, 0)
+    assert trajectory_cache.valid_anchors(row).tolist() == [
+        bool(trajectory_cache.sample(row, frame)["action_mask"].any())
+        for frame in range(row["frames"])
+    ]
+    np.testing.assert_allclose(sample["target_timestamps"], 3 + np.arange(1, 17) / 15)
+    np.testing.assert_allclose(sample["actions"][:12, 0], np.arange(1, 13) / 15)
+    assert sample["action_mask"][:12].all()
+    assert not sample["action_mask"][12:].any()
+    assert sample["actions"][:3, 7].tolist() == [0.0, 1.0, 1.0]
+    assert sample["state_mask"].tolist() == [True] * 7 + [False]
+    assert (
+        not RealizedTrajectoryCache(NumericEpisodeCache())
+        .sample(row, 4)["action_mask"]
+        .any()
+    )
+
+
+def test_realized_joint_trajectory_shared_statistics_exclude_fixed_validation(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from rlinf.data.datasets.openpi.mixture import MixtureSftDataset, prepare_mixture
+
+    root = tmp_path / "collection"
+    partition = root / "robot"
+    (root / "catalog").mkdir(parents=True)
+    (partition / "meta/episodes").mkdir(parents=True)
+    (partition / "data").mkdir()
+    (partition / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "codebase_version": "v3.0",
+                "data_path": "data/{file_index}.parquet",
+                "video_path": "{video_key}/{file_index}.mp4",
+            }
+        )
+    )
+    records, episodes, data, provenance = [], [], [], []
+    for episode, split in enumerate(["train", "val"]):
+        for frame in range(8):
+            data.append(
+                {
+                    "observation.state": [episode * 1000.0 + frame / 5] * 7 + [0.0],
+                    "action": [9999.0] * 8,
+                    "source.timestamp": frame / 5,
+                }
+            )
+        episodes.append(
+            {
+                "episode_index": episode,
+                "length": 8,
+                "dataset_from_index": episode * 8,
+                "dataset_to_index": (episode + 1) * 8,
+                "data/chunk_index": 0,
+                "data/file_index": 0,
+                "videos/front/chunk_index": 0,
+                "videos/front/file_index": 0,
+                "videos/front/from_timestamp": episode * 2.0,
+            }
+        )
+        records.append(
+            {
+                "catalog_id": str(episode),
+                "partition": "robot",
+                "provenance_file": "robot/meta/clip_provenance.jsonl",
+                "source_dataset": "robot",
+                "arms": 1,
+                "episode_index": episode,
+                "source_group_id": str(episode),
+                "split": "unassigned",
+                "assigned_split": split,
+                "quality_tier": "native_source_success",
+                "frames": 8,
+                "core_range_in_export": [0, 8],
+                "fps": 5,
+                "control_mode": "unrelated_native",
+                "task": "pick",
+            }
+        )
+        provenance.append({"episode_index": episode, "provenance": {}})
+    pq.write_table(pa.Table.from_pylist(data), partition / "data/0.parquet")
+    pq.write_table(
+        pa.Table.from_pylist(episodes), partition / "meta/episodes/0.parquet"
+    )
+    (root / "catalog/episodes.jsonl").write_text(
+        "".join(json.dumps(x) + "\n" for x in records)
+    )
+    (partition / "meta/clip_provenance.jsonl").write_text(
+        "".join(json.dumps(x) + "\n" for x in provenance)
+    )
+    source = {
+        "name": "robot",
+        "source_dataset": "robot",
+        "arms": 1,
+        "weight": 1,
+        "cameras": {"base_0_rgb": "front"},
+        "gripper_identity": "unknown",
+        "trajectory": {"gripper_target": None, "gripper_state": None},
+    }
+    output = tmp_path / "prepared"
+    prepare_mixture(
+        root,
+        output,
+        [source],
+        action_horizon=16,
+        action_dim=8,
+        target_recipe="realized_joint_trajectory",
+    )
+    dataset = MixtureSftDataset(output, action_horizon=16, action_dim=8)
+    stats = dataset.schemas["robot"]
+    assert max(stats["action"]["mean"]) < 2
+    assert stats["action"]["count"][7] == 0
+    _, _, state, actions, mask = dataset.numeric_item(0)
+    assert state[7] == 0
+    assert not mask[:, 7].any()
+    assert np.isfinite(actions).all()
+    assert (
+        len(
+            json.loads((output / "normalization.json").read_text())["target_recipe"][
+                "joint_state_indices"
+            ]
+        )
+        == 7
+    )
+
+
+def test_realized_sampler_balances_original_episodes_and_resumes_global_stream(
+    tmp_path,
+):
+    from collections import Counter
+
+    from rlinf.data.datasets.openpi.mixture import MixtureSftDataset, prepare_mixture
+    from rlinf.data.datasets.openpi.realized_trajectory import RealizedTrajectorySampler
+
+    root, sources = _write_native_mixture_fixture(tmp_path)
+    output = tmp_path / "prepared"
+    prepare_mixture(root, output, sources, val_fraction=0, sampling_unit="episode")
+    dataset = MixtureSftDataset(output, action_horizon=3, action_dim=4)
+
+    def sampler(rank=0, world_size=1):
+        return RealizedTrajectorySampler(
+            dataset,
+            samples_per_epoch=12000,
+            batch_size=1,
+            rank=rank,
+            world_size=world_size,
+            seed=17,
+        )
+
+    import copy
+    import pickle
+
+    legacy = copy.copy(dataset)
+    legacy.episodes = [
+        json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()
+    ]
+    for index, row in enumerate(legacy.episodes):
+        indexed = dataset.episodes[index]
+        np.testing.assert_array_equal(
+            indexed.pop("anchor_indices"), row["anchor_indices"]
+        )
+        assert indexed == {
+            key: value for key, value in row.items() if key != "anchor_indices"
+        }
+    legacy_sampler = RealizedTrajectorySampler(
+        legacy, samples_per_epoch=12000, batch_size=1, seed=17
+    )
+    assert list(legacy_sampler) == list(sampler())
+    serialized = pickle.dumps(dataset)
+    assert len(serialized) < 32_768
+    reopened = pickle.loads(serialized)
+    np.testing.assert_array_equal(reopened.ends, dataset.ends)
+    assert list(
+        RealizedTrajectorySampler(
+            reopened, samples_per_epoch=12000, batch_size=1, seed=17
+        )
+    ) == list(sampler())
+
+    reference = list(sampler())
+    rank0, rank1 = list(sampler(0, 2)), list(sampler(1, 2))
+    assert [value for pair in zip(rank0, rank1) for value in pair] == reference
+    positions = [
+        int(np.searchsorted(dataset.ends, index, side="right")) for index in reference
+    ]
+    counts = Counter(dataset.episodes[index]["schema_id"] for index in positions)
+    assert abs(counts["arm_a"] / len(reference) - 0.25) < 0.02
+    for schema in counts:
+        groups = Counter(
+            dataset.episodes[index]["source_group_id"]
+            for index in positions
+            if dataset.episodes[index]["schema_id"] == schema
+        )
+        assert all(
+            abs(count / counts[schema] - 1 / len(groups)) < 0.035
+            for count in groups.values()
+        )
+    assert len(set(reference)) < len(reference)
+    consumed = sampler()
+    iterator = iter(consumed)
+    assert [next(iterator) for _ in range(79)] == reference[:79]
+    restored = sampler()
+    restored.load_state_dict(consumed.state_dict())
+    assert list(restored) == reference[79:]
+    consumed.set_epoch(1)
+    assert list(consumed) != reference
+
+
+def test_realized_sampler_world_size_migration_preserves_global_prefix(tmp_path):
+    from itertools import islice
+
+    from rlinf.data.datasets.openpi.mixture import MixtureSftDataset, prepare_mixture
+    from rlinf.data.datasets.openpi.realized_trajectory import RealizedTrajectorySampler
+
+    root, sources = _write_native_mixture_fixture(tmp_path)
+    prepared = tmp_path / "prepared"
+    prepare_mixture(root, prepared, sources, val_fraction=0, sampling_unit="episode")
+    dataset = MixtureSftDataset(prepared, action_horizon=3, action_dim=4)
+
+    def make_sampler(rank, world_size):
+        return RealizedTrajectorySampler(
+            dataset,
+            samples_per_epoch=224000,
+            batch_size=2,
+            world_size=world_size,
+            rank=rank,
+            seed=17,
+        )
+
+    states, old_next = [], []
+    for rank in range(14):
+        sampler = make_sampler(rank, 14)
+        sampler.set_epoch(2)
+        iterator = iter(sampler)
+        list(islice(iterator, 256))
+        states.append(sampler.state_dict())
+        old_next.append(list(islice(iterator, 16)))
+    expected = [index for row in zip(*old_next, strict=True) for index in row]
+    new_next = []
+    for rank in range(16):
+        sampler = make_sampler(rank, 16)
+        with pytest.raises(ValueError, match="resume contract differs"):
+            sampler.load_state_dict(states[0])
+        migration = sampler.migrate_world_size(states)
+        assert migration["global_samples_consumed_in_epoch"] == 3584
+        assert sampler.position == 224
+        assert sampler.num_samples == 14000
+        assert sampler.epoch == 2
+        new_next.append(list(islice(iter(sampler), 14)))
+    assert [index for row in zip(*new_next, strict=True) for index in row] == expected
+
+    for field, value in (("seed", 18), ("position", 255), ("num_samples", 16002)):
+        changed = copy.deepcopy(states)
+        changed[0][field] = value
+        with pytest.raises(ValueError, match="migration"):
+            make_sampler(0, 16).migrate_world_size(changed)

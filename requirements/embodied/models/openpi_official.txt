@@ -1,0 +1,51 @@
+# Model/data imports used by the pinned MolmoBot and OpenPI PyTorch implementation.
+# Torch/torchvision are selected through install.sh's model default.
+numpy==2.3.5
+transformers==4.53.2
+jax==0.5.3
+jaxlib==0.5.3
+flax==0.10.2
+orbax-checkpoint==0.11.13
+optax==0.2.7
+chex==0.1.90
+jaxtyping==0.2.36
+ml-collections==1.0.0
+beartype==0.19.0
+sentencepiece==0.2.1
+einops==0.8.2
+safetensors==0.7.0
+huggingface-hub==0.36.2
+pydantic==2.12.5
+numpydantic==1.8.0
+hydra-core==1.3.2
+pillow==11.3.0
+opencv-python==4.13.0.92
+scipy==1.17.1
+fsspec==2026.2.0
+gcsfs==2026.2.0
+etils==1.14.0
+typeguard==4.5.1
+datasets==4.8.2
+beaker-py==2.5.5
+decord==0.6.0
+tqdm==4.67.3
+h5py==3.16.0
+pyyaml==6.0.3
+rich==14.3.3
+tyro==1.0.10
+av==17.0.0
+pyarrow==23.0.1
+augmax==0.4.1
+dm-tree==0.1.9
+equinox==0.13.6
+flatbuffers==25.12.19
+imageio==2.37.3
+tqdm-loggable==0.4.1
+treescope==0.1.10
+jsonlines==4.0.0
+draccus==0.10.0
+ml-dtypes==0.5.4
+tensorstore==0.1.82
+polars==1.39.2
+# This official locked wheel remains available although its version index is absent.
+polars-runtime-32 @ https://files.pythonhosted.org/packages/4b/ad/f95110341491949f7137f1c74b988a6fede81b0b145771f3a69d9001f15a/polars_runtime_32-1.39.2-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=5895c531f61cad339a6283410c5b142f51c785263970efdea4d3ec571c1d98ef

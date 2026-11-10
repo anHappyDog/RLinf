@@ -85,6 +85,7 @@ FROM base-image-platform-${PLATFORM} AS base-image-embodied-roboverse
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-polaris
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-genesis
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-franka
+FROM base-image-platform-${PLATFORM} AS base-image-embodied-openpi-official
 
 
 ##################################################################################################
@@ -275,6 +276,11 @@ RUN link_assets
 
 # Set default env
 RUN echo "source ${UV_PATH}/openvla/bin/activate" >> ~/.bashrc
+
+FROM embodied-common-image AS embodied-openpi-official-image
+
+RUN bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv openpi-official --model openpi_official --env dummy
+RUN echo "source ${UV_PATH}/openpi-official/bin/activate" >> ~/.bashrc
 
 FROM embodied-common-image AS embodied-behavior-openvlaoft-image
 

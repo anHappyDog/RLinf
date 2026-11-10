@@ -16,12 +16,16 @@ from collections.abc import Iterable
 from typing import Union
 
 import torch
+from torch.distributed.checkpoint import FileSystemWriter
+from torch.distributed.checkpoint.planner import SavePlan, SavePlanner
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_state_dict,
     set_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.checkpoint.storage import WriteResult
+from torch.futures import Future
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
@@ -29,6 +33,24 @@ from rlinf.hybrid_engines.fsdp import FSDP, DTensor, FSDPModule
 from rlinf.hybrid_engines.fsdp.utils import FSDPVersion, to_local_if_dtensor
 from rlinf.utils.logging import get_logger
 from rlinf.utils.utils import get_rng_state, set_rng_state
+
+
+class CheckpointFileSystemWriter(FileSystemWriter):
+    """Log local write failures before DCP serializes their exception chains."""
+
+    def write_data(
+        self, plan: SavePlan, planner: SavePlanner
+    ) -> Future[list[WriteResult]]:
+        """Write checkpoint data, preserving the local exception chain in logs."""
+        try:
+            return super().write_data(plan, planner)
+        except Exception:
+            get_logger().exception(
+                "Checkpoint data write failed on rank %s at %s",
+                torch.distributed.get_rank(),
+                self.checkpoint_id,
+            )
+            raise
 
 
 class Checkpoint(Stateful):

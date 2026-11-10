@@ -36,6 +36,8 @@ data:
   num_obs_steps: 1
   samples_per_epoch: 4096
   eval_max_samples: 128
+  mixture:
+    sample_cache_dir: null
 
 actor:
   group_name: ActorGroup

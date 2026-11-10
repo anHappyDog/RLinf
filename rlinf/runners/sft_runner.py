@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
 from omegaconf.dictconfig import DictConfig
@@ -48,6 +52,14 @@ class SFTRunner:
         self.consumed_samples = 0
         # the step here is GRPO step
         self.global_step = 0
+        self._last_checkpoint_step = None
+        self.save_interval_seconds = cfg.runner.get("save_interval_seconds", None)
+        if self.save_interval_seconds is not None and self.save_interval_seconds <= 0:
+            raise ValueError("runner.save_interval_seconds must be positive")
+        stop_at = cfg.runner.get("stop_at", None)
+        self.stop_at = datetime.fromisoformat(stop_at) if stop_at else None
+        if self.stop_at is not None and self.stop_at.utcoffset() is None:
+            raise ValueError("runner.stop_at must include a timezone offset")
         early_stop_cfg = cfg.runner.get("early_stop", None)
         self.early_stop = (
             EarlyStopController(early_stop_cfg) if early_stop_cfg is not None else None
@@ -77,6 +89,7 @@ class SFTRunner:
 
     def run(self) -> None:
         start_step = self.global_step
+        self._last_checkpoint_time = time.monotonic()
         global_pbar = tqdm(
             initial=start_step,
             total=self.max_steps,
@@ -84,6 +97,14 @@ class SFTRunner:
             ncols=800,
         )
         for _step in range(start_step, self.max_steps):
+            if self._deadline_reached():
+                if self._last_checkpoint_step != self.global_step:
+                    self._save_checkpoint()
+                logger.info(
+                    "Stopped at configured deadline after saving step %s",
+                    self.global_step,
+                )
+                break
             if hasattr(self.actor, "set_global_step"):
                 # set global step
                 self.actor.set_global_step(self.global_step)
@@ -103,10 +124,17 @@ class SFTRunner:
                     run_time_exceeded=False,
                 )
 
-                if save_model:
+                deadline_reached = self._deadline_reached()
+                timed_save = self.save_interval_seconds is not None and (
+                    time.monotonic() - self._last_checkpoint_time
+                    >= self.save_interval_seconds
+                )
+                if save_model or timed_save or deadline_reached:
                     self._save_checkpoint()
+                    deadline_reached = self._deadline_reached()
 
-                should_stop = False
+                should_stop = deadline_reached
+                eval_model = eval_model and not deadline_reached
                 if eval_model:
                     eval_handle: Handle = self.actor.run_eval()
                     eval_metrics = eval_handle.wait()
@@ -146,6 +174,11 @@ class SFTRunner:
             global_pbar.set_postfix(logging_metrics, refresh=False)
             global_pbar.update(1)
             if should_stop:
+                if deadline_reached:
+                    logger.info(
+                        "Stopped at configured deadline after saving step %s",
+                        self.global_step,
+                    )
                 break
 
         if self.early_stop is not None and self.early_stop.best_val_acc > 0:
@@ -153,6 +186,9 @@ class SFTRunner:
                 f"Early stopping triggered! Best val_acc: {self.early_stop.best_val_acc:.4f}"
             )
         self.metric_logger.finish()
+
+    def _deadline_reached(self) -> bool:
+        return self.stop_at is not None and datetime.now(timezone.utc) >= self.stop_at
 
     def run_eval(self) -> None:
         with self.timer("evaluate"):
@@ -191,7 +227,23 @@ class SFTRunner:
             )
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
+        marker = Path(base_output_dir) / "CHECKPOINT_COMPLETE.json"
+        marker.unlink(missing_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        pending_marker = marker.with_suffix(".tmp")
+        pending_marker.write_text(
+            json.dumps(
+                {
+                    "global_step": self.global_step,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "actor_path": actor_save_path,
+                }
+            )
+            + "\n"
+        )
+        pending_marker.replace(marker)
+        self._last_checkpoint_time = time.monotonic()
+        self._last_checkpoint_step = self.global_step
         if is_best and self.early_stop is not None:
             logger.info(
                 f"Saved best model (val_acc={self.early_stop.best_val_acc:.4f}) to {base_output_dir}"

@@ -118,7 +118,7 @@ NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_ENGINES=("sglang" "vllm")
-SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "pi0_fast" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "lingbotvlav2" "dreamzero" "fastwam" "cosmos3" "qwen3_vl" "abot_m0" "molmoact2" "evo1" "diffusion" "sglang")
+SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "openpi_official" "pi0_fast" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "lingbotvlav2" "dreamzero" "fastwam" "cosmos3" "qwen3_vl" "abot_m0" "molmoact2" "evo1" "diffusion" "sglang")
 SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "robocasa365" "franka" "franka-ros" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "so101" "piper" "yam" "dummy" "polaris")
 
 #=======================Utility Functions=======================
@@ -1577,6 +1577,7 @@ apply_model_default_torch() {
     [ -z "$TORCH_VERSION" ] || return 0
     local model_torch="-"
     case "$MODEL" in
+        openpi_official) model_torch="2.7.1" ;;
         openpi)
             if [ "$ENV_NAME" = "yam" ]; then
                 # OpenPI 0.1.1 requires torch 2.7.1; sync its matching vision/codec stack.
@@ -2457,6 +2458,40 @@ install_openvla_oft_model() {
             ;;
     esac
     uv pip uninstall pynvml || true
+}
+
+install_openpi_official_model() {
+    case "$ENV_NAME" in
+        dummy)
+            create_and_sync_venv
+            install_common_embodied_deps
+            ;;
+        *)
+            echo "Environment '$ENV_NAME' is not supported for OpenPI official SFT; use --env dummy." >&2
+            exit 1
+            ;;
+    esac
+
+    local openpi_path molmobot_path lerobot_path
+    openpi_path=$(clone_or_reuse_repo OPENPI_OFFICIAL_PATH "$VENV_DIR/openpi-official" "${GITHUB_PREFIX}https://github.com/Physical-Intelligence/openpi.git")
+    molmobot_path=$(clone_or_reuse_repo MOLMOBOT_PATH "$VENV_DIR/MolmoBot" "${GITHUB_PREFIX}https://github.com/allenai/MolmoBot.git")
+    lerobot_path=$(clone_or_reuse_repo LEROBOT_OFFICIAL_PATH "$VENV_DIR/lerobot-official" "${GITHUB_PREFIX}https://github.com/huggingface/lerobot.git")
+    git -C "$openpi_path" checkout --detach 54cbaee6ae0c010a1ed431871cdaa8f4684ac709
+    git -C "$molmobot_path" checkout --detach 33c0ca77bf6062a23d60ffd4a6859334c4a46d30
+    git -C "$lerobot_path" checkout --detach "$LEROBOT_COMMIT"
+
+    local openpi_patch="$SCRIPT_DIR/embodied/models/openpi_official.patch"
+    if ! git -C "$openpi_path" apply --reverse --check "$openpi_patch" 2>/dev/null; then
+        git -C "$openpi_path" apply "$openpi_patch"
+    fi
+
+    # MolmoBot's official NumPy override conflicts with OpenPI's package metadata.
+    # Install the pinned model runtime outside RLinf's project overrides.
+    pushd ~ >/dev/null
+    uv pip install -r "$SCRIPT_DIR/embodied/models/openpi_official.txt"
+    uv pip install --no-deps -e "$openpi_path" -e "$openpi_path/packages/openpi-client" -e "$molmobot_path" -e "$lerobot_path"
+    python "$molmobot_path/scripts/install_openpi_extras.py"
+    popd >/dev/null
 }
 
 install_openpi_model() {
@@ -4218,6 +4253,9 @@ main() {
                     ;;
                 openpi)
                     install_openpi_model
+                    ;;
+                openpi_official)
+                    install_openpi_official_model
                     ;;
                 pi0_fast)
                     install_pi0_fast_model

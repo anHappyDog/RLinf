@@ -64,8 +64,8 @@ class FSDPVersion(str, Enum):
     FSDP2 = "fsdp2"
 
 
-def create_device_mesh(world_size: int) -> DeviceMesh:
-    """Build the 1-D device mesh that FSDP shards over.
+def create_device_mesh(world_size: int, fsdp_config=None) -> DeviceMesh:
+    """Build the device mesh for full, hybrid, or replicated FSDP2 training.
 
     The default process group is created here rather than left to
     ``init_device_mesh``. When no default group exists, ``init_device_mesh``
@@ -78,9 +78,10 @@ def create_device_mesh(world_size: int) -> DeviceMesh:
 
     Args:
         world_size (int): Number of ranks participating in FSDP.
+        fsdp_config: FSDP configuration; omitted for the default 1-D mesh.
 
     Returns:
-        DeviceMesh: A 1-D mesh over ``world_size`` ranks named ``fsdp``.
+        DeviceMesh: A sharding mesh, with an optional leading replica dimension.
     """
     if torch.distributed.is_initialized():
         get_logger().warning(
@@ -92,8 +93,34 @@ def create_device_mesh(world_size: int) -> DeviceMesh:
         # No backend is passed, so torch still resolves the per-device backend
         # it would have picked on its own; only the timeout changes.
         torch.distributed.init_process_group(timeout=Cluster.get_collective_timeout())
+    mesh_shape = (world_size,)
+    mesh_dim_names = ("fsdp",)
+    if fsdp_config is not None and fsdp_config.get("strategy") == "fsdp2":
+        sharding = fsdp_config.get("sharding_strategy", "full_shard")
+        if sharding in ("hybrid_shard", "no_shard"):
+            shard_size = (
+                fsdp_config.get("hybrid_shard_size")
+                if sharding == "hybrid_shard"
+                else 1
+            )
+            if (
+                not isinstance(shard_size, int)
+                or isinstance(shard_size, bool)
+                or shard_size < 1
+                or world_size % shard_size
+            ):
+                raise ValueError(
+                    "FSDP2 hybrid_shard_size must be a positive divisor of "
+                    f"world_size={world_size}, got {shard_size}."
+                )
+            mesh_shape = (world_size // shard_size, shard_size)
+            mesh_dim_names = ("replicate", "fsdp")
+        elif sharding != "full_shard":
+            raise ValueError(f"Unsupported FSDP2 sharding strategy: {sharding}.")
     return init_device_mesh(
-        Worker.torch_device_type, mesh_shape=(world_size,), mesh_dim_names=["fsdp"]
+        Worker.torch_device_type,
+        mesh_shape=mesh_shape,
+        mesh_dim_names=mesh_dim_names,
     )
 
 

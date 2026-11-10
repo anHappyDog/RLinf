@@ -75,15 +75,25 @@ class Pi0Eval(EnvIO, Pi0):
                 "use a training task wrapper (rl / dagger / dsrl) for train rollouts."
             )
         observation = self.env_obs_to_observation(env_obs)
+        raw_state = (
+            self._select_configured_state(env_obs["states"])
+            if self._mixture_io is not None
+            else None
+        )
         if rtc_context is not None and self.rtc_enabled:
             if self.rtc_guidance_mode != "approx":
                 raise NotImplementedError(
                     f"Unsupported RTC guidance mode: {self.rtc_guidance_mode!r}"
                 )
             return self._predict_eval_with_rtc(
-                observation, rtc_context=rtc_context, noise=noise, rng=rng
+                observation,
+                rtc_context=rtc_context,
+                noise=noise,
+                rng=rng,
             )
-        return self._predict_eval(observation, noise=noise, rng=rng)
+        return self._predict_eval(
+            observation, noise=noise, rng=rng, raw_state=raw_state
+        )
 
     def _predict_eval_with_rtc(
         self,
@@ -140,11 +150,13 @@ class Pi0Eval(EnvIO, Pi0):
             prefix_mask,
             kv_cache,
         )
-        ref_chunk = self.output_transform(
-            {"actions": model_actions, "state": observation.state}
-        )["actions"]
-
         raw_proprio = self._select_configured_state(env_obs["states"])
+        reference_state = (
+            raw_proprio if self._mixture_io is not None else observation.state
+        )
+        ref_chunk = self.output_transform(
+            {"actions": model_actions, "state": reference_state}
+        )["actions"]
         if "maniskill" in self.config_name.lower():
             state_dim = (
                 raw_proprio.shape[-1]

@@ -93,6 +93,7 @@ SupportedModel.OPENVLA = SupportedModel.register("openvla", force=True)
 SupportedModel.OPENVLA_OFT = SupportedModel.register("openvla_oft", force=True)
 SupportedModel.MOLMOACT2 = SupportedModel.register("molmoact2", force=True)
 SupportedModel.OPENPI = SupportedModel.register("openpi", force=True)
+SupportedModel.OPENPI_OFFICIAL = SupportedModel.register("openpi_official", force=True)
 SupportedModel.PI0_FAST = SupportedModel.register("pi0_fast", force=True)
 SupportedModel.STARVLA = SupportedModel.register("starvla", force=True)
 SupportedModel.MLP_POLICY = SupportedModel.register("mlp_policy", force=True)
@@ -141,6 +142,7 @@ EMBODIED_MODEL = set(
         SupportedModel.OPENVLA,
         SupportedModel.OPENVLA_OFT,
         SupportedModel.OPENPI,
+        SupportedModel.OPENPI_OFFICIAL,
         SupportedModel.PI0_FAST,
         SupportedModel.STARVLA,
         SupportedModel.MLP_POLICY,
@@ -484,10 +486,16 @@ def validate_fp32_master_adamw_config(
     """Validate the FSDP backend supported by FP32 master AdamW."""
     strategy = str(strategy).lower()
     sharding_strategy = str(sharding_strategy).lower()
-    if strategy != "fsdp" or sharding_strategy != "no_shard":
+    if (strategy, sharding_strategy) not in {
+        ("fsdp", "no_shard"),
+        ("fsdp2", "full_shard"),
+        ("fsdp2", "hybrid_shard"),
+        ("fsdp2", "no_shard"),
+    }:
         raise ValueError(
-            "use_fp32_master_params requires FSDP1 "
-            "with fsdp_config.strategy=fsdp and sharding_strategy=no_shard."
+            "use_fp32_master_params requires FSDP1 no_shard or FSDP2 "
+            "full_shard, hybrid_shard, or no_shard; "
+            f"got strategy={strategy}, sharding_strategy={sharding_strategy}."
         )
 
 
@@ -546,12 +554,19 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
             sharding = (
                 str(cfg.fsdp_config.sharding_strategy).strip().lower().replace("-", "_")
             )
-            assert sharding == "no_shard" or (
-                cfg.fsdp_config.strategy == "fsdp"
-                and sharding in ("shard_grad_op", "full_shard")
+            assert (
+                sharding == "no_shard"
+                or (
+                    cfg.fsdp_config.strategy == "fsdp"
+                    and sharding in ("shard_grad_op", "full_shard")
+                )
+                or (
+                    cfg.fsdp_config.strategy == "fsdp2"
+                    and sharding in ("full_shard", "hybrid_shard")
+                )
             ), (
-                "openpi sharded training requires actor.fsdp_config.strategy='fsdp' "
-                "and sharding_strategy in ['shard_grad_op', 'full_shard']; "
+                "openpi sharded training requires FSDP1 full_shard/shard_grad_op "
+                "or FSDP2 full_shard/hybrid_shard; "
                 f"got strategy={cfg.fsdp_config.strategy!r}, "
                 f"sharding_strategy={cfg.fsdp_config.sharding_strategy!r}."
             )

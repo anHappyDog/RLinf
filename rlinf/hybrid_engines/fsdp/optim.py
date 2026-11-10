@@ -79,7 +79,7 @@ class FP32MasterAdamW(Optimizer):
         state["exp_avg"] = self._new_fp32_tensor_like(param)
         state["exp_avg_sq"] = self._new_fp32_tensor_like(param)
         if param.dtype != torch.float32:
-            state["fp32_master_param"] = param.detach().to(torch.float32).clone()
+            state["fp32_master_param"] = param.detach().to(torch.float32)
         return state
 
     @torch.no_grad()
@@ -164,10 +164,8 @@ class FP32MasterAdamW(Optimizer):
                     if isinstance(value, torch.Tensor):
                         target_device = param.device if key != "step" else value.device
                         target_dtype = torch.float32 if key != "step" else value.dtype
-                        extracted[key] = (
-                            value.detach()
-                            .to(device=target_device, dtype=target_dtype)
-                            .clone()
+                        extracted[key] = value.detach().to(
+                            device=target_device, dtype=target_dtype
                         )
                 if extracted:
                     fp32_state[param] = extracted

@@ -123,7 +123,27 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     task = OmegaConf.select(model_cfg, "task", default="sft")
     task = str(task).lower() if task is not None else "sft"
 
-    if task == "sft":
+    from rlinf.models.embodiment.openpi.qtarget import (
+        CanonicalQtargetPi0,
+        load_qtarget_assets,
+    )
+
+    qtarget_assets = load_qtarget_assets(
+        model_path,
+        OmegaConf.select(model_cfg, "qtarget_manifest_dir", default=None),
+    )
+    if qtarget_assets is not None and task in ("sft", "eval"):
+        if pi0_config.action_dim != 8 or (
+            pi0_config.action_horizon
+            != qtarget_assets["normalization"]["action_horizon"]
+        ):
+            raise ValueError(
+                "Canonical action8/horizon differs from model architecture"
+            )
+        model = CanonicalQtargetPi0(
+            pi0_config, **runtime, rlt_cfg=rlt_cfg, qtarget_assets=qtarget_assets
+        )
+    elif task == "sft":
         model = Pi0(
             pi0_config,
             num_steps=num_steps,
@@ -253,6 +273,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             "use 'eval', 'sft', 'rl', 'dagger', or 'dsrl'."
         )
 
+    _apply_openpi_param_dtypes(model, target_dtype)
     if full_weights_path is not None:
         load_full_weights(
             model,
@@ -264,7 +285,10 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
         load_base_safetensors(model, safetensors_path)
 
     _freeze_after_load(model, task)
-    _apply_openpi_param_dtypes(model, target_dtype)
+    if bool(OmegaConf.select(model_cfg, "freeze_vision", default=False)):
+        model.img.requires_grad_(False)
+        # The checkpoint's vision_tower excludes the multimodal projection.
+        model.img.head.requires_grad_(True)
 
     n_params = sum(param.numel() for param in model.parameters())
     source = full_weights_path if full_weights_path is not None else safetensors_path
@@ -370,6 +394,8 @@ def _resolve_action_horizon_and_chunk(cfg, model_cfg) -> tuple[int, int]:
         return int(yaml_horizon), action_chunk
 
     config_name = str(OmegaConf.select(model_cfg, "config_name", default="") or "")
+    if config_name == "native_mixture":
+        raise ValueError("native_mixture requires openpi.action_horizon")
     if config_name:
         from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
 
@@ -407,6 +433,38 @@ def _resolve_data_kwargs(cfg):
 
 
 def _install_transforms(model, cfg, config_name: str):
+    if config_name == "native_mixture":
+        from omegaconf import OmegaConf
+
+        from rlinf.models.embodiment.openpi.mixture_io import MixturePolicyIO
+
+        if str(OmegaConf.select(cfg, "openpi.task", default="sft")) != "eval":
+            raise ValueError("native_mixture online I/O currently supports task=eval")
+        if bool(OmegaConf.select(cfg, "openpi.rtc_enabled", default=False)):
+            raise ValueError(
+                "native_mixture RTC requires rebasing previous actions to the current "
+                "raw-state anchor"
+            )
+        manifest_dir = OmegaConf.select(cfg, "openpi.mixture.manifest_dir")
+        schema_id = OmegaConf.select(cfg, "openpi.mixture.schema_id")
+        if manifest_dir is None or schema_id is None:
+            raise ValueError(
+                "native_mixture eval requires openpi.mixture.manifest_dir and schema_id"
+            )
+        policy_io = MixturePolicyIO(
+            manifest_dir,
+            schema_id,
+            action_dim=model.action_dim,
+            max_token_len=model.max_token_len,
+        )
+        horizon = policy_io.manifest.get("action_horizon")
+        if horizon is not None and int(horizon) != model.action_horizon:
+            raise ValueError(
+                f"Prepared action horizon {horizon} differs from model {model.action_horizon}"
+            )
+        model.setup_mixture_io(policy_io)
+        return model
+
     from rlinf.models.embodiment.openpi.transforms.pipeline import (
         build_openpi_transforms,
     )

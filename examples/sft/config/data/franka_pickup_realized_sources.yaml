@@ -1,0 +1,246 @@
+# New learning target; qualification records distinguish primary evidence from existing contracts.
+sources:
+- name: molmobot
+  source_dataset: molmobot
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.exterior
+    left_wrist_0_rgb: observation.images.wrist
+  control_contract:
+    representation: realized_joint_trajectory_v1
+    joint_target: future measured joint7 radians; linear interpolation on source observation
+      timestamps
+    gripper_target: normalized closure 0 open / 1 closed; zero-order held source command
+      when verified, otherwise masked
+    state: current measured joint7 and verified measured gripper when available
+    warning: new learning target; not original recorded joint commands
+    arm_order: single
+  training_group: realized_joint_trajectory_v1
+  gripper_identity: Robotiq 2F85
+  trajectory:
+    gripper_target:
+      feature: action
+      index: 7
+      open: 0
+      closed: 255
+      clip: true
+      time_offset_s: 0.0
+      evidence: publisher MolmoBot Robotiq command endpoints; row action already obs[i]
+        paired commands[i+1]; no extra time shift
+    gripper_state:
+      feature: observation.state
+      index: 7
+      open: 0
+      closed: 0.824033
+      clip: true
+      time_offset_s: 0.0
+      evidence: official MolmoBot GripperStateTransform clips first driver/.824033
+    gripper_missing_reason: null
+    joint_qualification:
+      value_policy: retain native measured q7 without numerical conversion
+      configured_unit: radian
+      evidence: 'primary: MuJoCo hinge qpos radians; fr3_joint1..7 publisher mapping'
+  fixed_partition_splits:
+    molmobot: train
+    molmobot_val: val
+- name: viola
+  source_dataset: viola
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.exterior
+    left_wrist_0_rgb: observation.images.wrist
+  control_contract:
+    representation: realized_joint_trajectory_v1
+    joint_target: future measured joint7 radians; linear interpolation on source observation
+      timestamps
+    gripper_target: normalized closure 0 open / 1 closed; zero-order held source command
+      when verified, otherwise masked
+    state: current measured joint7 and verified measured gripper when available
+    warning: new learning target; not original recorded joint commands
+    arm_order: single
+  training_group: realized_joint_trajectory_v1
+  gripper_identity: Franka gripper; physical aperture normalization unavailable
+  trajectory:
+    gripper_target:
+      feature: action
+      index: 6
+      open: 0
+      closed: 1
+      clip: true
+      time_offset_s: 0.0
+      evidence: native gripper_closedness_command; publisher Octo transform
+    gripper_state: null
+    gripper_missing_reason: null
+    joint_qualification:
+      value_policy: retain native measured q7 without numerical conversion
+      configured_unit: radian
+      evidence: existing pipeline q0..q6 contract; publisher unit recheck not completed
+- name: iamlab
+  source_dataset: iamlab_cmu_pickup_insert_converted_externally_to_rlds
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.exterior
+    left_wrist_0_rgb: observation.images.wrist
+  control_contract:
+    representation: realized_joint_trajectory_v1
+    joint_target: future measured joint7 radians; linear interpolation on source observation
+      timestamps
+    gripper_target: normalized closure 0 open / 1 closed; zero-order held source command
+      when verified, otherwise masked
+    state: current measured joint7 and verified measured gripper when available
+    warning: new learning target; not original recorded joint commands
+    arm_order: single
+  training_group: realized_joint_trajectory_v1
+  gripper_identity: Franka gripper; binary status only
+  trajectory:
+    gripper_target: null
+    gripper_state:
+      feature: observation.state
+      index: 7
+      open: 1
+      closed: 0
+      clip: true
+      time_offset_s: 0.0
+      evidence: 'binary recorded status: 1 open, 0 closed; no continuous aperture'
+    gripper_missing_reason: action gripper polarity unverified
+    joint_qualification:
+      value_policy: retain native measured q7 without numerical conversion
+      configured_unit: radian
+      evidence: existing source contract declares radians; publisher recheck not completed
+- name: knu_fr3
+  source_dataset: knu_fr3
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.agent
+    left_wrist_0_rgb: observation.images.wrist
+  control_contract:
+    representation: realized_joint_trajectory_v1
+    joint_target: future measured joint7 radians; linear interpolation on source observation
+      timestamps
+    gripper_target: normalized closure 0 open / 1 closed; zero-order held source command
+      when verified, otherwise masked
+    state: current measured joint7 and verified measured gripper when available
+    warning: new learning target; not original recorded joint commands
+    arm_order: single
+  training_group: realized_joint_trajectory_v1
+  gripper_identity: Franka FR3 gripper; normalized closure
+  trajectory:
+    gripper_target:
+      feature: action
+      index: 7
+      open: 0
+      closed: 1
+      clip: true
+      time_offset_s: 0.0
+      evidence: recorded normalized gripper closedness
+    gripper_state:
+      feature: observation.state
+      index: 7
+      open: 0
+      closed: 1
+      clip: true
+      time_offset_s: 0.0
+      evidence: recorded normalized measured gripper closedness
+    gripper_missing_reason: null
+    joint_qualification:
+      value_policy: retain native measured q7 without numerical conversion
+      configured_unit: radian
+      evidence: existing pipeline radians contract; publisher only confirms joint1..7
+        order
+- name: fr3_pick_place
+  source_dataset: fr3_pick_place
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.exterior_image_1_left
+    left_wrist_0_rgb: observation.images.wrist_image_left
+  control_contract:
+    representation: realized_joint_trajectory_v1
+    joint_target: future measured joint7 radians; linear interpolation on source observation
+      timestamps
+    gripper_target: normalized closure 0 open / 1 closed; zero-order held source command
+      when verified, otherwise masked
+    state: current measured joint7 and verified measured gripper when available
+    warning: new learning target; not original recorded joint commands
+    arm_order: single
+  training_group: realized_joint_trajectory_v1
+  gripper_identity: Franka FR3 gripper; command lineage may fallback to measured
+  trajectory:
+    gripper_target: null
+    gripper_state:
+      feature: observation.state
+      index: 7
+      open: 0
+      closed: 1
+      clip: true
+      time_offset_s: 0.0
+      evidence: publisher measured clip(1-width/0.08,0,1)
+    gripper_missing_reason: action may fallback to measured; no per-row command lineage
+      marker
+    joint_qualification:
+      value_policy: retain native measured q7 without numerical conversion
+      configured_unit: radian
+      evidence: 'primary: direct libfranka q joint1..7 recording'
+- name: nyu_franka_play
+  source_dataset: nyu_franka_play_dataset_converted_externally_to_rlds
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.exterior
+  control_contract:
+    representation: realized_joint_trajectory_v1
+    joint_target: future measured joint7 radians; linear interpolation on source observation
+      timestamps
+    gripper_target: normalized closure 0 open / 1 closed; zero-order held source command
+      when verified, otherwise masked
+    state: current measured joint7 and verified measured gripper when available
+    warning: new learning target; not original recorded joint commands
+    arm_order: single
+  training_group: realized_joint_trajectory_v1
+  gripper_identity: Franka gripper; measured gripper absent
+  trajectory:
+    gripper_target:
+      feature: action
+      index: 13
+      open: 1
+      closed: -1
+      clip: true
+      time_offset_s: 0.0
+      evidence: 'publisher NYU gripper command: +1 open, -1 close'
+    gripper_state: null
+    gripper_missing_reason: null
+    joint_qualification:
+      value_policy: retain native measured q7 without numerical conversion
+      configured_unit: radian
+      evidence: existing pipeline q0..q6 contract; publisher unit recheck not completed
+- name: roboset_pick
+  source_dataset: roboset
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.top
+    left_wrist_0_rgb: observation.images.wrist
+  control_contract:
+    representation: realized_joint_trajectory_v1
+    joint_target: future measured joint7 radians; linear interpolation on source observation
+      timestamps
+    gripper_target: normalized closure 0 open / 1 closed; zero-order held source command
+      when verified, otherwise masked
+    state: current measured joint7 and verified measured gripper when available
+    warning: new learning target; not original recorded joint commands
+    arm_order: single
+  training_group: realized_joint_trajectory_v1
+  gripper_identity: Robotiq family; per-trial actuator scale/offset unresolved
+  trajectory:
+    gripper_target: null
+    gripper_state: null
+    gripper_missing_reason: per-trial actuator calibration unavailable
+    joint_qualification:
+      value_policy: retain native measured q7 without numerical conversion
+      configured_unit: radian
+      evidence: Polymetis measured joint radians upstream; final qp_arm per-sensor
+        scale/offset lineage unverified

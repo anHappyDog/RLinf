@@ -1,7 +1,9 @@
 Franka Pickup Mixture SFT
 =========================
 
-Train π₀.₅ on all or selected sources in a curated Franka pickup collection. This recipe reads LeRobot v3.0 partitions and their shared catalog, prepares grouped training and validation splits, and fine-tunes one policy on native control schemas. It preserves each source's sampling rate and action meaning; deployment still requires the matching source controller and normalization statistics.
+Train π₀.₅ on all or selected sources in a curated Franka pickup collection. This recipe reads LeRobot v3.0 partitions and their shared catalog, prepares grouped training, validation, and test splits, and fine-tunes one policy with explicit control adapters. Choose the legacy native-control profile or the v2 joint-relative profile, then reuse its action and observation transforms at inference. Each source retains its original sampling rate.
+
+For a MolmoBot checkpoint, follow `Use the Official MolmoBot Model`_ below. That route preserves the checkpoint's original processor, normalization, and H16 action horizon.
 
 Overview
 --------
@@ -14,7 +16,7 @@ Use the same loader for single-arm and dual-arm demonstrations, with a source pr
    .. grid-item-card:: Models
       :text-align: center
 
-      π₀.₅
+      π₀.₅ · MolmoBot π₀
 
    .. grid-item-card:: Methods
       :text-align: center
@@ -42,7 +44,7 @@ The collection combines pickup clips from real and simulated robots. Preparation
 
    * - Profile
      - Data
-     - Default Weight
+     - Legacy Default Weight
    * - ``molmobot``
      - Simulated single arm
      - 4
@@ -71,9 +73,9 @@ A training sample uses the current camera frames and state to predict 50 future 
    * - Item
      - Training Representation
    * - Observation
-     - Up to three current RGB views resized to 224 × 224; missing views have a false image mask. Native state uses per-schema ``tanh((state - mean) / std)`` and is padded to 32 dimensions.
+     - Up to three current RGB views resized to 224 × 224; missing views have a false image mask. State is encoded and normalized per schema, then padded to 32 dimensions. The legacy profile uses ``tanh((state - mean) / std)``; v2 joint profiles use quantiles and canonical grippers.
    * - Action
-     - 50 × 32 tensor. Native 7 / 8 / 14 / 16-dimensional actions are normalized per schema. Padding, clip tails, and non-core targets have zero loss weight.
+     - 50 × 32 tensor. Native 7 / 8 / 14 / 16-dimensional actions pass through the selected adapter and per-schema normalization. Padding, clip tails, and non-core targets have zero loss weight.
    * - Prompt
      - Task text plus schema, control mode, and native FPS; up to 200 tokens, including the discretized state input.
    * - History
@@ -88,21 +90,28 @@ Prepare the Dataset
 
 Start with the converted collection root containing ``catalog/episodes.jsonl`` and its referenced partitions. Keep the original videos available: the partitions may contain relative links, and the loader reads the recorded video offset for each episode.
 
-Run preparation from the repository root in the training environment:
+Use the v2 source configuration for verified DROID and DuoBench joint interfaces. Pass multiple converted roots when new pickup collections live alongside the original catalog:
 
 .. code:: bash
 
    export PYTHONPATH="$PWD:${PYTHONPATH:-}"
    python examples/sft/prepare_pickup_mixture.py \
-     --catalog-root /path/to/unified_lerobot_v1 \
-     --output-dir /path/to/prepared-pickup-mixture \
+     --catalog-root /path/to/unified_lerobot_v1 /path/to/duobench_pickup_v2 \
+     --source-config examples/sft/config/data/franka_pickup_sources_v2.yaml \
+     --output-dir /path/to/prepared-pickup-mixture-v2 \
+     --action-horizon 50 --action-dim 32 \
+     --sampling-unit episode --statistics-max-anchors 8192 \
      --allow-development
 
-This writes ``train.jsonl``, ``val.jsonl``, ``normalization.json``, and ``summary.json`` without copying media. ``--allow-development`` explicitly includes historical development clips in training, which allows the small pilot sources to participate. Omit it to train only on eligible non-development data, and select profiles with ``--sources molmobot habit``. Each selected profile must retain eligible training episodes.
+This writes ``train.jsonl``, ``val.jsonl``, ``test.jsonl``, ``normalization.json``, ``contract.json``, and ``summary.json`` without copying media. Use ``--sources duobench_real duobench_sim`` to select profiles. Each selected profile needs eligible training episodes. ``--allow-development`` includes historical pilot clips in training; omit it to exclude those clips.
 
-The split is deterministic for ``--seed`` and ``--val-fraction``. Episodes sharing a scene, or a source group when a scene is unavailable, stay together. Development groups always stay in training. Statistics use training core rows only and are computed separately for each schema; validation rows never enter normalization. Actions use mean/std normalization. State tensors and the discretized state tokenizer both use ``tanh((state - mean) / std)`` to stay in the tokenizer's bounded range. Constant columns use std 1. Reuse the same schema statistics and transforms at inference; invert the action transform before sending commands to its controller.
+The preparer honors catalog ``assigned_split`` values of ``train``, ``val``, and ``test``. Otherwise, ``--seed`` and ``--val-fraction`` split by scene, or by source group when a scene is unavailable. All clips from one original episode stay together, and development groups remain in training. The test manifest is reserved for independent evaluation; the SFT loader reads only train and validation. For a short trial, add ``--max-train-episodes 2 --max-val-episodes 1``. These limits apply per profile after splitting. Check the actual episode and anchor counts in ``summary.json`` before training.
 
-For a short trial, add ``--max-train-episodes 2 --max-val-episodes 1``. These limits apply per profile after splitting. Inspect ``summary.json`` to see the actual eligible episodes and supervised anchors before launching training; small sources may contribute no validation episodes.
+V2 DROID and DuoBench profiles subtract the current observed joint position from every future joint target in the action chunk. All future steps share that reference; this is different from taking consecutive differences. Grippers map to 0=open and 1=closed and pass through normalization unchanged. Profiles with verified ``adapter`` or ``normalization`` entries compute statistics after this transformation, using valid supervised future targets only. Deterministic hash sampling selects at most 32 anchors per original episode and at most ``--statistics-max-anchors`` per schema. Quantile normalization uses q01/q99 without clipping. The sample count, transform, and normalization parameters are recorded in the manifest.
+
+To retain the original native-action recipe, use ``examples/sft/config/data/franka_pickup_sources.yaml``. Profiles without adapter or normalization entries use action mean/std and state ``tanh((state - mean) / std)``, calculated from training core rows. The v2 source file selects DROID and DuoBench only; use the legacy file for other sources while their controller contracts are reviewed. Validation and test data never contribute statistics.
+
+The prepared contract hashes the split manifests and normalization file. Adapter-aware preparation also binds the action horizon and model dimension; changing either requires new statistics. Each checkpoint saves normalization, summary, contract, and exposure records in ``mixture_assets``. Resume checks reject a different prepared mixture rather than silently continuing with changed action semantics.
 
 Installation
 ------------
@@ -167,12 +176,39 @@ Point both data paths at the prepared directory and launch the standard VLA SFT 
 
 The default run performs 1,000 optimizer steps, validates every 100 steps, and saves at step 1,000. For a short trial, append ``runner.max_steps=3 runner.val_check_interval=1 runner.save_interval=3``. ``data.samples_per_epoch`` controls the sampled training anchors per epoch, and ``data.eval_max_samples`` bounds validation cost.
 
-The sampler first chooses a schema according to its configured weight, then chooses an eligible anchor from that schema. Source size therefore does not determine its mixture share. Adjust weights or camera mappings in ``examples/sft/config/data/franka_pickup_sources.yaml`` and rerun preparation to record the changed mixture.
+With ``--sampling-unit episode``, the sampler chooses a schema by its configured weight, then an original source episode uniformly, then one of its eligible anchors uniformly. Multiple clips from one original episode share that episode's probability. ``--sampling-unit frame`` retains the legacy uniform-within-schema anchor sampling. Weights specify source shares, independent of source size; draws are with replacement. Change the selected source configuration and rerun preparation to record a different mixture.
+
+For a remote host with a slow data link, materialize the exact model inputs before transfer. Set ``data.mixture.sample_cache_dir=/path/to/sample-cache`` to read its ``train`` and ``val`` subdirectories. Each subdirectory contains ``metadata.json`` with ``contract`` from the corresponding dataset's ``sample_cache_contract()`` and ``indices`` listing cached dataset indices. Store each unchanged ``dataset[index]`` dictionary as ``<index>.pkl.gz`` using gzip and pickle protocol 5. Create these artifacts from your prepared dataset and verify their hashes after transfer.
+
+The cache preserves the original dataset length, sampling weights, source groups, numeric arrays, image values, tokens, and masks. Its contract binds the selected manifest rows, schemas, dimensions, token length, and preprocessing source hashes. Include every index requested by the chosen sampler seed, epochs, sample budget, and validation limit. A changed input contract or a missing cached index stops loading; regenerate the relevant cache when changing the recipe.
+
+Match Inference to Training
+---------------------------
+
+Use the same prepared schema to turn native observations into model input and predicted chunks back into controller commands. In an evaluation configuration for a matching 16-dimensional DuoBench environment, set:
+
+.. code:: yaml
+
+   actor:
+     model:
+       action_dim: 16
+       openpi:
+         task: eval
+         config_name: native_mixture
+         action_horizon: 50
+         model_action_dim: 32
+         mixture:
+           manifest_dir: /path/to/prepared-pickup-mixture-v2
+           schema_id: duobench_sim
+
+This installs ``MixturePolicyIO`` using the selected schema. ``manifest_dir`` also accepts a checkpoint's ``mixture_assets`` directory; its normalization hash is checked against the saved contract. Supply batched native ``states`` and ``task_descriptions``, plus HWC RGB views under model slots in ``images`` or the conventional ``main_images``, ``wrist_images``, and ``extra_view_images`` keys. RGB values are uint8 in [0, 255] or floating point in [0, 1]. The schema selects the required views. Training and inference share resizing, padding, prompt construction, state encoding, and normalization.
+
+Action decoding removes padded dimensions, reverses normalization and gripper mapping, and adds the original observed joint positions to the relative chunk. The original state travels with the request explicitly; normalized state is never the joint reference. ``native_mixture`` online I/O currently supports ordinary ``task: eval``. ``rtc_enabled: true`` is rejected: a relative action chunk from a previous request must first be rebased to the new observation's joint reference. This numerical interface has CPU coverage; using it in a simulator requires verified state order, camera mapping, controller commands, and execution timing. Pickup success still requires closed-loop evaluation.
 
 Extend the Mixture
 ------------------
 
-Add a source profile when another collection uses the same catalog and LeRobot layout. Give it a unique ``name``, a matching ``source_dataset``, an optional ``domain``, a positive ``weight``, and a mapping from supported camera slots to its image features. One profile must contain one control mode and FPS; split heterogeneous sources into separate profiles.
+Add a source profile when another collection uses the same catalog and LeRobot layout. Give it a unique ``name``, a matching ``source_dataset``, an optional ``domain``, a positive ``weight``, and a mapping from supported camera slots to its image features. One profile must contain one control mode and FPS; split heterogeneous sources into separate profiles. Specify ``adapter`` for reversible control changes and ``normalization`` for transformed statistics. Keep joint/state indices, gripper endpoints, units, and coordinate frames explicit in the source contract.
 
 The shared loader reads the selected episodes, source video offsets, numeric schema, and supervision masks from the manifests. A new compatible source needs a profile rather than a source-specific loader branch. A new observation modality or physical action representation requires an explicit model adapter.
 
@@ -184,3 +220,82 @@ Visualization and Results
 -------------------------
 
 Read TensorBoard logs under ``runner.logger.log_path`` and the saved checkpoints under ``checkpoints/global_step_<N>/``. Validation uses a fixed seed, restores training RNG state, and disables image augmentation. Its flow loss measures prediction of held-out demonstrations; robot pickup success requires a separate closed-loop evaluation with the matching controller. See :doc:`Training Metrics </rst_source/reference/metrics>` for the shared logging conventions.
+
+Use the Official MolmoBot Model
+-------------------------------
+
+Use ``franka_pickup_sft_openpi_official`` to fine-tune a MolmoBot checkpoint through the original OpenPI PyTorch core. This route uses the checkpoint's data transforms and normalization, absolute joint targets, and H16/D8 actions. Select native MolmoBot single-arm manifests or use the DROID native8 reader described below; other robot interfaces need their own explicit adapter.
+
+Install the Official Runtime
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Create a separate Python 3.11 environment for the official model. The installer selects Torch 2.7.1 and pins the OpenPI, MolmoBot, and LeRobot source revisions used by this recipe:
+
+.. code:: bash
+
+   UV_TORCH_BACKEND=cu126 bash requirements/install.sh embodied \
+     --venv .venv-openpi-official --model openpi_official --env dummy
+   source .venv-openpi-official/bin/activate
+
+The installer applies the original OpenPI transformers replacement to this environment. It installs the model and data dependencies with CPU JAX; Torch performs the model computation. The ``dummy`` target selects the SFT runtime. The Docker target for this environment is ``embodied-openpi-official``.
+
+Download the checkpoint together with its training config and normalization assets:
+
+.. code:: bash
+
+   hf download allenai/MolmoBot-Pi0-DROID \
+     --revision 48c8e2fc1868fd34dba1dd059278e7a2430a5383 \
+     --local-dir /path/to/molmobot-pi0-droid
+
+The model directory must retain ``assets/train_config.pkl`` and ``assets/molmobot/norm_stats.json``. The loader reads the trusted checkpoint config to reconstruct the original processor.
+
+Train With the Checkpoint Transforms
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Point the official recipe at the prepared native manifests and the checkpoint directory:
+
+.. code:: bash
+
+   export EMBODIED_PATH="$PWD/examples/sft"
+   export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+   python examples/sft/train_vla_sft.py \
+     --config-path "$EMBODIED_PATH/config" \
+     --config-name franka_pickup_sft_openpi_official \
+     data.train_data_paths.target=/path/to/prepared-native-pickup \
+     data.train_data_paths.auxiliary=/path/to/prepared-molmo-pickup \
+     data.val_data_paths.target=/path/to/prepared-native-pickup \
+     actor.model.model_path=/path/to/molmobot-pi0-droid \
+     runner.logger.log_path=/path/to/official-pickup-sft-results
+
+This model uses its original mean/std normalization and full-element flow-matching loss. The loader selects anchors with a complete supervised H16 future and records each sample's source and original episode for exposure accounting. Read the resulting sample counts before choosing a training budget.
+
+Read DROID native8 manifests whose prepared schema in ``normalization.json`` declares ``native_control_mode: droid_absolute_joint_position_and_normalized_closure``. Both the state and action contain seven absolute joint positions followed by continuous gripper closure, with 0=open and 1=closed. The MolmoBot route retains its native state9/action8 layout and driver/actuator-command scales.
+
+The DROID adapter requires a MolmoBot ``MlSpacesDatasetConfigFactory`` checkpoint with ``joint_pos_actions=True``. It skips only ``GripperStateTransform`` and ``GripperActionTransform``, since DROID already supplies normalized closure. All other checkpoint data transforms, statistical normalization, and model transforms remain in the original order. DROID and MolmoBot transform chains are cached separately. A shared storage format does not make different action interfaces interchangeable.
+
+To add prepared DROID data to the named source mapping above, append ``+data.train_data_paths.droid=/path/to/prepared-droid``. Its schemas become ``droid/<schema_id>`` and use the existing auxiliary sampling stream. This reader support covers data preparation; actual SFT and closed-loop pickup performance require separate validation with the selected checkpoint.
+
+The example uses ``openpi_cosine`` with peak learning rate 5e-5 and 1,000 warmup updates. The first optimizer update uses 5e-5 / 1001, about 4.995e-8. Each optimizer update advances the scheduler once. The configured schedule length is 300,000 updates; with ``min_lr: 5e-5``, the learning rate stays at the peak after warmup.
+
+The named directories namespace their source schemas as ``target/molmobot`` and ``auxiliary/molmobot``. With ``data.official.sampling: target_exposure``, the target and auxiliary streams use independent random generators. Set ``target_samples_per_epoch`` and ``auxiliary_samples_per_epoch`` under ``data.official`` to control their counts; changing the auxiliary count preserves the target stream's sampled order and exposure within each epoch.
+
+For an exposure-matched comparison, run the same number of complete epochs in target-only and mixed training, and report the additional optimizer updates used by the auxiliary data. A fixed ``runner.max_steps`` can end the runs at different points in their target streams; compare the saved source sample counts. Append ``runner.max_epochs=1 runner.max_steps=-1 data.official.target_samples_per_epoch=512 data.official.auxiliary_samples_per_epoch=0`` for target-only training. For mixed training, use the same overrides with ``data.official.auxiliary_samples_per_epoch=512``. With global batch size 4, these runs use 128 and 256 updates respectively, each with 512 target samples.
+
+Adding auxiliary samples also adds optimizer updates and advances warmup further. Include an additional target-only control with the same number of updates as mixed training, and report the actual target sample counts. Record the learning rate used before each optimizer update. The existing ``learning_rate`` metric is read after the scheduler advances and therefore gives the next update's rate.
+
+For a two-update target-only SFT integration test, set ``OPENPI_OFFICIAL_MODEL_PATH`` and ``OPENPI_OFFICIAL_DATA_PATH`` to the checkpoint and target data paths, then run ``bash tests/e2e_tests/sft/run_vla_sft.sh franka_pickup_sft_openpi_official_test`` with ``REPO_PATH`` set to the repository. The corresponding SFT CI job is enabled when repository variables with those two names point to assets on its runner.
+
+Export for the Original Policy Loader
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Export the trained actor to a new directory before loading it with the original OpenPI or MolmoBot policy:
+
+.. code:: bash
+
+   python -m rlinf.models.embodiment.openpi_official.checkpoint \
+     --actor-dir /path/to/experiment/checkpoints/global_step_N/actor \
+     --output-dir /path/to/exported-policy
+
+The exporter reads ``full_weights.pt`` and ``upstream_assets`` from the actor directory, strictly restores the ``core.*`` tensors into the original CPU model, and saves ``model.safetensors`` with shared-weight metadata. It copies the original training config and data normalization statistics into ``assets`` and writes ``EXPORT.json`` after export completes. Keep this complete directory, including ``EXPORT.json``, when transferring the trained policy; the RLinf ``full_weights.pt`` keys cannot be used directly as an original-model safetensors file.
+
+RLinf recognizes ``EXPORT.json`` and loads these weights through ``rlinf.models.embodiment.openpi_official.policy.load_exported_policy``. External OpenPI or MolmoBot services should use the same helper with their training config and exported directory. The upstream factory temporarily casts FP32 normalization-layer weights to BF16; the helper strictly restores exported tensors after their final dtypes are established, preserving the learned FP32 updates. Publisher checkpoints retain the original upstream loading path.

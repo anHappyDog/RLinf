@@ -421,16 +421,41 @@ def config(selector="module_names", targets=None, wrap_mode="individual", **kwar
     )
 
 
-@pytest.mark.parametrize("sharding", ["shard_grad_op", "full_shard"])
-def test_openpi_sharded_training_requires_fsdp1(sharding):
+def test_openpi_fsdp2_rejects_shard_grad_op():
     actor = OmegaConf.create(
         {
             "model": {"model_type": "openpi"},
-            "fsdp_config": {"strategy": "fsdp2", "sharding_strategy": sharding},
+            "fsdp_config": {"strategy": "fsdp2", "sharding_strategy": "shard_grad_op"},
         }
     )
     with pytest.raises(AssertionError, match="openpi sharded training requires"):
         validate_fsdp_cfg(actor)
+
+
+@pytest.mark.parametrize("sharding", ["full_shard", "hybrid_shard"])
+def test_openpi_fsdp2_retains_selective_precision(sharding):
+    actor = OmegaConf.create(
+        {
+            "model": {"model_type": "openpi"},
+            "optim": {"use_fp32_master_params": True},
+            "fsdp_config": {
+                "strategy": "fsdp2",
+                "sharding_strategy": sharding,
+                "use_orig_params": True,
+                "mixed_precision": {
+                    "param_dtype": None,
+                    "reduce_dtype": None,
+                    "buffer_dtype": None,
+                    "cast_forward_inputs": False,
+                },
+                "amp_autocast": {"enabled": False},
+            },
+        }
+    )
+    validated = validate_fsdp_cfg(actor)
+    assert validated.fsdp_config.mixed_precision.param_dtype is None
+    assert not validated.fsdp_config.amp_autocast.enabled
+    assert validated.optim.use_fp32_master_params
 
 
 @pytest.mark.parametrize(
@@ -1223,3 +1248,127 @@ def test_fp32_trainable_weights_beside_frozen_bf16_keep_small_updates(
     assert output.dtype == torch.bfloat16
     assert after.dtype == torch.float32
     assert (after != before).all()
+
+
+def _check_fp32_master_dtensor_resume(rank, init_file, checkpoint_dir):
+    from torch.distributed.checkpoint import load, save
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_state_dict,
+        set_state_dict,
+    )
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+
+    from rlinf.hybrid_engines.fsdp.optim import FP32MasterAdamW
+    from rlinf.scheduler import Worker
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=4
+    )
+    try:
+        Worker.torch_device_type = "cpu"
+        mesh = init_device_mesh("cpu", (4,))
+
+        def make(target_mesh, placements):
+            model = nn.Module()
+            model.register_parameter(
+                "weight",
+                nn.Parameter(
+                    distribute_tensor(
+                        torch.ones(8, dtype=torch.bfloat16), target_mesh, placements
+                    )
+                ),
+            )
+            optimizer = FP32MasterAdamW(model.parameters(), lr=1e-5, weight_decay=0)
+            optimizer._initialize_state(model.weight)
+            return model, optimizer
+
+        def step(model, optimizer):
+            model.weight.grad = torch.full_like(model.weight, 0.01)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        model, optimizer = make(mesh, [Shard(0)])
+        for _ in range(10):
+            step(model, optimizer)
+        master = optimizer.state[model.weight]["fp32_master_param"]
+        assert master.dtype == torch.float32
+        assert torch.all(master.to_local() < 1)
+        assert torch.all(model.weight.to_local() == 1)
+        options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+        model_sd, optim_sd = get_state_dict(model, optimizer, options=options)
+        save({"model": model_sd, "optim": optim_sd}, checkpoint_id=checkpoint_dir)
+
+        step(model, optimizer)
+        for sharding, shard_size in [("hybrid_shard", 2), ("no_shard", 1)]:
+            replica_mesh = create_device_mesh(
+                4,
+                OmegaConf.create(
+                    {
+                        "strategy": "fsdp2",
+                        "sharding_strategy": sharding,
+                        "hybrid_shard_size": shard_size,
+                    }
+                ),
+            )
+            assert replica_mesh.shape == (4 // shard_size, shard_size)
+            assert replica_mesh.mesh_dim_names == ("replicate", "fsdp")
+            resumed, resumed_optimizer = make(replica_mesh, [Replicate(), Shard(0)])
+            model_sd, optim_sd = get_state_dict(
+                resumed, resumed_optimizer, options=options
+            )
+            load({"model": model_sd, "optim": optim_sd}, checkpoint_id=checkpoint_dir)
+            set_state_dict(
+                resumed,
+                resumed_optimizer,
+                model_state_dict=model_sd,
+                optim_state_dict=optim_sd,
+                options=options,
+            )
+            step(resumed, resumed_optimizer)
+            for key, expected in optimizer.state[model.weight].items():
+                actual = resumed_optimizer.state[resumed.weight][key]
+                assert expected.dtype == actual.dtype
+                if hasattr(expected, "to_local"):
+                    assert actual.dtype == torch.float32
+                    assert actual.placements == (Replicate(), Shard(0))
+                    expected, actual = expected.full_tensor(), actual.full_tensor()
+                assert torch.equal(expected, actual), key
+            assert torch.equal(model.weight.full_tensor(), resumed.weight.full_tensor())
+    finally:
+        dist.destroy_process_group()
+
+
+def test_fp32_master_dtensor_checkpoint_resume(tmp_path):
+    torch.multiprocessing.spawn(
+        _check_fp32_master_dtensor_resume,
+        args=(str(tmp_path / "init"), str(tmp_path / "checkpoint")),
+        nprocs=4,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "strategy,sharding_strategy,supported",
+    [
+        ("fsdp", "no_shard", True),
+        ("fsdp2", "full_shard", True),
+        ("fsdp2", "hybrid_shard", True),
+        ("fsdp2", "no_shard", True),
+        ("fsdp", "full_shard", False),
+        ("fsdp", "shard_grad_op", False),
+    ],
+)
+def test_fp32_master_backend_validation(strategy, sharding_strategy, supported):
+    from rlinf.config import validate_fp32_master_adamw_config
+
+    if supported:
+        validate_fp32_master_adamw_config(
+            strategy=strategy, sharding_strategy=sharding_strategy
+        )
+    else:
+        with pytest.raises(ValueError, match="requires FSDP1 no_shard or FSDP2"):
+            validate_fp32_master_adamw_config(
+                strategy=strategy, sharding_strategy=sharding_strategy
+            )

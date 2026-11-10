@@ -482,42 +482,26 @@ class Pi0(model.BaseModel):
         that module and must not be converted — so this uses ``llm`` +
         ``img``, never ``self.to()``.
         """
-        # Same branch order as OpenPI: bf16 converts then falls through to
-        # the fp32 restore; float32 converts and returns.
-        if precision == "bfloat16":
-            self.llm.to(dtype=torch.bfloat16)
-            self.img.to(dtype=torch.bfloat16)
-        elif precision == "float32":
-            self.llm.to(dtype=torch.float32)
-            self.img.to(dtype=torch.float32)
-            return
-        else:
+        if precision not in ("bfloat16", "float32"):
             raise ValueError(f"Invalid precision: {precision}")
-
-        # 1:1 with OpenPI's substring list. Names come from
-        # ``openpi_pytorch_to_openpi``:
-        #   patch_embedding.weight/bias  -> img.stem.weight/bias
-        #   position_embedding.weight    -> img.pos_embedding
-        #   input_layernorm              -> pre_attention_norms
-        #   post_attention_layernorm     -> pre_ffw_norms
-        #   model.norm                   -> final_norms
-        #     (language_model.norm + gemma_expert.model.norm)
-        params_to_keep_float32 = [
+        fp32_names = (
             "img.stem.weight",
             "img.stem.bias",
             "img.pos_embedding",
             "pre_attention_norms",
             "pre_ffw_norms",
             "final_norms",
-        ]
-
-        # OpenPI iterates paligemma_with_expert.named_parameters(); llm + img
-        # are that module. Do not scan action/value heads.
+        )
+        # Cast each parameter once so FP32 checkpoint values are never rounded
+        # through BF16 before restoring their storage dtype.
         for name, param in self.named_parameters():
-            if not (name.startswith("llm.") or name.startswith("img.")):
+            if not name.startswith(("llm.", "img.")):
                 continue
-            if any(selector in name for selector in params_to_keep_float32):
-                param.data = param.data.to(dtype=torch.float32)
+            keep_fp32 = precision == "float32" or any(
+                selector in name for selector in fp32_names
+            )
+            dtype = torch.float32 if keep_fp32 else torch.bfloat16
+            param.data = param.data.to(dtype=dtype)
 
     def sample_actions(
         self,
@@ -858,6 +842,10 @@ class Pi0(model.BaseModel):
         data: Any,
         use_action_chunk_loss: bool = False,
         train: bool = True,
+        noise: torch.Tensor | None = None,
+        time: torch.Tensor | None = None,
+        return_loss_statistics: bool = False,
+        loss_statistic_slices: tuple[slice, ...] = (slice(None),),
         **kwargs,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Flow-matching SFT loss. Shared by SFT, DAgger, and PPO co-train."""
@@ -869,10 +857,46 @@ class Pi0(model.BaseModel):
         observation = self._observation_to_device(observation)
         actions = self._actions_to_device(actions)
         if not self.rlt_cfg.use_rlt:
-            per_element_loss = self.compute_loss(observation, actions, train=train)
-            return self._reduce_sft_loss(
+            sample_kwargs = {}
+            if noise is not None:
+                sample_kwargs["noise"] = noise
+            if time is not None:
+                sample_kwargs["time"] = time
+            per_element_loss = self.compute_loss(
+                observation, actions, train=train, **sample_kwargs
+            )
+            loss = self._reduce_sft_loss(
                 per_element_loss, use_action_chunk_loss, action_loss_mask
             )
+            if not return_loss_statistics:
+                return loss
+            with torch.no_grad():
+                values = per_element_loss.detach().double()
+                mask = (
+                    torch.ones_like(values, dtype=torch.bool)
+                    if action_loss_mask is None
+                    else action_loss_mask.to(device=values.device, dtype=torch.bool)
+                )
+                if use_action_chunk_loss:
+                    horizon = self.action_chunk or values.shape[1]
+                    dimensions = self.action_env_dim or values.shape[-1]
+                    values = values[:, :horizon, :dimensions]
+                    mask = mask[:, :horizon, :dimensions]
+                statistics = []
+                for component in loss_statistic_slices:
+                    weights = mask[..., component]
+                    counts = weights.sum(dim=(-2, -1))
+                    sums = (
+                        values[..., component]
+                        .masked_fill(~weights, 0)
+                        .sum(dim=(-2, -1))
+                    )
+                    statistics.append(
+                        torch.stack(
+                            (sums / counts.clamp_min(1), counts > 0, counts), dim=-1
+                        )
+                    )
+            return {"loss": loss, "loss_statistics": torch.stack(statistics, dim=1)}
 
         per_element_loss, prefix_output, prefix_mask = (
             self._sft_forward_with_rlt_prefix(observation, actions, train=train)

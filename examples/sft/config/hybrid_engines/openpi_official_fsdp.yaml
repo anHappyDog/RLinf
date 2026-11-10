@@ -1,0 +1,17 @@
+defaults:
+  - fsdp
+  - _self_
+
+strategy: fsdp2
+gradient_checkpointing: true
+mixed_precision:
+  param_dtype: null
+  reduce_dtype: null
+  buffer_dtype: null
+  cast_forward_inputs: false
+amp_autocast:
+  enabled: false
+wrap_policy:
+  transformer_layer_cls_to_wrap: []
+  module_classes_to_wrap: [GemmaRMSNorm, SiglipVisionEmbeddings]
+  no_split_names: [openpi_fp32_projection]

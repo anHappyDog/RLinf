@@ -1,0 +1,204 @@
+# Select one training_group per preparation; native schemas need separate recipes.
+sources:
+- name: molmobot
+  source_dataset: molmobot
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.exterior
+    left_wrist_0_rgb: observation.images.wrist
+  control_contract:
+    representation: native_source_specific
+    action:
+    - joint_target_rad_0
+    - joint_target_rad_1
+    - joint_target_rad_2
+    - joint_target_rad_3
+    - joint_target_rad_4
+    - joint_target_rad_5
+    - joint_target_rad_6
+    - gripper_command_0_255
+    state:
+    - joint_position_rad_0
+    - joint_position_rad_1
+    - joint_position_rad_2
+    - joint_position_rad_3
+    - joint_position_rad_4
+    - joint_position_rad_5
+    - joint_position_rad_6
+    - left_gripper_driver_rad
+    - right_gripper_driver_rad
+    gripper: native values retained; no inferred units or endpoints
+    arm_order: single
+  training_group: molmobot
+- name: viola
+  source_dataset: viola
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.exterior
+    left_wrist_0_rgb: observation.images.wrist
+  control_contract:
+    representation: native_source_specific
+    action:
+    - world_vector_0
+    - world_vector_1
+    - world_vector_2
+    - rotation_delta_0
+    - rotation_delta_1
+    - rotation_delta_2
+    - gripper_closedness_command
+    - terminate_episode
+    state:
+    - q_0
+    - q_1
+    - q_2
+    - q_3
+    - q_4
+    - q_5
+    - q_6
+    - gripper_width
+    gripper: native values retained; no inferred units or endpoints
+    arm_order: single
+  training_group: viola
+- name: iamlab
+  source_dataset: iamlab_cmu_pickup_insert_converted_externally_to_rlds
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.exterior
+    left_wrist_0_rgb: observation.images.wrist
+  control_contract:
+    representation: native_source_specific
+    action:
+    - ee_x
+    - ee_y
+    - ee_z
+    - quaternion_0
+    - quaternion_1
+    - quaternion_2
+    - quaternion_3
+    - gripper_command
+    state:
+    - q_0
+    - q_1
+    - q_2
+    - q_3
+    - q_4
+    - q_5
+    - q_6
+    - gripper_status
+    - joint_torque_native_0
+    - joint_torque_native_1
+    - joint_torque_native_2
+    - joint_torque_native_3
+    - joint_torque_native_4
+    - joint_torque_native_5
+    - ee_force_native_0
+    - ee_force_native_1
+    - ee_force_native_2
+    - ee_force_native_3
+    - ee_force_native_4
+    - ee_force_native_5
+    gripper: native values retained; no inferred units or endpoints
+    arm_order: single
+  training_group: iamlab
+- name: knu_fr3
+  source_dataset: knu_fr3
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.agent
+    left_wrist_0_rgb: observation.images.wrist
+  control_contract:
+    representation: native_source_specific
+    action: native_absolute_joint_position_rad_gripper_command
+    state: native observation.state; no remapping
+    gripper: native values retained; no inferred units or endpoints
+    arm_order: single
+  training_group: knu_fr3
+- name: fr3_pick_place
+  source_dataset: fr3_pick_place
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.exterior_image_1_left
+    left_wrist_0_rgb: observation.images.wrist_image_left
+  control_contract:
+    representation: native_source_specific
+    action: native_joint_velocity7_gripper_closedness
+    state: native observation.state; no remapping
+    gripper: native values retained; no inferred units or endpoints
+    arm_order: single
+  training_group: fr3_pick_place
+- name: nyu_franka_play
+  source_dataset: nyu_franka_play_dataset_converted_externally_to_rlds
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.exterior
+  control_contract:
+    representation: native_source_specific
+    action:
+    - q_velocity_command_0
+    - q_velocity_command_1
+    - q_velocity_command_2
+    - q_velocity_command_3
+    - q_velocity_command_4
+    - q_velocity_command_5
+    - q_velocity_command_6
+    - ee_delta_x
+    - ee_delta_y
+    - ee_delta_z
+    - ee_delta_roll
+    - ee_delta_pitch
+    - ee_delta_yaw
+    - gripper_position_command
+    - terminate_episode
+    state:
+    - q_0
+    - q_1
+    - q_2
+    - q_3
+    - q_4
+    - q_5
+    - q_6
+    - ee_x
+    - ee_y
+    - ee_z
+    - ee_roll
+    - ee_pitch
+    - ee_yaw
+    gripper: native values retained; no inferred units or endpoints
+    arm_order: single
+  training_group: nyu_franka_play
+- name: roboset_pick
+  source_dataset: roboset
+  arms: 1
+  weight: 1.0
+  cameras:
+    base_0_rgb: observation.images.top
+    left_wrist_0_rgb: observation.images.wrist
+  control_contract:
+    representation: native_source_specific
+    action:
+    - ctrl_arm_0
+    - ctrl_arm_1
+    - ctrl_arm_2
+    - ctrl_arm_3
+    - ctrl_arm_4
+    - ctrl_arm_5
+    - ctrl_arm_6
+    - ctrl_ee_0
+    state:
+    - qp_arm_0
+    - qp_arm_1
+    - qp_arm_2
+    - qp_arm_3
+    - qp_arm_4
+    - qp_arm_5
+    - qp_arm_6
+    - qp_ee_0
+    gripper: native values retained; no inferred units or endpoints
+    arm_order: single
+  training_group: roboset_pick

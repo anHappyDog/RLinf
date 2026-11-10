@@ -1,0 +1,11 @@
+model_type: openpi_official
+model_path: /path/to/MolmoBot-Pi0-DROID
+precision: null
+is_lora: false
+num_action_chunks: 16
+action_dim: 8
+num_steps: 10
+add_value_head: false
+openpi_official:
+  config_name: paligemma_mjthor_jointpos_frozenvision
+  freeze_vision: true

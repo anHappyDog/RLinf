@@ -1,0 +1,43 @@
+defaults:
+  - franka_pickup_sft_openpi_official
+  - _self_
+
+cluster:
+  num_nodes: 2
+  component_placement:
+    actor: "1-7,9-15"
+
+runner:
+  logger:
+    log_path: /mnt/public/daibo/results/franka_training_ready_20261106/train
+    experiment_name: realized_joint_trajectory_v1
+  max_steps: 20000
+  val_check_interval: 1000
+  save_interval: 1000
+
+data:
+  train_data_paths: /mnt/public/daibo/results/franka_training_ready_20261106/data/realized_joint_trajectory_v1
+  val_data_paths: /mnt/public/daibo/results/franka_training_ready_20261106/data/realized_joint_trajectory_v1
+  num_workers: 4
+  samples_per_epoch: 224000
+  eval_max_samples: 128
+  official:
+    recipe: realized_trajectory
+    sampling: weighted
+    cache_files: 8
+
+actor:
+  micro_batch_size: 2
+  global_batch_size: 224
+  eval_batch_size: 1
+  model:
+    model_path: /mnt/public/daibo/models/MolmoBot-Pi0-DROID
+    openpi_official:
+      trajectory_manifest_dir: /mnt/public/daibo/results/franka_training_ready_20261106/data/realized_joint_trajectory_v1
+  optim:
+    use_fp32_master_params: true
+    lr: 1.0e-5
+    lr_scheduler: openpi_cosine
+    lr_warmup_steps: 1000
+    total_training_steps: 20000
+    min_lr: 1.0e-6

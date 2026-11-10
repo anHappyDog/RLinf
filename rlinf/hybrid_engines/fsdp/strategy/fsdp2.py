@@ -197,8 +197,7 @@ class FSDP2Strategy(FSDPStrategyBase):
         """
         if not self.cfg.fsdp_config.enable_gradient_accumulation:
             return nullcontext()
-        if is_last_micro_batch:
-            model.set_requires_gradient_sync(True)
-        else:
-            model.set_requires_gradient_sync(False)
+        model.set_requires_gradient_sync(is_last_micro_batch)
+        if self.cfg.fsdp_config.get("retain_parameters_during_accumulation", False):
+            model.set_reshard_after_backward(is_last_micro_batch)
         return nullcontext()

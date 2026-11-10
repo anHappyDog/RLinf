@@ -1,0 +1,26 @@
+defaults:
+  - franka_pickup_sft_openpi_official
+  - _self_
+
+hydra:
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/sft/config
+
+runner:
+  logger:
+    log_path: /workspace/results/openpi_official_sft
+    experiment_name: test_openpi_official_pickup
+  max_steps: 2
+  val_check_interval: -1
+  save_interval: 2
+
+data:
+  train_data_paths: ${oc.env:OPENPI_OFFICIAL_DATA_PATH}
+  val_data_paths: ${oc.env:OPENPI_OFFICIAL_DATA_PATH}
+  official:
+    target_schemas: [molmobot]
+    auxiliary_samples_per_epoch: 0
+
+actor:
+  model:
+    model_path: ${oc.env:OPENPI_OFFICIAL_MODEL_PATH}

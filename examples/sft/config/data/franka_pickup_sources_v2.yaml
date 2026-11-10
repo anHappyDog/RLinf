@@ -1,0 +1,78 @@
+# Weights are source-level probabilities; source episodes are balanced separately.
+sources:
+  - name: droid
+    source_dataset: droid
+    domain: real
+    weight: 1.0
+    cameras:
+      base_0_rgb: observation.images.exterior_1_left
+    adapter:
+      kind: joint_relative
+      joint_action_indices: [0, 1, 2, 3, 4, 5, 6]
+      joint_state_indices: [0, 1, 2, 3, 4, 5, 6]
+      gripper_action_indices: [7]
+      gripper_state_indices: [7]
+      gripper_open: 0.0
+      gripper_closed: 1.0
+    normalization:
+      transform: quantile
+    model_control_mode: joint_chunk_relative_7_and_absolute_closed_gripper
+    control_contract:
+      joint_unit: radian
+      joint_reference: current_observation_for_entire_chunk
+      native_action: absolute_joint_position_target
+      state: measured_joint_position_and_normalized_gripper_position
+      canonical_gripper: zero_open_one_closed
+      arm_order: single
+  - name: duobench_real
+    source_dataset: duobench
+    domain: real
+    weight: 1.0
+    cameras:
+      base_0_rgb: observation.images.head
+      left_wrist_0_rgb: observation.images.left_wrist
+      right_wrist_0_rgb: observation.images.right_wrist
+    adapter:
+      kind: joint_relative
+      joint_action_indices: [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
+      joint_state_indices: [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
+      gripper_action_indices: [7, 15]
+      gripper_state_indices: [7, 15]
+      gripper_open: 1.0
+      gripper_closed: 0.0
+    normalization:
+      transform: quantile
+    model_control_mode: dual_joint_chunk_relative_and_absolute_closed_grippers
+    control_contract:
+      joint_unit: radian
+      joint_reference: current_observation_for_entire_chunk
+      native_action: absolute_joint_position_target
+      state: measured_joint_position_and_normalized_gripper_opening
+      canonical_gripper: zero_open_one_closed
+      arm_order: left_then_right
+  - name: duobench_sim
+    source_dataset: duobench
+    domain: sim
+    weight: 1.0
+    cameras:
+      base_0_rgb: observation.images.head
+      left_wrist_0_rgb: observation.images.left_wrist
+      right_wrist_0_rgb: observation.images.right_wrist
+    adapter:
+      kind: joint_relative
+      joint_action_indices: [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
+      joint_state_indices: [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
+      gripper_action_indices: [7, 15]
+      gripper_state_indices: [7, 15]
+      gripper_open: 1.0
+      gripper_closed: 0.0
+    normalization:
+      transform: quantile
+    model_control_mode: dual_joint_chunk_relative_and_absolute_closed_grippers
+    control_contract:
+      joint_unit: radian
+      joint_reference: current_observation_for_entire_chunk
+      native_action: absolute_joint_position_target
+      state: measured_joint_position_and_normalized_gripper_opening
+      canonical_gripper: zero_open_one_closed
+      arm_order: left_then_right

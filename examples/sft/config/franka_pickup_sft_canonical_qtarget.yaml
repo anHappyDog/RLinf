@@ -1,0 +1,92 @@
+defaults:
+  - model/pi0@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+# Prepare explicitly READY sources with prepare_qtarget_mixture.py.
+# Action chunks retain consecutive frames at each source's original rate.
+cluster:
+  num_nodes: ???
+  component_placement:
+    actor: ???
+
+runner:
+  task_type: sft
+  max_epochs: -1
+  max_steps: ???
+  val_check_interval: ???
+  save_interval: ???
+  logger:
+    log_path: ../results
+    project_name: rlinf
+    experiment_name: canonical_qtarget
+    logger_backends: [tensorboard]
+
+data:
+  type: official_mixture
+  train_data_paths: ???
+  val_data_paths: ???
+  num_workers: 16
+  samples_per_epoch: ???
+  eval_max_samples: ???
+  official:
+    recipe: canonical_qtarget
+    sampling: weighted
+    cache_files: 4
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: ???
+  global_batch_size: ???
+  eval_batch_size: 1
+  seed: 0
+  model:
+    model_path: ???
+    precision: null
+    pi05: false
+    num_action_chunks: 16
+    action_dim: 8
+    num_steps: 10
+    openpi:
+      task: sft
+      config_name: paligemma_mjthor_jointpos_frozenvision
+      action_chunk: 16
+      action_horizon: 16
+      action_env_dim: 8
+      model_action_dim: 8
+      embed_dtype: bf16
+      torch_compile: false
+      freeze_vision: true
+      # Same prepared directory as data.train_data_paths; saved with the model.
+      qtarget_manifest_dir: ???
+  optim:
+    lr: ???
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: openpi_cosine
+    lr_warmup_steps: ???
+    total_training_steps: ???
+    min_lr: ???
+    use_fp32_master_params: true
+  fsdp_config:
+    strategy: fsdp2
+    sharding_strategy: hybrid_shard
+    hybrid_shard_size: 8
+    gradient_checkpointing: false
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+      cast_forward_inputs: false
+    amp_autocast:
+      enabled: false

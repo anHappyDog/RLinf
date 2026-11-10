@@ -67,7 +67,12 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             self.data_loader, self.data_config = self.build_dataloader(
                 self.cfg.data.train_data_paths, eval_dataset=False
             )
-            self.data_iter = iter(self.data_loader)
+            self.data_iter = (
+                None
+                if cfg.data.get("type") == "official_mixture"
+                and cfg.runner.get("resume_dir") is not None
+                else iter(self.data_loader)
+            )
 
         if self.cfg.data.get("val_data_paths") is not None:
             self.eval_data_loader, self.eval_data_config = self.build_dataloader(

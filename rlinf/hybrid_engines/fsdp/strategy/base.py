@@ -31,7 +31,10 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from rlinf.hybrid_engines.fsdp import FSDP, DTensor, FSDPModule
-from rlinf.hybrid_engines.fsdp.strategy.checkpoint import Checkpoint
+from rlinf.hybrid_engines.fsdp.strategy.checkpoint import (
+    Checkpoint,
+    CheckpointFileSystemWriter,
+)
 from rlinf.hybrid_engines.fsdp.utils import (
     FSDPVersion,
 )
@@ -234,7 +237,7 @@ class FSDPStrategyBase(ABC):
                 dcp_save_path = os.path.join(save_path, "dcp_checkpoint")
                 dcp.save(
                     {"fsdp_checkpoint": training_state},
-                    checkpoint_id=dcp_save_path,
+                    storage_writer=CheckpointFileSystemWriter(dcp_save_path),
                 )
 
         except BaseException as e:

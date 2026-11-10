@@ -187,12 +187,12 @@ def _observation_to_dtype(obs: Observation, dtype: torch.dtype) -> Observation:
     Used to ensure inputs match FSDP2 MixedPrecisionPolicy parameter dtype,
     since cast_forward_inputs cannot reach tensors nested inside dataclasses.
 
-    Images are kept in float32 — SigLIPViT runs stem in float32 internally (matching JAX).
+    Images and state remain float32 for the vision stem and state projection.
     """
     return Observation(
         images=obs.images,  # Leave images in float32 for SigLIPViT stem
         image_masks={k: _tensor_to_dtype(v, dtype) for k, v in obs.image_masks.items()},
-        state=obs.state.to(dtype=dtype),
+        state=obs.state.to(dtype=torch.float32),
         tokenized_prompt=_tensor_to_dtype(obs.tokenized_prompt, dtype),
         tokenized_prompt_mask=_tensor_to_dtype(obs.tokenized_prompt_mask, dtype),
         token_ar_mask=_tensor_to_dtype(obs.token_ar_mask, dtype),

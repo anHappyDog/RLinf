@@ -4,6 +4,39 @@ on:
   workflow_call:
 
 jobs:
+  sft-openpi-official-pickup-test:
+    if: ${{ vars.OPENPI_OFFICIAL_MODEL_PATH != '' && vars.OPENPI_OFFICIAL_DATA_PATH != '' }}
+    runs-on: embodied
+    env:
+      OPENPI_OFFICIAL_MODEL_PATH: ${{ vars.OPENPI_OFFICIAL_MODEL_PATH }}
+      OPENPI_OFFICIAL_DATA_PATH: ${{ vars.OPENPI_OFFICIAL_DATA_PATH }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Create official OpenPI SFT environment
+        run: |
+          unset UV_DEFAULT_INDEX
+          export UV_PATH=/workspace/dataset/.uv
+          export UV_LINK_MODE=symlink
+          export UV_CACHE_DIR=/workspace/dataset/.uv_cache
+          export UV_PYTHON_INSTALL_DIR=/workspace/dataset/.uv_python
+          UV_TORCH_BACKEND=cu126 bash requirements/install.sh embodied --model openpi_official --env dummy
+
+      - name: Train official OpenPI on pickup data
+        timeout-minutes: 20
+        run: |
+          export REPO_PATH=$(pwd)
+          export EMBODIED_PATH="$REPO_PATH/examples/sft"
+          source .venv/bin/activate
+          bash tests/e2e_tests/sft/run_vla_sft.sh franka_pickup_sft_openpi_official_test
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -rf .venv
+          uv cache prune
+
   sft-dreamzero-droid-wan22-test:
     runs-on: embodied
     steps:

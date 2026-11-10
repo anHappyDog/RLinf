@@ -1,0 +1,22 @@
+defaults:
+  - franka_pickup_sft_realized_trajectory_14gpu
+  - _self_
+
+cluster:
+  component_placement:
+    actor: "0-15"
+
+runner:
+  save_interval: 3000
+  val_check_interval: 3000
+  logger:
+    experiment_name: realized_joint_trajectory_16gpu_from0
+
+actor:
+  micro_batch_size: 14
+  fsdp_config:
+    gradient_checkpointing: false
+    sharding_strategy: hybrid_shard
+    hybrid_shard_size: 8
+    retain_parameters_during_accumulation: true
+    reshard_after_forward: false

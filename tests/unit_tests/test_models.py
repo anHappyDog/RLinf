@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
+import json
 import sys
 import time
 from pathlib import Path
@@ -83,6 +85,50 @@ def openpi_sft_reducer():
     policy.action_chunk = 2
     policy.action_env_dim = 3
     return policy._reduce_sft_loss
+
+
+def test_openpi_selective_cast_preserves_fp32_values():
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+
+    policy = Pi0.__new__(Pi0)
+    torch.nn.Module.__init__(policy)
+    policy.llm = torch.nn.Module()
+    policy.llm.proj = torch.nn.Linear(2, 2)
+    policy.llm.final_norms = torch.nn.Linear(2, 2)
+    policy.img = torch.nn.Module()
+    policy.img.stem = torch.nn.Linear(2, 2)
+    policy.img.pos_embedding = torch.nn.Parameter(torch.full((2,), 1.001))
+    policy.action_out_proj = torch.nn.Linear(2, 2)
+    for parameter in policy.parameters():
+        parameter.data.fill_(1.001)
+    original = {name: p.detach().clone() for name, p in policy.named_parameters()}
+
+    policy.to_bfloat16_for_selected_params("bfloat16")
+
+    for name, parameter in policy.named_parameters():
+        if name.startswith("llm.proj."):
+            assert parameter.dtype == torch.bfloat16
+        else:
+            assert parameter.dtype == torch.float32
+            torch.testing.assert_close(parameter, original[name], rtol=0, atol=0)
+
+
+def test_openpi_observation_keeps_measured_state_fp32():
+    from rlinf.models.embodiment.openpi.modules.model import (
+        Observation,
+        _observation_to_dtype,
+    )
+
+    state = torch.tensor([[1.001, -0.123456]], dtype=torch.float32)
+    observation = Observation(
+        images={"base_0_rgb": torch.zeros(1, 8, 8, 3)},
+        image_masks={"base_0_rgb": torch.ones(1, dtype=torch.bool)},
+        state=state,
+    )
+    converted = _observation_to_dtype(observation, torch.bfloat16)
+
+    assert converted.state.dtype == torch.float32
+    torch.testing.assert_close(converted.state, state, rtol=0, atol=0)
 
 
 def test_openpi_sft_mask_excludes_padding_context_and_tail(openpi_sft_reducer):
@@ -1846,3 +1892,396 @@ def test_lingbotvlav2_smoke_config_composes(monkeypatch):
     )
     assert cfg.algorithm.adv_type == "gae" and cfg.algorithm.loss_type == "actor_critic"
     assert cfg.runner.max_steps == 2 and cfg.env.train.total_num_envs == 4
+
+
+@pytest.fixture
+def native_mixture_policy_io(tmp_path):
+    from rlinf.models.embodiment.openpi.mixture_io import MixturePolicyIO
+
+    schema = {
+        "action": {
+            "transform": "quantile",
+            "q01": [-2, -4, 0],
+            "q99": [2, 4, 1],
+            "passthrough_indices": [2],
+        },
+        "state": {
+            "transform": "quantile",
+            "q01": [0, 0, 0],
+            "q99": [20, 20, 1],
+            "passthrough_indices": [2],
+        },
+        "adapter": {
+            "kind": "joint_relative",
+            "joint_action_indices": [0, 1],
+            "joint_state_indices": [0, 1],
+            "gripper_action_indices": [2],
+            "gripper_state_indices": [2],
+            "gripper_open": 1.0,
+            "gripper_closed": 0.0,
+        },
+        "cameras": {"base_0_rgb": "observation.images.primary"},
+        "control_mode": "joint_relative",
+        "fps": 30,
+    }
+    manifest = {
+        "version": 2,
+        "action_horizon": 2,
+        "action_dim": 5,
+        "schemas": {"test": schema},
+    }
+    (tmp_path / "normalization.json").write_text(json.dumps(manifest))
+    return MixturePolicyIO(tmp_path, "test", action_dim=5)
+
+
+class _MixtureTokenizer:
+    """Stand in for the optional upstream tokenizer at the package boundary."""
+
+    def tokenize(self, prompt, state):
+        return np.array([len(prompt), len(state)]), np.array([True, True])
+
+
+def test_native_mixture_input_matches_shared_training_preparation(
+    native_mixture_policy_io,
+):
+    from rlinf.models.embodiment.openpi.mixture_io import (
+        build_observation,
+        build_prompt,
+    )
+
+    io = native_mixture_policy_io
+    io._tokenizer = _MixtureTokenizer()
+    image = np.full((40, 80, 3), 128, dtype=np.uint8)
+    raw_state = np.array([2.0, 5.0, 0.8], dtype=np.float32)
+    images = {"base_0_rgb": image}
+    task = "Pick up the cube."
+    state = np.array([-0.8, -0.5, 0.2, 0, 0], dtype=np.float32)
+    expected = build_observation(
+        state, images, build_prompt("test", "joint_relative", 30, task), io._tokenizer
+    )
+
+    actual = io.prepare_observation(raw_state, images, task)
+
+    for key in ("state", "tokenized_prompt", "tokenized_prompt_mask"):
+        np.testing.assert_allclose(actual[key], expected[key])
+    for slot in expected["image"]:
+        np.testing.assert_array_equal(actual["image"][slot], expected["image"][slot])
+        assert actual["image_mask"][slot] == expected["image_mask"][slot]
+    assert actual["image"]["base_0_rgb"].shape == (224, 224, 3)
+    np.testing.assert_array_equal(actual["image"]["base_0_rgb"][:56], -1)
+    assert not actual["image_mask"]["left_wrist_0_rgb"]
+
+
+def test_native_mixture_decode_uses_explicit_original_state(native_mixture_policy_io):
+    io = native_mixture_policy_io
+    io._tokenizer = _MixtureTokenizer()
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    state_a = np.array([[2.0, 5.0, 0.8]], dtype=np.float32)
+    state_b = np.array([[20.0, 50.0, 0.2]], dtype=np.float32)
+    env = {
+        "states": state_a,
+        "main_images": image[None],
+        "task_descriptions": ["Pick up the cube."],
+    }
+    io.batch_observation(env)
+    io.batch_observation({**env, "states": state_b})
+    actions = np.array(
+        [[[1, 2, 0.25, 999, 999], [3, 4, 0.75, 999, 999]]], dtype=np.float32
+    )
+
+    decoded_a = io.decode(actions, state_a)
+    decoded_b = io.decode(actions, state_b)
+
+    np.testing.assert_allclose(decoded_a, [[[4, 13, 0.75], [8, 21, 0.25]]])
+    np.testing.assert_allclose(decoded_b, [[[22, 58, 0.75], [26, 66, 0.25]]])
+    np.testing.assert_array_equal(state_a, [[2.0, 5.0, np.float32(0.8)]])
+    assert decoded_a.shape == (1, 2, 3)
+
+
+def test_native_mixture_env_output_uses_native_reference_and_chunk(
+    native_mixture_policy_io,
+):
+    from rlinf.models.embodiment.openpi.env_io import EnvIO
+
+    env_io = EnvIO()
+    env_io.action_chunk = 1
+    env_io.device = torch.device("cpu")
+    env_io.setup_mixture_io(native_mixture_policy_io)
+    model_actions = torch.tensor([[[1.0, 2.0, 0.25, 999, 999], [3, 4, 0.75, 999, 999]]])
+    raw_state = torch.tensor([[2.0, 5.0, 0.8]])
+
+    actual = env_io.decode_actions(model_actions, raw_state)
+
+    torch.testing.assert_close(actual, torch.tensor([[[4.0, 13.0, 0.75]]]))
+    with pytest.raises(ValueError, match="original observation state"):
+        env_io._predict_eval(SimpleNamespace(state=raw_state))
+
+
+def test_native_mixture_eval_factory_installs_prepared_schema(
+    native_mixture_policy_io, tmp_path
+):
+    from rlinf.models.embodiment.openpi import _install_transforms
+    from rlinf.models.embodiment.openpi.env_io import EnvIO
+
+    model = EnvIO()
+    model.action_dim = 5
+    model.action_horizon = 2
+    model.max_token_len = 200
+    cfg = OmegaConf.create(
+        {
+            "openpi": {
+                "task": "eval",
+                "mixture": {"manifest_dir": str(tmp_path), "schema_id": "test"},
+            }
+        }
+    )
+
+    assert _install_transforms(model, cfg, "native_mixture") is model
+    assert model._mixture_io.schema_id == "test"
+    assert model._mixture_io.schema == native_mixture_policy_io.schema
+    model.action_horizon = 3
+    with pytest.raises(ValueError, match="Prepared action horizon"):
+        _install_transforms(model, cfg, "native_mixture")
+
+
+@pytest.mark.parametrize("task", ["rl", "dagger", "dsrl"])
+def test_native_mixture_factory_rejects_unwired_rollout_tasks(task):
+    from rlinf.models.embodiment.openpi import _install_transforms
+
+    cfg = OmegaConf.create({"openpi": {"task": task}})
+    with pytest.raises(ValueError, match="currently supports task=eval"):
+        _install_transforms(None, cfg, "native_mixture")
+
+
+def test_native_mixture_rejects_bound_model_dimension(
+    native_mixture_policy_io, tmp_path
+):
+    from rlinf.models.embodiment.openpi.mixture_io import MixturePolicyIO
+
+    with pytest.raises(ValueError, match="Prepared action_dim 5 differs from model 6"):
+        MixturePolicyIO(tmp_path, "test", action_dim=6)
+
+
+def test_native_mixture_verifies_normalization_in_checkpoint_assets(
+    native_mixture_policy_io, tmp_path
+):
+    from rlinf.models.embodiment.openpi.mixture_io import MixturePolicyIO
+
+    normalization = tmp_path / "normalization.json"
+    contract = {
+        "files": {
+            "normalization.json": hashlib.sha256(
+                normalization.read_bytes()
+            ).hexdigest(),
+            "train.jsonl": "unused-training-manifest-hash",
+        }
+    }
+    (tmp_path / "contract.json").write_text(json.dumps(contract))
+    assert not (tmp_path / "train.jsonl").exists()
+    restored = MixturePolicyIO(tmp_path, "test", action_dim=5)
+    assert restored.schema == native_mixture_policy_io.schema
+
+    modified = json.loads(normalization.read_text())
+    modified["schemas"]["test"]["action"]["q99"][0] = 100
+    normalization.write_text(json.dumps(modified))
+    with pytest.raises(
+        ValueError, match="normalization.json differs from its contract"
+    ):
+        MixturePolicyIO(tmp_path, "test", action_dim=5)
+
+
+def test_native_mixture_factory_rejects_rtc_without_anchor_rebasing():
+    from rlinf.models.embodiment.openpi import _install_transforms
+
+    cfg = OmegaConf.create({"openpi": {"task": "eval", "rtc_enabled": True}})
+    with pytest.raises(ValueError, match="RTC requires rebasing previous actions"):
+        _install_transforms(None, cfg, "native_mixture")
+
+
+def test_official_checkpoint_export_restores_shared_weights(tmp_path):
+    safetensors = pytest.importorskip("safetensors")
+    from safetensors.torch import load_model
+
+    from rlinf.models.embodiment.openpi_official.checkpoint import export_core_weights
+
+    class TiedCore(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = torch.nn.Embedding(7, 4)
+            self.head = torch.nn.Linear(4, 7, bias=False)
+            self.head.weight = self.embedding.weight
+
+        def forward(self, tokens):
+            return self.head(self.embedding(tokens))
+
+    source = TiedCore()
+    actor_state = {
+        f"core.{name}": value.clone() for name, value in source.state_dict().items()
+    }
+    path = tmp_path / "model.safetensors"
+    export_core_weights(TiedCore(), actor_state, path)
+    restored = TiedCore()
+    load_model(restored, path)
+    assert restored.embedding.weight is restored.head.weight
+    tokens = torch.tensor([[0, 3, 6]])
+    torch.testing.assert_close(restored(tokens), source(tokens), atol=0, rtol=0)
+    with safetensors.safe_open(path, framework="pt") as stored:
+        assert len(stored.keys()) == 1
+        assert stored.metadata() == {"head.weight": "embedding.weight"}
+    assert not path.with_suffix(".safetensors.partial").exists()
+
+
+def test_official_template_supports_the_shared_model_factory():
+    from hydra import compose, initialize_config_dir
+    from omegaconf import open_dict
+
+    from rlinf.config import (
+        SUPPORTED_TRAINING_BACKENDS,
+        validate_fsdp_cfg,
+        validate_sft_cfg,
+    )
+
+    directory = Path(__file__).resolve().parents[2] / "examples/sft/config"
+    with initialize_config_dir(config_dir=str(directory), version_base="1.1"):
+        cfg = compose(config_name="franka_pickup_sft_openpi_official")
+    cfg = validate_sft_cfg(cfg)
+    assert cfg.actor.training_backend in SUPPORTED_TRAINING_BACKENDS
+    cfg.actor = validate_fsdp_cfg(cfg.actor)
+    assert cfg.actor.fsdp_config.strategy == "fsdp2"
+    cfg = cfg.actor.model
+    model_type = "test_official_template_factory"
+
+    def build_model(model_cfg, dtype):
+        assert dtype is None
+        return torch.nn.Linear(2, 1, bias=False)
+
+    register_model(model_type, build_model, force=True)
+    cfg.model_type = model_type
+    with open_dict(cfg):
+        cfg.load_to_device = False
+    model = get_model(cfg)
+    assert model.weight.shape == (1, 2)
+
+
+def test_official_checkpoint_export_rejects_inconsistent_actor_state(tmp_path):
+    pytest.importorskip("safetensors")
+    from rlinf.models.embodiment.openpi_official.checkpoint import export_core_weights
+
+    core = torch.nn.ModuleDict(
+        {
+            "embedding": torch.nn.Embedding(3, 2),
+            "head": torch.nn.Linear(2, 3, bias=False),
+        }
+    )
+    core["head"].weight = core["embedding"].weight
+    actor_state = {
+        f"core.{name}": value.clone() for name, value in core.state_dict().items()
+    }
+    path = tmp_path / "model.safetensors"
+    with pytest.raises(ValueError, match="only core"):
+        export_core_weights(core, {"other.weight": torch.ones(2)}, path)
+    missing = dict(actor_state)
+    del missing["core.head.weight"]
+    with pytest.raises(RuntimeError, match="Missing key"):
+        export_core_weights(core, missing, path)
+    actor_state["core.head.weight"] += 1
+    with pytest.raises(ValueError, match="Shared core parameter values differ"):
+        export_core_weights(core, actor_state, path)
+    assert not path.exists()
+
+
+def test_official_trajectory_loss_ignores_padding_and_missing_targets(monkeypatch):
+    from rlinf.models.embodiment.base_policy import ForwardType
+    from rlinf.models.embodiment.openpi_official.policy import OfficialOpenPiPolicy
+
+    upstream = ModuleType("openpi.models.model")
+    upstream.Observation = SimpleNamespace(from_dict=lambda observation: observation)
+    monkeypatch.setitem(sys.modules, "openpi.models.model", upstream)
+
+    class RegressionCore(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.prediction = torch.nn.Parameter(torch.zeros(2, 16, 8))
+
+        def forward(self, observation, actions, noise=None, time=None):
+            return (self.prediction - actions).square()
+
+    policy = OfficialOpenPiPolicy.__new__(OfficialOpenPiPolicy)
+    torch.nn.Module.__init__(policy)
+    policy.core = RegressionCore()
+    actions = torch.full((2, 16, 8), 1_000_000.0)
+    actions[0, 0, 0] = 2
+    actions[1, 0, :2] = torch.tensor([3.0, 4.0])
+    mask = torch.zeros_like(actions, dtype=torch.bool)
+    mask[0, 0, 0] = True
+    mask[1, 0, :2] = True
+    batch = {"observation": {}, "actions": actions, "action_loss_mask": mask}
+    loss = policy(ForwardType.SFT, data=batch)
+    output = policy(
+        ForwardType.SFT,
+        data=batch,
+        return_loss_statistics=True,
+        loss_statistic_slices=(slice(None), slice(0, 7), slice(7, 8)),
+    )
+    torch.testing.assert_close(output["loss"], loss)
+    assert not output["loss_statistics"].requires_grad
+    torch.testing.assert_close(
+        output["loss_statistics"],
+        torch.tensor(
+            [
+                [[4, 1, 1], [4, 1, 1], [0, 0, 0]],
+                [[12.5, 1, 2], [12.5, 1, 2], [0, 0, 0]],
+            ],
+            dtype=torch.float64,
+        ),
+    )
+    output["loss"].backward()
+    gradient_with_statistics = policy.core.prediction.grad.clone()
+    policy.core.prediction.grad = None
+    assert loss.item() == pytest.approx(8.25)
+    loss.backward()
+    expected_gradient = torch.zeros_like(actions)
+    expected_gradient[0, 0, 0] = -2
+    expected_gradient[1, 0, :2] = torch.tensor([-1.5, -2.0])
+    torch.testing.assert_close(policy.core.prediction.grad, expected_gradient)
+    torch.testing.assert_close(gradient_with_statistics, expected_gradient)
+
+    batch["actions"] = actions.masked_fill(~mask, -12.0)
+    assert policy(ForwardType.SFT, data=batch).item() == pytest.approx(8.25)
+    del batch["action_loss_mask"]
+    torch.testing.assert_close(
+        policy(ForwardType.SFT, data=batch), batch["actions"].square().mean()
+    )
+
+
+def test_official_dataset_loss_pools_counts_across_microbatches_and_ranks(monkeypatch):
+    from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+    worker = object.__new__(FSDPVlaSftWorker)
+    worker.cfg = OmegaConf.create(
+        {"data": {"official": {"recipe": "realized_trajectory"}}}
+    )
+    schemas = ["a", "b", "absent"]
+    totals = torch.zeros(3, 3, 3, dtype=torch.float64)
+    # Rank 0 sees two microbatches of a, and no samples of b.
+    for means in ([2.0], [4.0, 6.0]):
+        statistics = torch.zeros(len(means), 3, 3, dtype=torch.float64)
+        statistics[:, :2, 0] = torch.tensor(means)[:, None]
+        statistics[:, :2, 1:] = 1
+        worker._accumulate_dataset_loss(
+            totals, {"sample_schema": ["a"] * len(means)}, statistics, schemas
+        )
+    remote = torch.zeros_like(totals)
+    remote[0, :2] = torch.tensor([8.0, 1.0, 7.0])
+    remote[1] = torch.tensor([[10.0, 1, 8], [9.0, 1, 7], [17.0, 1, 1]])
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda values: values.add_(remote)
+    )
+    metrics = worker._reduce_dataset_loss(totals, schemas)
+    assert metrics["loss_by_dataset/a"] == pytest.approx(5.0)
+    assert metrics["loss_by_dataset/a/samples"] == 4
+    assert metrics["loss_by_dataset/a/mask_elements"] == 10
+    assert metrics["loss_by_dataset/b"] == 10
+    assert metrics["loss_by_dataset/b/gripper1"] == 17
+    assert "loss_by_dataset/a/gripper1" not in metrics
+    assert not any("absent" in key for key in metrics)

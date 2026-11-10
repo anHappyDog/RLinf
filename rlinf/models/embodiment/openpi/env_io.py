@@ -38,6 +38,7 @@ class EnvIO:
 
     _input_transform_fn = None
     _output_transform_fn = None
+    _mixture_io = None
 
     def setup_transforms(
         self,
@@ -50,7 +51,13 @@ class EnvIO:
         self._input_transform_fn = compose(transforms)
         self._output_transform_fn = compose(output_transforms)
 
+    def setup_mixture_io(self, policy_io: Any) -> None:
+        """Install the prepared mixture schema used by native-controller eval."""
+        self._mixture_io = policy_io
+
     def _ensure_transforms(self) -> None:
+        if self._mixture_io is not None:
+            return
         if self._input_transform_fn is None or self._output_transform_fn is None:
             raise RuntimeError(
                 f"{type(self).__name__}.setup_transforms(...) must be called "
@@ -82,10 +89,15 @@ class EnvIO:
 
     def input_transform(self, obs: dict, transpose: bool = False) -> dict:
         self._ensure_transforms()
+        if self._mixture_io is not None:
+            return self._mixture_io.batch_observation(obs)
         return apply_input_transform(self._input_transform_fn, obs, transpose=transpose)
 
     def output_transform(self, outputs: dict) -> dict:
         self._ensure_transforms()
+        if self._mixture_io is not None:
+            actions = self._mixture_io.decode(outputs["actions"], outputs["state"])
+            return {"actions": torch.from_numpy(actions)[:, : self.action_chunk]}
         return apply_output_transform(
             self._output_transform_fn,
             outputs,
@@ -93,7 +105,7 @@ class EnvIO:
         )
 
     def decode_actions(
-        self, model_actions: torch.Tensor, state: torch.Tensor
+        self, model_actions: torch.Tensor, state: torch.Tensor | np.ndarray
     ) -> torch.Tensor:
         """Run the output transform and return env-space actions on this device."""
         env_outputs = self.output_transform({"actions": model_actions, "state": state})
@@ -128,6 +140,13 @@ class EnvIO:
     def env_obs_to_observation(self, env_obs: dict[str, Any]) -> Observation:
         """Repack env obs through the transform pipeline onto this device."""
         self._ensure_transforms()
+        if self._mixture_io is not None:
+            native_obs = {
+                **env_obs,
+                "states": self._select_configured_state(env_obs["states"]),
+            }
+            processed = self._mixture_io.batch_observation(native_obs)
+            return self._observation_dict_to_device(processed)
         repacked = repack_env_obs(
             self.config_name,
             env_obs,
@@ -142,12 +161,18 @@ class EnvIO:
         *,
         noise: torch.Tensor | None = None,
         rng: torch.Generator | None = None,
+        raw_state: torch.Tensor | np.ndarray | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Deterministic Euler ODE sampler shared by eval / RL eval / DAgger."""
+        if self._mixture_io is not None and raw_state is None:
+            raise ValueError(
+                "Native mixture decoding requires the original observation state"
+            )
         model_actions = self.sample_actions(
             observation, num_steps=self.num_steps, noise=noise, rng=rng
         )
-        actions = self.decode_actions(model_actions, observation.state)
+        reference_state = observation.state if raw_state is None else raw_state
+        actions = self.decode_actions(model_actions, reference_state)
         B = actions.shape[0]
         result = {
             "prev_logprobs": None,
