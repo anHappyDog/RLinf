@@ -35,6 +35,45 @@ from rlinf.runners.reasoning_runner import ReasoningRunner
 from rlinf.utils.metric_utils import compute_evaluate_metrics, compute_rollout_metrics
 
 
+def test_tensorboard_batches_scalars_and_flushes_on_finish(tmp_path):
+    from rlinf.utils.metric_logger import MetricLogger
+
+    cfg = OmegaConf.create(
+        {
+            "runner": {
+                "logger": {
+                    "log_path": str(tmp_path),
+                    "logger_backends": ["tensorboard"],
+                }
+            }
+        }
+    )
+    logger = MetricLogger(cfg)
+    metrics = {f"train/source_{i}/loss": i / 10 for i in range(195)}
+    logger.log(metrics, 7)
+    logger.log({}, 7)
+    logger.log({"train/loss": torch.tensor(0.25), "train/samples": 3072}, 8)
+    logger.finish()
+
+    from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
+    from tensorboard.compat.proto.types_pb2 import DT_FLOAT
+    from tensorboard.util.tensor_util import make_ndarray
+
+    event_path = next((tmp_path / "tensorboard").glob("events.out.tfevents.*"))
+    events = [
+        event
+        for event in EventFileLoader(str(event_path)).Load()
+        if event.HasField("summary")
+    ]
+    assert [event.step for event in events] == [7, 8]
+    expected = [metrics, {"train/loss": 0.25, "train/samples": 3072}]
+    for event, values in zip(events, expected, strict=True):
+        assert len(event.summary.value) == len(values)
+        for value in event.summary.value:
+            assert value.tensor.dtype == DT_FLOAT
+            assert make_ndarray(value.tensor).item() == pytest.approx(values[value.tag])
+
+
 def test_compute_evaluate_metrics_reports_interact_delay_wait_time_stats():
     metrics = compute_evaluate_metrics(
         [

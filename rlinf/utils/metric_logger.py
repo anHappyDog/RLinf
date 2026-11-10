@@ -52,8 +52,16 @@ class _TensorboardLogger:
         self.writer = _import_summary_writer()(log_path)
 
     def log(self, data: dict[str, float], step: int) -> None:
-        for key, value in data.items():
-            self.writer.add_scalar(key, value, step)
+        from tensorboard.compat.proto.summary_pb2 import Summary
+        from torch.utils.tensorboard.summary import scalar
+
+        if not data:
+            return
+        # Batch scalars so the asynchronous writer appends one event per call.
+        summary = Summary(
+            value=[scalar(key, value).value[0] for key, value in data.items()]
+        )
+        self.writer._get_file_writer().add_summary(summary, step)
 
     def finish(self):
         self.writer.close()
