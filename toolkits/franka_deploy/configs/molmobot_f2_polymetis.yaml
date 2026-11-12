@@ -1,0 +1,47 @@
+hardware_confirmed: true
+robot_ip: 172.16.0.2
+robot_urdf: /home/infini/daibo/runs/input_alignment/left_robot.urdf
+backend: polymetis
+polymetis:
+  host: 127.0.0.1
+  port: 50061
+action_dt: 0.066
+gripper:
+  type: robotiq
+  model: 2F-85
+  device: /dev/serial/by-id/usb-FTDI_USB_TO_RS-485_DAATR4Y4-if00-port0
+  max_width_m: 0.085
+  baudrate: 115200
+  slave_id: 9
+  speed: 0.085
+  force: 10.0
+  force_units: percent
+  feedback_mapping: 'pinned Polymetis Robotiq 2F-85: open=3, closed=230, stroke=0.085m'
+cameras:
+  external:
+    type: realsense
+    serial: '142122070838'
+    resolution:
+    - 1280
+    - 720
+    fps: 30
+  wrist:
+    type: realsense
+    serial: '141722078696'
+    resolution:
+    - 1280
+    - 720
+    fps: 30
+action_scale: 1.0
+autohome:
+  enabled: true
+  duration: 5.0
+  home_jointpos:
+  - 0.0
+  - -0.7
+  - 0.0
+  - -2.35619
+  - 0.0
+  - 1.57079
+  - 0.0
+controller_profile: /home/infini/daibo/code/franka_deploy/polymetis_server/fr3.yaml

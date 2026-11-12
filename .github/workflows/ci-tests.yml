@@ -177,6 +177,7 @@ jobs:
               - 'tests/e2e_tests/offline_rl/**'
               - '.github/workflows/offline_rl-e2e-tests.yml'
             unit_test_filter: &unit
+              - 'toolkits/franka_deploy/**'
               - *shared
               - 'rlinf/robotics/**'
               # Unit tests import env modules directly (robot task envs, the

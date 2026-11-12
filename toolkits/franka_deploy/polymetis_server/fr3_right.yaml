@@ -1,0 +1,188 @@
+host: 127.0.0.1
+port: 50063
+hz: 1000
+sources:
+  polymetis_commit: 0a01a7fa7a7c65b2f9a3aebf5e79040940daf9d2
+  gains: DROID config/fr3/franka_hardware.yaml
+  rest_pose: MolmoBot robot_eval/config/droid.yaml official home
+  hardware_collision_thresholds: DROID FR3 40Nm/40N arrays applied only on explicit
+    physical service startup
+  automatic_recovery: false
+  droid_commit: 33ae6a67274f36d2e29525b86f23a56616ef43a7
+  urdf_sha256: 11b67362a60ef168bea6068281b2de253a9684b63b7550af2992af3dc004ab81
+robot_model:
+  robot_description_path: /home/infini/daibo/runs/right_input_alignment/right_robot.urdf
+  controlled_joints:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  num_dofs: 7
+  ee_link_name: link8
+  rest_pose:
+  - 0.0
+  - -0.7
+  - 0.0
+  - -2.35619
+  - 0.0
+  - 1.57079
+  - 0.0
+  joint_limits_low:
+  - -2.9007400166666666
+  - -1.8360900166666667
+  - -2.9007400166666666
+  - -3.077020016666667
+  - -2.87630335
+  - 0.43982265
+  - -3.05083335
+  joint_limits_high:
+  - 2.9007400166666666
+  - 1.8360900166666667
+  - 2.9007400166666666
+  - -0.11693708333333333
+  - 2.87630335
+  - 4.62163335
+  - 3.05083335
+  joint_damping:
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  torque_limits:
+  - 87.0
+  - 87.0
+  - 87.0
+  - 87.0
+  - 12.0
+  - 12.0
+  - 12.0
+controller:
+  default_Kq:
+  - 40
+  - 30
+  - 50
+  - 25
+  - 35
+  - 25
+  - 10
+  default_Kqd:
+  - 4
+  - 6
+  - 5
+  - 5
+  - 3
+  - 2
+  - 1
+  default_Kx:
+  - 400
+  - 400
+  - 400
+  - 15
+  - 15
+  - 15
+  default_Kxd:
+  - 37
+  - 37
+  - 37
+  - 2
+  - 2
+  - 2
+hardware:
+  robot_ip: 172.16.0.3
+  limit_rate: true
+  lpf_cutoff_frequency: 100
+  limits:
+    cartesian_pos_upper:
+    - 1.0
+    - 1.0
+    - 1.0
+    cartesian_pos_lower:
+    - -1.0
+    - -1.0
+    - -1.0
+    joint_pos_upper:
+    - 2.65
+    - 1.68
+    - 2.8
+    - -0.16
+    - 2.7
+    - 4.4
+    - 2.9
+    joint_pos_lower:
+    - -2.65
+    - -1.68
+    - -2.8
+    - -2.95
+    - -2.7
+    - 0.45
+    - -2.9
+    joint_vel:
+    - 2.075
+    - 2.075
+    - 2.075
+    - 2.075
+    - 2.51
+    - 2.51
+    - 2.51
+    elbow_vel: 2.075
+    joint_torques:
+    - 86.0
+    - 86.0
+    - 86.0
+    - 86.0
+    - 11.5
+    - 11.5
+    - 11.5
+  safety_controller:
+    is_active: true
+    margins:
+      cartesian_pos: 0.05
+      joint_pos: 0.2
+      joint_vel: 0.5
+    stiffness:
+      cartesian_pos: 200.0
+      joint_pos: 50.0
+      joint_vel: 20.0
+  apply_collision_behavior: true
+  collision_behavior:
+    lower_torque:
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    upper_torque:
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    lower_force:
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    upper_force:
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+cpu_affinity:
+  server:
+  - 14
+  hardware:
+  - 8
