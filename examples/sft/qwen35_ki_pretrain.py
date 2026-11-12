@@ -83,6 +83,13 @@ def parse_args():
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--resume")
+    parser.add_argument(
+        "--kernel-backend", choices=("native", "fa3_flashqla"), default="native"
+    )
+    parser.add_argument("--fa3-path", default="/opt/qwen35_fa3_fast")
+    parser.add_argument(
+        "--flashqla-path", default="/opt/qwen35_flashqla_probe/packages"
+    )
     parser.add_argument("--full-data-index", help="Prepared full Molmo numeric index")
     parser.add_argument("--checkpoint-seconds", type=float)
     parser.add_argument("--checkpoint-first-step", type=int)
@@ -593,6 +600,14 @@ def main():
         device=device, dtype=torch.float32
     )
     policy = KIFlowMatchingPolicy(vlm, expert, fast)
+    kernel_report = {"backend": args.kernel_backend}
+    if args.kernel_backend == "fa3_flashqla":
+        from rlinf.models.embodiment.qwen35_fm.accelerated_kernels import install_fa3
+        from rlinf.models.embodiment.qwen35_fm.flashqla_backend import install_flashqla
+
+        kernel_report["attention"] = install_fa3(policy, args.fa3_path)
+        kernel_report["linear_attention"] = install_flashqla(policy, args.flashqla_path)
+    status("kernels_ready", kernel_report=kernel_report)
     native_count = sum(parameter.numel() for parameter in vlm.parameters())
     expert_count = sum(parameter.numel() for parameter in expert.parameters())
     precision = MixedPrecisionPolicy(
@@ -743,6 +758,8 @@ def main():
                     "protocol": protocol,
                     "native_parameters": native_count,
                     "expert_parameters": expert_count,
+                    "kernel_report": kernel_report,
+                    "resume_checkpoint": args.resume,
                     "scope": "Knowledge-insulated robot FM/FAST CE with authentic VL CE; no closed-loop success",
                 },
                 indent=2,
@@ -790,6 +807,8 @@ def main():
                 json.dumps(
                     {
                         "step": step,
+                        "kernel_report": kernel_report,
+                        "resumed_from": args.resume,
                         "training_seconds": elapsed
                         + time.perf_counter()
                         - save_started,
