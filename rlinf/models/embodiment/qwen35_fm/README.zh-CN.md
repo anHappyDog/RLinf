@@ -53,6 +53,8 @@ actions = policy.sample(condition, steps=10, method="euler")
 
 `encode` 返回 token 特征及有效性 mask；`predict_velocity(noisy_actions, timestep, condition)` 在同一噪声水平同时评估全部动作位置。`loss(actions, condition, action_mask=...)` 采样高斯噪声和均匀时间，使用 `A_tau=(1-tau)*epsilon+tau*A`、目标速度 `A-epsilon`，计算有效 action coordinate 上的 MSE。`sample` 用 Euler 或 Heun 从时间 0 的噪声积分到时间 1 的动作。训练前先归一化动作，机器人执行前再反归一化。
 
+每次采样在调用内复用六个 block 的固定 VLM K/V 投影；Action GDN 状态仍在每次向量场评估时独立初始化。GQA 向原生 SDPA 传入紧凑的 KV heads，优先使用融合 CUDA 后端，包括带 padding 输入的 cuDNN；不支持的形状或设备使用原生 SDPA fallback。KI batch 在 pinning 和 GPU 搬运时保留共享图像 tensor，FM 与 CE 分母合并归约，指标仅在日志步读取。
+
 | 接口 | Shape |
 | --- | --- |
 | 动作、噪声、速度 | `[B,H,D_action]` |

@@ -53,6 +53,8 @@ actions = policy.sample(condition, steps=10, method="euler")
 
 `encode` returns token features and their validity mask. `predict_velocity(noisy_actions, timestep, condition)` evaluates every action position at one noise level. `loss(actions, condition, action_mask=...)` uses Gaussian noise and uniform time with `A_tau=(1-tau)*epsilon+tau*A`, target `A-epsilon`, and masked coordinate MSE. `sample` integrates from noise at time 0 to actions at time 1 using Euler or Heun. Normalize training actions before FM and invert that normalization before robot execution.
 
+Each sampling call caches the six blocks' fixed VLM K/V projections locally; action GDN states are still initialized for every vector-field evaluation. GQA passes compact KV heads to native SDPA and prioritizes fused CUDA backends, including cuDNN for padded inputs. Unsupported shapes or devices use native SDPA fallback. KI batches preserve shared image tensors through pinning and device transfer; FM and CE denominators are reduced together, with metrics read on logging steps.
+
 | Interface | Shape |
 | --- | --- |
 | Actions, noise, velocity | `[B,H,D_action]` |

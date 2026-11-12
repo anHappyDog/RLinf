@@ -112,6 +112,50 @@ def learning_rate_factor(step, warmup, horizon):
     return 0.1 + 0.9 * (1 + math.cos(math.pi * progress)) / 2
 
 
+def map_batch_tensors(batch, transform):
+    """Transform each tensor once, preserving shared prefix/CE image tensors."""
+    transformed = {}
+
+    def apply(value):
+        if isinstance(value, torch.Tensor):
+            identity = id(value)
+            if identity not in transformed:
+                transformed[identity] = transform(value)
+            return transformed[identity]
+        return {key: apply(item) for key, item in value.items()}
+
+    return apply(batch)
+
+
+class SharedTensorBatch(dict):
+    """Preserve tensor aliases when the DataLoader pins a KI batch."""
+
+    def pin_memory(self):
+        return map_batch_tensors(self, lambda tensor: tensor.pin_memory())
+
+
+class SharedTensorCollator:
+    """Wrap native collators with alias-preserving DataLoader pinning."""
+
+    def __init__(self, collator):
+        self.collator = collator
+
+    def __call__(self, samples):
+        return SharedTensorBatch(self.collator(samples))
+
+
+def global_loss_means(losses, counts, world):
+    """Reduce independent loss denominators together without host scalar reads."""
+    counts = torch.stack(counts).double()
+    totals = torch.stack((torch.stack(losses).detach().double() * counts, counts))
+    dist.all_reduce(totals)
+    weighted = [
+        loss * count.to(loss.dtype) * world / total.clamp_min(1).to(loss.dtype)
+        for loss, count, total in zip(losses, counts, totals[1], strict=True)
+    ]
+    return weighted, totals[0] / totals[1].clamp_min(1), totals[1]
+
+
 def main():
     from examples.sft.qwen35_ki_data import (
         KIRobotCollator,
@@ -485,7 +529,7 @@ def main():
         options = {
             "num_workers": args.workers,
             "pin_memory": True,
-            "collate_fn": collator,
+            "collate_fn": SharedTensorCollator(collator),
         }
         if args.workers:
             options.update(
@@ -507,26 +551,15 @@ def main():
     )
     vl_iterator = iter(loader(vl_train, vl_collator, prior_vl_steps, args.steps))
 
-    def to_device(value):
-        if isinstance(value, torch.Tensor):
-            return value.to(device=device, non_blocking=True)
-        return {key: to_device(item) for key, item in value.items()}
-
-    def global_mean(loss, count):
-        count = count.double()
-        totals = torch.stack((loss.detach().double() * count, count))
-        dist.all_reduce(totals)
-        weighted = (
-            loss * count.to(loss.dtype) * world / totals[1].clamp_min(1).to(loss.dtype)
+    def to_device(batch):
+        return map_batch_tensors(
+            batch, lambda tensor: tensor.to(device=device, non_blocking=True)
         )
-        return weighted, float(totals[0] / totals[1].clamp_min(1)), int(totals[1])
 
     def clip(parameters):
         norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0)
         norm = norm.full_tensor() if hasattr(norm, "full_tensor") else norm
-        if not bool(torch.isfinite(norm)):
-            raise RuntimeError("Expected finite KI gradient norms on every rank")
-        return float(norm)
+        return norm.detach()
 
     def save(step, elapsed):
         path = output / f"checkpoint_{step:06d}"
@@ -588,65 +621,43 @@ def main():
             for group in optimizer.param_groups:
                 group["lr"] = peak * factor
         torch.manual_seed(args.seed + 1000 + step * world + rank)
+        zero = torch.zeros((), device=device)
         if is_vl:
             local = policy.vl_loss(batch["vlm_inputs"])
-            loss, vl_loss, vl_tokens = global_mean(
-                local, (batch["vlm_inputs"]["labels"][:, 1:] != -100).sum()
+            weighted, means, counts = global_loss_means(
+                [local], [(batch["vlm_inputs"]["labels"][:, 1:] != -100).sum()], world
             )
-            fm_loss = action_ce = 0.0
-            fm_count = action_tokens = 0
+            loss, vl_loss, vl_tokens = weighted[0], means[0], counts[0]
+            fm_loss = action_ce = zero
+            fm_count = action_tokens = zero
         else:
             losses = policy(**batch)
-            fm, fm_loss, fm_count = global_mean(
-                losses["fm_loss"], losses["fm_valid_action_scalars"]
+            weighted, means, counts = global_loss_means(
+                [losses["fm_loss"], losses["action_ce_loss"]],
+                [losses["fm_valid_action_scalars"], losses["action_ce_tokens"]],
+                world,
             )
-            ce, action_ce, action_tokens = global_mean(
-                losses["action_ce_loss"], losses["action_ce_tokens"]
-            )
-            loss = fm + ce
-            vl_loss, vl_tokens = 0.0, 0
+            loss = weighted[0] + weighted[1]
+            fm_loss, action_ce = means.unbind()
+            fm_count, action_tokens = counts.unbind()
+            vl_loss = vl_tokens = zero
         finite = torch.isfinite(loss).int()
         dist.all_reduce(finite, op=dist.ReduceOp.MIN)
         if not bool(finite):
             raise RuntimeError(f"Nonfinite KI loss at update {step + 1}")
         loss.backward()
         vlm_norm = clip(vlm_parameters)
-        expert_norm = clip(expert_parameters) if not is_vl else 0.0
+        expert_norm = clip(expert_parameters) if not is_vl else zero
+        if not bool(torch.isfinite(torch.stack((vlm_norm, expert_norm))).all()):
+            raise RuntimeError("Expected finite KI gradient norms on every rank")
         if (vl_tokens if is_vl else action_tokens) > 0:
             optimizers[0].step()
         if not is_vl:
             optimizers[1].step()
-        torch.cuda.synchronize(device)
         last_step = step + 1
         elapsed = previous_seconds + time.perf_counter() - started
         if last_step == start_step + 1:
             check_replicas()
-        record = {
-            "step": last_step,
-            "domain": "vl" if is_vl else "robot",
-            "fm_loss": fm_loss,
-            "action_ce_loss": action_ce,
-            "vl_ce_loss": vl_loss,
-            "fm_valid_action_scalars": fm_count,
-            "action_ce_tokens": action_tokens,
-            "vl_tokens": vl_tokens,
-            "vlm_gradient_norm": vlm_norm,
-            "expert_gradient_norm": expert_norm,
-            "vlm_lr": args.vlm_lr * factor,
-            "expert_lr": args.expert_lr * factor,
-            "data_wait_seconds": data_ready - last_end,
-            "step_seconds": time.perf_counter() - last_end,
-            "training_seconds": elapsed,
-            "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
-            "robot_updates": last_step - last_step // args.vl_every,
-            "vl_updates": last_step // args.vl_every,
-        }
-        if rank == 0 and (
-            last_step % args.log_every == 0 or last_step == start_step + 1
-        ):
-            with (output / "metrics.jsonl").open("a") as handle:
-                handle.write(json.dumps(record) + "\n")
-            status("training", **record)
         stop = torch.tensor(
             int(
                 rank == 0
@@ -659,6 +670,45 @@ def main():
         )
         dist.broadcast(stop, 0)
         final = bool(stop) or last_step == args.steps
+        elapsed = previous_seconds + time.perf_counter() - started
+        if rank == 0 and (
+            last_step % args.log_every == 0 or last_step == start_step + 1
+        ):
+            metric_values = torch.stack(
+                (
+                    fm_loss,
+                    action_ce,
+                    vl_loss,
+                    fm_count,
+                    action_tokens,
+                    vl_tokens,
+                    vlm_norm,
+                    expert_norm,
+                )
+            ).tolist()
+            record = {
+                "step": last_step,
+                "domain": "vl" if is_vl else "robot",
+                "fm_loss": metric_values[0],
+                "action_ce_loss": metric_values[1],
+                "vl_ce_loss": metric_values[2],
+                "fm_valid_action_scalars": int(metric_values[3]),
+                "action_ce_tokens": int(metric_values[4]),
+                "vl_tokens": int(metric_values[5]),
+                "vlm_gradient_norm": metric_values[6],
+                "expert_gradient_norm": metric_values[7],
+                "vlm_lr": args.vlm_lr * factor,
+                "expert_lr": args.expert_lr * factor,
+                "data_wait_seconds": data_ready - last_end,
+                "step_seconds": time.perf_counter() - last_end,
+                "training_seconds": elapsed,
+                "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
+                "robot_updates": last_step - last_step // args.vl_every,
+                "vl_updates": last_step // args.vl_every,
+            }
+            with (output / "metrics.jsonl").open("a") as handle:
+                handle.write(json.dumps(record) + "\n")
+            status("training", **record)
         if last_step % args.checkpoint_every == 0 or final:
             checkpoint = save(last_step, elapsed)
         last_end = time.perf_counter()

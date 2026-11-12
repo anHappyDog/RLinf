@@ -14,6 +14,7 @@
 
 """Native hybrid VLM and continuous-action expert contracts."""
 
+import copy
 import inspect
 import os
 
@@ -31,6 +32,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from rlinf.models.embodiment.qwen35_fm.action_expert import (
     ActionExpertConfig,
     GDNStateReadAdapter,
+    GQACrossAttention,
     build_action_expert,
 )
 from rlinf.models.embodiment.qwen35_fm.policy import FlowMatchingPolicy
@@ -755,3 +757,147 @@ def test_ki_empty_action_targets_have_finite_zero_ce_gradients():
         for gradient in gradients
     )
     assert all(parameter.grad is None for parameter in policy.expert.parameters())
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_compact_gqa_matches_expanded_keys_and_gradients(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    attention = GQACrossAttention(expert_config()).to(device=device, dtype=dtype)
+    reference = copy.deepcopy(attention)
+    hidden = torch.randn(2, 4, 32, device=device, dtype=dtype, requires_grad=True)
+    context = torch.randn(2, 7, 32, device=device, dtype=dtype, requires_grad=True)
+    ref_hidden, ref_context = hidden.detach().clone(), context.detach().clone()
+    ref_hidden.requires_grad_()
+    ref_context.requires_grad_()
+    mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1], [1] * 7], device=device).bool()
+    output = attention(hidden, context, mask)
+    query = reference.q_proj(ref_hidden).view(2, 4, 4, 8).transpose(1, 2)
+    key = reference.k_proj(ref_context).view(2, 7, 2, 8).transpose(1, 2)
+    value = reference.v_proj(ref_context).view(2, 7, 2, 8).transpose(1, 2)
+    expanded = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key.repeat_interleave(2, dim=1),
+        value.repeat_interleave(2, dim=1),
+        attn_mask=mask[:, None, None, :],
+    )
+    expected = reference.out_proj(expanded.transpose(1, 2).reshape(2, 4, 32))
+    tolerance = (
+        {"rtol": 0.03, "atol": 0.002}
+        if device == "cuda"
+        else {"rtol": 2e-5, "atol": 2e-6}
+    )
+    torch.testing.assert_close(output, expected, **tolerance)
+    output.float().square().sum().backward()
+    expected.float().square().sum().backward()
+    for actual, baseline in zip(
+        attention.parameters(), reference.parameters(), strict=True
+    ):
+        if device == "cuda":
+            error = (actual.grad.float() - baseline.grad.float()).norm()
+            assert error <= 0.03 * baseline.grad.float().norm() + 1e-5
+        else:
+            torch.testing.assert_close(actual.grad, baseline.grad, **tolerance)
+    for actual, baseline in (
+        (hidden.grad, ref_hidden.grad),
+        (context.grad, ref_context.grad),
+    ):
+        if device == "cuda":
+            assert (
+                actual.float() - baseline.float()
+            ).norm() <= 0.03 * baseline.float().norm() + 1e-5
+        else:
+            torch.testing.assert_close(actual, baseline, **tolerance)
+
+
+@pytest.mark.parametrize("variant", ["gqa6", "gqa6_gdn3", "gqa6_vlm_state"])
+@pytest.mark.parametrize("method", ["euler", "heun"])
+def test_sample_reuses_only_fixed_context_projections(variant, method):
+    expert = build_action_expert(expert_config(variant), STATE_SPECS).eval()
+    policy = FlowMatchingPolicy(None, expert)
+    condition = synthetic_condition()
+    noise = torch.randn(2, 4, 3)
+    steps = 3
+    counts = dict.fromkeys(range(len(expert.blocks)), 0)
+    hooks = []
+    for index, block in enumerate(expert.blocks):
+
+        def count_projection(module, args, result, index=index):
+            counts[index] += 1
+
+        hooks.append(
+            block.cross_attention.k_proj.register_forward_hook(count_projection)
+        )
+    try:
+        actual = policy.sample(
+            condition, steps=steps, method=method, initial_noise=noise
+        )
+        assert list(counts.values()) == [1] * len(expert.blocks)
+        with torch.no_grad():
+            expected = noise.clone()
+            dt = 1 / steps
+            for index in range(steps):
+                time = torch.full((2,), index * dt)
+                velocity = policy.predict_velocity(expected, time, condition)
+                proposal = expected + dt * velocity
+                if method == "heun":
+                    next_velocity = policy.predict_velocity(
+                        proposal, time + dt, condition
+                    )
+                    expected = expected + dt * (velocity + next_velocity) / 2
+                else:
+                    expected = proposal
+        torch.testing.assert_close(actual, expected)
+        counts.update(dict.fromkeys(counts, 0))
+        changed = synthetic_condition(batch=1)
+        repeated = policy.sample(
+            changed, steps=steps, method=method, initial_noise=noise[:1]
+        )
+        assert repeated.shape == (1, 4, 3)
+        assert list(counts.values()) == [1] * len(expert.blocks)
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FSDP sampling requires CUDA")
+def test_sample_context_cache_survives_fsdp_casts(tmp_path):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    dist.init_process_group(
+        "nccl", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1
+    )
+    try:
+        expert = build_action_expert(expert_config()).cuda().eval()
+        precision = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+        mesh = init_device_mesh("cuda", (1,))
+        for block in expert.blocks:
+            fully_shard(block, mesh=mesh, mp_policy=precision)
+        fully_shard(expert, mesh=mesh, mp_policy=precision)
+        policy = FlowMatchingPolicy(None, expert)
+        source = synthetic_condition()
+        condition = VLMCondition(
+            source.hidden_states.cuda(), source.attention_mask.cuda()
+        )
+        counts = dict.fromkeys(range(len(expert.blocks)), 0)
+        hooks = []
+        for index, block in enumerate(expert.blocks):
+
+            def count_projection(module, args, result, index=index):
+                counts[index] += 1
+
+            hooks.append(
+                block.cross_attention.k_proj.register_forward_hook(count_projection)
+            )
+        try:
+            sample = policy.sample(condition, steps=3, method="heun")
+            assert sample.shape == (2, 4, 3) and sample.isfinite().all()
+            assert list(counts.values()) == [1] * len(expert.blocks)
+        finally:
+            for hook in hooks:
+                hook.remove()
+    finally:
+        dist.destroy_process_group()

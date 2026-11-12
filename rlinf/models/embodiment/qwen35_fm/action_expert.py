@@ -16,12 +16,14 @@
 
 import inspect
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Protocol
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 class VLMCondition(Protocol):
@@ -147,6 +149,13 @@ class ActionEmbedding(nn.Module):
         )
 
 
+class ActionContextCache:
+    """Own fixed VLM K/V for one solve, preserving identity through FSDP casts."""
+
+    def __init__(self) -> None:
+        self.key_values: dict[nn.Module, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 class GQACrossAttention(nn.Module):
     """Bidirectional grouped-query attention with True indicating valid keys."""
 
@@ -170,6 +179,7 @@ class GQACrossAttention(nn.Module):
         hidden: torch.Tensor,
         context: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        context_cache: ActionContextCache | None = None,
     ) -> torch.Tensor:
         batch, length, _ = hidden.shape
         query = (
@@ -177,29 +187,53 @@ class GQACrossAttention(nn.Module):
             .view(batch, length, self.num_heads, self.head_dim)
             .transpose(1, 2)
         )
-        key = (
-            self.k_proj(context)
-            .view(batch, -1, self.num_kv_heads, self.head_dim)
-            .transpose(1, 2)
+        cached = (
+            context_cache.key_values.get(self) if context_cache is not None else None
         )
-        value = (
-            self.v_proj(context)
-            .view(batch, -1, self.num_kv_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        repeats = self.num_heads // self.num_kv_heads
-        key, value = (
-            key.repeat_interleave(repeats, dim=1),
-            value.repeat_interleave(repeats, dim=1),
-        )
+        if cached is None:
+            key = (
+                self.k_proj(context)
+                .view(batch, -1, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            value = (
+                self.v_proj(context)
+                .view(batch, -1, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            if context_cache is not None:
+                context_cache.key_values[self] = (key, value)
+        else:
+            key, value = cached
         mask = (
             attention_mask[:, None, None, :].bool()
             if attention_mask is not None
             else None
         )
-        output = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=mask, dropout_p=0.0, is_causal=False
+        # Masked GQA otherwise defaults to math SDPA, which expands K/V internally.
+        backend = (
+            sdpa_kernel(
+                [
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.CUDNN_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ],
+                set_priority=True,
+            )
+            if query.is_cuda
+            else nullcontext()
         )
+        with backend:
+            output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+                is_causal=False,
+                enable_gqa=self.num_heads != self.num_kv_heads,
+            )
         return self.out_proj(output.transpose(1, 2).reshape(batch, length, -1))
 
 
@@ -321,6 +355,7 @@ class GQAActionBlock(nn.Module):
         condition: VLMCondition,
         state_adapter: GDNStateReadAdapter | None = None,
         action_mask: torch.Tensor | None = None,
+        context_cache: ActionContextCache | None = None,
     ) -> torch.Tensor:
         if self.self_attention is not None:
             hidden = hidden + self.self_attention(
@@ -330,6 +365,7 @@ class GQAActionBlock(nn.Module):
             self.cross_norm(hidden, time),
             condition.hidden_states,
             condition.attention_mask,
+            context_cache=context_cache,
         )
         if state_adapter is not None:
             hidden = hidden + state_adapter(hidden, condition.gdn_states)
@@ -474,6 +510,7 @@ class GQAActionExpert(nn.Module):
         timestep: torch.Tensor,
         condition: VLMCondition,
         action_mask: torch.Tensor | None = None,
+        context_cache: ActionContextCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode actions with the complete GQA backbone and return FM conditioning."""
         time = self.time_embedding(timestep.expand(noisy_actions.shape[0]))
@@ -484,7 +521,7 @@ class GQAActionExpert(nn.Module):
                 if len(self.state_adapters)
                 else None
             )
-            hidden = block(hidden, time, condition, adapter, action_mask)
+            hidden = block(hidden, time, condition, adapter, action_mask, context_cache)
         return hidden, time
 
     def forward(
@@ -493,8 +530,11 @@ class GQAActionExpert(nn.Module):
         timestep: torch.Tensor,
         condition: VLMCondition,
         action_mask: torch.Tensor | None = None,
+        context_cache: ActionContextCache | None = None,
     ) -> torch.Tensor:
-        hidden, _ = self.forward_hidden(noisy_actions, timestep, condition, action_mask)
+        hidden, _ = self.forward_hidden(
+            noisy_actions, timestep, condition, action_mask, context_cache
+        )
         return self.output(self.output_norm(hidden))
 
     def predict_velocity(
@@ -531,9 +571,10 @@ class GDNActionExpert(GQAActionExpert):
         timestep: torch.Tensor,
         condition: VLMCondition,
         action_mask: torch.Tensor | None = None,
+        context_cache: ActionContextCache | None = None,
     ) -> torch.Tensor:
         hidden, time = self.forward_hidden(
-            noisy_actions, timestep, condition, action_mask
+            noisy_actions, timestep, condition, action_mask, context_cache
         )
         for block in self.gdn_blocks:
             hidden = block(hidden, time, action_mask)

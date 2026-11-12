@@ -17,6 +17,7 @@
 import torch
 from torch import nn
 
+from .action_expert import ActionContextCache
 from .vlm import VLMCondition
 
 
@@ -34,10 +35,16 @@ class FlowMatchingPolicy(nn.Module):
         timestep: torch.Tensor,
         vlm_condition: VLMCondition,
         action_mask: torch.Tensor | None = None,
+        *,
+        context_cache: ActionContextCache | None = None,
     ) -> torch.Tensor:
         """Evaluate all action positions at one noise level, without persistent state."""
         return self.expert(
-            noisy_actions, timestep, vlm_condition, action_mask=action_mask
+            noisy_actions,
+            timestep,
+            vlm_condition,
+            action_mask=action_mask,
+            context_cache=context_cache,
         )
 
     def loss(
@@ -123,13 +130,19 @@ class FlowMatchingPolicy(nn.Module):
             )
         else:
             actions = initial_noise.clone()
+        # Fixed VLM K/V are reused only within this solve; action GDN stays stateless.
+        context_cache = ActionContextCache()
         dt = 1.0 / steps
         for index in range(steps):
             time = torch.full((actions.shape[0],), index * dt, device=actions.device)
-            velocity = self.predict_velocity(actions, time, condition)
+            velocity = self.predict_velocity(
+                actions, time, condition, context_cache=context_cache
+            )
             proposal = actions + dt * velocity
             if method == "heun":
-                next_velocity = self.predict_velocity(proposal, time + dt, condition)
+                next_velocity = self.predict_velocity(
+                    proposal, time + dt, condition, context_cache=context_cache
+                )
                 actions = actions + 0.5 * dt * (velocity + next_velocity)
             else:
                 actions = proposal
