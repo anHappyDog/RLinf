@@ -34,6 +34,7 @@ import yaml
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import (
+    FSDPModule,
     MixedPrecisionPolicy,
     fully_shard,
     register_fsdp_forward_method,
@@ -220,6 +221,9 @@ class LocalRunLogger:
         local_metrics = local_dir / "metrics.jsonl"
         if saved_metrics.exists() and not local_metrics.exists():
             local_metrics.write_bytes(saved_metrics.read_bytes())
+        from examples.sft.qwen35_ki_tensorboard import AsyncTensorBoard
+
+        self.tensorboard = AsyncTensorBoard(self.local_dir / "tensorboard")
         self.interval = interval
         self._stop = threading.Event()
         self._sync_lock = threading.Lock()
@@ -235,6 +239,7 @@ class LocalRunLogger:
         pending.replace(path)
 
     def metric(self, record):
+        self.tensorboard.metric(record)
         with (self.local_dir / "metrics.jsonl").open("a") as handle:
             handle.write(json.dumps(record) + "\n")
 
@@ -253,6 +258,13 @@ class LocalRunLogger:
                     pending = self.output / (name + ".sync.tmp")
                     pending.write_bytes(data)
                     pending.replace(self.output / name)
+                event_dir = self.local_dir / "tensorboard"
+                target_dir = self.output / "tensorboard"
+                target_dir.mkdir(exist_ok=True)
+                for path in event_dir.glob("events.out.tfevents.*"):
+                    pending = target_dir / (path.name + ".sync.tmp")
+                    pending.write_bytes(path.read_bytes())
+                    pending.replace(target_dir / path.name)
                 self.last_sync_error = None
             except OSError as error:
                 self.last_sync_error = str(error)
@@ -263,6 +275,7 @@ class LocalRunLogger:
         self.sync()
 
     def close(self):
+        self.tensorboard.close()
         self._stop.set()
         self._thread.join(timeout=30)
         if self._thread.is_alive() or self.last_sync_error:
@@ -746,6 +759,11 @@ def main():
         random.setstate(rng["python"])
         np.random.set_state(rng["numpy"])
         start_step, previous_seconds = metadata["step"], metadata["training_seconds"]
+    # The first resumed update may omit expert forward while FSDP finalizes all groups.
+    for module in policy.modules():
+        if isinstance(module, FSDPModule):
+            module.unshard()
+            module.reshard()
     if rank == 0:
         if args.resume:
             if not args.full_data_index:
