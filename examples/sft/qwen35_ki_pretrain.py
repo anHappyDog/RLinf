@@ -23,7 +23,7 @@ import random
 import threading
 import time
 from dataclasses import asdict
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -78,9 +78,15 @@ def parse_args():
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--cameras", nargs="+", default=["observation.images.exterior"])
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--vl-workers", type=int)
+    parser.add_argument("--gradient-accumulation", type=int, default=1)
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--resume")
+    parser.add_argument("--full-data-index", help="Prepared full Molmo numeric index")
+    parser.add_argument("--checkpoint-seconds", type=float)
+    parser.add_argument("--checkpoint-first-step", type=int)
+    parser.add_argument("--stop-at", help="UTC/offset ISO deadline for final save")
     parser.add_argument("--log-dir", help="Local log directory; defaults to /tmp")
     parser.add_argument("--log-sync-seconds", type=float, default=60.0)
     parser.add_argument(
@@ -165,6 +171,33 @@ def global_loss_means(losses, counts, world):
     return weighted, totals[0] / totals[1].clamp_min(1), totals[1]
 
 
+class FullRankBatches:
+    """Draw global full-dataset batches without materializing a dataset permutation."""
+
+    def __init__(self, size, batch_size, rank, world_size, seed, start, stop):
+        self.size, self.batch_size, self.rank = size, batch_size, rank
+        self.world_size, self.seed, self.start, self.stop = (
+            world_size,
+            seed,
+            start,
+            stop,
+        )
+
+    def __iter__(self):
+        for step in range(self.start, self.stop):
+            generator = torch.Generator().manual_seed(self.seed + step)
+            indices = torch.randint(
+                self.size, (self.batch_size * self.world_size,), generator=generator
+            )
+            start = self.rank * self.batch_size
+            yield [
+                (int(index), True) for index in indices[start : start + self.batch_size]
+            ]
+
+    def __len__(self):
+        return self.stop - self.start
+
+
 class LocalRunLogger:
     """Write training logs locally and mirror complete records off the hot path."""
 
@@ -235,6 +268,8 @@ class LocalRunLogger:
 
 def main():
     from examples.sft.qwen35_ki_data import (
+        FullKIRobotCollator,
+        FullKIRobotDataset,
         KIRobotCollator,
         KIRobotDataset,
         VLCollator,
@@ -245,7 +280,7 @@ def main():
     if args.log_sync_seconds <= 0:
         raise ValueError("Log sync interval must be positive")
     if not args.allow_uncached_data and (
-        not args.image_cache or not args.vl_image_cache
+        (not args.image_cache and not args.full_data_index) or not args.vl_image_cache
     ):
         raise ValueError(
             "KI training requires --image-cache and --vl-image-cache; "
@@ -254,6 +289,7 @@ def main():
     if (
         min(
             args.batch_size,
+            args.gradient_accumulation,
             args.steps,
             args.train_episodes,
             args.val_episodes,
@@ -271,12 +307,17 @@ def main():
     rank, world, local_rank = (
         int(os.environ[key]) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
     )
-    if world != 8 or int(os.environ.get("LOCAL_WORLD_SIZE", "0")) != 4:
-        raise ValueError("KI hybrid training requires two nodes with four ranks each")
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
+    if local_world < 1 or world % local_world:
+        raise ValueError("Expected equal local rank counts dividing the world size")
+    mesh_shape = (world // local_world, local_world)
+    stop_at = datetime.fromisoformat(args.stop_at).timestamp() if args.stop_at else None
+    if args.checkpoint_seconds is not None and args.checkpoint_seconds <= 0:
+        raise ValueError("Checkpoint interval must be positive")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl", timeout=timedelta(seconds=180), device_id=device)
-    mesh = init_device_mesh("cuda", (2, 4), mesh_dim_names=("replicate", "shard"))
+    mesh = init_device_mesh("cuda", mesh_shape, mesh_dim_names=("replicate", "shard"))
     output = Path(args.output).resolve()
     resume_metadata = (
         json.loads((Path(args.resume) / "metadata.json").read_text())
@@ -303,8 +344,10 @@ def main():
                 "stage": stage,
                 "variant": config.variant,
                 "world_size": world,
-                "mesh": [2, 4],
-                "global_batch_size": args.batch_size * world,
+                "mesh": list(mesh_shape),
+                "global_batch_size": args.batch_size
+                * world
+                * args.gradient_accumulation,
                 **fields,
             }
             if run_logger is None:
@@ -318,35 +361,55 @@ def main():
 
     status("loading_data", args=vars(args))
     root = Path(args.data_path).resolve()
-    train = MolmoBotSubset(
-        root / "molmobot",
-        config.horizon,
-        args.train_episodes,
-        args.chunks_per_episode,
-        args.cameras,
-        include_state=True,
-    )
-    val = MolmoBotSubset(
-        root / "molmobot_val",
-        config.horizon,
-        args.val_episodes,
-        args.chunks_per_episode,
-        args.cameras,
-        include_state=True,
-    )
-    if {item["provenance"]["source_episode_id"] for item in train.manifest} & {
-        item["provenance"]["source_episode_id"] for item in val.manifest
-    }:
-        raise ValueError(
-            "Robot train and validation must have disjoint source episodes"
+    if args.full_data_index:
+        from examples.sft.qwen35_ki_full_data import FullMolmoDataset
+
+        train = FullMolmoDataset(
+            root / "molmobot",
+            Path(args.full_data_index) / "train",
+            args.cameras,
+            config.horizon,
         )
-    mean, std = train.normalization()
-    if len(mean) != config.action_dim:
-        raise ValueError(f"Expected {config.action_dim} actions, found {len(mean)}")
-    raw_actions = torch.stack([sample["actions"] for sample in train.samples])
-    masks = torch.stack([sample["mask"] for sample in train.samples])
-    action_quantiles = FASTActionTokenizer.fit_quantiles(raw_actions, masks)
-    state_quantiles = FASTActionTokenizer.fit_quantiles(train.states[:, None])
+        val = FullMolmoDataset(
+            root / "molmobot_val",
+            Path(args.full_data_index) / "validation",
+            args.cameras,
+            config.horizon,
+            limit=512,
+        )
+        mean, std = train.normalization()
+        action_quantiles = train.action_quantiles
+        state_quantiles = train.state_quantiles
+    else:
+        train = MolmoBotSubset(
+            root / "molmobot",
+            config.horizon,
+            args.train_episodes,
+            args.chunks_per_episode,
+            args.cameras,
+            include_state=True,
+        )
+        val = MolmoBotSubset(
+            root / "molmobot_val",
+            config.horizon,
+            args.val_episodes,
+            args.chunks_per_episode,
+            args.cameras,
+            include_state=True,
+        )
+        if {item["provenance"]["source_episode_id"] for item in train.manifest} & {
+            item["provenance"]["source_episode_id"] for item in val.manifest
+        }:
+            raise ValueError(
+                "Robot train and validation must have disjoint source episodes"
+            )
+        mean, std = train.normalization()
+        if len(mean) != config.action_dim:
+            raise ValueError(f"Expected {config.action_dim} actions, found {len(mean)}")
+        raw_actions = torch.stack([sample["actions"] for sample in train.samples])
+        masks = torch.stack([sample["mask"] for sample in train.samples])
+        action_quantiles = FASTActionTokenizer.fit_quantiles(raw_actions, masks)
+        state_quantiles = FASTActionTokenizer.fit_quantiles(train.states[:, None])
     cache_paths = {}
     if args.image_cache:
         cache_root = Path(args.image_cache).resolve()
@@ -418,38 +481,113 @@ def main():
     ).to(device)
     fast = FASTActionTokenizer.from_pretrained(args.fast_path, action_quantiles)
     fast.attach(vlm.model, vlm.processor.tokenizer)
-    vlm.model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
-    if rank == 0 and args.resume is None:
-        sequences = {
-            "train": fast.encode_qwen(raw_actions, masks),
-            "validation": fast.encode_qwen(
-                torch.stack([sample["actions"] for sample in val.samples]),
-                torch.stack([sample["mask"] for sample in val.samples]),
-            ),
+    vlm.model.gradient_checkpointing_disable()
+    if args.full_data_index:
+        robot_train = FullKIRobotDataset(train, mean, std, state_quantiles)
+        robot_val = FullKIRobotDataset(val, mean, std, state_quantiles)
+    else:
+        if rank == 0 and args.resume is None:
+            sequences = {
+                "train": fast.encode_qwen(raw_actions, masks),
+                "validation": fast.encode_qwen(
+                    torch.stack([sample["actions"] for sample in val.samples]),
+                    torch.stack([sample["mask"] for sample in val.samples]),
+                ),
+            }
+            target_path.write_text(json.dumps(sequences))
+        dist.barrier()
+        sequences = json.loads(target_path.read_text())
+        robot_train = KIRobotDataset(
+            train,
+            mean,
+            std,
+            sequences["train"],
+            quantize_states(train.states, state_quantiles),
+            cache_paths.get("train"),
+            args.image_size,
+        )
+        robot_val = KIRobotDataset(
+            val,
+            mean,
+            std,
+            sequences["validation"],
+            quantize_states(val.states, state_quantiles),
+            cache_paths.get("validation"),
+            args.image_size,
+        )
+
+    def loader(dataset, collator, domain_start=0, domain_stop=None, batch_size=None):
+        batch_size = args.batch_size if batch_size is None else batch_size
+        sampler_cls = (
+            FullRankBatches
+            if args.full_data_index
+            and dataset is robot_train
+            and domain_stop is not None
+            else RankBatches
+        )
+        sampler = sampler_cls(
+            len(dataset), batch_size, rank, world, args.seed, domain_start, domain_stop
+        )
+        workers = (
+            args.vl_workers
+            if args.vl_workers is not None and dataset in (vl_train, vl_val)
+            else args.workers
+        )
+        options = {
+            "num_workers": workers,
+            "pin_memory": True,
+            "collate_fn": SharedTensorCollator(collator),
         }
-        target_path.write_text(json.dumps(sequences))
-    dist.barrier()
-    sequences = json.loads(target_path.read_text())
-    robot_train = KIRobotDataset(
-        train,
-        mean,
-        std,
-        sequences["train"],
-        quantize_states(train.states, state_quantiles),
-        cache_paths.get("train"),
-        args.image_size,
+        if workers:
+            options.update(
+                persistent_workers=True,
+                prefetch_factor=2,
+                multiprocessing_context="spawn",
+            )
+        return DataLoader(dataset, batch_sampler=sampler, **options)
+
+    if args.full_data_index:
+        robot_collator = FullKIRobotCollator(
+            args.model_path,
+            args.fast_path,
+            action_quantiles,
+            fast.bridge,
+            processor=vlm.processor if args.workers == 0 else None,
+        )
+    else:
+        robot_collator = KIRobotCollator(
+            args.model_path, processor=vlm.processor if args.workers == 0 else None
+        )
+    vl_collator = VLCollator(
+        args.model_path,
+        processor=vlm.processor
+        if (args.vl_workers if args.vl_workers is not None else args.workers) == 0
+        else None,
     )
-    robot_val = KIRobotDataset(
-        val,
-        mean,
-        std,
-        sequences["validation"],
-        quantize_states(val.states, state_quantiles),
-        cache_paths.get("validation"),
-        args.image_size,
+    sampler_start_step = resume_metadata["step"] if resume_metadata else 0
+    prior_vl_steps = sampler_start_step // args.vl_every
+    robot_iterator = iter(
+        loader(
+            robot_train,
+            robot_collator,
+            (sampler_start_step - prior_vl_steps) * args.gradient_accumulation,
+            args.steps * args.gradient_accumulation,
+        )
     )
+    vl_iterator = iter(
+        loader(
+            vl_train,
+            vl_collator,
+            prior_vl_steps * args.gradient_accumulation,
+            args.steps * args.gradient_accumulation,
+        )
+    )
+
+    def to_device(batch):
+        return map_batch_tensors(
+            batch, lambda tensor: tensor.to(device=device, non_blocking=True)
+        )
+
     torch.manual_seed(args.seed)
     expert = build_action_expert(config, vlm.state_specs).to(
         device=device, dtype=torch.float32
@@ -521,10 +659,17 @@ def main():
         "fast_source": fast.source,
         "fast_bridge": fast.bridge,
         "data_path": str(root),
+        "robot_sampling": "global_uniform_anchor_with_replacement"
+        if args.full_data_index
+        else "epoch_permutation",
         "cameras": args.cameras,
         "image_size": args.image_size,
-        "robot_train": train.manifest,
-        "robot_validation": val.manifest,
+        "robot_train": train.manifest_descriptor
+        if args.full_data_index
+        else train.manifest,
+        "robot_validation": val.manifest_descriptor
+        if args.full_data_index
+        else val.manifest,
         "vl_data_path": str(Path(args.vl_data_path).resolve()),
         "vl_format": args.vl_format,
         "vl_source_info": {"train": vl_train.info, "validation": vl_val.info},
@@ -536,14 +681,16 @@ def main():
         "state_layers": list(vlm.state_layers),
         "state_specs": vlm.state_specs,
         "batch_size_per_rank": args.batch_size,
+        "gradient_accumulation": args.gradient_accumulation,
         "world_size": world,
-        "mesh": [2, 4],
+        "mesh": list(mesh_shape),
         "seed": args.seed,
         "vl_every": args.vl_every,
         "warmup_steps": args.warmup_steps,
         "vlm_lr": args.vlm_lr,
         "expert_lr": args.expert_lr,
         "precision": "bfloat16",
+        "gradient_checkpointing": False,
         "schedule_steps": args.schedule_steps or args.steps,
         "gradient_paths": {
             "FM": "expert only; detached prefix hidden states and GDN memories",
@@ -586,7 +733,8 @@ def main():
         start_step, previous_seconds = metadata["step"], metadata["training_seconds"]
     if rank == 0:
         if args.resume:
-            (output / "fast_targets.json").write_text(json.dumps(sequences))
+            if not args.full_data_index:
+                (output / "fast_targets.json").write_text(json.dumps(sequences))
         fast.save_metadata(output / "fast_tokenizer.json")
         (output / "data_manifest.json").write_text(
             json.dumps(
@@ -607,46 +755,11 @@ def main():
             local = parameter.detach().to_local().double()
             checksum[0] += local.sum()
             checksum[1] += local.square().sum()
-        gathered = [torch.empty_like(checksum) for _ in range(2)]
+        gathered = [torch.empty_like(checksum) for _ in range(mesh_shape[0])]
         dist.all_gather(gathered, checksum, group=mesh["replicate"].get_group())
-        if not torch.equal(gathered[0], gathered[1]):
+        if any(not torch.equal(gathered[0], other) for other in gathered[1:]):
             raise RuntimeError("KI parameter shards differ across hybrid replicas")
         return checksum.tolist()
-
-    def loader(dataset, collator, domain_start=0, domain_stop=None, batch_size=None):
-        batch_size = args.batch_size if batch_size is None else batch_size
-        sampler = RankBatches(
-            len(dataset), batch_size, rank, world, args.seed, domain_start, domain_stop
-        )
-        options = {
-            "num_workers": args.workers,
-            "pin_memory": True,
-            "collate_fn": SharedTensorCollator(collator),
-        }
-        if args.workers:
-            options.update(
-                persistent_workers=True,
-                prefetch_factor=2,
-                multiprocessing_context="spawn",
-            )
-        return DataLoader(dataset, batch_sampler=sampler, **options)
-
-    robot_collator = KIRobotCollator(
-        args.model_path, processor=vlm.processor if args.workers == 0 else None
-    )
-    vl_collator = VLCollator(
-        args.model_path, processor=vlm.processor if args.workers == 0 else None
-    )
-    prior_vl_steps = start_step // args.vl_every
-    robot_iterator = iter(
-        loader(robot_train, robot_collator, start_step - prior_vl_steps, args.steps)
-    )
-    vl_iterator = iter(loader(vl_train, vl_collator, prior_vl_steps, args.steps))
-
-    def to_device(batch):
-        return map_batch_tensors(
-            batch, lambda tensor: tensor.to(device=device, non_blocking=True)
-        )
 
     def clip(parameters):
         norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0)
@@ -722,9 +835,25 @@ def main():
     last_end = started
     last_step, checkpoint, elapsed = start_step, None, previous_seconds
     checkpoint_seconds = logging_seconds = 0.0
+    last_checkpoint_time = time.monotonic()
     for step in range(start_step, args.steps):
         is_vl = (step + 1) % args.vl_every == 0
-        batch = to_device(next(vl_iterator if is_vl else robot_iterator))
+        iterator = vl_iterator if is_vl else robot_iterator
+        micro_batches = [next(iterator) for _ in range(args.gradient_accumulation)]
+        count_names = (
+            ("ce_token_count",)
+            if is_vl
+            else ("fm_valid_action_scalars", "ce_token_count")
+        )
+        counts = torch.tensor(
+            [
+                sum(int(batch["batch_metadata"][name]) for batch in micro_batches)
+                for name in count_names
+            ],
+            device=device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(counts)
         data_ready = time.perf_counter()
         factor = learning_rate_factor(
             step, args.warmup_steps, protocol["schedule_steps"]
@@ -735,34 +864,60 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             for group in optimizer.param_groups:
                 group["lr"] = peak * factor
-        torch.manual_seed(args.seed + 1000 + step * world + rank)
         zero = torch.zeros((), device=device)
+        numerators = torch.zeros(len(count_names), device=device, dtype=torch.float64)
+        for micro, cpu_batch in enumerate(micro_batches):
+            batch = to_device(cpu_batch)
+            torch.manual_seed(
+                args.seed
+                + 1000
+                + (step * args.gradient_accumulation + micro) * world
+                + rank
+            )
+            synchronize_gradients = micro + 1 == args.gradient_accumulation
+            policy.set_requires_gradient_sync(synchronize_gradients)
+            if is_vl:
+                local_losses = [
+                    policy.vl_loss(
+                        batch["vlm_inputs"], batch_metadata=batch["batch_metadata"]
+                    )
+                ]
+            else:
+                losses = policy(**batch)
+                local_losses = [losses["fm_loss"], losses["action_ce_loss"]]
+            local_counts = [batch["batch_metadata"][name] for name in count_names]
+            loss = sum(
+                local
+                * count.to(local.dtype)
+                * world
+                / total.clamp_min(1).to(local.dtype)
+                for local, count, total in zip(
+                    local_losses, local_counts, counts, strict=True
+                )
+            )
+            finite = torch.isfinite(loss).int()
+            dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+            if not bool(finite):
+                raise RuntimeError(
+                    f"Nonfinite KI loss at update {step + 1}, micro {micro}"
+                )
+            loss.backward()
+            numerators += torch.stack(
+                [
+                    local.detach().double() * count
+                    for local, count in zip(local_losses, local_counts, strict=True)
+                ]
+            )
+        policy.set_requires_gradient_sync(True)
+        dist.all_reduce(numerators)
+        means = numerators / counts.clamp_min(1)
         if is_vl:
-            local = policy.vl_loss(
-                batch["vlm_inputs"], batch_metadata=batch.get("batch_metadata")
-            )
-            weighted, means, counts = global_loss_means(
-                [local], [batch["batch_metadata"]["ce_token_count"]], world
-            )
-            loss, vl_loss, vl_tokens = weighted[0], means[0], counts[0]
-            fm_loss = action_ce = zero
-            fm_count = action_tokens = zero
+            vl_loss, vl_tokens = means[0], counts[0]
+            fm_loss = action_ce = fm_count = action_tokens = zero
         else:
-            losses = policy(**batch)
-            weighted, means, counts = global_loss_means(
-                [losses["fm_loss"], losses["action_ce_loss"]],
-                [losses["fm_valid_action_scalars"], losses["action_ce_tokens"]],
-                world,
-            )
-            loss = weighted[0] + weighted[1]
             fm_loss, action_ce = means.unbind()
             fm_count, action_tokens = counts.unbind()
             vl_loss = vl_tokens = zero
-        finite = torch.isfinite(loss).int()
-        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-        if not bool(finite):
-            raise RuntimeError(f"Nonfinite KI loss at update {step + 1}")
-        loss.backward()
         vlm_norm = clip(vlm_parameters)
         expert_norm = clip(expert_parameters) if not is_vl else zero
         if not bool(torch.isfinite(torch.stack((vlm_norm, expert_norm))).all()):
@@ -780,6 +935,7 @@ def main():
                 rank == 0
                 and (
                     elapsed >= args.max_seconds
+                    or (stop_at is not None and time.time() >= stop_at)
                     or run_logger.stop_requested
                     or (run_logger.local_dir / "STOP_AFTER_UPDATE").exists()
                 )
@@ -832,10 +988,31 @@ def main():
             run_logger.metric(record)
             status("training", **record)
             logging_seconds += time.perf_counter() - logging_started
-        if last_step % args.checkpoint_every == 0 or final:
+        save_due = torch.tensor(
+            int(
+                rank == 0
+                and (
+                    final
+                    or last_step == args.checkpoint_first_step
+                    or (
+                        args.checkpoint_seconds is not None
+                        and time.monotonic() - last_checkpoint_time
+                        >= args.checkpoint_seconds
+                    )
+                    or (
+                        args.checkpoint_seconds is None
+                        and last_step % args.checkpoint_every == 0
+                    )
+                )
+            ),
+            device=device,
+        )
+        dist.broadcast(save_due, 0)
+        if bool(save_due):
             checkpoint_started = time.perf_counter()
             checkpoint = save(last_step, elapsed)
             checkpoint_seconds += time.perf_counter() - checkpoint_started
+            last_checkpoint_time = time.monotonic()
             elapsed = previous_seconds + time.perf_counter() - started
         last_end = time.perf_counter()
         if final:

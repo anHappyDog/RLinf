@@ -179,7 +179,7 @@ Use `examples/sft/qwen35_ki_pretrain.py` to pretrain the VLA with a trainable Qw
 | Robot | Continuous action FM | Action Expert and its state-readout adapters |
 | Visual-language | Answer-token CE | Native Qwen |
 
-Every fourth update is a VL update (`--vl-every 4`); the other three combine robot CE and FM. Each component is globally averaged over its own valid targets. FM reads detached prefix hidden states and GDN matrices, while the trainable readout still receives gradients. A separate prefix-only native forward runs in evaluation mode under `no_grad`; the teacher-forced CE forward runs with training gradients and checkpointing. FAST targets never enter the FM prefix. This extra prefix forward is deliberate: the final GDN state after a teacher-forced FAST suffix would leak target actions. Native Qwen attention and recurrent kernels are retained.
+Every fourth update is a VL update (`--vl-every 4`); the other three combine robot CE and FM. Each component is globally averaged over its own valid targets. FM reads detached prefix hidden states and GDN matrices, while the trainable readout still receives gradients. A separate prefix-only native forward runs in evaluation mode under `no_grad`; the teacher-forced CE forward runs with training gradients and gradient checkpointing disabled. FAST targets never enter the FM prefix. This extra prefix forward is deliberate: the final GDN state after a teacher-forced FAST suffix would leak target actions. Native Qwen attention and recurrent kernels are retained.
 
 ### Prepare The Data And Token Targets
 
@@ -257,10 +257,22 @@ Distributed checkpoints contain Qwen, Expert, both optimizers, normalization, FA
 
 ### Input preparation and logging
 
-KI runs require verified `--image-cache` and `--vl-image-cache` inputs. Use `--allow-uncached-data` only for bounded diagnostics that intentionally decode source media. Numeric episode selection indexes each parquet once and slices the original rows; this does not change chunk selection, masks, normalization, or native action alignment. It does not provide a shared full-dataset numeric cache across ranks.
+The bounded KI mode requires verified `--image-cache` and `--vl-image-cache` inputs; full-data mode uses the prepared numeric index described below instead of the robot image cache. Use `--allow-uncached-data` only for bounded diagnostics that intentionally decode source media. Numeric episode selection indexes each parquet once and slices the original rows; this does not change chunk selection, masks, normalization, or native action alignment. It does not provide a shared full-dataset numeric cache across ranks.
 
 CPU collators validate the observation/FAST prefix contract and prepare CE positions before device transfer. Direct policy calls retain validation by default. The optimized batch path preserves detached FM conditioning and trainable FAST/VL CE.
 
 Keep `--output` on the checkpoint storage (for XJC, `/mnt/h_public/daibo/<run>`). Rank zero writes training metrics and status under `/tmp` by default, or `--log-dir` on a local disk, and mirrors complete records to the output every `--log-sync-seconds` (default 60). `local_logs.json` records the local directory. A failed mirror retains local logs; a clean exit attempts a final sync. `step_seconds` excludes logging and checkpoint I/O; cumulative `logging_seconds`, `checkpoint_seconds`, and `end_to_end_updates_per_second` expose their cost.
 
 The local `STOP_AFTER_UPDATE` path is recorded in `local_logs.json` and is checked each update; the same file under shared output is polled by the background mirror at the sync interval.
+
+### Full Molmo Training
+
+Use `--full-data-index INDEX_ROOT` to replace the bounded episode/chunk subset with lazy sampling of the prepared Molmo train anchors. Prepare `INDEX_ROOT/train` and `INDEX_ROOT/validation` separately with `python -m examples.sft.qwen35_ki_full_data --root DATASET_ROOT --output SPLIT_INDEX --cameras CAMERA ... --workers N`. Each `DATASET_ROOT` is the corresponding `molmobot` or `molmobot_val` directory. The preparation writes numeric sidecars, anchor/episode indexes, and training normalization; validation uses the training statistics. Camera order and horizon must match the prepared contract.
+
+Full mode reads native action8/state9 and synchronized video frames lazily. Workers generate FAST targets for each selected chunk rather than precomputing all action-token sequences. It requires `--vl-image-cache` but not `--image-cache`; the latter remains the bounded-mode RGB cache. Full robot training draws anchors with replacement using a deterministic global-batch seed. The current full-mode validation selects at most 512 anchors from the native validation index; it is an offline check, not a closed-loop benchmark.
+
+The FSDP2 mesh derives from `WORLD_SIZE` and `LOCAL_WORLD_SIZE`: ranks within a node shard parameters, and nodes form replicas. `--batch-size` is per-rank microbatch size; `--gradient-accumulation G` makes the effective batch `batch_size × WORLD_SIZE × G`. Every accumulated FM/CE term is weighted by its valid target count across all ranks and microbatches. Gradient checkpointing is disabled, including the CE branch. State readout batches its selected GDN-layer projections without changing the detached conditioning contract.
+
+`--workers` and optional `--vl-workers` set robot and VL workers per rank. Both training loaders keep their own worker pool, so the total is `WORLD_SIZE × (workers + vl_workers)` when both use workers; omitted `--vl-workers` inherits `--workers`. For example, 32 ranks with 20 robot and 4 VL workers create 768 workers. Allocate these counts from the actual CPU and memory budget.
+
+Set `--checkpoint-seconds 3600` for hourly saves; when set, it replaces the periodic `--checkpoint-every` update interval. `--checkpoint-first-step S` adds one early checkpoint at completed update S. `--stop-at 2026-11-13T00:00:00+00:00` stops after the current update reaches that deadline and saves before exiting; include an explicit timezone. Step and `--max-seconds` limits still apply. Checkpoints remain under `--output`, for example `/mnt/h_public/daibo/<run>`, with local logs and asynchronous mirroring as above.

@@ -1073,3 +1073,59 @@ def test_local_training_logs_survive_sync_failure_and_resume(tmp_path):
     assert logger.last_sync_error is None
     assert (output / "metrics.jsonl").read_text().endswith('{"step": 3}\n')
     assert (output / "status.json").read_text() == ('{"stage": "training", "step": 2}')
+
+
+def state_readout_reference(adapter, hidden, states):
+    import math
+
+    latent = adapter.query_input(hidden)
+    aggregate = torch.zeros_like(latent)
+    weights = adapter.layer_weights.softmax(0)
+    for weight, (layer, spec) in zip(weights, adapter.state_specs.items(), strict=True):
+        heads, key_dim, _ = spec
+        query = (
+            adapter.queries[str(layer)](latent)
+            .reshape(*hidden.shape[:2], heads, key_dim)
+            .float()
+        )
+        query = (
+            query
+            * torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
+            / math.sqrt(key_dim)
+        )
+        readout = torch.einsum("bthk,bhkv->bthv", query, states[layer].float())
+        readout = readout.flatten(-2).to(latent.dtype)
+        aggregate = aggregate + weight * adapter.outputs[str(layer)](readout)
+    readout = adapter.output(aggregate)
+    return adapter.gate(torch.cat((hidden, readout), dim=-1)).sigmoid() * readout
+
+
+@pytest.mark.parametrize("heterogeneous", [False, True])
+def test_batched_state_readout_matches_per_layer_gradients(heterogeneous):
+    specs = dict.fromkeys(range(18), (2, 8, 8))
+    if heterogeneous:
+        specs[1] = (1, 4, 8)
+    torch.manual_seed(27)
+    adapter = GDNStateReadAdapter(expert_config("gqa6_vlm_state"), specs)
+    expected = copy.deepcopy(adapter)
+    hidden = torch.randn(2, 4, 32, requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    states = {i: torch.randn(2, *spec, requires_grad=True) for i, spec in specs.items()}
+    reference_states = {
+        i: value.detach().clone().requires_grad_() for i, value in states.items()
+    }
+    actual = adapter(hidden, states)
+    reference = state_readout_reference(expected, reference_hidden, reference_states)
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-7)
+    actual.square().sum().backward()
+    reference.square().sum().backward()
+    torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=1e-4, atol=1e-8)
+    for i in states:
+        torch.testing.assert_close(
+            states[i].grad, reference_states[i].grad, rtol=1e-4, atol=1e-8
+        )
+    for (name, parameter), (other_name, other) in zip(
+        adapter.named_parameters(), expected.named_parameters(), strict=True
+    ):
+        assert name == other_name
+        torch.testing.assert_close(parameter.grad, other.grad, rtol=1e-4, atol=1e-8)

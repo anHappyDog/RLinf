@@ -31,7 +31,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from rlinf.models.embodiment.qwen35_fm.fast_tokenizer import build_ce_inputs
+from rlinf.models.embodiment.qwen35_fm.fast_tokenizer import (
+    FASTActionTokenizer,
+    build_ce_inputs,
+)
 from rlinf.models.embodiment.qwen35_fm.ki_policy import KIFlowMatchingPolicy
 
 
@@ -116,6 +119,58 @@ class KIRobotDataset(Dataset):
         }
 
 
+class FullKIRobotDataset(Dataset):
+    """Normalize lazily decoded native robot chunks using train-only statistics."""
+
+    def __init__(self, dataset, mean, std, state_quantiles: dict) -> None:
+        self.dataset = dataset
+        self.mean = torch.as_tensor(mean, dtype=torch.float32)
+        self.std = torch.as_tensor(std, dtype=torch.float32)
+        self.state_low = torch.tensor(state_quantiles["q01"], dtype=torch.float32)
+        high = torch.tensor(state_quantiles["q99"], dtype=torch.float32)
+        self.state_span = (high - self.state_low).clamp_min(1e-6)
+        if (
+            self.mean.shape != (8,)
+            or self.std.shape != (8,)
+            or not bool((self.std > 0).all())
+        ):
+            raise ValueError(
+                "Expected action mean/std of width 8 with positive standard deviations"
+            )
+        if (
+            self.state_low.shape != (9,)
+            or high.shape != (9,)
+            or not bool((high >= self.state_low).all())
+        ):
+            raise ValueError("Expected ordered native state quantiles of width 9")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        sample = self.dataset[index]
+        actions = sample["actions"].float()
+        bins = (
+            (
+                ((sample["state"].float() - self.state_low) / self.state_span).clamp(
+                    0, 1
+                )
+                * 255
+            )
+            .round()
+            .long()
+        )
+        return {
+            "actions": (actions - self.mean) / self.std,
+            "physical_actions": actions,
+            "action_mask": sample["action_mask"],
+            "state_bins": bins,
+            "images": sample["images"],
+            "cameras": sample["cameras"],
+            "instruction": sample["instruction"],
+        }
+
+
 class _ProcessorCollator:
     """Load only the native CPU processor in the process producing a batch."""
 
@@ -195,6 +250,52 @@ class KIRobotCollator(_ProcessorCollator):
                 prefix, ce_inputs, actions, action_mask
             ),
         }
+
+
+class FullKIRobotCollator(KIRobotCollator):
+    """Encode physical FAST targets on CPU without retaining an eager target table."""
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        fast_path: str | Path,
+        action_quantiles: dict,
+        fast_bridge: dict,
+        processor=None,
+    ) -> None:
+        super().__init__(model_path, processor)
+        self.fast_path = str(Path(fast_path).resolve())
+        self.action_quantiles = action_quantiles
+        self.fast_bridge = dict(fast_bridge)
+        self._fast = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["processor"] = None
+        state["_fast"] = None
+        return state
+
+    def _get_fast(self):
+        if self._fast is None:
+            self._fast = FASTActionTokenizer.from_pretrained(
+                self.fast_path, self.action_quantiles
+            )
+            if self._fast.processor.vocab_size != self.fast_bridge["fast_vocab_size"]:
+                raise ValueError(
+                    "Worker FAST vocabulary differs from the attached model vocabulary"
+                )
+            self._fast.bridge = self.fast_bridge
+        return self._fast
+
+    def __call__(self, samples) -> dict:
+        physical = torch.stack([sample["physical_actions"] for sample in samples])
+        masks = torch.stack([sample["action_mask"] for sample in samples])
+        targets = self._get_fast().encode_qwen(physical, masks)
+        encoded = [
+            {**sample, "fast_targets": sequence}
+            for sample, sequence in zip(samples, targets, strict=True)
+        ]
+        return super().__call__(encoded)
 
 
 class _VisualChoiceDataset(Dataset):

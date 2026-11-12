@@ -179,7 +179,7 @@ PYTHONPATH=. python -m torch.distributed.run \
 | Robot | 连续动作 FM | Action Expert 及其 state-readout adapter |
 | 视觉语言 | 答案 token CE | 原生 Qwen |
 
-`--vl-every 4` 表示每四次更新中有一次 VL 更新，其余三次同时计算 robot CE 和 FM。各 loss 分别按自己的全局有效 target 数归一化。FM 读取 detach 后的 prefix hidden states 和 GDN 矩阵，readout 自身仍接收梯度。Prefix-only 原生 forward 在 evaluation mode 和 `no_grad` 下运行；独立的 teacher-forced CE forward 保留训练梯度并启用 checkpointing。FAST 真值不进入 FM prefix。额外执行 prefix forward 是为了避免读取已经处理过 FAST 真值后缀的 GDN 最终状态而泄漏动作答案，Qwen 的原生 attention 和 recurrent kernel 均保留。
+`--vl-every 4` 表示每四次更新中有一次 VL 更新，其余三次同时计算 robot CE 和 FM。各 loss 分别按自己的全局有效 target 数归一化。FM 读取 detach 后的 prefix hidden states 和 GDN 矩阵，readout 自身仍接收梯度。Prefix-only 原生 forward 在 evaluation mode 和 `no_grad` 下运行；独立的 teacher-forced CE forward 保留训练梯度；KI 入口关闭 gradient checkpointing。FAST 真值不进入 FM prefix。额外执行 prefix forward 是为了避免读取已经处理过 FAST 真值后缀的 GDN 最终状态而泄漏动作答案，Qwen 的原生 attention 和 recurrent kernel 均保留。
 
 ### 准备数据与 Token Target
 
@@ -257,10 +257,22 @@ PYTHONPATH=. python -m torch.distributed.run \
 
 ### 输入准备与日志
 
-KI 训练要求提供已验证的 `--image-cache` 和 `--vl-image-cache`。只有刻意读取源视频或 parquet 的小规模诊断才使用 `--allow-uncached-data`。数值数据每个 parquet 建立一次 episode 行区间索引，再按原顺序切片；chunk 选择、mask、归一化和原生动作对齐保持不变。这不等于已实现跨 rank 共享的全量数值缓存。
+有界子集 KI 模式要求提供已验证的 `--image-cache` 和 `--vl-image-cache`；下述全量模式使用预建数值索引，不要求机器人图像 cache。只有刻意读取源视频或 parquet 的小规模诊断才使用 `--allow-uncached-data`。数值数据每个 parquet 建立一次 episode 行区间索引，再按原顺序切片；chunk 选择、mask、归一化和原生动作对齐保持不变。这不等于已实现跨 rank 共享的全量数值缓存。
 
 CPU collator 在搬运前校验观测与 FAST prefix 契约，并生成 CE 监督位置。直接调用 policy 时默认仍保留校验。优化路径保持 FM conditioning detach，FAST/VL CE 继续训练 VLM。
 
 `--output` 用于 checkpoint 存储，XJC 使用 `/mnt/h_public/daibo/<run>`。Rank zero 默认在 `/tmp` 写训练指标和状态，也可用 `--log-dir` 指定本地盘；每隔 `--log-sync-seconds`（默认60秒）向 output 同步完整记录。`local_logs.json` 记录本地路径。同步失败会保留本地日志，正常退出会尝试最终同步。`step_seconds` 不包含日志和 checkpoint I/O；累计的 `logging_seconds`、`checkpoint_seconds` 和 `end_to_end_updates_per_second` 用于反映这些开销。
 
 `local_logs.json` 记录的本地 `STOP_AFTER_UPDATE` 每步检查；output 下的同名共享控制文件由后台同步线程按同步间隔轮询。
+
+### 全量 Molmo 训练
+
+传入 `--full-data-index INDEX_ROOT`，用预建 Molmo train anchors 的惰性采样替代有界 episode/chunk 子集。分别执行 `python -m examples.sft.qwen35_ki_full_data --root DATASET_ROOT --output SPLIT_INDEX --cameras CAMERA ... --workers N`，准备 `INDEX_ROOT/train` 和 `INDEX_ROOT/validation`。`DATASET_ROOT` 分别为 `molmobot` 与 `molmobot_val` 目录。准备过程生成数值 sidecar、anchor/episode 索引及训练归一化；验证使用训练统计。相机顺序和 horizon 必须与索引契约一致。
+
+全量模式惰性读取原生 action8/state9 及同步视频帧，worker 为抽中的 chunk 动态生成 FAST targets，不预先生成全部动作 token。该模式要求 `--vl-image-cache`，不要求 `--image-cache`；后者仍用于有界子集的 RGB cache。机器人训练按全局 batch 的确定性 seed 有放回抽取 anchor。当前全量验证最多使用 native validation 索引中的512个 anchor，只是离线检查，不代表闭环任务效果。
+
+FSDP2 mesh 由 `WORLD_SIZE` 和 `LOCAL_WORLD_SIZE` 推导：节点内分片，节点间复制。`--batch-size` 是每 rank 的 microbatch；`--gradient-accumulation G` 将有效 batch 设为 `batch_size × WORLD_SIZE × G`。累积的 FM/CE 各项按所有 rank、所有 microbatch 的有效 target 总数加权。Gradient checkpointing 保持关闭，CE 分支也不启用。State readout 批量计算选中 GDN 层的投影，conditioning 仍然 detach。
+
+`--workers` 和可选 `--vl-workers` 分别指定每 rank 的机器人和 VL worker 数。两个训练 loader 各自保留 worker pool；都启用 worker 时，总数为 `WORLD_SIZE × (workers + vl_workers)`，省略 `--vl-workers` 时继承 `--workers`。例如32个 rank、每 rank 20个机器人 worker 加4个 VL worker，共768个 worker。应按实际 CPU 和内存预算分配。
+
+`--checkpoint-seconds 3600` 指定每小时保存；设置后替代按更新数触发的 `--checkpoint-every`。`--checkpoint-first-step S` 额外在完成第 S 次更新时保存一次。`--stop-at 2026-11-13T00:00:00+00:00` 在当前更新到达截止时间后保存并退出，必须显式提供时区。步数和 `--max-seconds` 限制仍然有效。Checkpoint 继续写入 `--output`，例如 `/mnt/h_public/daibo/<run>`；本地日志和异步同步方式不变。

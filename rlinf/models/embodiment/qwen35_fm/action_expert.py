@@ -285,6 +285,10 @@ class GDNStateReadAdapter(nn.Module):
                 "State-conditioned experts require at least one selected GDN layer"
             )
         self.state_specs = dict(state_specs)
+        grouped = {}
+        for index, (layer, spec) in enumerate(state_specs.items()):
+            grouped.setdefault(spec, []).append((index, layer))
+        self.state_groups = tuple(grouped.items())
         rank = config.state_adapter_dim
         self.query_input = nn.Linear(config.hidden_size, rank, bias=False)
         self.queries = nn.ModuleDict(
@@ -311,25 +315,45 @@ class GDNStateReadAdapter(nn.Module):
         latent = self.query_input(hidden)
         aggregate = torch.zeros_like(latent)
         weights = self.layer_weights.softmax(dim=0)
-        for weight, (layer, spec) in zip(weights, self.state_specs.items()):
-            state = states[layer]
-            if state.shape[1:] != spec or state.shape[0] != hidden.shape[0]:
-                raise ValueError(
-                    f"GDN layer {layer}: expected {(hidden.shape[0], *spec)}, got {tuple(state.shape)}"
-                )
+        layer_readouts = {}
+        for spec, layers in self.state_groups:
             heads, key_dim, _ = spec
-            query = self.queries[str(layer)](latent).reshape(
-                *hidden.shape[:2], heads, key_dim
+            memories = []
+            for _, layer in layers:
+                state = states[layer]
+                if state.shape[1:] != spec or state.shape[0] != hidden.shape[0]:
+                    raise ValueError(
+                        f"GDN layer {layer}: expected {(hidden.shape[0], *spec)}, got {tuple(state.shape)}"
+                    )
+                memories.append(state)
+            query_weights = torch.cat(
+                [self.queries[str(layer)].weight for _, layer in layers]
             )
-            query = query.float()
+            query = (
+                F.linear(latent, query_weights)
+                .reshape(*hidden.shape[:2], len(layers), heads, key_dim)
+                .permute(2, 0, 1, 3, 4)
+                .float()
+            )
             query = (
                 query
                 * torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
                 / math.sqrt(key_dim)
             )
-            readout = torch.einsum("bthk,bhkv->bthv", query, state.float())
-            readout = readout.flatten(-2).to(latent.dtype)
-            aggregate = aggregate + weight * self.outputs[str(layer)](readout)
+            readout = (
+                torch.einsum("lbthk,lbhkv->lbthv", query, torch.stack(memories).float())
+                .flatten(-2)
+                .to(latent.dtype)
+            )
+            output_weights = torch.stack(
+                [self.outputs[str(layer)].weight for _, layer in layers]
+            )
+            projected = torch.einsum("lbti,lri->lbtr", readout, output_weights)
+            for (index, _), value in zip(layers, projected, strict=True):
+                layer_readouts[index] = value
+        # Preserve the original low-precision accumulation order across groups.
+        for index in range(len(self.state_specs)):
+            aggregate = aggregate + weights[index] * layer_readouts[index]
         readout = self.output(aggregate)
         return self.gate(torch.cat((hidden, readout), dim=-1)).sigmoid() * readout
 
