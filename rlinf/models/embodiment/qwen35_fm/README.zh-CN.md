@@ -20,7 +20,7 @@
 
 五份预设统一使用 hidden size 1024、FFN size 4096、action horizon 16、action dimension 8，以及 16 个 query head 和 4 个 KV head。叠加 GDN 统一使用 8 个 key/value head，key/value head dimension 均为 128。参数量由实际增加的模块自然决定，不再通过调整宽度凑目标预算。比较时还应固定数据、seed、归一化、优化和 conditioning 设置。
 
-`depth` 控制 GQA 骨干深度，`gdn_depth` 控制后置 GDN 层数；默认分别为六层 GQA 和 variant 名称中的 GDN 层数。`action_self_attn: false` 用于 GQA 只保留 cross-attention 的消融。每层都通过 adaptive normalization 接收 FM timestep，动作 embedding 还加入可学习的物理时间位置和 timestep embedding。
+`depth` 控制 GQA 骨干深度，`gdn_depth` 控制后置 GDN 层数；默认分别为六层 GQA 和 variant 名称中的 GDN 层数。`action_self_attn: false` 用于 GQA 只保留 cross-attention 的消融。每层都通过 adaptive normalization 接收 FM timestep，动作 embedding 还加入可学习的动作索引位置和 timestep embedding。
 
 ## 编码输入并预测动作
 
@@ -254,3 +254,13 @@ PYTHONPATH=. python -m torch.distributed.run \
 运行 `PYTHONPATH=. python -m pytest tests/unit_tests/test_qwen35_fm.py -q -k ki_`，检查 KI 梯度路由、prefix 隔离、原生 masked CE 等价性、FAST mapping 及多模态 CE；若审核过的本地 tokenizer 路径不同，设置 `QWEN35_FAST_TOKENIZER`。本次 session 已通过十一项 KI 测试，以及八 rank、完整 Qwen 的四次更新 smoke；首次 smoke 使用单 exterior 视角。[状态记录](../../../../results/qwen35_ki_20261112/smoke_v3/status.json) 保留了实际 robot/VL 更新数和 loss，四视角正式运行仍需自己的实测结果。
 
 分布式 checkpoint 保存 Qwen、Expert、两个 optimizer、归一化、FAST mapping、sampler/update 位置和各 rank RNG，完整模型 smoke checkpoint 约 30 GB。使用 `--resume /absolute/path/to/checkpoint_XXXXXX` 时，保持数据、相机顺序、batch、precision、optimizer 和 schedule 协议一致。日志分开记录 FM、action CE、VL CE 及各自的 validation 分母；这些 offline 目标验证学习和梯度路径，不能代表闭环成功率或通用 web 知识保留。
+
+### 输入准备与日志
+
+KI 训练要求提供已验证的 `--image-cache` 和 `--vl-image-cache`。只有刻意读取源视频或 parquet 的小规模诊断才使用 `--allow-uncached-data`。数值数据每个 parquet 建立一次 episode 行区间索引，再按原顺序切片；chunk 选择、mask、归一化和原生动作对齐保持不变。这不等于已实现跨 rank 共享的全量数值缓存。
+
+CPU collator 在搬运前校验观测与 FAST prefix 契约，并生成 CE 监督位置。直接调用 policy 时默认仍保留校验。优化路径保持 FM conditioning detach，FAST/VL CE 继续训练 VLM。
+
+`--output` 用于 checkpoint 存储，XJC 使用 `/mnt/h_public/daibo/<run>`。Rank zero 默认在 `/tmp` 写训练指标和状态，也可用 `--log-dir` 指定本地盘；每隔 `--log-sync-seconds`（默认60秒）向 output 同步完整记录。`local_logs.json` 记录本地路径。同步失败会保留本地日志，正常退出会尝试最终同步。`step_seconds` 不包含日志和 checkpoint I/O；累计的 `logging_seconds`、`checkpoint_seconds` 和 `end_to_end_updates_per_second` 用于反映这些开销。
+
+`local_logs.json` 记录的本地 `STOP_AFTER_UPDATE` 每步检查；output 下的同名共享控制文件由后台同步线程按同步间隔轮询。

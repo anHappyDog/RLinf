@@ -37,6 +37,7 @@ class MolmoBotSubset:
         cameras: list[str],
         include_state: bool = False,
     ) -> None:
+        import pyarrow as pa
         import pyarrow.parquet as pq
 
         self.root = Path(root)
@@ -77,6 +78,7 @@ class MolmoBotSubset:
         self.manifest = []
         loaded_path = None
         table = None
+        episode_slices = {}
         for episode in episodes:
             path = self.root / self.info["data_path"].format(
                 chunk_index=episode["data/chunk_index"],
@@ -94,11 +96,27 @@ class MolmoBotSubset:
                     columns.append("observation.state")
                 table = pq.read_table(path, columns=columns)
                 loaded_path = path
-            import pyarrow.compute as pc
-
-            rows = table.filter(
-                pc.equal(table["episode_index"], episode["episode_index"])
-            )
+                episode_slices = {}
+                episode_ids = table["episode_index"].to_numpy()
+                if len(episode_ids):
+                    boundaries = np.r_[
+                        0,
+                        np.flatnonzero(episode_ids[1:] != episode_ids[:-1]) + 1,
+                        len(episode_ids),
+                    ]
+                    for start, stop in zip(
+                        boundaries[:-1], boundaries[1:], strict=True
+                    ):
+                        episode_slices.setdefault(int(episode_ids[start]), []).append(
+                            (int(start), int(stop - start))
+                        )
+            slices = episode_slices.get(episode["episode_index"], [])
+            if len(slices) == 1:
+                rows = table.slice(*slices[0])
+            elif slices:
+                rows = pa.concat_tables([table.slice(*part) for part in slices])
+            else:
+                rows = table.slice(0, 0)
             actions = np.array(rows["action"].to_pylist(), dtype=np.float32)
             states = (
                 np.array(rows["observation.state"].to_pylist(), dtype=np.float32)

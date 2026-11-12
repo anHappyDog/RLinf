@@ -32,6 +32,7 @@ import torch
 from torch.utils.data import Dataset
 
 from rlinf.models.embodiment.qwen35_fm.fast_tokenizer import build_ce_inputs
+from rlinf.models.embodiment.qwen35_fm.ki_policy import KIFlowMatchingPolicy
 
 
 class KIRobotDataset(Dataset):
@@ -180,12 +181,18 @@ class KIRobotCollator(_ProcessorCollator):
             contents.append(content)
             sequences.append(sample["fast_targets"])
         prefix = self._prefix_inputs(contents, images)
+        actions = torch.stack([sample["actions"] for sample in samples])
+        action_mask = torch.stack([sample["action_mask"] for sample in samples])
+        ce_inputs = build_ce_inputs(
+            prefix, sequences, self.processor.tokenizer.pad_token_id
+        )
         return {
-            "actions": torch.stack([sample["actions"] for sample in samples]),
-            "action_mask": torch.stack([sample["action_mask"] for sample in samples]),
+            "actions": actions,
+            "action_mask": action_mask,
             "prefix_inputs": prefix,
-            "ce_inputs": build_ce_inputs(
-                prefix, sequences, self.processor.tokenizer.pad_token_id
+            "ce_inputs": ce_inputs,
+            "batch_metadata": KIFlowMatchingPolicy.prepare_robot_metadata(
+                prefix, ce_inputs, actions, action_mask
             ),
         }
 
@@ -306,7 +313,11 @@ class VLCollator(_ProcessorCollator):
             else []
             for sample in samples
         ]
-        return {"vlm_inputs": build_ce_inputs(prefix, targets, tokenizer.pad_token_id)}
+        inputs = build_ce_inputs(prefix, targets, tokenizer.pad_token_id)
+        return {
+            "vlm_inputs": inputs,
+            "batch_metadata": KIFlowMatchingPolicy.prepare_ce_metadata(inputs),
+        }
 
 
 def _robo2vlm_group(item_id: str) -> str:

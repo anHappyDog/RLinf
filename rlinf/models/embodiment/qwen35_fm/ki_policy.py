@@ -58,7 +58,12 @@ class KIFlowMatchingPolicy(FlowMatchingPolicy):
         self.vl_weight = vl_weight
 
     @torch.no_grad()
-    def encode_prefix(self, prefix_inputs: Mapping[str, torch.Tensor]) -> VLMCondition:
+    def encode_prefix(
+        self,
+        prefix_inputs: Mapping[str, torch.Tensor],
+        *,
+        validate_padding: bool = True,
+    ) -> VLMCondition:
         """Encode observations only, with fresh native caches and insulated outputs.
 
         The evaluation context permits native cached GDN extraction even when
@@ -75,6 +80,7 @@ class KIFlowMatchingPolicy(FlowMatchingPolicy):
             condition = self.vlm.encode(
                 **prefix_inputs,
                 extract_states=self.expert.config.variant == "gqa6_vlm_state",
+                validate_padding=validate_padding,
             )
         finally:
             for module, training in training_modes:
@@ -103,8 +109,52 @@ class KIFlowMatchingPolicy(FlowMatchingPolicy):
             raise ValueError("Token CE labels must ignore padding positions")
         return labels
 
-    def _causal_ce_loss(self, inputs: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        labels = self._labels(inputs)
+    @staticmethod
+    def prepare_ce_metadata(
+        inputs: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Validate a CPU CE batch and select its supervised logit columns."""
+        if inputs["input_ids"].device.type != "cpu":
+            raise ValueError(
+                "Prepare KI batch metadata before transferring inputs to GPU"
+            )
+        labels = KIFlowMatchingPolicy._labels(inputs)
+        shift_labels = F.pad(labels, (0, 1), value=-100)[:, 1:]
+        supervised = shift_labels != -100
+        positions = supervised.any(0).nonzero(as_tuple=True)[0]
+        if positions.numel() == 0:
+            positions = torch.zeros(1, dtype=torch.long)
+        return {"ce_positions": positions, "ce_token_count": supervised.sum()}
+
+    @staticmethod
+    def prepare_robot_metadata(
+        prefix_inputs: Mapping[str, torch.Tensor],
+        ce_inputs: Mapping[str, torch.Tensor],
+        actions: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Validate one CPU robot batch before it enters the training hot path."""
+        if prefix_inputs["input_ids"].device.type != "cpu":
+            raise ValueError(
+                "Prepare KI batch metadata before transferring inputs to GPU"
+            )
+        KIFlowMatchingPolicy._validate_prefix(prefix_inputs, ce_inputs)
+        if action_mask.shape != actions.shape:
+            raise ValueError("Expected robot action_mask to match [B,H,D] actions")
+        count = action_mask.sum()
+        ce_metadata = KIFlowMatchingPolicy.prepare_ce_metadata(ce_inputs)
+        if not bool(count > 0) and bool(ce_metadata["ce_token_count"] > 0):
+            raise ValueError(
+                "Supervised action tokens require valid continuous actions"
+            )
+        return {**ce_metadata, "fm_valid_action_scalars": count}
+
+    def _causal_ce_loss(
+        self,
+        inputs: Mapping[str, torch.Tensor],
+        batch_metadata: Mapping[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        labels = self._labels(inputs) if batch_metadata is None else inputs["labels"]
         model_inputs = dict(inputs)
         for name in (
             "past_key_values",
@@ -119,11 +169,15 @@ class KIFlowMatchingPolicy(FlowMatchingPolicy):
                     f"KI token CE owns {name}; supply uncached native inputs"
                 )
         shift_labels = F.pad(labels, (0, 1), value=-100)[:, 1:]
-        token_count = (shift_labels != -100).sum()
-        positions = (shift_labels != -100).any(0).nonzero(as_tuple=True)[0]
-        if positions.numel() == 0:
-            # Empty local supervision still participates in FSDP collectives.
-            positions = torch.zeros(1, device=labels.device, dtype=torch.long)
+        if batch_metadata is None:
+            token_count = (shift_labels != -100).sum()
+            positions = (shift_labels != -100).any(0).nonzero(as_tuple=True)[0]
+            if positions.numel() == 0:
+                # Empty local supervision still participates in FSDP collectives.
+                positions = torch.zeros(1, device=labels.device, dtype=torch.long)
+        else:
+            token_count = batch_metadata["ce_token_count"]
+            positions = batch_metadata["ce_positions"]
         # Native CE accepts already-shifted targets. Project only supervised
         # columns so image/prompt tokens do not allocate vocabulary-sized logits.
         output = self.vlm.model(
@@ -136,13 +190,21 @@ class KIFlowMatchingPolicy(FlowMatchingPolicy):
         )
         return output.loss
 
-    def action_ce_loss(self, ce_inputs: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    def action_ce_loss(
+        self,
+        ce_inputs: Mapping[str, torch.Tensor],
+        batch_metadata: Mapping[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         """Compute native autoregressive CE over the masked FAST action suffix."""
-        return self._causal_ce_loss(ce_inputs)
+        return self._causal_ce_loss(ce_inputs, batch_metadata)
 
-    def vl_loss(self, vlm_batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """Compute native masked CE for authentic vision-language co-training."""
-        return self._causal_ce_loss(vlm_batch)
+    def vl_loss(
+        self,
+        vlm_batch: Mapping[str, torch.Tensor],
+        batch_metadata: Mapping[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Compute native masked CE using optional CPU-validated metadata."""
+        return self._causal_ce_loss(vlm_batch, batch_metadata)
 
     @staticmethod
     def _validate_prefix(
@@ -195,6 +257,7 @@ class KIFlowMatchingPolicy(FlowMatchingPolicy):
         vlm_batch: Mapping[str, torch.Tensor] | None = None,
         noise: torch.Tensor | None = None,
         timestep: torch.Tensor | None = None,
+        batch_metadata: Mapping[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return insulated FM, action CE, optional VL CE, and their weighted sum.
 
@@ -207,13 +270,23 @@ class KIFlowMatchingPolicy(FlowMatchingPolicy):
             vlm_batch: Optional native image/text batch with masked next-token labels.
             noise: Optional matched FM Gaussian sample.
             timestep: Optional matched FM times [B].
+            batch_metadata: Metadata from prepare_robot_metadata for this exact batch.
+                Omit it for unvalidated direct calls.
         """
-        self._validate_prefix(prefix_inputs, ce_inputs)
-        condition = self.encode_prefix(prefix_inputs)
-        fm_loss = self.loss(
-            actions, condition, action_mask, noise=noise, timestep=timestep
+        if batch_metadata is None:
+            self._validate_prefix(prefix_inputs, ce_inputs)
+        condition = self.encode_prefix(
+            prefix_inputs, validate_padding=batch_metadata is None
         )
-        action_ce_loss = self.action_ce_loss(ce_inputs)
+        fm_loss = self.loss(
+            actions,
+            condition,
+            action_mask,
+            noise=noise,
+            timestep=timestep,
+            mask_validated=batch_metadata is not None,
+        )
+        action_ce_loss = self.action_ce_loss(ce_inputs, batch_metadata)
         vl_loss = (
             self.vl_loss(vlm_batch)
             if vlm_batch is not None
@@ -225,7 +298,9 @@ class KIFlowMatchingPolicy(FlowMatchingPolicy):
             + self.vl_weight * vl_loss
         )
         valid_scalars = (
-            actions.numel()
+            batch_metadata["fm_valid_action_scalars"]
+            if batch_metadata is not None
+            else actions.numel()
             if action_mask is None
             else (
                 action_mask.sum() * actions.shape[-1]
@@ -238,7 +313,9 @@ class KIFlowMatchingPolicy(FlowMatchingPolicy):
             "fm_loss": fm_loss,
             "action_ce_loss": action_ce_loss,
             "vl_loss": vl_loss,
-            "action_ce_tokens": (ce_inputs["labels"][:, 1:] != -100).sum(),
+            "action_ce_tokens": batch_metadata["ce_token_count"]
+            if batch_metadata is not None
+            else (ce_inputs["labels"][:, 1:] != -100).sum(),
             "vl_tokens": (vlm_batch["labels"][:, 1:] != -100).sum()
             if vlm_batch is not None
             else actions.new_zeros((), dtype=torch.long),

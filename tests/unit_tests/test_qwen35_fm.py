@@ -901,3 +901,175 @@ def test_sample_context_cache_survives_fsdp_casts(tmp_path):
                 hook.remove()
     finally:
         dist.destroy_process_group()
+
+
+def test_ki_prepared_batch_matches_direct_loss_and_gradients():
+    from rlinf.models.embodiment.qwen35_fm.ki_policy import KIFlowMatchingPolicy
+
+    policy = ki_policy().train()
+    prefix, ce_inputs = ki_inputs()
+    device = prefix["input_ids"].device
+    actions = torch.randn(2, 4, 8, device=device)
+    mask = torch.ones_like(actions, dtype=torch.bool)
+    mask[0, -1] = False
+    noise = torch.randn_like(actions)
+    timestep = torch.tensor([0.2, 0.8], device=device)
+    metadata = KIFlowMatchingPolicy.prepare_robot_metadata(
+        {key: value.cpu() for key, value in prefix.items()},
+        {key: value.cpu() for key, value in ce_inputs.items()},
+        actions.cpu(),
+        mask.cpu(),
+    )
+    metadata = {key: value.to(device) for key, value in metadata.items()}
+    results, gradients = [], []
+    for prepared in (None, metadata):
+        policy.zero_grad(set_to_none=True)
+        result = policy(
+            prefix,
+            ce_inputs,
+            actions,
+            mask,
+            noise=noise,
+            timestep=timestep,
+            batch_metadata=prepared,
+        )
+        result["loss"].backward()
+        results.append({key: value.detach().clone() for key, value in result.items()})
+        gradients.append(
+            {
+                name: parameter.grad.detach().clone()
+                for name, parameter in policy.named_parameters()
+                if parameter.grad is not None
+            }
+        )
+    assert gradients[0].keys() == gradients[1].keys()
+    for key in results[0]:
+        torch.testing.assert_close(results[0][key], results[1][key], rtol=0, atol=0)
+    for name in gradients[0]:
+        torch.testing.assert_close(
+            gradients[0][name], gradients[1][name], rtol=0, atol=0
+        )
+    with torch.no_grad():
+        direct = policy.vl_loss(ce_inputs)
+        prepared = policy.vl_loss(ce_inputs, batch_metadata=metadata)
+    torch.testing.assert_close(direct, prepared, rtol=0, atol=0)
+
+
+def test_ki_cpu_metadata_rejects_invalid_prefix_and_labels():
+    from rlinf.models.embodiment.qwen35_fm.ki_policy import KIFlowMatchingPolicy
+
+    prefix, ce_inputs = ki_inputs()
+    prefix = {key: value.cpu() for key, value in prefix.items()}
+    ce_inputs = {key: value.cpu() for key, value in ce_inputs.items()}
+    actions = torch.randn(2, 4, 8)
+    mask = torch.ones_like(actions, dtype=torch.bool)
+    changed = {key: value.clone() for key, value in ce_inputs.items()}
+    changed["input_ids"][0, 0] = 20
+    with pytest.raises(ValueError, match="identical"):
+        KIFlowMatchingPolicy.prepare_robot_metadata(prefix, changed, actions, mask)
+    changed = {key: value.clone() for key, value in ce_inputs.items()}
+    changed["labels"][0, 1] = changed["input_ids"][0, 1]
+    with pytest.raises(ValueError, match="suffix"):
+        KIFlowMatchingPolicy.prepare_robot_metadata(prefix, changed, actions, mask)
+    changed = {key: value.clone() for key, value in ce_inputs.items()}
+    changed["attention_mask"][0, -1] = 0
+    with pytest.raises(ValueError, match="padding"):
+        KIFlowMatchingPolicy.prepare_ce_metadata(changed)
+    empty = {key: value.clone() for key, value in ce_inputs.items()}
+    empty["labels"].fill_(-100)
+    metadata = KIFlowMatchingPolicy.prepare_robot_metadata(
+        prefix, empty, actions, torch.zeros_like(mask)
+    )
+    assert metadata["ce_token_count"] == metadata["fm_valid_action_scalars"] == 0
+    assert metadata["ce_positions"].tolist() == [0]
+
+
+def test_molmobot_subset_preserves_interleaved_episode_rows(tmp_path):
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from examples.sft.qwen35_fm_data import MolmoBotSubset
+
+    root = tmp_path / "molmobot"
+    (root / "meta/episodes").mkdir(parents=True)
+    (root / "data").mkdir()
+    (root / "meta/info.json").write_text(
+        json.dumps({"features": {}, "data_path": "data/file-{file_index}.parquet"})
+    )
+    episodes = [
+        {
+            "episode_index": episode,
+            "length": 3,
+            "tasks": [f"pick object {episode}"],
+            "data/chunk_index": 0,
+            "data/file_index": 0,
+            "pipeline/provenance": json.dumps({"source_episode_id": episode}),
+        }
+        for episode in [2, 1]
+    ]
+    pq.write_table(pa.Table.from_pylist(episodes), root / "meta/episodes/file.parquet")
+    rows = []
+    for episode, step in [(1, 0), (2, 0), (1, 1), (1, 2), (2, 1), (2, 2)]:
+        rows.append(
+            {
+                "episode_index": episode,
+                "action": [float(episode * 10 + step)] * 8,
+                "observation.state": [float(episode * 100 + step)] * 9,
+                "source.extra.pipeline_supervision_mask": step != 1,
+                "source.observation_index": step,
+                "source.action_index": step + 1,
+            }
+        )
+    pq.write_table(pa.Table.from_pylist(rows), root / "data/file-0.parquet")
+    subset = MolmoBotSubset(root, 2, 2, 2, [], include_state=True)
+    assert [row["episode_index"] for row in subset.manifest] == [2, 2, 1, 1]
+    for episode, samples in [(2, subset.samples[:2]), (1, subset.samples[2:])]:
+        for start, sample in enumerate(samples):
+            torch.testing.assert_close(
+                sample["actions"][:, 0],
+                torch.tensor([episode * 10 + start, episode * 10 + start + 1]).float(),
+            )
+            assert sample["mask"][:, 0].tolist() == (
+                [True, False] if start == 0 else [False, True]
+            )
+            assert sample["state"].tolist() == [float(episode * 100 + start)] * 9
+            assert sample["episode"]["tasks"] == [f"pick object {episode}"]
+    assert [row["provenance"]["source_episode_id"] for row in subset.manifest] == [
+        2,
+        2,
+        1,
+        1,
+    ]
+
+
+def test_local_training_logs_survive_sync_failure_and_resume(tmp_path):
+    from examples.sft.qwen35_ki_pretrain import LocalRunLogger
+
+    output = tmp_path / "shared"
+    output.mkdir()
+    (output / "metrics.jsonl").write_text('{"step":1}\n')
+    local = tmp_path / "local"
+    logger = LocalRunLogger(output, local, 3600)
+    try:
+        logger.metric({"step": 2})
+        logger.status({"stage": "training", "step": 2})
+        logger.sync()
+        assert (output / "metrics.jsonl").read_text() == ('{"step":1}\n{"step": 2}\n')
+        for path in output.iterdir():
+            path.unlink()
+        output.rmdir()
+        logger.metric({"step": 3})
+        logger.sync()
+        assert logger.last_sync_error
+        assert (local / "metrics.jsonl").read_text().endswith('{"step": 3}\n')
+        output.mkdir()
+        (output / "STOP_AFTER_UPDATE").touch()
+        logger.sync()
+        assert logger.stop_requested
+    finally:
+        logger.close()
+    assert logger.last_sync_error is None
+    assert (output / "metrics.jsonl").read_text().endswith('{"step": 3}\n')
+    assert (output / "status.json").read_text() == ('{"stage": "training", "step": 2}')

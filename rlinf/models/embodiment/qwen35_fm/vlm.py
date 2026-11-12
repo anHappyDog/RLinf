@@ -169,6 +169,7 @@ class Qwen35VLMWrapper(nn.Module):
         instruction: str | list[str] | None = None,
         extract_states: bool = False,
         output_hidden_states: bool = False,
+        validate_padding: bool = True,
         **model_inputs: Any,
     ) -> VLMCondition:
         """Return native features and, when requested, differentiable memories.
@@ -192,7 +193,7 @@ class Qwen35VLMWrapper(nn.Module):
         if model_inputs.pop("use_cache", extract_states) != extract_states:
             raise ValueError("use_cache is controlled by extract_states")
         mask = model_inputs.get("attention_mask")
-        if extract_states and mask is not None:
+        if extract_states and mask is not None and validate_padding:
             if not isinstance(mask, torch.Tensor) or mask.ndim != 2:
                 raise ValueError("GDN state extraction requires a 2-D token mask")
             if bool((mask[:, :-1].bool() & ~mask[:, 1:].bool()).any()):

@@ -15,10 +15,12 @@
 """Hybrid FSDP knowledge-insulated robot FM/FAST CE and native visual-language CE."""
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
+import threading
 import time
 from dataclasses import asdict
 from datetime import timedelta
@@ -79,6 +81,13 @@ def parse_args():
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--resume")
+    parser.add_argument("--log-dir", help="Local log directory; defaults to /tmp")
+    parser.add_argument("--log-sync-seconds", type=float, default=60.0)
+    parser.add_argument(
+        "--allow-uncached-data",
+        action="store_true",
+        help="Permit video/parquet decoding for bounded diagnostics",
+    )
     parser.add_argument(
         "--reshard-after-forward", action=argparse.BooleanOptionalAction, default=False
     )
@@ -156,6 +165,74 @@ def global_loss_means(losses, counts, world):
     return weighted, totals[0] / totals[1].clamp_min(1), totals[1]
 
 
+class LocalRunLogger:
+    """Write training logs locally and mirror complete records off the hot path."""
+
+    def __init__(self, output: Path, local_dir: Path, interval: float):
+        self.output = output
+        self.local_dir = local_dir
+        if local_dir.resolve() == output.resolve():
+            raise ValueError(
+                "Local logs and shared output must use different directories"
+            )
+        self.local_dir.mkdir(parents=True, exist_ok=True)
+        saved_metrics = output / "metrics.jsonl"
+        local_metrics = local_dir / "metrics.jsonl"
+        if saved_metrics.exists() and not local_metrics.exists():
+            local_metrics.write_bytes(saved_metrics.read_bytes())
+        self.interval = interval
+        self._stop = threading.Event()
+        self._sync_lock = threading.Lock()
+        self.last_sync_error = None
+        self.stop_requested = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def status(self, record):
+        path = self.local_dir / "status.json"
+        pending = path.with_suffix(".json.tmp")
+        pending.write_text(json.dumps(record))
+        pending.replace(path)
+
+    def metric(self, record):
+        with (self.local_dir / "metrics.jsonl").open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+    def sync(self):
+        """Publish snapshots atomically, retaining local logs after write failures."""
+        with self._sync_lock:
+            try:
+                self.stop_requested |= (self.output / "STOP_AFTER_UPDATE").exists()
+                for name in ("metrics.jsonl", "status.json"):
+                    path = self.local_dir / name
+                    if not path.exists():
+                        continue
+                    data = path.read_bytes()
+                    if name == "metrics.jsonl":
+                        data = data[: data.rfind(b"\n") + 1]
+                    pending = self.output / (name + ".sync.tmp")
+                    pending.write_bytes(data)
+                    pending.replace(self.output / name)
+                self.last_sync_error = None
+            except OSError as error:
+                self.last_sync_error = str(error)
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            self.sync()
+        self.sync()
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=30)
+        if self._thread.is_alive() or self.last_sync_error:
+            get_logger().warning(
+                "Log sync incomplete; local logs remain at %s: %s",
+                self.local_dir,
+                self.last_sync_error or "shared storage did not respond",
+            )
+
+
 def main():
     from examples.sft.qwen35_ki_data import (
         KIRobotCollator,
@@ -165,6 +242,15 @@ def main():
     )
 
     args = parse_args()
+    if args.log_sync_seconds <= 0:
+        raise ValueError("Log sync interval must be positive")
+    if not args.allow_uncached_data and (
+        not args.image_cache or not args.vl_image_cache
+    ):
+        raise ValueError(
+            "KI training requires --image-cache and --vl-image-cache; "
+            "use --allow-uncached-data only for bounded diagnostics"
+        )
     if (
         min(
             args.batch_size,
@@ -209,6 +295,8 @@ def main():
     state_layers = values.pop("state_layers", None)
     config = ActionExpertConfig(**values)
 
+    run_logger = None
+
     def status(stage, **fields):
         if rank == 0:
             record = {
@@ -219,10 +307,14 @@ def main():
                 "global_batch_size": args.batch_size * world,
                 **fields,
             }
-            temporary = output / "status.json.tmp"
-            temporary.write_text(json.dumps(record, indent=2))
-            temporary.replace(output / "status.json")
-            logger.info(json.dumps(record))
+            if run_logger is None:
+                temporary = output / "status.json.tmp"
+                temporary.write_text(json.dumps(record, indent=2))
+                temporary.replace(output / "status.json")
+            else:
+                run_logger.status(record)
+            if stage != "training":
+                logger.info(json.dumps(record))
 
     status("loading_data", args=vars(args))
     root = Path(args.data_path).resolve()
@@ -562,6 +654,7 @@ def main():
         return norm.detach()
 
     def save(step, elapsed):
+        save_started = time.perf_counter()
         path = output / f"checkpoint_{step:06d}"
         if rank == 0:
             path.mkdir(exist_ok=False)
@@ -584,7 +677,9 @@ def main():
                 json.dumps(
                     {
                         "step": step,
-                        "training_seconds": elapsed,
+                        "training_seconds": elapsed
+                        + time.perf_counter()
+                        - save_started,
                         "protocol": protocol,
                         "manifest": str(output / "data_manifest.json"),
                     },
@@ -594,6 +689,25 @@ def main():
         dist.barrier()
         return str(path)
 
+    if rank == 0:
+        identity = hashlib.sha256(str(output).encode()).hexdigest()[:12]
+        local_logs = (
+            Path(args.log_dir).resolve()
+            if args.log_dir
+            else Path("/tmp") / f"rlinf_ki_{identity}_{os.getpid()}"
+        )
+        run_logger = LocalRunLogger(output, local_logs, args.log_sync_seconds)
+        (output / "local_logs.json").write_text(
+            json.dumps(
+                {
+                    "directory": str(local_logs),
+                    "pid": os.getpid(),
+                    "stop_file": str(local_logs / "STOP_AFTER_UPDATE"),
+                    "shared_stop_poll_seconds": args.log_sync_seconds,
+                }
+            )
+            + "\n"
+        )
     status(
         "ready",
         resumed_step=start_step,
@@ -607,6 +721,7 @@ def main():
     started = time.perf_counter()
     last_end = started
     last_step, checkpoint, elapsed = start_step, None, previous_seconds
+    checkpoint_seconds = logging_seconds = 0.0
     for step in range(start_step, args.steps):
         is_vl = (step + 1) % args.vl_every == 0
         batch = to_device(next(vl_iterator if is_vl else robot_iterator))
@@ -623,9 +738,11 @@ def main():
         torch.manual_seed(args.seed + 1000 + step * world + rank)
         zero = torch.zeros((), device=device)
         if is_vl:
-            local = policy.vl_loss(batch["vlm_inputs"])
+            local = policy.vl_loss(
+                batch["vlm_inputs"], batch_metadata=batch.get("batch_metadata")
+            )
             weighted, means, counts = global_loss_means(
-                [local], [(batch["vlm_inputs"]["labels"][:, 1:] != -100).sum()], world
+                [local], [batch["batch_metadata"]["ce_token_count"]], world
             )
             loss, vl_loss, vl_tokens = weighted[0], means[0], counts[0]
             fm_loss = action_ce = zero
@@ -663,7 +780,8 @@ def main():
                 rank == 0
                 and (
                     elapsed >= args.max_seconds
-                    or (output / "STOP_AFTER_UPDATE").exists()
+                    or run_logger.stop_requested
+                    or (run_logger.local_dir / "STOP_AFTER_UPDATE").exists()
                 )
             ),
             device=device,
@@ -701,16 +819,24 @@ def main():
                 "expert_lr": args.expert_lr * factor,
                 "data_wait_seconds": data_ready - last_end,
                 "step_seconds": time.perf_counter() - last_end,
+                "checkpoint_seconds": checkpoint_seconds,
+                "logging_seconds": logging_seconds,
+                "end_to_end_updates_per_second": (last_step - start_step)
+                / max(elapsed - previous_seconds, 1e-9),
                 "training_seconds": elapsed,
                 "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
                 "robot_updates": last_step - last_step // args.vl_every,
                 "vl_updates": last_step // args.vl_every,
             }
-            with (output / "metrics.jsonl").open("a") as handle:
-                handle.write(json.dumps(record) + "\n")
+            logging_started = time.perf_counter()
+            run_logger.metric(record)
             status("training", **record)
+            logging_seconds += time.perf_counter() - logging_started
         if last_step % args.checkpoint_every == 0 or final:
+            checkpoint_started = time.perf_counter()
             checkpoint = save(last_step, elapsed)
+            checkpoint_seconds += time.perf_counter() - checkpoint_started
+            elapsed = previous_seconds + time.perf_counter() - started
         last_end = time.perf_counter()
         if final:
             break
@@ -720,6 +846,8 @@ def main():
         "validating",
         step=last_step,
         checkpoint=checkpoint,
+        checkpoint_seconds=checkpoint_seconds,
+        logging_seconds=logging_seconds,
         training_seconds=training_seconds,
     )
     if args.skip_validation:
@@ -732,6 +860,8 @@ def main():
             robot_updates=last_step - last_step // args.vl_every,
             vl_updates=last_step // args.vl_every,
         )
+        if run_logger is not None:
+            run_logger.close()
         dist.barrier()
         dist.destroy_process_group()
         return
@@ -749,6 +879,10 @@ def main():
             original_count = mask.sum()
             if not bool(original_count):
                 batch["action_mask"] = torch.ones_like(mask)
+                batch["batch_metadata"] = dict(batch["batch_metadata"])
+                batch["batch_metadata"]["fm_valid_action_scalars"] = batch[
+                    "action_mask"
+                ].sum()
             losses = policy(**batch)
             robot_terms[0] += losses["fm_loss"].double() * original_count
             robot_terms[1] += original_count
@@ -758,8 +892,10 @@ def main():
             robot_terms[3] += losses["action_ce_tokens"]
         for index, raw_batch in enumerate(loader(vl_val, vl_collator, batch_size=1)):
             batch = to_device(raw_batch)
-            local = policy.vl_loss(batch["vlm_inputs"])
-            count = (batch["vlm_inputs"]["labels"][:, 1:] != -100).sum()
+            local = policy.vl_loss(
+                batch["vlm_inputs"], batch_metadata=batch.get("batch_metadata")
+            )
+            count = batch["batch_metadata"]["ce_token_count"]
             vl_terms += torch.stack((local.double() * count, count.double()))
     dist.all_reduce(robot_terms)
     dist.all_reduce(vl_terms)
@@ -768,6 +904,8 @@ def main():
         step=last_step,
         stop_reason="step_budget" if last_step == args.steps else "time_or_stop_file",
         checkpoint=checkpoint,
+        checkpoint_seconds=checkpoint_seconds,
+        logging_seconds=logging_seconds,
         training_seconds=training_seconds,
         validation_seconds=time.perf_counter() - validation_start,
         validation_fm_loss=float(robot_terms[0] / robot_terms[1].clamp_min(1)),
@@ -779,6 +917,8 @@ def main():
         robot_updates=last_step - last_step // args.vl_every,
         vl_updates=last_step // args.vl_every,
     )
+    if run_logger is not None:
+        run_logger.close()
     dist.barrier()
     dist.destroy_process_group()
 

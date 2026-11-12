@@ -20,7 +20,7 @@ The three additive GDN experts retain the complete GQA baseline: each GQA block 
 
 All presets use the same hidden size 1024, FFN size 4096, action horizon 16, action dimension 8, and 16 query / 4 KV heads. Additive GDN blocks also share 8 key/value heads and key/value head dimensions 128. Parameter counts follow naturally from the added modules; widths are not adjusted to reach a target budget. Keep data, seeds, normalization, optimization, and conditioning fixed when comparing these configurations.
 
-Set `depth` to override the GQA backbone depth and `gdn_depth` to override the number of appended GDN blocks; defaults are six GQA blocks and the GDN count named by the variant. Set `action_self_attn: false` for the GQA cross-attention-only ablation. Each block receives the FM time through adaptive normalization. Action embeddings also include learned physical-time positions and the time embedding.
+Set `depth` to override the GQA backbone depth and `gdn_depth` to override the number of appended GDN blocks; defaults are six GQA blocks and the GDN count named by the variant. Set `action_self_attn: false` for the GQA cross-attention-only ablation. Each block receives the FM time through adaptive normalization. Action embeddings also include learned action-index positions and the time embedding.
 
 ## Encode And Predict Actions
 
@@ -254,3 +254,13 @@ FP32 master parameters and AdamW states are retained, computation uses BF16, and
 Run `PYTHONPATH=. python -m pytest tests/unit_tests/test_qwen35_fm.py -q -k ki_` for KI gradient routing, prefix isolation, native masked CE equivalence, FAST mapping, and multimodal CE checks. Set `QWEN35_FAST_TOKENIZER` if the reviewed local tokenizer lives elsewhere. Eleven KI tests and an eight-rank, full-Qwen, four-update smoke passed in this session; that first smoke used one exterior view. Its [status receipt](../../../../results/qwen35_ki_20261112/smoke_v3/status.json) records the actual robot/VL counts and losses. Four-view production runs require their own measured results.
 
 Distributed checkpoints contain Qwen, Expert, both optimizers, normalization, FAST mapping, sampler/update position, and every rank's RNG; the full-model smoke checkpoint is approximately 30 GB. Use `--resume /absolute/path/to/checkpoint_XXXXXX` with unchanged data, camera order, batch, precision, optimizer, and schedule protocol. Logs distinguish FM, action CE, and VL CE and report each validation denominator. These offline objectives validate learning and routing; they do not establish closed-loop success or retention of general web knowledge.
+
+### Input preparation and logging
+
+KI runs require verified `--image-cache` and `--vl-image-cache` inputs. Use `--allow-uncached-data` only for bounded diagnostics that intentionally decode source media. Numeric episode selection indexes each parquet once and slices the original rows; this does not change chunk selection, masks, normalization, or native action alignment. It does not provide a shared full-dataset numeric cache across ranks.
+
+CPU collators validate the observation/FAST prefix contract and prepare CE positions before device transfer. Direct policy calls retain validation by default. The optimized batch path preserves detached FM conditioning and trainable FAST/VL CE.
+
+Keep `--output` on the checkpoint storage (for XJC, `/mnt/h_public/daibo/<run>`). Rank zero writes training metrics and status under `/tmp` by default, or `--log-dir` on a local disk, and mirrors complete records to the output every `--log-sync-seconds` (default 60). `local_logs.json` records the local directory. A failed mirror retains local logs; a clean exit attempts a final sync. `step_seconds` excludes logging and checkpoint I/O; cumulative `logging_seconds`, `checkpoint_seconds`, and `end_to_end_updates_per_second` expose their cost.
+
+The local `STOP_AFTER_UPDATE` path is recorded in `local_logs.json` and is checked each update; the same file under shared output is polled by the background mirror at the sync interval.

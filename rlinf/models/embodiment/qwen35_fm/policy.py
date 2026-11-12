@@ -55,6 +55,7 @@ class FlowMatchingPolicy(nn.Module):
         *,
         noise: torch.Tensor | None = None,
         timestep: torch.Tensor | None = None,
+        mask_validated: bool = False,
     ) -> torch.Tensor:
         """Compute linear-path FM MSE over valid action coordinates.
 
@@ -91,7 +92,7 @@ class FlowMatchingPolicy(nn.Module):
         if mask.ndim == 2:
             mask = mask.unsqueeze(-1)
         mask = mask.expand_as(error)
-        if not torch.any(mask > 0):
+        if not mask_validated and not torch.any(mask > 0):
             raise ValueError(
                 "action_mask must contain at least one valid action coordinate"
             )
