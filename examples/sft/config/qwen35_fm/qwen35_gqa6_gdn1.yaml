@@ -1,0 +1,19 @@
+# Matched widths; additive variants retain the complete GQA backbone.
+expert:
+  variant: gqa6_gdn1
+  hidden_size: 1024
+  intermediate_size: 4096
+  num_heads: 16
+  num_kv_heads: 4
+  vlm_hidden_size: 2048
+  action_dim: 8
+  horizon: 16
+  depth: 6
+  action_self_attn: true
+  gdn_num_key_heads: 8
+  gdn_num_value_heads: 8
+  gdn_key_head_dim: 128
+  gdn_value_head_dim: 128
+  gdn_kernel: native
+  state_injection: per_block
+  state_adapter_dim: 128
