@@ -85,6 +85,11 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--resume")
     parser.add_argument(
+        "--replace-vl-data",
+        action="store_true",
+        help="Resume weights/optimizers and robot sampling, restarting VL sampling on new data",
+    )
+    parser.add_argument(
         "--kernel-backend", choices=("native", "fa3_flashqla"), default="native"
     )
     parser.add_argument("--fa3-path", default="/opt/qwen35_fa3_fast")
@@ -344,6 +349,15 @@ def main():
         if args.resume
         else None
     )
+    if args.replace_vl_data and resume_metadata is None:
+        raise ValueError("Replacing VL data requires a resume checkpoint")
+    vl_sampling_origin = (
+        resume_metadata["step"] // args.vl_every
+        if args.replace_vl_data
+        else resume_metadata["protocol"].get("vl_sampling_origin_update", 0)
+        if resume_metadata
+        else 0
+    )
     target_path = (
         Path(resume_metadata["manifest"]).parent if resume_metadata else output
     ) / "fast_targets.json"
@@ -482,6 +496,26 @@ def main():
         seed=args.seed,
         excluded_image_hashes=vl_val.image_hashes,
     )
+    vl_manifest_format = (
+        "cache_sha256"
+        if args.replace_vl_data
+        else resume_metadata["protocol"].get("vl_manifest_format", "inline")
+        if resume_metadata
+        else "inline"
+    )
+
+    def vl_manifest(dataset):
+        if vl_manifest_format == "inline":
+            return dataset.manifest
+        metadata_path = Path(dataset.image_cache_file).with_suffix(".json")
+        with metadata_path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        return {
+            "metadata_file": str(metadata_path),
+            "metadata_sha256": digest,
+            "examples": len(dataset),
+        }
+
     status(
         "loading_model",
         robot_train_chunks=len(train),
@@ -598,7 +632,7 @@ def main():
         loader(
             vl_train,
             vl_collator,
-            prior_vl_steps * args.gradient_accumulation,
+            (prior_vl_steps - vl_sampling_origin) * args.gradient_accumulation,
             args.steps * args.gradient_accumulation,
         )
     )
@@ -701,8 +735,9 @@ def main():
         "vl_data_path": str(Path(args.vl_data_path).resolve()),
         "vl_format": args.vl_format,
         "vl_source_info": {"train": vl_train.info, "validation": vl_val.info},
-        "vl_train": vl_train.manifest,
-        "vl_validation": vl_val.manifest,
+        "vl_manifest_format": vl_manifest_format,
+        "vl_train": vl_manifest(vl_train),
+        "vl_validation": vl_manifest(vl_val),
         "fm_normalization": {"mean": mean.tolist(), "std": std.tolist()},
         "fast_normalization": action_quantiles,
         "state_quantiles": state_quantiles,
@@ -714,6 +749,7 @@ def main():
         "mesh": list(mesh_shape),
         "seed": args.seed,
         "vl_every": args.vl_every,
+        "vl_sampling_origin_update": vl_sampling_origin,
         "warmup_steps": args.warmup_steps,
         "vlm_lr": args.vlm_lr,
         "expert_lr": args.expert_lr,
@@ -731,7 +767,23 @@ def main():
         metadata = resume_metadata
         if args.schedule_steps is None:
             protocol["schedule_steps"] = metadata["protocol"]["schedule_steps"]
-        if json.loads(json.dumps(protocol)) != metadata["protocol"]:
+        previous_protocol = dict(metadata["protocol"])
+        previous_protocol.setdefault("vl_sampling_origin_update", 0)
+        previous_protocol.setdefault("vl_manifest_format", "inline")
+        comparable_protocol = json.loads(json.dumps(protocol))
+        if args.replace_vl_data:
+            if output == Path(metadata["manifest"]).parent:
+                raise ValueError("Replacing VL data requires a new output directory")
+            for field in (
+                "vl_data_path",
+                "vl_source_info",
+                "vl_train",
+                "vl_validation",
+                "vl_sampling_origin_update",
+                "vl_manifest_format",
+            ):
+                comparable_protocol[field] = previous_protocol[field]
+        if comparable_protocol != previous_protocol:
             raise ValueError(
                 "KI resume protocol differs from checkpoint; data/model/normalization/schedule must match"
             )
