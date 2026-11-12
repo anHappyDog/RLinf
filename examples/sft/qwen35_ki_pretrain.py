@@ -895,7 +895,6 @@ def main():
             )
             synchronize_gradients = micro + 1 == args.gradient_accumulation
             policy.set_requires_gradient_sync(synchronize_gradients)
-            policy.set_reshard_after_backward(synchronize_gradients)
             if is_vl:
                 local_losses = [
                     policy.vl_loss(
@@ -929,7 +928,6 @@ def main():
                 ]
             )
         policy.set_requires_gradient_sync(True)
-        policy.set_reshard_after_backward(True)
         dist.all_reduce(numerators)
         means = numerators / counts.clamp_min(1)
         if is_vl:
